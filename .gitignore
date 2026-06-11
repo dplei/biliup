@@ -56,3 +56,5 @@ cookies.json
 logs/
 CLAUDE.md
 .claude/
+# macOS
+.DS_Store

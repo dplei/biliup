@@ -1,0 +1,14 @@
+# Rust 构建产物（镜像内由 maturin 重新编译，本机 2.8G+ 不应进上下文）
+target/
+# 前端依赖与产物（镜像内 npm install / npm run build 重新生成）
+node_modules/
+out/
+.next/
+# 版本库与本机杂物
+.git/
+.github/
+**/.DS_Store
+*.log
+# 运行时生成物 / 凭证（.env* 为已跟踪的构建配置，不可忽略）
+cookies.json
+data/
