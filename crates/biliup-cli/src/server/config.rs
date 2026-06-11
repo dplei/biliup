@@ -38,6 +38,13 @@ pub struct Config {
     #[serde(default)]
     pub segment_processor_parallel: Option<bool>,
 
+    /// 删除时机：本地切片文件何时执行后处理（如 rm 删本地）。
+    /// "stream_end"/None = 下播后统一删除（默认）；
+    /// "per_segment" = 每片上传成功后立即删除，磁盘峰值≈单个切片，适合小磁盘机器。
+    /// 注意：submit（生成稿件）始终在下播后一次性进行，此项只改后处理（删除）的时机。
+    #[serde(default)]
+    pub segment_delete_mode: Option<String>,
+
     /// 上传器类型：Noop | bili_web | biliup-rs | 其他
     #[serde(default)]
     pub uploader: Option<String>,

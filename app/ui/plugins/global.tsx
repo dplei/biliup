@@ -297,6 +297,20 @@ const Global: React.FC = () => {
           <Form.Select.Option value="web">网页（web）</Form.Select.Option>
         </Form.Select>
         <Form.Select
+          field="segment_delete_mode"
+          label="删除时机（segment_delete_mode）"
+          extraText="切片本地文件的删除时机。「每片删」：每个切片上传成功后立即删本地，磁盘峰值≈单个切片，适合小磁盘机器；「下播后删」：录制结束后统一删除（默认）。注意稿件提交（submit）始终在下播后一次性进行，本项只影响删除时机。"
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          initValue="stream_end"
+        >
+          <Form.Select.Option value="stream_end">下播后删（默认）</Form.Select.Option>
+          <Form.Select.Option value="per_segment">每片删（每片上传后立即删，省磁盘）</Form.Select.Option>
+        </Form.Select>
+        <Form.Select
           field="uploader"
           label="上传插件（uploader）"
           extraText="全局默认上传插件选择。"
