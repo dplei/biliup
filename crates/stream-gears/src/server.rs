@@ -161,19 +161,16 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
         .with_line_number(true)
         .with_thread_ids(true);
 
-    // 按日期滚动，每天创建新文件
+    // 主程序日志写到工作目录(容器内 /opt)的 ds_update.log。
+    // 文件名必须与 web「实时日志-主程序运行日志」(ws.rs 读 ds_update.log)一致——
+    // 此前误配成 download.log(builder 重复调用，prefix 被第二次覆盖)，导致网页一直「不存在」。
+    // NEVER 不滚动以保持固定文件名；文件会持续增长，需偶尔清空(`: > /opt/ds_update.log`)。
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(Rotation::DAILY) // rotate log files once every hour
-        .rotation(Rotation::NEVER) // rotate log files once every hour
-        .filename_prefix("biliup") // log file names will be prefixed with `myapp.`
-        .filename_prefix("download") // log file names will be prefixed with `myapp.`
-        .filename_suffix("log") // log file names will be suffixed with `.log`
-        // .max_log_files(3)
-        // .build("logs") // try to build an appender that stores log files in `/var/log`
-        .build("") // try to build an appender that stores log files in `/var/log`
+        .rotation(Rotation::NEVER)
+        .filename_prefix("ds_update")
+        .filename_suffix("log")
+        .build("")
         .expect("initializing rolling file appender failed");
-    // 或者按小时滚动
-    // let file_appender = tracing_appender::rolling::hourly("logs", "upload.log");
 
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
