@@ -61,18 +61,12 @@ where
         .segment_processor
         .clone()
         .unwrap_or_default();
-    // 删除时机开关：per_segment = 每片上传成功后立即后处理（删本地），省磁盘；
-    // 其余/默认 = 累积到下播后统一后处理。submit 始终在下播后一次性进行。
-    let delete_after_each_segment =
-        ctx.config().segment_delete_mode.as_deref() == Some("per_segment");
-    let uploaded_videos = pipeline_upload_videos(
-        rx,
-        &upload_context,
-        &segment_processors,
-        ctx,
-        delete_after_each_segment,
-    )
-    .await?;
+    // 删除时机开关（per_segment = 每片上传成功后立即后处理删本地，省磁盘；
+    // 其余/默认 = 累积到下播后统一后处理）在 pipeline_upload_videos 内部「逐段」读取，
+    // 这样录制途中修改全局配置也能对后续分段即时生效，而不会被开播那一刻的旧值锁死整场。
+    // submit 始终在下播后一次性进行。
+    let uploaded_videos =
+        pipeline_upload_videos(rx, &upload_context, &segment_processors, ctx).await?;
 
     // 3. 提交到B站
     if !uploaded_videos.videos.is_empty() {
@@ -149,7 +143,6 @@ async fn pipeline_upload_videos<F>(
     context: &UploadContext,
     segment_processors: &[HookStep],
     ctx: &Context,
-    delete_after_each_segment: bool,
 ) -> AppResult<UploadedVideos>
 where
     F: FnMut(&SegmentInfo),
@@ -182,6 +175,10 @@ where
                 // 1.0.7 的 FileInfo(video, danmaku) 语义：上传完成后的 postprocessor
                 // 继续接收本段视频路径和对应弹幕路径。segment_processor 可能已把
                 // 首个视频路径原地替换（例如 Remux .ts→.mp4），因此这里保留转换后的路径集。
+                // 「逐段」读取删除时机：每段上传成功后都按当前配置决定，故录制途中改配置
+                // 对后续分段即时生效，不会被开播那一刻的旧值锁死整场。
+                let delete_after_each_segment =
+                    ctx.config().segment_delete_mode.as_deref() == Some("per_segment");
                 if delete_after_each_segment {
                     // 「每片删」：本段上传成功后立即后处理（删本地），磁盘峰值≈单切片。
                     // submit 仍在下播后统一进行，故此处不累积到 uploaded.paths。
