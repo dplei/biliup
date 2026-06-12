@@ -161,14 +161,15 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
         .with_line_number(true)
         .with_thread_ids(true);
 
-    // 主程序日志写到工作目录(容器内 /opt)的 ds_update.log。
-    // 文件名必须与 web「实时日志-主程序运行日志」(ws.rs 读 ds_update.log)一致——
+    // 主程序日志写到工作目录(容器内 /opt)，文件 ds_update.<日期>.log（前缀须与 web
+    // 「实时日志-主程序运行日志」一致，ws.rs 会解析 ds_update.* 取最新一个）。
     // 此前误配成 download.log(builder 重复调用，prefix 被第二次覆盖)，导致网页一直「不存在」。
-    // NEVER 不滚动以保持固定文件名；文件会持续增长，需偶尔清空(`: > /opt/ds_update.log`)。
+    // 按天滚动 + 只留最近 7 天(max_log_files)，避免日志在小磁盘上无限增长。
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(Rotation::NEVER)
+        .rotation(Rotation::DAILY)
         .filename_prefix("ds_update")
         .filename_suffix("log")
+        .max_log_files(7)
         .build("")
         .expect("initializing rolling file appender failed");
 

@@ -37,7 +37,19 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
         return;
     }
 
-    let log_file = PathBuf::from(&file_param);
+    // 日志按天滚动后真实文件名是 ds_update.<日期>.log，这里把逻辑名解析成最新的实体文件。
+    let mut log_file = match resolve_latest_log(&file_param) {
+        Some(p) => p,
+        None => {
+            let _ = ws
+                .send(Message::Text(
+                    format!("日志文件 {} 不存在", file_param).into(),
+                ))
+                .await;
+            let _ = ws.send(Message::Close(None)).await;
+            return;
+        }
+    };
 
     // 发送初始内容（最后50行）并获取当前大小
     let mut file_size = match send_last_lines(&mut ws, &log_file, 50).await {
@@ -95,6 +107,28 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
             }
 
             _ = tick.tick() => {
+                // 跨天滚动：重新解析最新日志文件，若切换了就重载最后几行
+                if let Some(latest) = resolve_latest_log(&file_param)
+                    && latest != log_file
+                {
+                    log_file = latest;
+                    let _ = ws
+                        .send(Message::Text("日志已按天滚动到新文件，重新加载...".into()))
+                        .await;
+                    match send_last_lines(&mut ws, &log_file, 50).await {
+                        Ok(size) => {
+                            file_size = size;
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = ws
+                                .send(Message::Text(format!("读取日志文件错误: {}", e).into()))
+                                .await;
+                            error!("读取日志文件错误: {}", e);
+                            break;
+                        }
+                    }
+                }
                 // 文件是否存在
                 let meta = match fs::metadata(&log_file).await {
                     Ok(m) => m,
@@ -143,6 +177,33 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
 
     let _ = ws.send(Message::Close(None)).await;
     debug!("WebSocket日志会话结束: {}", file_param);
+}
+
+/// 把逻辑日志名（如 "ds_update.log"）解析为工作目录下实际最新的日志文件。
+/// 按天滚动后真实文件名形如 "ds_update.2026-06-12.log"，这里匹配「精确同名」或
+/// 「<prefix>.*.<suffix>」两种，取修改时间最新的一个；都不存在则返回 None。
+fn resolve_latest_log(file_param: &str) -> Option<PathBuf> {
+    let (prefix, suffix) = file_param.rsplit_once('.').unwrap_or((file_param, ""));
+    let dot_prefix = format!("{prefix}.");
+    let dot_suffix = format!(".{suffix}");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(".").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let matches =
+            name == file_param || (name.starts_with(&dot_prefix) && name.ends_with(&dot_suffix));
+        if !matches {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().map(|(t, _)| mtime >= *t).unwrap_or(true) {
+            newest = Some((mtime, entry.path()));
+        }
+    }
+    newest.map(|(_, p)| p)
 }
 
 // 发送最后 n 行，并返回当前文件大小
