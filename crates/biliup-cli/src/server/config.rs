@@ -51,6 +51,12 @@ pub struct Config {
     #[serde(default)]
     pub cookie_health_webhook: Option<String>,
 
+    /// 合集分区ID（season section_id）。每个主播在「录播管理」里经 override 各设各的，
+    /// 投稿成功后自动把新稿件加入该合集（B 站「视频合集」）。留空=不加合集。
+    /// section_id 通过创作中心合集管理或「列出我的合集」接口获取。
+    #[serde(default)]
+    pub season_section_id: Option<i64>,
+
     /// 上传器类型：Noop | bili_web | biliup-rs | 其他
     #[serde(default)]
     pub uploader: Option<String>,

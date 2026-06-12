@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Instant;
 use tokio::pin;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // 辅助结构体
 struct UploadContext {
@@ -81,7 +81,25 @@ where
         )
         .await?;
         let submit_api = ctx.config().submit_api.clone();
-        submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+        let submit_result =
+            submit_to_bilibili(&upload_context.bilibili, &studio, submit_api.as_deref()).await?;
+
+        // 投稿成功后：若该主播（经 override）配置了合集分区，则把新稿件加入合集。
+        // 失败不影响主流程，仅告警（可稍后在创作中心手动补加）。
+        if let Some(section_id) = ctx.config().season_section_id {
+            match submit_result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("aid"))
+                .and_then(|a| a.as_u64())
+            {
+                Some(aid) => {
+                    add_archive_to_season_with_retry(&upload_context.bilibili, section_id, aid)
+                        .await
+                }
+                None => warn!(?submit_result, "投稿响应缺少 aid，跳过加入合集"),
+            }
+        }
     }
 
     // 4. 执行后处理
@@ -90,6 +108,26 @@ where
     }
 
     Ok(())
+}
+
+/// 把稿件加入合集，带重试。新稿件审核中，view 接口取 cid 可能有几十秒延迟，故重试。
+async fn add_archive_to_season_with_retry(bilibili: &BiliBili, section_id: i64, aid: u64) {
+    for attempt in 1..=5u32 {
+        match bilibili.add_archive_to_season(section_id, aid).await {
+            Ok(()) => {
+                info!(aid, section_id, "稿件已加入合集");
+                return;
+            }
+            Err(e) => {
+                warn!(aid, section_id, attempt, "加入合集失败，将重试: {:?}", e);
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        }
+    }
+    error!(
+        aid,
+        section_id, "加入合集多次失败，已放弃（可稍后在创作中心手动添加）"
+    );
 }
 
 async fn initialize_upload_context(

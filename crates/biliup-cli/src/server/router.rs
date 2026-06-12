@@ -1,5 +1,5 @@
 use crate::server::api::bilibili_endpoints::{
-    archive_pre_endpoint, get_myinfo_endpoint, get_proxy_endpoint,
+    archive_pre_endpoint, get_myinfo_endpoint, get_proxy_endpoint, get_seasons_endpoint,
 };
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_streamers_endpoint,
@@ -51,6 +51,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         // B站API代理路由
         .route("/bili/archive/pre", get(archive_pre_endpoint)) // 投稿预处理
         .route("/bili/space/myinfo", get(get_myinfo_endpoint)) // 获取用户信息
+        .route("/bili/seasons", get(get_seasons_endpoint)) // 列出视频合集（查 section_id）
         .route("/bili/proxy", get(get_proxy_endpoint)) // 代理请求
         // 认证相关路由
         .route("/v1/get_qrcode", get(get_qrcode)) // 获取二维码

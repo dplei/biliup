@@ -61,6 +61,27 @@ pub async fn get_myinfo_endpoint(
     ))
 }
 
+/// 列出当前账号的视频合集（season）及分区，用于在「录播管理」里查到要填的 section_id。
+/// 参数 user=cookie文件路径（如 data/16416555.json）。返回 data.seasons[i].sections.sections[j].id 即 section_id。
+pub async fn get_seasons_endpoint(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let user = params
+        .get("user")
+        .map(|s| s.as_str())
+        .unwrap_or("cookies.json");
+    let bili = login_by_cookies(user, None)
+        .await
+        .change_context(AppError::Custom(user.to_string()))
+        .map_err(report_to_response)?;
+    Ok(Json(
+        bili.list_seasons()
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?,
+    ))
+}
+
 /// 代理请求端点
 pub async fn get_proxy_endpoint(
     State(client): State<StatelessClient>,

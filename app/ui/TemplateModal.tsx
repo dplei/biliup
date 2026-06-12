@@ -169,6 +169,23 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
             optionList={list}
           />
 
+          <Form.InputNumber
+            field="override.season_section_id"
+            label={{ text: '合集分区ID（season_section_id）', optional: true }}
+            placeholder="留空=不加合集"
+            style={{ width: 260 }}
+            showClear
+            extraText={
+              <div style={{ fontSize: '14px' }}>
+                填写后，本主播每次投稿成功会自动把新稿件加入该 B 站「视频合集」（一主播一合集）。
+                <br />
+                section_id 获取：浏览器打开 <code>/bili/seasons?user=投稿模板里的cookie文件路径</code>
+                （如 <code>/bili/seasons?user=data/16416555.json</code>），在返回 JSON 里找
+                <code>seasons[].sections.sections[].id</code> 即为分区ID。
+              </div>
+            }
+          />
+
           <ArrayField
             field="postprocessor"
             initValue={entity === undefined ? [{ cmd: 'rm' }] : undefined}

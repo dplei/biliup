@@ -446,6 +446,85 @@ impl BiliBili {
         }
     }
 
+    /// 列出当前账号的视频合集（season）及其分区（section），用于查询 section_id。
+    /// 返回原始 JSON 的 data 字段：data.seasons[i].season.{id,title}、
+    /// data.seasons[i].sections.sections[j].{id,title}（其中 sections[j].id 即 section_id）。
+    pub async fn list_seasons(&self) -> Result<serde_json::Value> {
+        let ret: serde_json::Value = self
+            .client
+            .get("https://member.bilibili.com/x2/creative/web/seasons")
+            .query(&[
+                ("pn", "1"),
+                ("ps", "30"),
+                ("order", "mtime"),
+                ("sort", "desc"),
+                ("draft", "1"),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+        if ret["code"].as_i64() == Some(0) {
+            Ok(ret["data"].clone())
+        } else {
+            Err(Kind::Custom(format!("list_seasons failed: {ret:?}")))
+        }
+    }
+
+    /// 查询稿件信息（标题、cid），加入合集前需要。
+    async fn get_archive_view(&self, aid: u64) -> Result<(String, u64)> {
+        let ret: serde_json::Value = self
+            .client
+            .get("https://api.bilibili.com/x/web-interface/view")
+            .query(&[("aid", aid.to_string())])
+            .send()
+            .await?
+            .json()
+            .await?;
+        if ret["code"].as_i64() != Some(0) {
+            return Err(Kind::Custom(format!("get archive view failed: {ret:?}")));
+        }
+        let title = ret["data"]["title"].as_str().unwrap_or_default().to_string();
+        let cid = ret["data"]["cid"]
+            .as_u64()
+            .or_else(|| ret["data"]["pages"][0]["cid"].as_u64())
+            .ok_or_else(|| Kind::Custom(format!("cid not found in view: {ret:?}")))?;
+        Ok((title, cid))
+    }
+
+    /// 把指定稿件加入合集分区（section）。投稿成功后调用；失败由调用方决定是否致命。
+    /// 新稿件可能审核中，view 接口偶有延迟，调用方可重试。
+    pub async fn add_archive_to_season(&self, section_id: i64, aid: u64) -> Result<()> {
+        let (title, cid) = self.get_archive_view(aid).await?;
+        let csrf = self.get_csrf()?.to_string();
+        let body = serde_json::json!({
+            "sectionId": section_id,
+            "episodes": [{
+                "aid": aid,
+                "cid": cid,
+                "title": title,
+                "charging_pay": 0,
+            }],
+            "csrf": csrf,
+        });
+        let ret: serde_json::Value = self
+            .client
+            .post(format!(
+                "https://member.bilibili.com/x2/creative/web/season/section/episodes/add?csrf={csrf}"
+            ))
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if ret["code"].as_i64() == Some(0) {
+            info!("已加入合集 section_id={section_id}: aid={aid} title={title}");
+            Ok(())
+        } else {
+            Err(Kind::Custom(format!("add_to_season failed: {ret:?}")))
+        }
+    }
+
     #[deprecated(note = "no longer working, fallback to `edit_by_app`")]
     pub async fn edit(&self, studio: &Studio, proxy: Option<&str>) -> Result<serde_json::Value> {
         warn!("客户端接口已失效, 将使用app接口");
