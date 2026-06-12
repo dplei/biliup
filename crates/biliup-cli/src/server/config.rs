@@ -45,6 +45,12 @@ pub struct Config {
     #[serde(default)]
     pub segment_delete_mode: Option<String>,
 
+    /// cookie 健康提示 webhook（可选）。检测到平台 cookie 可能失效（连续直播间检查失败）时，
+    /// 以及恢复时各推送一次。URL 含 `{title}`/`{content}` 占位 → GET 替换（兼容 Bark/Server酱）；
+    /// 否则 POST JSON `{"title":..,"content":..}`（兼容企业微信/钉钉/自建）。留空则只在网页横幅提示。
+    #[serde(default)]
+    pub cookie_health_webhook: Option<String>,
+
     /// 上传器类型：Noop | bili_web | biliup-rs | 其他
     #[serde(default)]
     pub uploader: Option<String>,

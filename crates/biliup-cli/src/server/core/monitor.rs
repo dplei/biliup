@@ -1,3 +1,4 @@
+use crate::server::common::cookie_health;
 use crate::server::common::download::start_download_workflow;
 use crate::server::common::upload::UploaderMessage;
 use crate::server::core::live::{live_request, streamer_info};
@@ -92,7 +93,9 @@ impl Monitor {
             room.change_status(Stage::Download, WorkerStatus::Pending)
                 .await;
             let url = room.get_streamer().url.clone();
-            let interval = room.get_config().event_loop_interval;
+            let cfg = room.get_config();
+            let interval = cfg.event_loop_interval;
+            let webhook = cfg.cookie_health_webhook.clone();
             let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
                 self.wake_waker(room.id()).await;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -102,6 +105,8 @@ impl Monitor {
             // 检查直播状态
             match plugin.check_stream(request).await {
                 Ok(LiveStatus::Live { stream }) => {
+                    // 检查成功（cookie 工作正常）
+                    cookie_health::record_success(platform_name, webhook.as_deref());
                     let sql_no_id = streamer_info(&stream);
                     let insert = match StreamerInfo::builder()
                         .url(sql_no_id.url.clone())
@@ -136,10 +141,18 @@ impl Monitor {
                     info!("成功开始录制 {}", url);
                 }
                 Ok(LiveStatus::Offline) => {
+                    // 未开播也是一次成功的检查（cookie 正常，只是主播没播）
+                    cookie_health::record_success(platform_name, webhook.as_deref());
                     self.wake_waker(room.id()).await;
                     debug!(url = room.get_streamer().url, "未开播")
                 }
                 Err(e) => {
+                    // 检查出错（取流/检测失败或风控）= cookie 可能失效的信号
+                    cookie_health::record_error(
+                        platform_name,
+                        &format!("{e:?}"),
+                        webhook.as_deref(),
+                    );
                     self.wake_waker(room.id()).await;
                     error!(e=?e, ctx=room.get_streamer().url,"检查直播间出错")
                 }

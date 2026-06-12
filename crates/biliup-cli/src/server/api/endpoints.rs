@@ -544,6 +544,11 @@ pub async fn get_status(
     })))
 }
 
+/// 平台 cookie 健康状态：供前端横幅轮询。返回 `{ platforms: [{platform, unhealthy, ...}] }`。
+pub async fn get_cookie_health() -> Json<serde_json::Value> {
+    Json(crate::server::common::cookie_health::snapshot())
+}
+
 #[derive(Deserialize)]
 pub struct PostUploads {
     files: Vec<PathBuf>,

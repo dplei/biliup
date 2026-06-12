@@ -15,6 +15,7 @@ import {
   Typography,
   Tabs,
   TabPane,
+  Banner,
 } from '@douyinfe/semi-ui'
 import { registerMediaQuery, responsiveMap } from '@/app/lib/utils'
 import { IconPlusCircle, IconStar, IconGlobe } from '@douyinfe/semi-icons'
@@ -35,6 +36,10 @@ const Dashboard: React.FC = () => {
   const { Header, Content } = Layout
   const { data: entity, error, isLoading } = useSWR('/v1/configuration', fetcher)
   const { trigger } = useSWRMutation('/v1/configuration', put)
+  // cookie 健康状态轮询：异常时顶部红色横幅提示需更换 cookie
+  const { data: cookieHealth } = useSWR('/v1/health/cookie', fetcher, { refreshInterval: 60000 })
+  const platformName = (p: string) => (p === 'Douyin' ? '抖音' : p)
+  const unhealthy: any[] = (cookieHealth?.platforms ?? []).filter((p: any) => p?.unhealthy)
   const formRef = useRef<FormApi>()
   // const [formKey, setFormKey] = useState(0); // 初始化一个key
   // 触发表单重新挂载
@@ -130,6 +135,25 @@ const Dashboard: React.FC = () => {
         ></Nav>
       </Header>
       <Content>
+        {unhealthy.length > 0 ? (
+          <Banner
+            type="danger"
+            description={
+              <div>
+                {unhealthy.map((p: any) => {
+                  const since = p?.since_ms ? new Date(p.since_ms).toLocaleString() : null
+                  return (
+                    <div key={p.platform}>
+                      {platformName(p.platform)} cookie 可能已失效，建议尽快更换 cookie（sessionid）。
+                      {since ? `自 ${since} 起连续检查失败。` : ''}
+                      {p?.last_error ? `（最近错误：${String(p.last_error).slice(0, 120)}）` : ''}
+                    </div>
+                  )
+                })}
+              </div>
+            }
+          />
+        ) : null}
         <main className={styles.rootConfigPanel}>
           <div className={styles.main}>
             <div className={styles.content}>

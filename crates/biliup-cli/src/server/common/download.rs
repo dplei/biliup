@@ -1,3 +1,4 @@
+use crate::server::common::cookie_health;
 use crate::server::common::upload::UploaderMessage;
 use crate::server::common::util::FileValidator;
 use crate::server::core::downloader::cover_downloader;
@@ -135,12 +136,19 @@ impl DownloadTask {
         plugin: Arc<dyn LivePlugin + Send + Sync>,
         rooms_handle: Arc<Monitor>,
     ) -> AppResult<()> {
-        // 重试配置
-        let mut retry_count = 0;
-        let max_retries = 3; // 最大重试次数
-        let base_delay = Duration::from_secs(2); // 基础延迟时间（2秒）
-        let max_delay = Duration::from_secs(ctx.config().delay); // 最大延迟时间（60秒）
+        // 下播确认 / 重连配置
+        // grace = 下播宽限期（config.delay 秒）：流中断后持续复查重连，直到「确实连续离线
+        // 超过 grace」才判定真下播 → 投稿。避免抖音等 flv 短暂中断（CDN/签名轮换）被当成
+        // 下播，结果一场直播被切成多个稿件。grace=0（默认）→ 一离线立即结束，保持老行为。
+        let grace = Duration::from_secs(ctx.config().delay);
+        let base_delay = Duration::from_secs(2); // 复查退避基数
+        let max_backoff = Duration::from_secs(30); // 单次复查间隔上限，保证宽限窗口内多次复查
+        let mut retry_count: u32 = 0; // 仅用于退避递增与日志
+        let mut offline_since: Option<std::time::Instant> = None; // 连续离线的起点
         let url = ctx.live_streamer().url.clone();
+        // cookie 健康监测：录制中断流复查时同样喂给健康统计（录制时检测）
+        let platform = plugin.name();
+        let cookie_webhook = ctx.config().cookie_health_webhook.clone();
         let mut stream = ctx.live_stream().clone();
         let filename_prefix = ctx
             .live_streamer()
@@ -180,54 +188,61 @@ impl DownloadTask {
                 Ok(LiveStatus::Live {
                     stream: next_stream,
                 }) => {
+                    cookie_health::record_success(platform, cookie_webhook.as_deref());
                     stream = *next_stream;
-                    info!(
-                        url = url,
-                        "Stream is still live, preparing to retry. attempt: {}", retry_count
-                    );
-                    // 成功下载后重置计数
+                    // 流恢复：重置下播计时，继续录进同一会话（不投稿、不分稿件）
+                    offline_since = None;
                     retry_count = 0;
+                    info!(url = url, "Stream is still live, continuing same session");
                 }
                 Ok(LiveStatus::Offline) => {
+                    // 下播是一次成功的检查（cookie 正常）
+                    cookie_health::record_success(platform, cookie_webhook.as_deref());
+                    let since = *offline_since.get_or_insert_with(std::time::Instant::now);
                     retry_count += 1;
-                    // 继续循环，重新执行下载
-                    info!(url = url, "Stream went offline, stopping download");
+                    if since.elapsed() >= grace {
+                        info!(url = url, "连续离线超过宽限期 {:?}，确认下播，结束本场", grace);
+                        break components;
+                    }
+                    info!(
+                        url = url,
+                        "Stream went offline，宽限期内继续复查 ({:?}/{:?})",
+                        since.elapsed(),
+                        grace
+                    );
                 }
                 Err(e) => {
+                    // 检查出错 = cookie 可能失效（去抖后累计，达阈值才提示）
+                    cookie_health::record_error(
+                        platform,
+                        &format!("{e:?}"),
+                        cookie_webhook.as_deref(),
+                    );
+                    let since = *offline_since.get_or_insert_with(std::time::Instant::now);
                     retry_count += 1;
-                    // 继续循环，重新执行下载
+                    if since.elapsed() >= grace {
+                        warn!(
+                            url = url,
+                            "检查直播间持续失败超过宽限期 {:?}，结束本场: {:?}", grace, e
+                        );
+                        break components;
+                    }
                     warn!(
                         url = url,
-                        "Failed to check stream status: {:?}, stopping download", e
+                        "Failed to check stream status: {:?}，宽限期内继续复查 ({:?}/{:?})",
+                        e,
+                        since.elapsed(),
+                        grace
                     );
                 }
             }
 
-            if retry_count >= max_retries {
-                warn!(
-                    url = url,
-                    "Maximum retry attempts ({}) reached, stopping", max_retries
-                );
-                break components;
-            }
-
-            info!(
-                url = url,
-                "preparing to retry. Attempt: {}/{}",
-                retry_count + 1,
-                max_retries
-            );
-
-            // 计算指数退避延迟: delay = base_delay * 2^retry_count
-            let delay = if retry_count != 0 {
-                base_delay * 2_u32.pow(retry_count)
-            } else {
-                Duration::ZERO
-            };
-            let delay = delay.min(max_delay); // 限制最大延迟时间
-
-            info!("Retrying download in {:?}...", delay);
-            tokio::time::sleep(delay).await;
+            // 复查退避：指数增长但封顶 max_backoff，保证宽限窗口内多次复查
+            let backoff = base_delay
+                .saturating_mul(2_u32.saturating_pow(retry_count.min(5)))
+                .min(max_backoff);
+            info!("Retrying download in {:?}...", backoff);
+            tokio::time::sleep(backoff).await;
         };
         // 异步清理任务
         if let Some(client) = danmaku_client.clone()

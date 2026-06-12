@@ -43,6 +43,7 @@ qrcode.png
 data/
 .next
 out
+tsconfig.tsbuildinfo
 downloads/
 target
 _internal

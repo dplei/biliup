@@ -305,11 +305,35 @@ const Global: React.FC = () => {
             alignSelf: 'stretch',
             padding: 0,
           }}
-          initValue="stream_end"
+          // 不要用 initValue：Semi 中字段级 initValue 优先级高于 Form 的 initValues={entity}，
+          // 会让每次刷新都把已保存值覆盖回 stream_end（看起来像“保存没生效”）。
+          // 用 placeholder 提示默认即可；留空时后端按 stream_end 处理。
+          placeholder="下播后删（默认）"
+          showClear={true}
         >
           <Form.Select.Option value="stream_end">下播后删（默认）</Form.Select.Option>
           <Form.Select.Option value="per_segment">每片删（每片上传后立即删，省磁盘）</Form.Select.Option>
         </Form.Select>
+        <Form.Input
+          field="cookie_health_webhook"
+          label="Cookie 失效推送（cookie_health_webhook）"
+          placeholder="留空则只在网页顶部横幅提示"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              检测到平台 cookie 可能失效（连续多次直播间检查失败，如抖音风控/sessionid 过期）时，向此地址推送一次提醒，恢复时再推一次。
+              <br />
+              URL 含 <code>{'{title}'}</code> / <code>{'{content}'}</code> 占位 → 用 GET 替换（兼容 Bark、Server酱）；否则 POST JSON <code>{'{title, content}'}</code>（兼容企业微信、钉钉、自建）。
+              <br />
+              示例（Bark）：<code>https://api.day.app/你的key/{'{title}'}/{'{content}'}</code>
+            </div>
+          }
+          style={{ width: '100%' }}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+          showClear={true}
+        />
         <Form.Select
           field="uploader"
           label="上传插件（uploader）"
