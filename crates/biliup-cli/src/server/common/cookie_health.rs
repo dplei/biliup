@@ -150,7 +150,34 @@ fn notify(webhook: Option<&str>, title: &str, content: &str) {
     let content = content.to_string();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let result = if url.contains("{title}") || url.contains("{content}") {
+        let result = if url.contains("oapi.dingtalk.com") {
+            // 钉钉自定义机器人：需 {msgtype:text, text:{content}}。安全设置用「自定义关键词」
+            // 时，文案必须含该关键词——这里固定前缀「【biliup】」，用户把关键词设为 biliup 即可。
+            let body = json!({
+                "msgtype": "text",
+                "text": { "content": format!("【biliup】{title}\n{content}") }
+            })
+            .to_string();
+            client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+        } else if url.contains("qyapi.weixin.qq.com") {
+            // 企业微信群机器人：同样需 {msgtype:text, text:{content}}
+            let body = json!({
+                "msgtype": "text",
+                "text": { "content": format!("{title}\n{content}") }
+            })
+            .to_string();
+            client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+        } else if url.contains("{title}") || url.contains("{content}") {
             let final_url = url
                 .replace("{title}", &urlencoding::encode(&title))
                 .replace("{content}", &urlencoding::encode(&content));

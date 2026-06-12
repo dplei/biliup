@@ -35,6 +35,15 @@ async fn main() -> AppResult<()> {
     let timer = tracing_subscriber::fmt::time::LocalTime::new(format_description!(
         "[year]-[month]-[day] [hour]:[minute]:[second]"
     ));
+    let file_timer = tracing_subscriber::fmt::time::LocalTime::new(format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    ));
+
+    // 文件日志：写到工作目录（容器内 /opt）的 ds_update.log，供 web「实时日志」页 tail。
+    // Rust 版此前只往 stdout 打日志，故该文件一直「不存在」；这里补上文件输出层。
+    // non_blocking 的 _log_guard 必须存活到进程结束（绑定在 main，随 run().await 持续）。
+    let file_appender = tracing_appender::rolling::never(".", "ds_update.log");
+    let (file_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
 
     let console_filter = tracing_subscriber::EnvFilter::new(&cli.rust_log);
     // let (file_filter_layer, file_reload_handle) = reload::Layer::new(file_filter);
@@ -42,6 +51,12 @@ async fn main() -> AppResult<()> {
     tracing_subscriber::registry()
         .with(console_filter_layer)
         .with(tracing_subscriber::fmt::layer().with_timer(timer))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_timer(file_timer),
+        )
         .init();
 
     let user_cookie = expand_path(cli.user_cookie);

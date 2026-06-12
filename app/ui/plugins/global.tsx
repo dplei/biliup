@@ -320,11 +320,15 @@ const Global: React.FC = () => {
           placeholder="留空则只在网页顶部横幅提示"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              检测到平台 cookie 可能失效（连续多次直播间检查失败，如抖音风控/sessionid 过期）时，向此地址推送一次提醒，恢复时再推一次。
+              检测到平台 cookie 可能失效（连续多次直播间检查失败，如抖音风控/sessionid 过期）时，向此地址推送一次提醒，恢复时再推一次。按 URL 自动识别格式：
               <br />
-              URL 含 <code>{'{title}'}</code> / <code>{'{content}'}</code> 占位 → 用 GET 替换（兼容 Bark、Server酱）；否则 POST JSON <code>{'{title, content}'}</code>（兼容企业微信、钉钉、自建）。
+              • <b>钉钉</b>（含 oapi.dingtalk.com）：自动发钉钉机器人格式。机器人「安全设置」请选「自定义关键词」并填 <code>biliup</code>（推送文案已带此前缀）。
               <br />
-              示例（Bark）：<code>https://api.day.app/你的key/{'{title}'}/{'{content}'}</code>
+              • <b>企业微信</b>（含 qyapi.weixin.qq.com）：自动发群机器人格式。
+              <br />
+              • <b>Bark / Server酱</b>：URL 里写 <code>{'{title}'}</code> / <code>{'{content}'}</code> 占位 → 用 GET 替换。例：<code>https://api.day.app/你的key/{'{title}'}/{'{content}'}</code>
+              <br />
+              • <b>自建</b>：其余地址按 POST JSON <code>{'{title, content}'}</code> 发送。
             </div>
           }
           style={{ width: '100%' }}
