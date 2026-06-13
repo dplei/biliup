@@ -1,7 +1,7 @@
 use crate::server::errors::{AppError, AppResult};
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{Rgb, RgbImage, codecs::jpeg::JpegEncoder};
-use imageproc::drawing::draw_text_mut;
+use imageproc::drawing::{draw_text_mut, text_size};
 
 /// 内嵌字体（思源黑体 CN Bold）
 const FONT_BYTES: &[u8] = include_bytes!("../../../assets/fonts/SourceHanSansCN-Bold.otf");
@@ -62,7 +62,7 @@ pub fn render_cover(lines: &[String], opts: &CoverOptions) -> AppResult<Vec<u8>>
     let mut scale_px = opts.base_font_px;
     let widest = lines
         .iter()
-        .map(|l| line_width(&font, opts.base_font_px, l))
+        .map(|l| text_size(PxScale::from(opts.base_font_px), &font, l).0 as f32)
         .fold(0.0_f32, f32::max);
     if widest > max_text_w && widest > 0.0 {
         scale_px = opts.base_font_px * (max_text_w / widest);
@@ -73,13 +73,14 @@ pub fn render_cover(lines: &[String], opts: &CoverOptions) -> AppResult<Vec<u8>>
     let scaled = font.as_scaled(scale);
     let line_h = scaled.height();
     let gap = line_h * opts.line_gap_ratio;
+    // max(1): 避免空输入时除零，并让空白图仍垂直居中
     let n = lines.len().max(1) as f32;
     let total_h = n * line_h + (n - 1.0).max(0.0) * gap;
     let mut y = ((opts.height as f32 - total_h) / 2.0).max(opts.margin as f32);
 
     // 4. 逐行行内居中绘制（带轻微描边）
     for line in &lines {
-        let lw = line_width(&font, scale_px, line);
+        let lw = text_size(scale, &font, line).0 as f32;
         let x = ((opts.width as f32 - lw) / 2.0).max(0.0);
         draw_line_with_stroke(&mut img, opts, &font, scale, x, y, line);
         y += line_h + gap;
@@ -93,23 +94,8 @@ pub fn render_cover(lines: &[String], opts: &CoverOptions) -> AppResult<Vec<u8>>
     Ok(buf)
 }
 
-/// 计算一行文字在给定字号下的像素宽度
-fn line_width(font: &FontRef, px: f32, text: &str) -> f32 {
-    let scaled = font.as_scaled(PxScale::from(px));
-    let mut w = 0.0_f32;
-    let mut prev = None;
-    for c in text.chars() {
-        let id = scaled.glyph_id(c);
-        if let Some(p) = prev {
-            w += scaled.kern(p, id);
-        }
-        w += scaled.h_advance(id);
-        prev = Some(id);
-    }
-    w
-}
-
-/// 画一行：先在 4 个对角偏移画描边色，再画正文，保证非黑背景上也清晰
+/// 画一行：先在 4 个对角偏移画描边色，再画正文，保证非黑背景上也清晰。
+/// 4 次描边 pass 是有意为之——在未来非黑背景上提升可读性；当前黑底下视觉上无副作用。
 fn draw_line_with_stroke(
     img: &mut RgbImage,
     opts: &CoverOptions,
