@@ -57,6 +57,11 @@ pub struct Config {
     #[serde(default)]
     pub season_section_id: Option<i64>,
 
+    /// 增量投稿重启续接时间窗口（分钟）。留空回退默认 30。
+    /// 重启后某 room 在窗口内存在未 finalize 的会话则续接其 aid，否则新建稿。
+    #[serde(default)]
+    pub recovery_window_minutes: Option<u64>,
+
     /// 上传器类型：Noop | bili_web | biliup-rs | 其他
     #[serde(default)]
     pub uploader: Option<String>,
