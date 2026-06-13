@@ -213,6 +213,7 @@ fn to_upload_streamer_insert(
             .cover_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
+        cover_template: None,
         description: streamer.description.clone(),
         dynamic: streamer.dynamic.clone(),
         dtime: streamer

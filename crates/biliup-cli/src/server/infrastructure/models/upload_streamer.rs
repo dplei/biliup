@@ -21,6 +21,8 @@ pub struct UploadStreamer {
     pub copyright_source: Option<String>,
     /// 封面路径
     pub cover_path: Option<String>,
+    /// 封面文字模板（留空=用 cover_path；填写=生成黑底封面，优先）
+    pub cover_template: Option<String>,
     /// 视频简介
     pub description: Option<String>,
     /// 动态内容
@@ -68,6 +70,7 @@ pub struct InsertUploadStreamer {
     pub copyright: Option<u8>,
     pub copyright_source: Option<String>,
     pub cover_path: Option<String>,
+    pub cover_template: Option<String>,
     pub description: Option<String>,
     pub dynamic: Option<String>,
     pub dtime: Option<u32>,
