@@ -1,4 +1,5 @@
 use crate::UploadLine;
+use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
@@ -368,6 +369,25 @@ pub(crate) async fn build_studio(
                 .unwrap_or_default(), // 处理额外字段
         )
         .build();
+    // 自动封面：cover_template 非空则生成黑底封面，覆盖 studio.cover；
+    // _auto_cover_tmp 持有临时文件，build_studio 返回（上传完成后）时自动删除。
+    let mut _auto_cover_tmp: Option<tempfile::NamedTempFile> = None;
+    if let Some(tpl) = upload_config
+        .cover_template
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let text = recorder.format(tpl);
+        let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+        match render_to_tempfile(&lines, &CoverOptions::default()) {
+            Ok(f) => {
+                studio.cover = f.path().to_string_lossy().into_owned();
+                _auto_cover_tmp = Some(f);
+            }
+            Err(e) => error!(e=?e, "生成自动封面失败，回退到 cover_path"),
+        }
+    }
     // 处理封面上传
     if !studio.cover.is_empty()
         && let Ok(c) = &std::fs::read(&studio.cover).inspect_err(|e| error!(e=?e))

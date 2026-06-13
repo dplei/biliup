@@ -94,6 +94,24 @@ pub fn render_cover(lines: &[String], opts: &CoverOptions) -> AppResult<Vec<u8>>
     Ok(buf)
 }
 
+/// 渲染并写入一个临时 JPG 文件，返回句柄（调用方持有以控制生命周期）
+pub fn render_to_tempfile(
+    lines: &[String],
+    opts: &CoverOptions,
+) -> AppResult<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let bytes = render_cover(lines, opts)?;
+    let mut f = tempfile::Builder::new()
+        .prefix("biliup-cover-")
+        .suffix(".jpg")
+        .tempfile()
+        .map_err(|e| AppError::Custom(format!("创建临时封面失败: {e}")))?;
+    f.write_all(&bytes)
+        .and_then(|_| f.flush())
+        .map_err(|e| AppError::Custom(format!("写入临时封面失败: {e}")))?;
+    Ok(f)
+}
+
 /// 画一行：先在 4 个对角偏移画描边色，再画正文，保证非黑背景上也清晰。
 /// 4 次描边 pass 是有意为之——在未来非黑背景上提升可读性；当前黑底下视觉上无副作用。
 fn draw_line_with_stroke(
@@ -153,6 +171,13 @@ mod tests {
     fn handles_long_line_without_panic() {
         let long = "超长主播名".repeat(20);
         let bytes = render_cover(&[long], &CoverOptions::default()).unwrap();
+        assert_eq!(decode_dims(&bytes), (1146, 717));
+    }
+
+    #[test]
+    fn render_to_tempfile_writes_valid_jpeg() {
+        let f = render_to_tempfile(&["主播".to_string()], &CoverOptions::default()).unwrap();
+        let bytes = std::fs::read(f.path()).unwrap();
         assert_eq!(decode_dims(&bytes), (1146, 717));
     }
 }
