@@ -9,6 +9,7 @@ pub mod download;
 pub mod upload;
 /// 通用工具函数
 pub mod util;
+pub mod upload_session;
 
 pub fn construct_headers(hash_map: &HashMap<String, String>) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
