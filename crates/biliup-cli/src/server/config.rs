@@ -303,6 +303,10 @@ pub struct StreamerConfig {
     #[serde(default)]
     pub cover_path: Option<PathBuf>,
 
+    /// 封面文字模板（留空=用 cover_path；填写=生成黑底封面，优先）
+    #[serde(default)]
+    pub cover_template: Option<String>,
+
     /// 视频描述（保留缩进和多行格式）
     #[serde(default)]
     pub description: Option<String>,

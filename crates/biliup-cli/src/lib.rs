@@ -213,7 +213,7 @@ fn to_upload_streamer_insert(
             .cover_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
-        cover_template: None,
+        cover_template: streamer.cover_template.clone(),
         description: streamer.description.clone(),
         dynamic: streamer.dynamic.clone(),
         dtime: streamer
@@ -253,6 +253,7 @@ fn has_upload_config(streamer: &StreamerConfig) -> bool {
         || streamer.copyright.is_some()
         || streamer.copyright_source.is_some()
         || streamer.cover_path.is_some()
+        || streamer.cover_template.is_some()
         || streamer.description.is_some()
         || streamer.credits.is_some()
         || streamer.dynamic.is_some()
