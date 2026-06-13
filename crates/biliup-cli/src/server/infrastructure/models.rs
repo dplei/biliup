@@ -59,6 +59,29 @@ pub struct FileItem {
     pub streamer_info_id: i64,
 }
 
+/// 增量投稿会话模型
+/// 一场直播对应一行，记录 B 站稿件号与已投稿视频列表（JSON）。
+#[derive(Model, Debug, Clone, Serialize, Deserialize)]
+#[ormlite(table = "upload_session", insert = "InsertUploadSession")]
+pub struct UploadSession {
+    /// 主键ID
+    pub id: i64,
+    /// 配置直播间(room)稳定 id，跨重启匹配用
+    pub live_streamer_id: i64,
+    /// 当前挂接的会话 id（重启续接时更新）
+    pub streamer_info_id: i64,
+    /// B站稿件号，None=还没建稿
+    pub aid: Option<i64>,
+    /// B站 bvid
+    pub bvid: Option<String>,
+    /// 已成功投稿的 Video 列表（JSON 字符串），edit 时携带
+    pub videos_json: String,
+    /// uploading / submitted / finalized
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 配置模型
 /// 存储应用程序的配置信息
 #[derive(Model, Debug, Clone, Serialize, Deserialize)]
