@@ -2,7 +2,8 @@ use crate::UploadLine;
 use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, finalize_session, insert_session, parse_videos,
-    reattach_session, select_recovery_candidate, update_session_videos,
+    reattach_session, select_recovery_candidate, update_session_after_submit,
+    update_session_videos,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
@@ -181,11 +182,10 @@ async fn submit_or_append_segment(
         archive.bvid = bvid.clone();
 
         if let (Some(aid_val), Some(row_id)) = (aid, archive.session_row_id) {
-            update_session_videos(ctx.pool(), row_id, &archive.videos).await?;
-            let _ = aid_val;
+            update_session_after_submit(ctx.pool(), row_id, aid_val, bvid.clone(), &archive.videos).await?;
         } else if let Some(aid_val) = aid {
             let row =
-                insert_session(ctx.pool(), room_id, streamer_info_id, aid_val, bvid, &archive.videos)
+                insert_session(ctx.pool(), room_id, streamer_info_id, aid_val, bvid.clone(), &archive.videos)
                     .await?;
             archive.session_row_id = Some(row.id);
         } else {

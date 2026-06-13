@@ -109,6 +109,31 @@ pub async fn update_session_videos(
     Ok(())
 }
 
+/// 续接行上首次建稿成功后，写回 aid/bvid/videos/status。
+pub async fn update_session_after_submit(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    aid: u64,
+    bvid: Option<String>,
+    videos: &[Video],
+) -> AppResult<()> {
+    let mut row = UploadSession::select()
+        .where_("id = ?")
+        .bind(session_row_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    row.aid = Some(aid as i64);
+    row.bvid = bvid;
+    row.videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
+    row.status = "submitted".to_string();
+    row.updated_at = chrono::Utc::now();
+    row.update_all_fields(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    Ok(())
+}
+
 /// 下播收尾：标记 finalized。
 pub async fn finalize_session(pool: &ConnectionPool, session_row_id: i64) -> AppResult<()> {
     let mut row = UploadSession::select()
