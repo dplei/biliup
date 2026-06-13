@@ -32,6 +32,8 @@ glob = "0.3.2"
 qrcode = "0.14"
 indicatif =  "0.18.0"
 image = "0.25"
+imageproc = "0.25"
+ab_glyph = "0.2"
 dialoguer = "0.12.0"
 chrono = { workspace = true, features = ["serde"] }
 indexmap = { version = "2.8.0" }
