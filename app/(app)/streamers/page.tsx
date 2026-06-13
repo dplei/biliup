@@ -73,7 +73,22 @@ export default function Home() {
         statusTag = <Tag color="pink">暂停中</Tag>
         break
     }
-    return { ...handleEntityPostprocessor(live), statusTag }
+    // 未绑定投稿模板：不录制，额外显示「缺少投稿」标签提示去绑定。
+    const missingUpload =
+      live.upload_streamers_id == null ? (
+        <Tag color="orange" style={{ marginLeft: 4 }}>
+          缺少投稿
+        </Tag>
+      ) : null
+    return {
+      ...handleEntityPostprocessor(live),
+      statusTag: (
+        <>
+          {statusTag}
+          {missingUpload}
+        </>
+      ),
+    }
   })
 
   const handleOk = async (values: any) => {

@@ -96,6 +96,15 @@ impl Monitor {
             let cfg = room.get_config();
             let interval = cfg.event_loop_interval;
             let webhook = cfg.cookie_health_webhook.clone();
+            // 未绑定投稿模板：不录制（录了传不上、还白占磁盘）。前端据 /v1/streamers 返回的
+            // upload_streamers_id==null 显示「缺少投稿」标签。绑定后 worker 会重建并恢复录制。
+            if room.get_upload_config().is_none() {
+                room.change_status(Stage::Download, WorkerStatus::Idle).await;
+                debug!(url = url, "未绑定投稿模板，跳过录制（缺少投稿）");
+                self.wake_waker(room.id()).await;
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                continue;
+            }
             let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
                 self.wake_waker(room.id()).await;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
