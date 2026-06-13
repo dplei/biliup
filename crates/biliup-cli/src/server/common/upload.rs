@@ -152,94 +152,169 @@ async fn submit_or_append_segment(
     cached_studio: &mut Option<Studio>,
     video: Video,
 ) -> AppResult<()> {
+    if archive.aid.is_none() {
+        create_archive(
+            ctx,
+            upload_context,
+            upload_config,
+            archive,
+            cached_studio,
+            video,
+        )
+        .await
+    } else {
+        append_to_archive(
+            ctx,
+            upload_context,
+            upload_config,
+            archive,
+            cached_studio,
+            video,
+        )
+        .await
+    }
+}
+
+/// 首段：构建 studio（封面上传/自动封面等一次性开销）并建稿。
+async fn create_archive(
+    ctx: &Context,
+    upload_context: &UploadContext,
+    upload_config: &UploadStreamer,
+    archive: &mut LiveArchive,
+    cached_studio: &mut Option<Studio>,
+    video: Video,
+) -> AppResult<()> {
     let bilibili = &upload_context.bilibili;
     let room_id = ctx.worker_id();
     let streamer_info_id = ctx.id();
 
-    if archive.aid.is_none() {
-        // 首段：构建 studio（封面上传/自动封面等一次性开销）并建稿。
-        let mut recorder = ctx.recorder(ctx.streamer_info().clone());
-        recorder.filename_prefix = upload_config.title.clone();
-        let mut studio =
-            build_studio(upload_config, bilibili, vec![video.clone()], &recorder).await?;
+    let mut recorder = ctx.recorder(ctx.streamer_info().clone());
+    recorder.filename_prefix = upload_config.title.clone();
+    let mut studio = build_studio(upload_config, bilibili, vec![video.clone()], &recorder).await?;
 
-        let submit_api = ctx.config().submit_api.clone();
-        let resp = submit_to_bilibili(bilibili, &studio, submit_api.as_deref()).await?;
-        let aid = resp
-            .data
-            .as_ref()
-            .and_then(|d| d.get("aid"))
-            .and_then(|a| a.as_u64());
-        let bvid = resp
-            .data
-            .as_ref()
-            .and_then(|d| d.get("bvid"))
-            .and_then(|b| b.as_str())
-            .map(|s| s.to_string());
+    let submit_api = ctx.config().submit_api.clone();
+    let resp = submit_to_bilibili(bilibili, &studio, submit_api.as_deref()).await?;
+    let aid = resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("aid"))
+        .and_then(|a| a.as_u64());
+    let bvid = resp
+        .data
+        .as_ref()
+        .and_then(|d| d.get("bvid"))
+        .and_then(|b| b.as_str())
+        .map(|s| s.to_string());
 
-        archive.videos = vec![video];
-        archive.aid = aid;
-        archive.bvid = bvid.clone();
+    archive.videos = vec![video];
+    archive.aid = aid;
+    archive.bvid = bvid.clone();
 
-        if let (Some(aid_val), Some(row_id)) = (aid, archive.session_row_id) {
-            update_session_after_submit(ctx.pool(), row_id, aid_val, bvid.clone(), &archive.videos).await?;
-        } else if let Some(aid_val) = aid {
-            let row =
-                insert_session(ctx.pool(), room_id, streamer_info_id, aid_val, bvid.clone(), &archive.videos)
-                    .await?;
-            archive.session_row_id = Some(row.id);
-        } else {
-            warn!(?resp, "建稿响应缺少 aid，无法落库 upload_session");
+    // DB 写入 best-effort：稿件已在 B 站，落库失败不影响本段状态。
+    if let (Some(aid_val), Some(row_id)) = (aid, archive.session_row_id) {
+        if let Err(e) =
+            update_session_after_submit(ctx.pool(), row_id, aid_val, bvid.clone(), &archive.videos)
+                .await
+        {
+            error!(?e, "落库 upload_session 失败(已投稿成功)");
         }
-
-        studio.aid = archive.aid;
-        *cached_studio = Some(studio);
-
-        if let (Some(section_id), Some(aid_val)) = (ctx.config().season_section_id, archive.aid) {
-            add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
-        }
-    } else {
-        // 后续段：追加到已有 aid。
-        if cached_studio.is_none() {
-            // 重启续接：进程内无缓存 studio，用 B 站现有稿件数据兜底重建。
-            if let Some(aid_val) = archive.aid {
-                let vid = biliup::bilibili::Vid::Aid(aid_val);
-                match bilibili.studio_data(&vid, None).await {
-                    Ok(mut s) => {
-                        s.aid = archive.aid;
-                        *cached_studio = Some(s);
-                    }
-                    Err(e) => {
-                        warn!(?e, "studio_data 兜底失败，改为重建最小 studio");
-                        let mut recorder = ctx.recorder(ctx.streamer_info().clone());
-                        recorder.filename_prefix = upload_config.title.clone();
-                        let mut s = build_studio(
-                            upload_config,
-                            bilibili,
-                            archive.videos.clone(),
-                            &recorder,
-                        )
-                        .await?;
-                        s.aid = archive.aid;
-                        *cached_studio = Some(s);
-                    }
-                }
+    } else if let Some(aid_val) = aid {
+        match insert_session(
+            ctx.pool(),
+            room_id,
+            streamer_info_id,
+            aid_val,
+            bvid.clone(),
+            &archive.videos,
+        )
+        .await
+        {
+            Ok(row) => {
+                archive.session_row_id = Some(row.id);
+            }
+            Err(e) => {
+                error!(?e, "落库 upload_session 失败(已投稿成功)");
             }
         }
-        archive.videos.push(video);
-        let Some(studio) = cached_studio.as_mut() else {
-            bail!(AppError::Custom("cached studio missing for edit".into()));
-        };
-        studio.aid = archive.aid;
-        studio.videos = archive.videos.clone();
-        bilibili
-            .edit_by_app(studio, None)
-            .await
-            .change_context(AppError::Unknown)?;
-        if let Some(row_id) = archive.session_row_id {
-            update_session_videos(ctx.pool(), row_id, &archive.videos).await?;
+    } else {
+        error!(?resp, "建稿响应缺少 aid，无法落库 upload_session");
+    }
+
+    studio.aid = archive.aid;
+    *cached_studio = Some(studio);
+
+    if let (Some(section_id), Some(aid_val)) = (ctx.config().season_section_id, archive.aid) {
+        add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
+    }
+
+    Ok(())
+}
+
+/// 重启续接时，进程内无缓存 studio——从 B 站稿件数据兜底重建。
+async fn ensure_cached_studio(
+    ctx: &Context,
+    upload_context: &UploadContext,
+    upload_config: &UploadStreamer,
+    archive: &LiveArchive,
+    cached_studio: &mut Option<Studio>,
+) -> AppResult<()> {
+    if cached_studio.is_some() {
+        return Ok(());
+    }
+    if let Some(aid_val) = archive.aid {
+        let bilibili = &upload_context.bilibili;
+        let vid = biliup::bilibili::Vid::Aid(aid_val);
+        match bilibili.studio_data(&vid, None).await {
+            Ok(mut s) => {
+                s.aid = archive.aid;
+                *cached_studio = Some(s);
+            }
+            Err(e) => {
+                warn!(?e, "studio_data 兜底失败，改为重建最小 studio");
+                let mut recorder = ctx.recorder(ctx.streamer_info().clone());
+                recorder.filename_prefix = upload_config.title.clone();
+                let mut s =
+                    build_studio(upload_config, bilibili, archive.videos.clone(), &recorder)
+                        .await?;
+                s.aid = archive.aid;
+                *cached_studio = Some(s);
+            }
         }
     }
+    Ok(())
+}
+
+/// 后续段：追加到已有 aid。
+async fn append_to_archive(
+    ctx: &Context,
+    upload_context: &UploadContext,
+    upload_config: &UploadStreamer,
+    archive: &mut LiveArchive,
+    cached_studio: &mut Option<Studio>,
+    video: Video,
+) -> AppResult<()> {
+    let bilibili = &upload_context.bilibili;
+
+    ensure_cached_studio(ctx, upload_context, upload_config, archive, cached_studio).await?;
+
+    archive.videos.push(video);
+    let Some(studio) = cached_studio.as_mut() else {
+        bail!(AppError::Custom("cached studio missing for edit".into()));
+    };
+    studio.aid = archive.aid;
+    studio.videos = archive.videos.clone();
+    bilibili
+        .edit_by_app(studio, None)
+        .await
+        .change_context(AppError::Unknown)?;
+
+    // DB 写入 best-effort：edit 已在 B 站成功，落库失败不影响本段状态。
+    if let Some(row_id) = archive.session_row_id {
+        if let Err(e) = update_session_videos(ctx.pool(), row_id, &archive.videos).await {
+            warn!(?e, "更新 upload_session videos 失败(已 edit 成功)");
+        }
+    }
+
     Ok(())
 }
 
@@ -250,6 +325,7 @@ async fn prepare_archive(ctx: &Context) -> AppResult<LiveArchive> {
         .config()
         .recovery_window_minutes
         .unwrap_or(DEFAULT_RECOVERY_WINDOW_MINUTES) as i64;
+    // read-then-reattach 非事务，但安全：本架构中每个 live_streamer_id（room）只有一个 worker。
     let sessions = active_sessions_for_room(ctx.pool(), room_id).await?;
     let now = chrono::Utc::now();
     if let Some(idx) = select_recovery_candidate(&sessions, room_id, now, window) {
@@ -320,7 +396,11 @@ where
             }
         }
     }
-    Ok(if archive.aid.is_some() { Some(archive) } else { None })
+    Ok(if archive.aid.is_some() {
+        Some(archive)
+    } else {
+        None
+    })
 }
 
 async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {

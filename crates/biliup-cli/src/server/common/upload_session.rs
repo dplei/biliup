@@ -19,9 +19,7 @@ pub fn select_recovery_candidate(
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            s.live_streamer_id == room_id
-                && s.status != "finalized"
-                && s.updated_at >= cutoff
+            s.live_streamer_id == room_id && s.status != "finalized" && s.updated_at >= cutoff
         })
         .max_by_key(|(_, s)| s.updated_at)
         .map(|(i, _)| i)
@@ -89,11 +87,11 @@ pub async fn insert_session(
     .change_context(AppError::Unknown)
 }
 
-/// 追加段后更新 videos_json 与 updated_at。
-pub async fn update_session_videos(
+/// 公共：按 id 取行、就地修改、写回。
+async fn mutate_session(
     pool: &ConnectionPool,
     session_row_id: i64,
-    videos: &[Video],
+    f: impl FnOnce(&mut UploadSession) -> AppResult<()>,
 ) -> AppResult<()> {
     let mut row = UploadSession::select()
         .where_("id = ?")
@@ -101,12 +99,26 @@ pub async fn update_session_videos(
         .fetch_one(pool)
         .await
         .change_context(AppError::Unknown)?;
-    row.videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
+    f(&mut row)?;
     row.updated_at = chrono::Utc::now();
     row.update_all_fields(pool)
         .await
         .change_context(AppError::Unknown)?;
     Ok(())
+}
+
+/// 追加段后更新 videos_json 与 updated_at。
+pub async fn update_session_videos(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    videos: &[Video],
+) -> AppResult<()> {
+    let videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
+    mutate_session(pool, session_row_id, |row| {
+        row.videos_json = videos_json;
+        Ok(())
+    })
+    .await
 }
 
 /// 续接行上首次建稿成功后，写回 aid/bvid/videos/status。
@@ -117,37 +129,24 @@ pub async fn update_session_after_submit(
     bvid: Option<String>,
     videos: &[Video],
 ) -> AppResult<()> {
-    let mut row = UploadSession::select()
-        .where_("id = ?")
-        .bind(session_row_id)
-        .fetch_one(pool)
-        .await
-        .change_context(AppError::Unknown)?;
-    row.aid = Some(aid as i64);
-    row.bvid = bvid;
-    row.videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
-    row.status = "submitted".to_string();
-    row.updated_at = chrono::Utc::now();
-    row.update_all_fields(pool)
-        .await
-        .change_context(AppError::Unknown)?;
-    Ok(())
+    let videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
+    mutate_session(pool, session_row_id, |row| {
+        row.aid = Some(aid as i64);
+        row.bvid = bvid;
+        row.videos_json = videos_json;
+        row.status = "submitted".to_string();
+        Ok(())
+    })
+    .await
 }
 
 /// 下播收尾：标记 finalized。
 pub async fn finalize_session(pool: &ConnectionPool, session_row_id: i64) -> AppResult<()> {
-    let mut row = UploadSession::select()
-        .where_("id = ?")
-        .bind(session_row_id)
-        .fetch_one(pool)
-        .await
-        .change_context(AppError::Unknown)?;
-    row.status = "finalized".to_string();
-    row.updated_at = chrono::Utc::now();
-    row.update_all_fields(pool)
-        .await
-        .change_context(AppError::Unknown)?;
-    Ok(())
+    mutate_session(pool, session_row_id, |row| {
+        row.status = "finalized".to_string();
+        Ok(())
+    })
+    .await
 }
 
 /// 从 videos_json 反序列化已投稿视频列表。
@@ -160,12 +159,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn session(
-        id: i64,
-        room_id: i64,
-        status: &str,
-        updated_at: DateTime<Utc>,
-    ) -> UploadSession {
+    fn session(id: i64, room_id: i64, status: &str, updated_at: DateTime<Utc>) -> UploadSession {
         UploadSession {
             id,
             live_streamer_id: room_id,
