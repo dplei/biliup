@@ -115,6 +115,7 @@ docker compose pull && docker compose up -d
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
+| `071f0ada` | `1.2.1-incrsubmit` | 增量投稿：每段上传即建稿/edit 追加并落 `upload_session` 表，崩溃/重启按 room+30min 窗口续接同一稿件，每段成功后删本地（防丢已传内容） |
 | `788e7ff1` | `1.2.1-autocover` | 自动封面：上传模板 `cover_template` 填写则生成「黑底+主播名+直播时间」封面（优先于 cover_path），内嵌思源黑体 |
 | `33f1dd17` | `1.2.1-season` | 投稿后自动加主播专属合集 + ds_update.log 按天滚动留 7 天 |
 | `6b1510f8` | `1.2.1-dingtalk-filelog` | web 实时日志写 ds_update.log + cookie 推送适配钉钉/企业微信 |
