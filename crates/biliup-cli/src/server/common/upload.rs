@@ -1,16 +1,17 @@
 use crate::UploadLine;
 use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile};
 use crate::server::common::upload_session::{
-    LiveArchive, active_sessions_for_room, finalize_session, insert_session, parse_videos,
-    reattach_session, select_recovery_candidate, update_session_after_submit,
-    update_session_videos,
+    LiveArchive, active_sessions_for_room, get_streamer_info, insert_uploading_session,
+    mark_submitted, parse_videos, reattach_session, select_recovery_candidate,
+    select_stale_session_indices, update_session_videos,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
+use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
-use crate::server::infrastructure::models::InsertFileItem;
+use crate::server::infrastructure::models::{InsertFileItem, StreamerInfo};
 use crate::server::infrastructure::models::hook_step::{
     HookStep, process_video, process_video_paths,
 };
@@ -23,7 +24,7 @@ use biliup::error::Kind;
 use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
-use error_stack::{ResultExt, bail};
+use error_stack::ResultExt;
 use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
@@ -62,15 +63,32 @@ where
         .clone()
         .unwrap_or_default();
 
+    // 方案B：录制期间只上传分段并把 Video 引用累积落库（uploading 态），不投稿；
+    // 下播后一次性提交（整场只审一次，避免「过审后追加→重新审核」）。
     let archive =
         pipeline_upload_videos(rx, &upload_context, upload_config, &segment_processors, ctx)
             .await?;
 
+    // 下播收尾：把本场累积的全部分段一次性提交。失败则保持 uploading，
+    // 下次该 room 开播时由 prepare_archive 补提交。
     if let Some(archive) = archive
+        && !archive.videos.is_empty()
         && let Some(row_id) = archive.session_row_id
     {
-        if let Err(e) = finalize_session(ctx.pool(), row_id).await {
-            warn!(?e, "finalize upload_session 失败");
+        let config = ctx.config();
+        if let Err(e) = submit_session(
+            &upload_context,
+            ctx.pool(),
+            upload_config,
+            config.season_section_id,
+            config.submit_api.as_deref(),
+            ctx.streamer_info(),
+            row_id,
+            &archive.videos,
+        )
+        .await
+        {
+            error!(?e, "下播一次性提交失败，保持 uploading 待下次补提交");
         }
     }
 
@@ -143,57 +161,23 @@ pub(crate) fn segment_paths(event: &SegmentInfo) -> Vec<PathBuf> {
     paths
 }
 
-/// 每段上传成功后：首段建稿，后续 edit 追加。就地更新 archive 与缓存 studio，并落库。
-async fn submit_or_append_segment(
-    ctx: &Context,
+/// 一次性提交一个会话累积的全部分段：构建 studio → submit_by_app → 写回 aid 并 finalize → 加合集。
+/// 仅在成功拿到 aid 时才 finalize；失败保持 uploading，留待下次开播补提交。
+/// `streamer_info` 决定标题/时间，补提交废弃会话时传该会话当时的 streamer_info。
+async fn submit_session(
     upload_context: &UploadContext,
+    pool: &ConnectionPool,
     upload_config: &UploadStreamer,
-    archive: &mut LiveArchive,
-    cached_studio: &mut Option<Studio>,
-    video: Video,
-) -> AppResult<()> {
-    if archive.aid.is_none() {
-        create_archive(
-            ctx,
-            upload_context,
-            upload_config,
-            archive,
-            cached_studio,
-            video,
-        )
-        .await
-    } else {
-        append_to_archive(
-            ctx,
-            upload_context,
-            upload_config,
-            archive,
-            cached_studio,
-            video,
-        )
-        .await
-    }
-}
-
-/// 首段：构建 studio（封面上传/自动封面等一次性开销）并建稿。
-async fn create_archive(
-    ctx: &Context,
-    upload_context: &UploadContext,
-    upload_config: &UploadStreamer,
-    archive: &mut LiveArchive,
-    cached_studio: &mut Option<Studio>,
-    video: Video,
+    season_section_id: Option<i64>,
+    submit_api: Option<&str>,
+    streamer_info: &StreamerInfo,
+    session_row_id: i64,
+    videos: &[Video],
 ) -> AppResult<()> {
     let bilibili = &upload_context.bilibili;
-    let room_id = ctx.worker_id();
-    let streamer_info_id = ctx.id();
-
-    let mut recorder = ctx.recorder(ctx.streamer_info().clone());
-    recorder.filename_prefix = upload_config.title.clone();
-    let mut studio = build_studio(upload_config, bilibili, vec![video.clone()], &recorder).await?;
-
-    let submit_api = ctx.config().submit_api.clone();
-    let resp = submit_to_bilibili(bilibili, &studio, submit_api.as_deref()).await?;
+    let recorder = Recorder::new(upload_config.title.clone(), streamer_info.clone());
+    let studio = build_studio(upload_config, bilibili, videos.to_vec(), &recorder).await?;
+    let resp = submit_to_bilibili(bilibili, &studio, submit_api).await?;
     let aid = resp
         .data
         .as_ref()
@@ -206,139 +190,103 @@ async fn create_archive(
         .and_then(|b| b.as_str())
         .map(|s| s.to_string());
 
-    archive.videos = vec![video];
-    archive.aid = aid;
-    archive.bvid = bvid.clone();
-
-    // DB 写入 best-effort：稿件已在 B 站，落库失败不影响本段状态。
-    if let (Some(aid_val), Some(row_id)) = (aid, archive.session_row_id) {
-        if let Err(e) =
-            update_session_after_submit(ctx.pool(), row_id, aid_val, bvid.clone(), &archive.videos)
-                .await
-        {
-            error!(?e, "落库 upload_session 失败(已投稿成功)");
-        }
-    } else if let Some(aid_val) = aid {
-        match insert_session(
-            ctx.pool(),
-            room_id,
-            streamer_info_id,
-            aid_val,
-            bvid.clone(),
-            &archive.videos,
-        )
-        .await
-        {
-            Ok(row) => {
-                archive.session_row_id = Some(row.id);
+    match aid {
+        Some(aid_val) => {
+            // 提交成功即 finalize；写回失败仅告警（稿件已在 B 站，重复提交风险大于收益）。
+            if let Err(e) = mark_submitted(pool, session_row_id, aid_val, bvid).await {
+                error!(?e, "提交成功但写回 upload_session 失败");
             }
-            Err(e) => {
-                error!(?e, "落库 upload_session 失败(已投稿成功)");
+            if let Some(section_id) = season_section_id {
+                add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
             }
         }
-    } else {
-        error!(?resp, "建稿响应缺少 aid，无法落库 upload_session");
-    }
-
-    studio.aid = archive.aid;
-    *cached_studio = Some(studio);
-
-    if let (Some(section_id), Some(aid_val)) = (ctx.config().season_section_id, archive.aid) {
-        add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
-    }
-
-    Ok(())
-}
-
-/// 重启续接时，进程内无缓存 studio——从 B 站稿件数据兜底重建。
-async fn ensure_cached_studio(
-    ctx: &Context,
-    upload_context: &UploadContext,
-    upload_config: &UploadStreamer,
-    archive: &LiveArchive,
-    cached_studio: &mut Option<Studio>,
-) -> AppResult<()> {
-    if cached_studio.is_some() {
-        return Ok(());
-    }
-    if let Some(aid_val) = archive.aid {
-        let bilibili = &upload_context.bilibili;
-        let vid = biliup::bilibili::Vid::Aid(aid_val);
-        match bilibili.studio_data(&vid, None).await {
-            Ok(mut s) => {
-                s.aid = archive.aid;
-                *cached_studio = Some(s);
-            }
-            Err(e) => {
-                warn!(?e, "studio_data 兜底失败，改为重建最小 studio");
-                let mut recorder = ctx.recorder(ctx.streamer_info().clone());
-                recorder.filename_prefix = upload_config.title.clone();
-                let mut s =
-                    build_studio(upload_config, bilibili, archive.videos.clone(), &recorder)
-                        .await?;
-                s.aid = archive.aid;
-                *cached_studio = Some(s);
-            }
+        None => {
+            error!(?resp, "提交响应缺少 aid，未 finalize（待下次开播补提交）");
         }
     }
     Ok(())
 }
 
-/// 后续段：追加到已有 aid。
-async fn append_to_archive(
-    ctx: &Context,
-    upload_context: &UploadContext,
-    upload_config: &UploadStreamer,
-    archive: &mut LiveArchive,
-    cached_studio: &mut Option<Studio>,
-    video: Video,
-) -> AppResult<()> {
-    let bilibili = &upload_context.bilibili;
-
-    ensure_cached_studio(ctx, upload_context, upload_config, archive, cached_studio).await?;
-
+/// 每段上传成功后：把 Video 累积进 archive 并落库（uploading 态），供下播一次性提交 & 重启恢复。
+/// 首段创建会话行，之后更新 videos_json。落库失败则返回 Err（调用方据此保留本地文件不删）。
+async fn persist_segment(ctx: &Context, archive: &mut LiveArchive, video: Video) -> AppResult<()> {
     archive.videos.push(video);
-    let Some(studio) = cached_studio.as_mut() else {
-        bail!(AppError::Custom("cached studio missing for edit".into()));
-    };
-    studio.aid = archive.aid;
-    studio.videos = archive.videos.clone();
-    bilibili
-        .edit_by_app(studio, None)
-        .await
-        .change_context(AppError::Unknown)?;
-
-    // DB 写入 best-effort：edit 已在 B 站成功，落库失败不影响本段状态。
-    if let Some(row_id) = archive.session_row_id {
-        if let Err(e) = update_session_videos(ctx.pool(), row_id, &archive.videos).await {
-            warn!(?e, "更新 upload_session videos 失败(已 edit 成功)");
+    match archive.session_row_id {
+        Some(row_id) => update_session_videos(ctx.pool(), row_id, &archive.videos).await,
+        None => {
+            let row =
+                insert_uploading_session(ctx.pool(), ctx.worker_id(), ctx.id(), &archive.videos)
+                    .await?;
+            archive.session_row_id = Some(row.id);
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
-/// 开播时准备本场稿件状态：命中窗口内未 finalize 的同 room 会话则续接，否则返回空 archive。
-async fn prepare_archive(ctx: &Context) -> AppResult<LiveArchive> {
+/// 开播时准备本场会话状态：
+/// 1) 先把「已废弃」会话（超窗口仍未提交）一次性补提交并 finalize，避免分段永远滞留未投稿；
+/// 2) 再续接「窗口内」的会话（重启打断的同一场）继续累积，下播统一提交；
+/// 3) 都没有则全新开始。
+async fn prepare_archive(
+    upload_context: &UploadContext,
+    upload_config: &UploadStreamer,
+    ctx: &Context,
+) -> AppResult<LiveArchive> {
     let room_id = ctx.worker_id();
-    let window = ctx
-        .config()
+    let config = ctx.config();
+    let window = config
         .recovery_window_minutes
         .unwrap_or(DEFAULT_RECOVERY_WINDOW_MINUTES) as i64;
     // read-then-reattach 非事务，但安全：本架构中每个 live_streamer_id（room）只有一个 worker。
     let sessions = active_sessions_for_room(ctx.pool(), room_id).await?;
     let now = chrono::Utc::now();
+
+    // (1) 补提交废弃会话（用各自当时的 streamer_info 构建标题/时间）。
+    for idx in select_stale_session_indices(&sessions, room_id, now, window) {
+        let stale = &sessions[idx];
+        let videos = parse_videos(&stale.videos_json);
+        if videos.is_empty() {
+            continue;
+        }
+        let streamer_info = match get_streamer_info(ctx.pool(), stale.streamer_info_id).await {
+            Ok(si) => si,
+            Err(e) => {
+                warn!(?e, row_id = stale.id, "补提交废弃会话：取 StreamerInfo 失败，跳过");
+                continue;
+            }
+        };
+        info!(row_id = stale.id, n = videos.len(), "补提交上一场未提交的废弃会话");
+        if let Err(e) = submit_session(
+            upload_context,
+            ctx.pool(),
+            upload_config,
+            config.season_section_id,
+            config.submit_api.as_deref(),
+            &streamer_info,
+            stale.id,
+            &videos,
+        )
+        .await
+        {
+            warn!(?e, row_id = stale.id, "补提交废弃会话失败，下次开播再试");
+        }
+    }
+
+    // (2) 续接窗口内的会话。
     if let Some(idx) = select_recovery_candidate(&sessions, room_id, now, window) {
         let candidate = sessions[idx].clone();
         let videos = parse_videos(&candidate.videos_json);
-        let aid = candidate.aid.map(|a| a as u64);
-        let bvid = candidate.bvid.clone();
-        info!(aid=?aid, room_id, "重启续接已有稿件，将 edit 追加后续分段");
+        info!(
+            row_id = candidate.id,
+            room_id,
+            n = videos.len(),
+            "重启续接：继续累积本场分段，下播统一提交"
+        );
         let row = reattach_session(ctx.pool(), candidate, ctx.id()).await?;
         Ok(LiveArchive {
             session_row_id: Some(row.id),
-            aid,
-            bvid,
+            aid: None,
+            bvid: None,
             videos,
         })
     } else {
@@ -356,8 +304,7 @@ async fn pipeline_upload_videos<F>(
 where
     F: FnMut(&SegmentInfo),
 {
-    let mut archive = prepare_archive(ctx).await?;
-    let mut cached_studio: Option<Studio> = None;
+    let mut archive = prepare_archive(upload_context, upload_config, ctx).await?;
     pin!(rx);
     while let Some(event) = rx.next().await {
         let mut paths = segment_paths(&event);
@@ -374,19 +321,12 @@ where
 
         match upload_single_file(&upload_path, upload_context).await {
             Ok(video) => {
-                if let Err(e) = submit_or_append_segment(
-                    ctx,
-                    upload_context,
-                    upload_config,
-                    &mut archive,
-                    &mut cached_studio,
-                    video,
-                )
-                .await
-                {
-                    error!(file = ?upload_path, "submit/append failed, keeping local file: {:?}", e);
+                // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
+                if let Err(e) = persist_segment(ctx, &mut archive, video).await {
+                    error!(file = ?upload_path, "落库累积失败，保留本地文件: {:?}", e);
                     continue;
                 }
+                // 已上传到 B 站存储 + 引用已落库 ⇒ durable，可安全删本地（磁盘峰值≈单片）。
                 if let Err(e) = execute_postprocessor(paths, ctx).await {
                     error!(file = ?upload_path, "per-segment postprocessor failed: {:?}", e);
                 }
@@ -396,10 +336,10 @@ where
             }
         }
     }
-    Ok(if archive.aid.is_some() {
-        Some(archive)
-    } else {
+    Ok(if archive.videos.is_empty() {
         None
+    } else {
+        Some(archive)
     })
 }
 
@@ -733,13 +673,19 @@ impl UActor {
                 let result = match ctx.upload_config() {
                     Some(config) => process_with_upload(inspect, &ctx, config).await,
                     None => {
-                        let mut paths = Vec::new();
+                        // 未绑定投稿模板：仅录制。消费分段事件，但【不执行会删文件的后处理】，
+                        // 避免误配把没上传的录像静默删掉（footgun）。文件保留本地由用户处置。
                         pin!(inspect);
-                        while let Some(event) = inspect.next().await {
-                            paths.extend(segment_paths(&event));
+                        let mut segments = 0u32;
+                        while inspect.next().await.is_some() {
+                            segments += 1;
                         }
-                        // 无上传配置时，直接执行后处理
-                        execute_postprocessor(paths, &ctx).await
+                        warn!(
+                            url = ctx.live_streamer().url,
+                            segments,
+                            "未绑定投稿模板，仅录制；已保留本地文件，跳过后处理（避免误删未上传录像）"
+                        );
+                        Ok(())
                     }
                 };
 

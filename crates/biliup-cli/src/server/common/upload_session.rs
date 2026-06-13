@@ -1,6 +1,6 @@
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::models::{InsertUploadSession, UploadSession};
+use crate::server::infrastructure::models::{InsertUploadSession, StreamerInfo, UploadSession};
 use biliup::bilibili::Video;
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
@@ -8,6 +8,7 @@ use ormlite::{Insert, Model};
 
 /// 从候选会话中选出可续接的那条：同 room、未 finalize、updated_at 在窗口内、取最新。
 /// 返回选中项在 `sessions` 中的下标，便于调用方按需取用（避免借用纠纷）。
+/// 方案B 下「未 finalize」即 status="uploading"（累积中、尚未下播提交）。
 pub fn select_recovery_candidate(
     sessions: &[UploadSession],
     room_id: i64,
@@ -23,6 +24,27 @@ pub fn select_recovery_candidate(
         })
         .max_by_key(|(_, s)| s.updated_at)
         .map(|(i, _)| i)
+}
+
+/// 选出「已废弃」的会话下标：同 room、未 finalize、但 updated_at 已超出窗口。
+/// 这些是上一场直播累积了分段却没等到下播提交（典型：进程在下播前重启、
+/// 且停机期间直播已结束）。开播时应把它们一次性补提交并 finalize，避免上传
+/// 到 B 站存储的分段永远滞留未投稿。
+pub fn select_stale_session_indices(
+    sessions: &[UploadSession],
+    room_id: i64,
+    now: DateTime<Utc>,
+    window_minutes: i64,
+) -> Vec<usize> {
+    let cutoff = now - chrono::Duration::minutes(window_minutes);
+    sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.live_streamer_id == room_id && s.status != "finalized" && s.updated_at < cutoff
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// 进程内的本场稿件状态。aid=None 表示尚未建稿。
@@ -62,29 +84,37 @@ pub async fn reattach_session(
         .change_context(AppError::Unknown)
 }
 
-/// 首段建稿后插入会话行。
-pub async fn insert_session(
+/// 首段上传成功后插入会话行（uploading 态：累积中、尚未提交，aid 暂空）。
+pub async fn insert_uploading_session(
     pool: &ConnectionPool,
     room_id: i64,
     streamer_info_id: i64,
-    aid: u64,
-    bvid: Option<String>,
     videos: &[Video],
 ) -> AppResult<UploadSession> {
     let now = chrono::Utc::now();
     InsertUploadSession {
         live_streamer_id: room_id,
         streamer_info_id,
-        aid: Some(aid as i64),
-        bvid,
+        aid: None,
+        bvid: None,
         videos_json: serde_json::to_string(videos).change_context(AppError::Unknown)?,
-        status: "submitted".to_string(),
+        status: "uploading".to_string(),
         created_at: now,
         updated_at: now,
     }
     .insert(pool)
     .await
     .change_context(AppError::Unknown)
+}
+
+/// 按 id 查会话所属的 StreamerInfo（补提交废弃会话时，需用它当时的标题/时间构建 studio）。
+pub async fn get_streamer_info(pool: &ConnectionPool, id: i64) -> AppResult<StreamerInfo> {
+    StreamerInfo::select()
+        .where_("id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)
 }
 
 /// 公共：按 id 取行、就地修改、写回。
@@ -121,28 +151,16 @@ pub async fn update_session_videos(
     .await
 }
 
-/// 续接行上首次建稿成功后，写回 aid/bvid/videos/status。
-pub async fn update_session_after_submit(
+/// 下播后一次性提交成功：写回 aid/bvid 并标记 finalized（本场结束、不再参与续接/补提交）。
+pub async fn mark_submitted(
     pool: &ConnectionPool,
     session_row_id: i64,
     aid: u64,
     bvid: Option<String>,
-    videos: &[Video],
 ) -> AppResult<()> {
-    let videos_json = serde_json::to_string(videos).change_context(AppError::Unknown)?;
     mutate_session(pool, session_row_id, |row| {
         row.aid = Some(aid as i64);
         row.bvid = bvid;
-        row.videos_json = videos_json;
-        row.status = "submitted".to_string();
-        Ok(())
-    })
-    .await
-}
-
-/// 下播收尾：标记 finalized。
-pub async fn finalize_session(pool: &ConnectionPool, session_row_id: i64) -> AppResult<()> {
-    mutate_session(pool, session_row_id, |row| {
         row.status = "finalized".to_string();
         Ok(())
     })
@@ -217,5 +235,25 @@ mod tests {
     fn none_when_empty() {
         let now = now_fixed();
         assert_eq!(select_recovery_candidate(&[], 7, now, 30), None);
+    }
+
+    #[test]
+    fn stale_picks_only_out_of_window_non_finalized_same_room() {
+        let now = now_fixed();
+        let sessions = vec![
+            session(1, 7, "uploading", t(5, now)),   // 窗口内 -> 不算废弃
+            session(2, 7, "uploading", t(31, now)),  // 超窗口 -> 废弃
+            session(3, 7, "finalized", t(40, now)),  // 已 finalize -> 跳过
+            session(4, 8, "uploading", t(40, now)),  // 别的 room -> 跳过
+            session(5, 7, "uploading", t(90, now)),  // 超窗口 -> 废弃
+        ];
+        assert_eq!(select_stale_session_indices(&sessions, 7, now, 30), vec![1, 4]);
+    }
+
+    #[test]
+    fn stale_empty_when_all_in_window() {
+        let now = now_fixed();
+        let sessions = vec![session(1, 7, "uploading", t(10, now))];
+        assert!(select_stale_session_indices(&sessions, 7, now, 30).is_empty());
     }
 }
