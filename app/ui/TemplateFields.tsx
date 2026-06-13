@@ -284,6 +284,13 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
           style={{ width: 464 }}
           placeholder="/cover/up.jpg"
         />
+        <Input
+          field="cover_template"
+          label="封面文字模板"
+          style={{ width: 464 }}
+          placeholder="留空用上方封面图；示例：{streamer}\n%Y-%m-%d %H点场"
+          extraText="填写后自动生成黑底封面，优先于「视频封面」。支持 {streamer}/{title}/{url} 与时间占位符，\n 换行"
+        />
         <TextArea
           style={{ maxWidth: 560 }}
           field="description"
