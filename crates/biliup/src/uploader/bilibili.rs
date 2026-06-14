@@ -484,7 +484,10 @@ impl BiliBili {
         if ret["code"].as_i64() != Some(0) {
             return Err(Kind::Custom(format!("get archive view failed: {ret:?}")));
         }
-        let title = ret["data"]["title"].as_str().unwrap_or_default().to_string();
+        let title = ret["data"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let cid = ret["data"]["cid"]
             .as_u64()
             .or_else(|| ret["data"]["pages"][0]["cid"].as_u64())

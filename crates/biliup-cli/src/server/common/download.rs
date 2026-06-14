@@ -201,7 +201,10 @@ impl DownloadTask {
                     let since = *offline_since.get_or_insert_with(std::time::Instant::now);
                     retry_count += 1;
                     if since.elapsed() >= grace {
-                        info!(url = url, "连续离线超过宽限期 {:?}，确认下播，结束本场", grace);
+                        info!(
+                            url = url,
+                            "连续离线超过宽限期 {:?}，确认下播，结束本场", grace
+                        );
                         break components;
                     }
                     info!(

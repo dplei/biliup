@@ -7,9 +7,9 @@ pub mod cookie_health;
 pub mod cover_generator;
 pub mod download;
 pub mod upload;
+pub mod upload_session;
 /// 通用工具函数
 pub mod util;
-pub mod upload_session;
 
 pub fn construct_headers(hash_map: &HashMap<String, String>) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
