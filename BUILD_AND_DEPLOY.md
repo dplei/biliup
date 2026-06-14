@@ -115,6 +115,7 @@ docker compose pull && docker compose up -d
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
+| `a1f279ea` | `1.2.1-submitonce` | 方案B：录制期每段上传即落 `upload_session`(uploading)并删本地，**下播一次性提交**(整场只审一次，消除「过审后追加→重新审核」)；重启续接窗口内会话、开播补提交废弃会话；未绑投稿则不录制并显示「缺少投稿」标签；修 `cover_template` 不落库 |
 | `071f0ada` | `1.2.1-incrsubmit` | 增量投稿：每段上传即建稿/edit 追加并落 `upload_session` 表，崩溃/重启按 room+30min 窗口续接同一稿件，每段成功后删本地（防丢已传内容） |
 | `788e7ff1` | `1.2.1-autocover` | 自动封面：上传模板 `cover_template` 填写则生成「黑底+主播名+直播时间」封面（优先于 cover_path），内嵌思源黑体 |
 | `33f1dd17` | `1.2.1-season` | 投稿后自动加主播专属合集 + ds_update.log 按天滚动留 7 天 |
