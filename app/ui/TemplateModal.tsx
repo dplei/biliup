@@ -159,6 +159,7 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
               field="filename_prefix"
               label="文件名模板（可选）"
               placeholder="{streamer}%Y-%m-%dT%H_%M_%S"
+              extraText="普通冒号会替换为 _；如需冒号请写 %H{colon}%M{colon}%S"
           />
 
           <Form.Select

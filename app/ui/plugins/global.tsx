@@ -169,6 +169,8 @@ const Global: React.FC = () => {
               {'\u007B'}title{'\u007D'}: 直播标题
               <br />
               %Y-%m-%d %H_%M_%S: 开始录制时的 年-月-日 时_分_秒
+              <br />
+              普通冒号会替换为 _；如需冒号请写 %H{'{colon}'}%M{'{colon}'}%S
             </div>
           }
           label="文件名模板（filename_prefix）"

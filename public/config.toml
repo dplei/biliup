@@ -12,8 +12,9 @@ file_size = 2621440000
 #segment_time = "01:00:00"
 ### 小于此大小的视频文件将会被过滤删除，单位MB
 filtering_threshold = 20
-### 自定义录播文件名模板, 支持变量 {streamer}:你在配置里设置的直播间名 %Y-%m-%d %H_%M_%S:创建文件的时间, {title}:当场直播间标题
+### 自定义录播文件名模板, 支持变量 {streamer}:你在配置里设置的直播间名, {title}:当场直播间标题, {colon}:字面冒号
 ### 如果上传文件，文件名必须包含设定的模板名。其次，如果没有定义时间，文件分片可能会互相覆盖，所以推荐设置时间来避免分段文件名重复。
+### 普通冒号会被替换为 _；如需输出冒号，使用 {colon}，例如 %H{colon}%M{colon}%S。
 #filename_prefix = "{streamer}%Y-%m-%d %H_%M_%S{title}"
 ### 视频分段后处理并行
 ### 开启后无法保证分段后处理先后执行顺序
@@ -228,7 +229,7 @@ dynamic = "#空间动态#"
 #is_only_self = 0 ### 可见范围, 1为仅自己可见
 #extra_fields = '<json 字符串>' ### 实现添加自定义提交参数，示例：extra_fields: '{"watermark": {"state": 0}}'自制稿件关闭水印，参数自抓 @https://github.com/biliup/biliup-rs/pull/171
 #uploader = "biliup-rs"  ### 覆盖全局默认上传插件，Noop为不上传，但会执行后处理
-#filename_prefix = '{streamer}%Y-%m-%d %H_%M_%S{title}'  ### 覆盖全局自定义录播文件命名规则
+#filename_prefix = '{streamer}%Y-%m-%d %H_%M_%S{title}'  ### 覆盖全局自定义录播文件命名规则，如需冒号可写 %H{colon}%M{colon}%S
 user_cookie = "cookies.json" ### 使用指定的账号上传
 #use_live_cover = true # 获取BILIBILI直播间封面并作为投稿封面。此封面优先级低于单个主播指定的自定义封面。
 tags = ["biliup", "视频标签"]

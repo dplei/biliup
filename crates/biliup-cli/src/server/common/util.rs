@@ -28,12 +28,17 @@ impl Recorder {
 
     /// 生成文件名模板（包含时间格式占位符），并清洗非法字符
     pub fn filename_template(&self) -> String {
-        let raw = if let Some(prefix) = &self.filename_prefix {
-            self.template_with(prefix)
+        if let Some(prefix) = &self.filename_prefix {
+            render_filename_template(
+                prefix,
+                &self.streamer_info.name,
+                &self.streamer_info.title,
+                &self.streamer_info.url,
+            )
         } else {
-            format!("{}%Y-%m-%dT%H_%M_%S", self.streamer_info.name)
-        };
-        sanitize_filename(&raw)
+            let streamer = sanitize_filename_chars(&self.streamer_info.name);
+            finish_filename_sanitization(format!("{streamer}%Y-%m-%dT%H_%M_%S"))
+        }
     }
 
     fn template_with(&self, template: &str) -> String {
@@ -86,9 +91,10 @@ impl Recorder {
 }
 
 /// 非法字符清洗（最小可用实现）
-/// - 替换常见非法字符为 '_'；去掉末尾空格与点（Windows 兼容）
+/// - 替换常见非法字符为 '_'；去掉末尾空格与点
+/// - 普通 ':' 会被替换为 '_'；需要字面冒号时在文件名模板中写作 `{colon}`
 /// - 保留 '%'，以便 strftime 能正常工作
-fn sanitize_filename(name: &str) -> String {
+fn sanitize_filename_chars(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for ch in name.chars() {
         match ch {
@@ -97,16 +103,52 @@ fn sanitize_filename(name: &str) -> String {
             _ => out.push(ch),
         }
     }
-    let out = out.trim_end_matches([' ', '.']).to_string();
+    out
+}
+
+fn finish_filename_sanitization(name: String) -> String {
+    let out = name.trim_end_matches([' ', '.']).to_string();
     if out.is_empty() { "_".to_string() } else { out }
+}
+
+fn render_filename_template(template: &str, streamer: &str, title: &str, url: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find('{') {
+        out.push_str(&sanitize_filename_chars(&rest[..start]));
+        rest = &rest[start..];
+
+        if rest.starts_with("{streamer}") {
+            out.push_str(&sanitize_filename_chars(streamer));
+            rest = &rest["{streamer}".len()..];
+        } else if rest.starts_with("{title}") {
+            out.push_str(&sanitize_filename_chars(title));
+            rest = &rest["{title}".len()..];
+        } else if rest.starts_with("{url}") {
+            out.push_str(&sanitize_filename_chars(url));
+            rest = &rest["{url}".len()..];
+        } else if rest.starts_with("{colon}") {
+            out.push(':');
+            rest = &rest["{colon}".len()..];
+        } else {
+            out.push('{');
+            rest = &rest['{'.len_utf8()..];
+        }
+    }
+
+    out.push_str(&sanitize_filename_chars(rest));
+    finish_filename_sanitization(out)
 }
 
 /// 生成弹幕文件名模板（包含时间格式占位符），并清洗非法字符
 pub fn danmaku_filename_template(filename_prefix: Option<&str>, name: &str) -> String {
-    let template = filename_prefix
-        .map(|prefix| prefix.replace("{streamer}", name))
-        .unwrap_or_else(|| format!("{}%Y-%m-%dT%H_%M_%S", name));
-    sanitize_filename(&template)
+    filename_prefix
+        .map(|prefix| render_filename_template(prefix, name, "", ""))
+        .unwrap_or_else(|| {
+            let streamer = sanitize_filename_chars(name);
+            finish_filename_sanitization(format!("{streamer}%Y-%m-%dT%H_%M_%S"))
+        })
 }
 
 /// 从 URL 中提取媒体扩展名（小写），例如 "flv", "mp4" 等。
@@ -173,7 +215,82 @@ pub fn parse_time(segment_time: &str) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::common::util::media_ext_from_url;
+    use crate::server::common::util::{Recorder, media_ext_from_url};
+    use crate::server::infrastructure::models::StreamerInfo;
+    use chrono::{Local, TimeZone};
+
+    #[test]
+    fn filename_template_sanitizes_plain_colon_time_separators() {
+        let start_time = Local
+            .with_ymd_and_hms(2026, 6, 17, 14, 57, 18)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Recorder::new(
+            Some("{streamer} %Y-%m-%d %H:%M:%S".to_string()),
+            StreamerInfo::new("小桐人", "https://example.com", "直播标题", start_time, ""),
+        );
+
+        assert_eq!(recorder.format_filename(), "小桐人 2026-06-17 14_57_18");
+    }
+
+    #[test]
+    fn filename_template_preserves_colon_tokens_for_time_separators() {
+        let start_time = Local
+            .with_ymd_and_hms(2026, 6, 17, 14, 57, 18)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Recorder::new(
+            Some("{streamer} %Y-%m-%d %H{colon}%M{colon}%S".to_string()),
+            StreamerInfo::new("小桐人", "https://example.com", "直播标题", start_time, ""),
+        );
+
+        assert_eq!(recorder.format_filename(), "小桐人 2026-06-17 14:57:18");
+    }
+
+    #[test]
+    fn filename_template_sanitizes_unescaped_literal_colons() {
+        let start_time = Local
+            .with_ymd_and_hms(2026, 6, 17, 14, 57, 18)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Recorder::new(
+            Some("{streamer}: %Y-%m-%d %H{colon}%M{colon}%S".to_string()),
+            StreamerInfo::new("小桐人", "https://example.com", "直播标题", start_time, ""),
+        );
+
+        assert_eq!(recorder.format_filename(), "小桐人_ 2026-06-17 14:57:18");
+    }
+
+    #[test]
+    fn filename_template_does_not_treat_streamer_text_as_colon_token() {
+        let start_time = Local
+            .with_ymd_and_hms(2026, 6, 17, 14, 57, 18)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Recorder::new(
+            Some("{streamer} %H{colon}%M{colon}%S".to_string()),
+            StreamerInfo::new(
+                "小桐人{colon}:备注",
+                "https://example.com",
+                "直播标题",
+                start_time,
+                "",
+            ),
+        );
+
+        assert_eq!(recorder.format_filename(), "小桐人{colon}_备注 14:57:18");
+    }
+
+    #[test]
+    fn danmaku_filename_template_uses_colon_token() {
+        assert_eq!(
+            crate::server::common::util::danmaku_filename_template(
+                Some("{streamer} %H{colon}%M{colon}%S"),
+                "小桐人:备注",
+            ),
+            "小桐人_备注 %H:%M:%S"
+        );
+    }
 
     #[test]
     fn it_works() {
