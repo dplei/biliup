@@ -115,6 +115,7 @@ docker compose pull && docker compose up -d
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
+| `579c535f` | `1.2.1-coverfix` | 修封面文字模板两个 bug：①字面 `\n` 不换行——`split_template_lines()` 先把 `\n` 还原为真实换行再切分（前端单行输入框存的是字面 `\n`，旧代码 `split('\n')` 切的是真实换行符，切不开）；②emoji 显示成豆腐块——内嵌 `NotoEmoji-Regular.ttf`(OFL) 做逐字字体回退混排，思源黑体缺的字形改用 emoji 字体。⚠️ `ab_glyph` 只能画单色轮廓，emoji 是白色单色剪影非彩色 |
 | `2d04cd4a` | `1.2.1-submitonce` | **修迁移崩溃重发**：`a1f279ea` 误把已应用的 migration 4 改了字节(校验和不符)导致 sqlx VersionMismatch 启动 panic、19159 拒连。已用生产 DB 副本核对 `_sqlx_migrations` v4 校验和=`2352d0f3…`，还原 migration 4 至部署字节(`4f0e51a`)，并对生产 DB 副本本地跑通迁移启动验证。功能同下。**已应用的迁移文件绝不可改字节(含注释)，改动须新建迁移** |
 | ~~`a1f279ea`~~ 作废 | ~~`1.2.1-submitonce`~~ | 方案B：录制期每段上传即落 `upload_session`(uploading)并删本地，**下播一次性提交**(整场只审一次，消除「过审后追加→重新审核」)；重启续接窗口内会话、开播补提交废弃会话；未绑投稿则不录制并显示「缺少投稿」标签；修 `cover_template` 不落库。⚠️改了已应用迁移导致启动崩溃，被 `2d04cd4a` 取代 |
 | `071f0ada` | `1.2.1-incrsubmit` | 增量投稿：每段上传即建稿/edit 追加并落 `upload_session` 表，崩溃/重启按 room+30min 窗口续接同一稿件，每段成功后删本地（防丢已传内容） |

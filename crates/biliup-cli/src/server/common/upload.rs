@@ -1,5 +1,5 @@
 use crate::UploadLine;
-use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile};
+use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile, split_template_lines};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_uploading_session,
     mark_submitted, parse_videos, reattach_session, select_recovery_candidate,
@@ -469,7 +469,7 @@ pub(crate) async fn build_studio(
         .filter(|s| !s.is_empty())
     {
         let text = recorder.format(tpl);
-        let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+        let lines = split_template_lines(&text);
         match render_to_tempfile(&lines, &CoverOptions::default()) {
             Ok(f) => {
                 studio.cover = f.path().to_string_lossy().into_owned();
