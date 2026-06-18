@@ -1,3 +1,4 @@
+use crate::server::common::missing_segment::insert_video_at_order;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::{InsertUploadSession, StreamerInfo, UploadSession};
@@ -172,6 +173,32 @@ pub fn parse_videos(videos_json: &str) -> Vec<Video> {
     serde_json::from_str(videos_json).unwrap_or_default()
 }
 
+pub fn videos_with_inserted_segment(
+    videos_json: &str,
+    video: Video,
+    segment_order: i64,
+) -> AppResult<Vec<Video>> {
+    let mut videos: Vec<Video> = serde_json::from_str(videos_json).unwrap_or_default();
+    insert_video_at_order(&mut videos, video, segment_order);
+    Ok(videos)
+}
+
+pub async fn insert_session_video_at_order(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    video: Video,
+    segment_order: i64,
+) -> AppResult<Vec<Video>> {
+    let mut updated = Vec::new();
+    mutate_session(pool, session_row_id, |row| {
+        updated = videos_with_inserted_segment(&row.videos_json, video, segment_order)?;
+        row.videos_json = serde_json::to_string(&updated).change_context(AppError::Unknown)?;
+        Ok(())
+    })
+    .await?;
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,13 +268,16 @@ mod tests {
     fn stale_picks_only_out_of_window_non_finalized_same_room() {
         let now = now_fixed();
         let sessions = vec![
-            session(1, 7, "uploading", t(5, now)),   // 窗口内 -> 不算废弃
-            session(2, 7, "uploading", t(31, now)),  // 超窗口 -> 废弃
-            session(3, 7, "finalized", t(40, now)),  // 已 finalize -> 跳过
-            session(4, 8, "uploading", t(40, now)),  // 别的 room -> 跳过
-            session(5, 7, "uploading", t(90, now)),  // 超窗口 -> 废弃
+            session(1, 7, "uploading", t(5, now)),  // 窗口内 -> 不算废弃
+            session(2, 7, "uploading", t(31, now)), // 超窗口 -> 废弃
+            session(3, 7, "finalized", t(40, now)), // 已 finalize -> 跳过
+            session(4, 8, "uploading", t(40, now)), // 别的 room -> 跳过
+            session(5, 7, "uploading", t(90, now)), // 超窗口 -> 废弃
         ];
-        assert_eq!(select_stale_session_indices(&sessions, 7, now, 30), vec![1, 4]);
+        assert_eq!(
+            select_stale_session_indices(&sessions, 7, now, 30),
+            vec![1, 4]
+        );
     }
 
     #[test]
@@ -255,5 +285,24 @@ mod tests {
         let now = now_fixed();
         let sessions = vec![session(1, 7, "uploading", t(10, now))];
         assert!(select_stale_session_indices(&sessions, 7, now, 30).is_empty());
+    }
+
+    fn video(name: &str) -> Video {
+        Video {
+            title: Some(name.to_string()),
+            filename: name.to_string(),
+            desc: String::new(),
+        }
+    }
+
+    #[test]
+    fn inserts_video_into_session_json_at_recorded_order() {
+        let videos = vec![video("p1"), video("p2"), video("p4")];
+        let json = serde_json::to_string(&videos).unwrap();
+
+        let result = videos_with_inserted_segment(&json, video("p3"), 2).unwrap();
+
+        let names: Vec<_> = result.into_iter().map(|v| v.filename).collect();
+        assert_eq!(names, vec!["p1", "p2", "p3", "p4"]);
     }
 }

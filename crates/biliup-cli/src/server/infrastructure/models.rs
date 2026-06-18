@@ -82,6 +82,30 @@ pub struct UploadSession {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Missing segment recovery queue.
+#[derive(Model, Debug, Clone, Serialize, Deserialize)]
+#[ormlite(
+    table = "upload_missing_segment",
+    insert = "InsertUploadMissingSegment"
+)]
+pub struct UploadMissingSegment {
+    pub id: i64,
+    pub live_streamer_id: i64,
+    pub streamer_info_id: i64,
+    pub upload_session_id: Option<i64>,
+    pub aid: Option<i64>,
+    pub file_path: String,
+    pub danmaku_file_path: Option<String>,
+    pub segment_order: i64,
+    pub status: String,
+    pub attempts: i64,
+    pub line_index: i64,
+    pub next_retry_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 配置模型
 /// 存储应用程序的配置信息
 #[derive(Model, Debug, Clone, Serialize, Deserialize)]

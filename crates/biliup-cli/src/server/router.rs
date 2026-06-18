@@ -4,10 +4,11 @@ use crate::server::api::bilibili_endpoints::{
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_streamers_endpoint,
     delete_template_endpoint, delete_user_endpoint, get_configuration, get_cookie_health,
-    get_qrcode, get_status, get_streamer_info, get_streamer_info_files, get_streamers_endpoint,
-    get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
-    login_by_qrcode, pause_streamers_endpoint, post_streamers_endpoint, post_uploads,
-    put_configuration, put_streamers_endpoint,
+    get_missing_uploads, get_qrcode, get_status, get_streamer_info, get_streamer_info_files,
+    get_streamers_endpoint, get_upload_streamer_endpoint, get_upload_streamers_endpoint,
+    get_users_endpoint, get_videos, login_by_qrcode, pause_streamers_endpoint,
+    post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
+    recover_missing_upload,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
@@ -60,6 +61,11 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/videos", get(get_videos)) // 获取视频列表
         .route("/v1/status", get(get_status))
         .route("/v1/health/cookie", get(get_cookie_health)) // cookie 健康状态（前端横幅轮询）
+        .route("/v1/uploads/missing", get(get_missing_uploads))
+        .route(
+            "/v1/uploads/missing/{id}/recover",
+            post(recover_missing_upload),
+        )
         .route("/v1/uploads", post(post_uploads))
         .route_service("/static/{path}", get(using_serve_file_from_a_route))
         .with_state(service_register) // 注入服务注册器状态

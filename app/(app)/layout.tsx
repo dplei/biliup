@@ -13,7 +13,7 @@ import {
     IconDoubleChevronRight,
     IconStar,
     IconVideoListStroked,
-    IconHome,
+    IconSendStroked,
     IconSetting,
     IconHistory,
 } from '@douyinfe/semi-icons'
@@ -53,24 +53,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         () =>
             [
                 {
-                    itemKey: 'home',
-                    text: '主页',
-                    icon: (
-                        <div
-                            style={{
-                                backgroundColor: '#ffaa00ff',
-                                borderRadius: 'var(--semi-border-radius-medium)',
-                                color: 'var(--semi-color-bg-0)',
-                                display: 'flex',
-                                // justifyContent: 'center',
-                                padding: '4px',
-                            }}
-                        >
-                            <IconHome size="small" />
-                        </div>
-                    ),
-                },
-                {
                     itemKey: 'manager',
                     text: '录播管理',
                     items: [
@@ -106,6 +88,23 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                             }}
                         >
                             <IconCloudStroked size="small" />
+                        </div>
+                    ),
+                },
+                {
+                    itemKey: 'missing',
+                    text: '缺失补传',
+                    icon: (
+                        <div
+                            style={{
+                                backgroundColor: 'rgba(var(--semi-pink-5), 1)',
+                                borderRadius: 'var(--semi-border-radius-medium)',
+                                color: 'var(--semi-color-bg-0)',
+                                display: 'flex',
+                                padding: '4px',
+                            }}
+                        >
+                            <IconSendStroked size="small" />
                         </div>
                     ),
                 },
@@ -202,7 +201,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     )
     const renderWrapper = useCallback(({ itemElement, isSubNav, isInSubNav, props }: any) => {
         const routerMap: Record<string, string> = {
-            home: '/',
+            missing: '/missing',
             history: '/history',
             dashboard: '/dashboard',
             streamers: '/streamers',

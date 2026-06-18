@@ -1,13 +1,6 @@
-'use client'
+import { redirect } from 'next/navigation'
 
-const Home: React.FC = () => (
-  <iframe
-    style={{
-      borderWidth: 0,
-    }}
-    height="100%"
-    src="https://biliup.github.io/biliup/docs/guide/changelog/"
-  ></iframe>
-)
-
-export default Home
+export default function Home() {
+  // 「主页」已下线，根地址默认进入直播管理。
+  redirect('/streamers')
+}

@@ -6,6 +6,7 @@ use std::str::FromStr;
 pub mod cookie_health;
 pub mod cover_generator;
 pub mod download;
+pub mod missing_segment;
 pub mod upload;
 pub mod upload_session;
 /// 通用工具函数

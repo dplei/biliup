@@ -1,9 +1,15 @@
 use crate::UploadLine;
-use crate::server::common::cover_generator::{CoverOptions, render_to_tempfile, split_template_lines};
+use crate::server::common::cover_generator::{
+    CoverOptions, render_to_tempfile, split_template_lines,
+};
+use crate::server::common::missing_segment::{
+    due_missing_segments_for_session, enqueue_missing_segment, mark_retry_failure,
+    mark_retry_success, next_segment_order, patch_studio_videos, upload_line_for_recovery,
+};
 use crate::server::common::upload_session::{
-    LiveArchive, active_sessions_for_room, get_streamer_info, insert_uploading_session,
-    mark_submitted, parse_videos, reattach_session, select_recovery_candidate,
-    select_stale_session_indices, update_session_videos,
+    LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
+    insert_uploading_session, mark_submitted, parse_videos, reattach_session,
+    select_recovery_candidate, select_stale_session_indices, update_session_videos,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
@@ -11,12 +17,13 @@ use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
-use crate::server::infrastructure::models::{InsertFileItem, StreamerInfo};
 use crate::server::infrastructure::models::hook_step::{
     HookStep, process_video, process_video_paths,
 };
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
+use crate::server::infrastructure::models::{InsertFileItem, StreamerInfo, UploadMissingSegment};
 use async_channel::Receiver;
+use biliup::bilibili::Vid;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
@@ -28,10 +35,13 @@ use error_stack::ResultExt;
 use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
+use ormlite::Model;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::pin;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 
 // 辅助结构体
@@ -40,6 +50,17 @@ struct UploadContext {
     line: Line,
     threads: usize,
     client: StatelessClient,
+}
+
+static GLOBAL_UPLOAD_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
+
+async fn acquire_global_upload_permit() -> OwnedSemaphorePermit {
+    GLOBAL_UPLOAD_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("global upload semaphore should not be closed")
 }
 
 /// 重启续接默认时间窗口（分钟）
@@ -71,10 +92,15 @@ where
 
     // 下播收尾：把本场累积的全部分段一次性提交。失败则保持 uploading，
     // 下次该 room 开播时由 prepare_archive 补提交。
-    if let Some(archive) = archive
+    if let Some(mut archive) = archive
         && !archive.videos.is_empty()
         && let Some(row_id) = archive.session_row_id
     {
+        if let Err(e) =
+            recover_due_missing_segments(&upload_context, ctx, row_id, &mut archive).await
+        {
+            error!(?e, row_id, "静默补传缺失分段失败，继续提交已成功分段");
+        }
         let config = ctx.config();
         if let Err(e) = submit_session(
             &upload_context,
@@ -251,11 +277,19 @@ async fn prepare_archive(
         let streamer_info = match get_streamer_info(ctx.pool(), stale.streamer_info_id).await {
             Ok(si) => si,
             Err(e) => {
-                warn!(?e, row_id = stale.id, "补提交废弃会话：取 StreamerInfo 失败，跳过");
+                warn!(
+                    ?e,
+                    row_id = stale.id,
+                    "补提交废弃会话：取 StreamerInfo 失败，跳过"
+                );
                 continue;
             }
         };
-        info!(row_id = stale.id, n = videos.len(), "补提交上一场未提交的废弃会话");
+        info!(
+            row_id = stale.id,
+            n = videos.len(),
+            "补提交上一场未提交的废弃会话"
+        );
         if let Err(e) = submit_session(
             upload_context,
             ctx.pool(),
@@ -305,6 +339,7 @@ where
     F: FnMut(&SegmentInfo),
 {
     let mut archive = prepare_archive(upload_context, upload_config, ctx).await?;
+    let mut missing_count = 0usize;
     pin!(rx);
     while let Some(event) = rx.next().await {
         let mut paths = segment_paths(&event);
@@ -319,6 +354,7 @@ where
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
 
+        let _permit = acquire_global_upload_permit().await;
         match upload_single_file(&upload_path, upload_context).await {
             Ok(video) => {
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
@@ -332,7 +368,26 @@ where
                 }
             }
             Err(e) => {
-                error!(file = ?upload_path, "upload_single_file failed, skipping segment: {:?}", e);
+                let err = format!("{e:?}");
+                let segment_order = next_segment_order(archive.videos.len(), missing_count);
+                missing_count += 1;
+                error!(file = ?upload_path, segment_order, "upload_single_file failed, queueing missing segment: {:?}", e);
+                if let Err(queue_err) = enqueue_missing_segment(
+                    ctx.pool(),
+                    ctx.worker_id(),
+                    ctx.id(),
+                    archive.session_row_id,
+                    archive.aid.map(|aid| aid as i64),
+                    &upload_path,
+                    event.danmaku_file_path.as_deref(),
+                    segment_order,
+                    err,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    error!(file = ?upload_path, "failed to enqueue missing segment: {:?}", queue_err);
+                }
             }
         }
     }
@@ -387,6 +442,86 @@ async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppRes
         total_size as f64 / 1000. / t as f64
     );
     Ok(video)
+}
+
+async fn recover_due_missing_segments(
+    upload_context: &UploadContext,
+    ctx: &Context,
+    session_row_id: i64,
+    archive: &mut LiveArchive,
+) -> AppResult<()> {
+    let now = chrono::Utc::now();
+    let rows = due_missing_segments_for_session(ctx.pool(), session_row_id, now).await?;
+    for mut row in rows {
+        row.status = "uploading".to_string();
+        row.updated_at = chrono::Utc::now();
+        let line_index = row.line_index;
+        let file_path = row.file_path.clone();
+        let segment_order = row.segment_order;
+        let row_id = row.id;
+        row = row
+            .update_all_fields(ctx.pool())
+            .await
+            .change_context(AppError::Unknown)?;
+
+        let selected_line = upload_line_for_recovery(line_index);
+        let recovery_context = if let Some(line) = selected_line {
+            let line_str = match line {
+                UploadLine::Bda2 => "bda2",
+                UploadLine::Tx => "tx",
+                UploadLine::Bldsa => "bldsa",
+                // Unknown future variant: fall through to probe instead of silently misrouting to bda2
+                _ => "auto",
+            };
+            UploadContext {
+                bilibili: upload_context.bilibili.clone(),
+                line: get_upload_line(&upload_context.client.client, line_str).await?,
+                threads: upload_context.threads,
+                client: upload_context.client.clone(),
+            }
+        } else {
+            UploadContext {
+                bilibili: upload_context.bilibili.clone(),
+                line: Probe::probe(&upload_context.client.client)
+                    .await
+                    .unwrap_or_default(),
+                threads: upload_context.threads,
+                client: upload_context.client.clone(),
+            }
+        };
+
+        let path = PathBuf::from(&file_path);
+        let result = {
+            let _permit = acquire_global_upload_permit().await;
+            upload_single_file(&path, &recovery_context).await
+        };
+
+        match result {
+            Ok(video) => {
+                let updated =
+                    insert_session_video_at_order(ctx.pool(), session_row_id, video, segment_order)
+                        .await?;
+                archive.videos = updated;
+                mark_retry_success(&mut row, chrono::Utc::now());
+                row.update_all_fields(ctx.pool())
+                    .await
+                    .change_context(AppError::Unknown)?;
+                if let Err(e) = execute_postprocessor(vec![path], ctx).await {
+                    error!(
+                        row_id,
+                        "postprocessor failed after missing segment recovery: {:?}", e
+                    );
+                }
+            }
+            Err(e) => {
+                mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
+                row.update_all_fields(ctx.pool())
+                    .await
+                    .change_context(AppError::Unknown)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn submit_to_bilibili(
@@ -574,6 +709,117 @@ pub async fn upload(
     }
 
     Ok((bilibili, videos))
+}
+
+pub async fn manual_recover_missing_segment(
+    config: &Config,
+    pool: &ConnectionPool,
+    missing_id: i64,
+) -> AppResult<()> {
+    let mut row = UploadMissingSegment::select()
+        .where_("id = ?")
+        .bind(missing_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+
+    // Atomic claim: flip to 'uploading' only if the row is still actionable.
+    // Rows already 'succeeded', 'uploading' (another recovery in flight), or otherwise
+    // finalized are intentionally skipped — idempotent no-op.
+    let claim_now = chrono::Utc::now();
+    let claimed = sqlx::query(
+        "UPDATE upload_missing_segment SET status = 'uploading', updated_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'failed')",
+    )
+    .bind(claim_now)
+    .bind(missing_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    if claimed.rows_affected() == 0 {
+        // Already succeeded, or another recovery is in flight — nothing to do.
+        return Ok(());
+    }
+
+    // Perform the upload + edit/insert inside a fallible scope so that any failure
+    // resets the row to 'failed' and persists the error before returning.
+    let upload_result: AppResult<()> = async {
+        let _streamer_info = get_streamer_info(pool, row.streamer_info_id).await?;
+        let upload_config = UploadStreamer::select()
+            .where_("id = (SELECT upload_streamers_id FROM livestreamers WHERE id = ?)")
+            .bind(row.live_streamer_id)
+            .fetch_one(pool)
+            .await
+            .change_context(AppError::Unknown)?;
+
+        let upload_context =
+            initialize_upload_context(config, &StatelessClient::default(), &upload_config).await?;
+        let path = PathBuf::from(&row.file_path);
+        let video = {
+            let _permit = acquire_global_upload_permit().await;
+            upload_single_file(&path, &upload_context).await?
+        };
+
+        if let Some(session_id) = row.upload_session_id {
+            let session = crate::server::infrastructure::models::UploadSession::select()
+                .where_("id = ?")
+                .bind(session_id)
+                .fetch_one(pool)
+                .await
+                .change_context(AppError::Unknown)?;
+            if let Some(aid) = session.aid.or(row.aid) {
+                let bilibili = &upload_context.bilibili;
+                let mut studio = bilibili
+                    .studio_data(&Vid::Aid(aid as u64), None)
+                    .await
+                    .change_context(AppError::Unknown)?;
+                patch_studio_videos(&mut studio, video, row.segment_order);
+                bilibili
+                    .edit_by_app(&studio, None)
+                    .await
+                    .change_context(AppError::Unknown)?;
+            } else {
+                insert_session_video_at_order(pool, session_id, video, row.segment_order).await?;
+            }
+        } else if let Some(aid) = row.aid {
+            let bilibili = &upload_context.bilibili;
+            let mut studio = bilibili
+                .studio_data(&Vid::Aid(aid as u64), None)
+                .await
+                .change_context(AppError::Unknown)?;
+            patch_studio_videos(&mut studio, video, row.segment_order);
+            bilibili
+                .edit_by_app(&studio, None)
+                .await
+                .change_context(AppError::Unknown)?;
+        } else {
+            return Err(error_stack::Report::new(AppError::Custom(
+                "missing segment has neither upload_session_id nor aid".to_string(),
+            )));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    match upload_result {
+        Ok(()) => {
+            mark_retry_success(&mut row, chrono::Utc::now());
+            row = row
+                .update_all_fields(pool)
+                .await
+                .change_context(AppError::Unknown)?;
+            let _ = row;
+            Ok(())
+        }
+        Err(e) => {
+            mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
+            row.update_all_fields(pool)
+                .await
+                .change_context(AppError::Unknown)?;
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
