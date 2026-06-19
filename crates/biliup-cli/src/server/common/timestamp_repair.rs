@@ -108,9 +108,17 @@ fn stderr_indicates_anomaly(stderr: &str) -> bool {
 #[async_trait]
 impl FfmpegRunner for SystemFfmpeg {
     async fn detect_anomaly(&self, path: &Path) -> AppResult<bool> {
-        // 全片扫描：-c copy -f null，只读不重编码；warning 级别即可暴露时间戳告警。
+        // 全片扫描：-c copy -f null，只读不重编码。
+        // 使用 verbose 级别确保 "Invalid timestamp" / "Application provided invalid" 等
+        // 低于 warning 的模式也能输出；-nostats 抑制进度行噪声。
         let output = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "warning", "-fflags", "+igndts", "-i"])
+            .args([
+                "-hide_banner",
+                "-loglevel", "verbose",
+                "-nostats",
+                "-fflags", "+igndts",
+                "-i",
+            ])
             .arg(path)
             .args(["-c", "copy", "-f", "null", "-"])
             .kill_on_drop(true)
@@ -118,7 +126,19 @@ impl FfmpegRunner for SystemFfmpeg {
             .await
             .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(stderr_indicates_anomaly(&stderr))
+        // 模式命中优先：即使退出码非零也应尝试修复。
+        if stderr_indicates_anomaly(&stderr) {
+            return Ok(true);
+        }
+        // 无异常模式，但退出码非零 → 可能是路径错误等无关故障，向上报错。
+        if !output.status.success() {
+            bail!(AppError::Custom(format!(
+                "ffmpeg detect exited non-zero ({}) for {}",
+                output.status,
+                path.display()
+            )));
+        }
+        Ok(false)
     }
 
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
