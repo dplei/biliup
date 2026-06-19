@@ -4,6 +4,8 @@ use std::str::FromStr;
 
 /// 平台 cookie 健康监测（检测失效并经横幅/webhook 提示）
 pub mod cookie_health;
+/// 上传前时间戳异常检测与修复
+pub mod timestamp_repair;
 pub mod cover_generator;
 pub mod download;
 pub mod missing_segment;
