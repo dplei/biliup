@@ -197,3 +197,20 @@ fn notify(webhook: Option<&str>, title: &str, content: &str) {
         }
     });
 }
+
+/// 对外告警入口：复用 cookie 健康的 webhook 分发逻辑，用于时间戳修复等其它告警场景。
+pub fn notify_alert(webhook: Option<&str>, title: &str, content: &str) {
+    notify(webhook, title, content);
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::notify_alert;
+
+    #[tokio::test]
+    async fn notify_alert_with_none_webhook_is_noop() {
+        // 不应 panic；webhook 为 None 时静默返回
+        notify_alert(None, "t", "c");
+        notify_alert(Some(""), "t", "c");
+    }
+}
