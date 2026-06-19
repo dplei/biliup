@@ -25,7 +25,7 @@ pub trait FfmpegRunner {
 pub fn repaired_temp_path(src: &Path) -> PathBuf {
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("segment");
     let dir = src.parent().unwrap_or_else(|| Path::new("."));
-    dir.join(format!("{stem}.fixed.mp4"))
+    dir.join(format!("{stem}.{}.fixed.mp4", std::process::id()))
 }
 
 pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
@@ -51,7 +51,7 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
                 info!(file = ?path, "remux copy 修复成功");
                 return RepairOutcome::Repaired(dst);
             }
-            Ok(true) => info!(file = ?path, "remux copy 后仍异常，尝试重编码"),
+            Ok(true) => warn!(file = ?path, "remux copy 后仍异常，尝试重编码"),
             Err(e) => {
                 warn!(file = ?dst, "修复后检测失败，降级直传原片: {e:?}");
                 let _ = tokio::fs::remove_file(&dst).await;
@@ -68,7 +68,7 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
     match runner.reencode(path, &dst).await {
         Ok(()) => match runner.detect_anomaly(&dst).await {
             Ok(false) => {
-                info!(file = ?path, "重编码修复成功");
+                warn!(file = ?path, "重编码修复成功");
                 RepairOutcome::Repaired(dst)
             }
             Ok(true) => {
@@ -167,6 +167,17 @@ impl FfmpegRunner for SystemFfmpeg {
                 src.display()
             )));
         }
+        // Guard: ffmpeg may exit 0 but produce no output (e.g. codec mismatch).
+        match tokio::fs::metadata(dst).await {
+            Ok(m) if m.len() > 0 => {}
+            _ => {
+                let _ = tokio::fs::remove_file(dst).await;
+                bail!(AppError::Custom(format!(
+                    "ffmpeg remux_copy produced empty output for {}",
+                    src.display()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -194,6 +205,17 @@ impl FfmpegRunner for SystemFfmpeg {
                 "ffmpeg reencode failed (status {status:?}) for {}",
                 src.display()
             )));
+        }
+        // Guard: ffmpeg may exit 0 but produce no output (e.g. codec unavailable).
+        match tokio::fs::metadata(dst).await {
+            Ok(m) if m.len() > 0 => {}
+            _ => {
+                let _ = tokio::fs::remove_file(dst).await;
+                bail!(AppError::Custom(format!(
+                    "ffmpeg reencode produced empty output for {}",
+                    src.display()
+                )));
+            }
         }
         Ok(())
     }
