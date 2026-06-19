@@ -143,46 +143,51 @@ mod tests {
         }
     }
 
-    fn p() -> PathBuf {
-        std::env::temp_dir().join("seg_test.flv")
+    fn p(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tsr_{name}.flv"))
     }
 
     #[tokio::test]
     async fn clean_when_no_anomaly() {
+        let path = p("clean_when_no_anomaly");
         let f = FakeFfmpeg::new(vec![Ok(false)], true, true);
-        assert_eq!(normalize_timestamps(&p(), &f).await, RepairOutcome::Clean);
+        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 
     #[tokio::test]
     async fn repaired_by_copy_when_remux_fixes() {
         // detect: 原片异常 → copy 后干净
+        let path = p("repaired_by_copy_when_remux_fixes");
         let f = FakeFfmpeg::new(vec![Ok(true), Ok(false)], true, true);
         assert_eq!(
-            normalize_timestamps(&p(), &f).await,
-            RepairOutcome::Repaired(repaired_temp_path(&p()))
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Repaired(repaired_temp_path(&path))
         );
     }
 
     #[tokio::test]
     async fn repaired_by_reencode_when_copy_insufficient() {
         // detect: 原异常 → copy 后仍异常 → reencode 后干净
+        let path = p("repaired_by_reencode_when_copy_insufficient");
         let f = FakeFfmpeg::new(vec![Ok(true), Ok(true), Ok(false)], true, true);
         assert_eq!(
-            normalize_timestamps(&p(), &f).await,
-            RepairOutcome::Repaired(repaired_temp_path(&p()))
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Repaired(repaired_temp_path(&path))
         );
     }
 
     #[tokio::test]
     async fn unfixable_when_reencode_still_anomalous() {
         // detect: 原异常 → copy 仍异常 → reencode 仍异常
+        let path = p("unfixable_when_reencode_still_anomalous");
         let f = FakeFfmpeg::new(vec![Ok(true), Ok(true), Ok(true)], true, true);
-        assert_eq!(normalize_timestamps(&p(), &f).await, RepairOutcome::Unfixable);
+        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Unfixable);
     }
 
     #[tokio::test]
     async fn degrades_to_clean_when_detect_errors() {
         // 检测阶段进程出错 → 保守降级为 Clean（直传原片）
+        let path = p("degrades_to_clean_when_detect_errors");
         let f = FakeFfmpeg::new(
             vec![Err(error_stack::Report::new(
                 crate::server::errors::AppError::Custom("ffmpeg missing".into()),
@@ -190,13 +195,14 @@ mod tests {
             true,
             true,
         );
-        assert_eq!(normalize_timestamps(&p(), &f).await, RepairOutcome::Clean);
+        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 
     #[tokio::test]
     async fn degrades_to_clean_when_remux_process_fails() {
         // 原片异常但 remux 进程报错，且 reencode 也报错 → 无法修复进程层面 → 降级 Clean（不阻断上传）
+        let path = p("degrades_to_clean_when_remux_process_fails");
         let f = FakeFfmpeg::new(vec![Ok(true)], false, false);
-        assert_eq!(normalize_timestamps(&p(), &f).await, RepairOutcome::Clean);
+        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 }
