@@ -11,6 +11,8 @@ use crate::server::common::upload_session::{
     insert_uploading_session, mark_submitted, parse_videos, reattach_session,
     select_recovery_candidate, select_stale_session_indices, update_session_videos,
 };
+use crate::server::common::cookie_health::notify_alert;
+use crate::server::common::timestamp_repair::{normalize_timestamps, RepairOutcome, SystemFfmpeg};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
@@ -349,10 +351,24 @@ where
             error!(file = ?event.prev_file_path, "segment_processor failed, skipping segment: {:?}", e);
             continue;
         }
-        let upload_path = paths
+        let original_path = paths
             .first()
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
+
+        // 上传前时间戳检测与修复（全局开关，默认开）。
+        let repair_enabled = ctx.config().timestamp_repair.unwrap_or(true);
+        let outcome = if repair_enabled {
+            normalize_timestamps(&original_path, &SystemFfmpeg).await
+        } else {
+            RepairOutcome::Clean
+        };
+
+        // 决定实际上传的文件：Repaired 用修复件，其余用原片。
+        let upload_path = match &outcome {
+            RepairOutcome::Repaired(fixed) => fixed.clone(),
+            _ => original_path.clone(),
+        };
 
         let _permit = acquire_global_upload_permit().await;
         match upload_single_file(&upload_path, upload_context).await {
@@ -360,11 +376,38 @@ where
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
                 if let Err(e) = persist_segment(ctx, &mut archive, video).await {
                     error!(file = ?upload_path, "落库累积失败，保留本地文件: {:?}", e);
+                    // Repaired 的临时修复件未 durable，清理掉避免残留。
+                    if let RepairOutcome::Repaired(fixed) = &outcome {
+                        let _ = tokio::fs::remove_file(fixed).await;
+                    }
                     continue;
                 }
-                // 已上传到 B 站存储 + 引用已落库 ⇒ durable，可安全删本地（磁盘峰值≈单片）。
-                if let Err(e) = execute_postprocessor(paths, ctx).await {
-                    error!(file = ?upload_path, "per-segment postprocessor failed: {:?}", e);
+                // durable，按 outcome 处理本地文件。
+                match outcome {
+                    RepairOutcome::Unfixable => {
+                        // 保留本地原文件 + 告警，跳过自动删除。
+                        error!(file = ?original_path, "时间戳无法修复，保留本地文件待手动处理");
+                        notify_alert(
+                            ctx.config().cookie_health_webhook.as_deref(),
+                            "biliup 时间戳修复失败",
+                            &format!(
+                                "分段 {} 时间戳异常且无法自动修复，已保留本地文件，请手动处理（B 站「修改视频」重传）。",
+                                original_path.display()
+                            ),
+                        );
+                    }
+                    RepairOutcome::Repaired(fixed) => {
+                        // 先删修复临时件，再删原始 paths（原片+弹幕）。
+                        let _ = tokio::fs::remove_file(&fixed).await;
+                        if let Err(e) = execute_postprocessor(paths, ctx).await {
+                            error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
+                        }
+                    }
+                    RepairOutcome::Clean => {
+                        if let Err(e) = execute_postprocessor(paths, ctx).await {
+                            error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
+                        }
+                    }
                 }
             }
             Err(e) => {
