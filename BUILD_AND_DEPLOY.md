@@ -115,6 +115,7 @@ docker compose pull && docker compose up -d
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
+| `58c19e5d` | `1.2.2-tsrepair` | 上传前时间戳异常检测/修复：分段上传前用 ffmpeg 全片扫(`-c copy -f null`)检测时间戳跳变(典型 FLV 32 位回绕，B 站转码失败根因)，异常则 `-c copy` 重封装→重编码逐级修复；覆盖主链路+两条补传路径(`upload_single_file_with_repair`)；全局开关 `timestamp_repair` 默认开，正常片零额外写盘；极罕见不可修片保留本地+webhook 告警。⚠️检测 stderr 模式未经真实 ffmpeg 跑验，部署后留意首批转码结果 |
 | `f9554efd` | `1.2.2-templatefix` | ①文件名模板支持冒号 token（`%H:%M:%S` 等时间格式不再被错误转义）；②封面渲染改进：实际嵌入 `NotoEmoji-Regular.ttf`(OFL) 做逐字字体回退混排，思源黑体缺字形改用 emoji 字体渲染白色单色轮廓 |
 | `579c535f` | `1.2.1-coverfix` | 修封面文字模板两个 bug：①字面 `\n` 不换行——`split_template_lines()` 先把 `\n` 还原为真实换行再切分（前端单行输入框存的是字面 `\n`，旧代码 `split('\n')` 切的是真实换行符，切不开）；②emoji 显示成豆腐块——内嵌 `NotoEmoji-Regular.ttf`(OFL) 做逐字字体回退混排，思源黑体缺的字形改用 emoji 字体。⚠️ `ab_glyph` 只能画单色轮廓，emoji 是白色单色剪影非彩色 |
 | `2d04cd4a` | `1.2.1-submitonce` | **修迁移崩溃重发**：`a1f279ea` 误把已应用的 migration 4 改了字节(校验和不符)导致 sqlx VersionMismatch 启动 panic、19159 拒连。已用生产 DB 副本核对 `_sqlx_migrations` v4 校验和=`2352d0f3…`，还原 migration 4 至部署字节(`4f0e51a`)，并对生产 DB 副本本地跑通迁移启动验证。功能同下。**已应用的迁移文件绝不可改字节(含注释)，改动须新建迁移** |
