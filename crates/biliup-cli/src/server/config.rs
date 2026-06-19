@@ -45,6 +45,13 @@ pub struct Config {
     #[serde(default)]
     pub segment_delete_mode: Option<String>,
 
+    /// 上传前时间戳异常检测与修复总开关。
+    /// None/true = 开启（默认）：每个分段上传前扫描时间戳，异常则自动 remux/重编码修复，
+    /// 避免 B 站转码因「时间戳跳变」失败；正常片零额外写盘。
+    /// false = 关闭：直接上传原片（旧行为）。
+    #[serde(default)]
+    pub timestamp_repair: Option<bool>,
+
     /// cookie 健康提示 webhook（可选）。检测到平台 cookie 可能失效（连续直播间检查失败）时，
     /// 以及恢复时各推送一次。URL 含 `{title}`/`{content}` 占位 → GET 替换（兼容 Bark/Server酱）；
     /// 否则 POST JSON `{"title":..,"content":..}`（兼容企业微信/钉钉/自建）。留空则只在网页横幅提示。
@@ -556,6 +563,26 @@ impl Config {
     /// 从指定路径加载配置文件，如果不存在则创建默认配置
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> AppResult<Self> {
         Self::load(path)
+    }
+}
+
+#[cfg(test)]
+mod timestamp_repair_config_tests {
+    use super::Config;
+
+    #[test]
+    fn timestamp_repair_defaults_to_none_and_treated_as_on() {
+        // 空配置（不含 timestamp_repair 字段）应能反序列化，字段为 None
+        let cfg: Config = serde_yaml::from_str("{}").expect("empty config should parse");
+        assert_eq!(cfg.timestamp_repair, None);
+        // 约定：None 视为开
+        assert!(cfg.timestamp_repair.unwrap_or(true));
+    }
+
+    #[test]
+    fn timestamp_repair_can_be_disabled() {
+        let cfg: Config = serde_yaml::from_str("timestamp_repair: false").expect("parse");
+        assert_eq!(cfg.timestamp_repair, Some(false));
     }
 }
 

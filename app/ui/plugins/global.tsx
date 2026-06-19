@@ -316,6 +316,15 @@ const Global: React.FC = () => {
           <Form.Select.Option value="stream_end">下播后删（默认）</Form.Select.Option>
           <Form.Select.Option value="per_segment">每片删（每片上传后立即删，省磁盘）</Form.Select.Option>
         </Form.Select>
+        <Form.Switch
+          field="timestamp_repair"
+          label="时间戳修复（timestamp_repair）"
+          extraText={<div style={{ fontSize: '14px' }}>上传前扫描每个分段的时间戳，发现跳变/非单调时自动 remux 或重编码修复，避免 B 站转码因「时间戳跳变」失败。正常片不额外写盘。默认开启；连重编码都修不好的极罕见片会保留本地文件并 webhook 告警，供手动处理。</div>}
+          fieldStyle={{
+            alignSelf: 'stretch',
+            padding: 0,
+          }}
+        />
         <Form.Input
           field="cookie_health_webhook"
           label="Cookie 失效推送（cookie_health_webhook）"
