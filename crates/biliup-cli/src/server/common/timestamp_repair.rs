@@ -1,6 +1,8 @@
-use crate::server::errors::AppResult;
+use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
+use error_stack::{ResultExt, bail};
 use std::path::{Path, PathBuf};
+use tokio::process::Command;
 use tracing::{error, info, warn};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -86,6 +88,94 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
             let _ = tokio::fs::remove_file(&dst).await;
             RepairOutcome::Clean
         }
+    }
+}
+
+pub struct SystemFfmpeg;
+
+/// stderr 中命中任一模式即判为时间戳异常（用具体模式，避免宽泛词误判）。
+fn stderr_indicates_anomaly(stderr: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "Non-monotonic DTS",
+        "non monotonically increasing dts",
+        "timestamp discontinuity",
+        "Invalid timestamp",
+        "Application provided invalid",
+    ];
+    PATTERNS.iter().any(|p| stderr.contains(p))
+}
+
+#[async_trait]
+impl FfmpegRunner for SystemFfmpeg {
+    async fn detect_anomaly(&self, path: &Path) -> AppResult<bool> {
+        // 全片扫描：-c copy -f null，只读不重编码；warning 级别即可暴露时间戳告警。
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "warning", "-fflags", "+igndts", "-i"])
+            .arg(path)
+            .args(["-c", "copy", "-f", "null", "-"])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(stderr_indicates_anomaly(&stderr))
+    }
+
+    async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "warning", "-y",
+                "-fflags", "+genpts+igndts", "-i",
+            ])
+            .arg(src)
+            .args([
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                "-muxdelay", "0", "-muxpreload", "0",
+            ])
+            .arg(dst)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .change_context(AppError::Custom("failed to spawn ffmpeg (remux)".into()))?;
+        if !status.success() {
+            let _ = tokio::fs::remove_file(dst).await;
+            bail!(AppError::Custom(format!(
+                "ffmpeg remux_copy failed (status {status:?}) for {}",
+                src.display()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()> {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "warning", "-y",
+                "-fflags", "+genpts", "-i",
+            ])
+            .arg(src)
+            .args([
+                "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+            ])
+            .arg(dst)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .change_context(AppError::Custom("failed to spawn ffmpeg (reencode)".into()))?;
+        if !status.success() {
+            let _ = tokio::fs::remove_file(dst).await;
+            bail!(AppError::Custom(format!(
+                "ffmpeg reencode failed (status {status:?}) for {}",
+                src.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -204,5 +294,29 @@ mod tests {
         let path = p("degrades_to_clean_when_remux_process_fails");
         let f = FakeFfmpeg::new(vec![Ok(true)], false, false);
         assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
+    }
+
+    /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_detect_clean_on_generated_file() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_good.mp4");
+        // 生成 2 秒正常测试视频
+        let st = tokio::process::Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10"])
+            .arg(&good)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(st.success());
+
+        let runner = SystemFfmpeg;
+        let anomaly = runner.detect_anomaly(&good).await.expect("detect");
+        assert!(!anomaly, "正常文件不应报时间戳异常");
+
+        // 正常文件走整条流程应得 Clean
+        assert_eq!(normalize_timestamps(&good, &runner).await, RepairOutcome::Clean);
+        let _ = tokio::fs::remove_file(&good).await;
     }
 }
