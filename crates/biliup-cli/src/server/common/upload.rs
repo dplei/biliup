@@ -356,26 +356,14 @@ where
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
 
-        // 上传前时间戳检测与修复（全局开关，默认开）。
+        // 上传前时间戳检测与修复（全局开关，默认开），helper 内部选路并上传。
         let repair_enabled = ctx.config().timestamp_repair.unwrap_or(true);
-        let outcome = if repair_enabled {
-            normalize_timestamps(&original_path, &SystemFfmpeg).await
-        } else {
-            RepairOutcome::Clean
-        };
-
-        // 决定实际上传的文件：Repaired 用修复件，其余用原片。
-        let upload_path = match &outcome {
-            RepairOutcome::Repaired(fixed) => fixed.clone(),
-            _ => original_path.clone(),
-        };
-
         let _permit = acquire_global_upload_permit().await;
-        match upload_single_file(&upload_path, upload_context).await {
-            Ok(video) => {
+        match upload_single_file_with_repair(&original_path, upload_context, repair_enabled).await {
+            Ok((video, outcome)) => {
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
                 if let Err(e) = persist_segment(ctx, &mut archive, video).await {
-                    error!(file = ?upload_path, "落库累积失败，保留本地文件: {:?}", e);
+                    error!(file = ?original_path, "落库累积失败，保留本地文件: {:?}", e);
                     // Repaired 的临时修复件未 durable，清理掉避免残留。
                     if let RepairOutcome::Repaired(fixed) = &outcome {
                         let _ = tokio::fs::remove_file(fixed).await;
@@ -414,14 +402,14 @@ where
                 let err = format!("{e:?}");
                 let segment_order = next_segment_order(archive.videos.len(), missing_count);
                 missing_count += 1;
-                error!(file = ?upload_path, segment_order, "upload_single_file failed, queueing missing segment: {:?}", e);
+                error!(file = ?original_path, segment_order, "upload_single_file failed, queueing missing segment: {:?}", e);
                 if let Err(queue_err) = enqueue_missing_segment(
                     ctx.pool(),
                     ctx.worker_id(),
                     ctx.id(),
                     archive.session_row_id,
                     archive.aid.map(|aid| aid as i64),
-                    &upload_path,
+                    &original_path,
                     event.danmaku_file_path.as_deref(),
                     segment_order,
                     err,
@@ -429,7 +417,7 @@ where
                 )
                 .await
                 {
-                    error!(file = ?upload_path, "failed to enqueue missing segment: {:?}", queue_err);
+                    error!(file = ?original_path, "failed to enqueue missing segment: {:?}", queue_err);
                 }
             }
         }
@@ -439,6 +427,33 @@ where
     } else {
         Some(archive)
     })
+}
+
+/// 上传前时间戳检测/修复 + 上传。返回 (Video, RepairOutcome) 供调用方决定本地文件清理与告警。
+/// repair_enabled=false 时跳过 ffmpeg，等价 Clean。上传失败时会清理自身产生的临时修复件。
+async fn upload_single_file_with_repair(
+    original_path: &Path,
+    context: &UploadContext,
+    repair_enabled: bool,
+) -> AppResult<(Video, RepairOutcome)> {
+    let outcome = if repair_enabled {
+        normalize_timestamps(original_path, &SystemFfmpeg).await
+    } else {
+        RepairOutcome::Clean
+    };
+    let upload_path = match &outcome {
+        RepairOutcome::Repaired(fixed) => fixed.clone(),
+        _ => original_path.to_path_buf(),
+    };
+    match upload_single_file(&upload_path, context).await {
+        Ok(video) => Ok((video, outcome)),
+        Err(e) => {
+            if let RepairOutcome::Repaired(fixed) = &outcome {
+                let _ = tokio::fs::remove_file(fixed).await;
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
@@ -534,13 +549,14 @@ async fn recover_due_missing_segments(
         };
 
         let path = PathBuf::from(&file_path);
+        let repair_enabled = ctx.config().timestamp_repair.unwrap_or(true);
         let result = {
             let _permit = acquire_global_upload_permit().await;
-            upload_single_file(&path, &recovery_context).await
+            upload_single_file_with_repair(&path, &recovery_context, repair_enabled).await
         };
 
         match result {
-            Ok(video) => {
+            Ok((video, outcome)) => {
                 let updated =
                     insert_session_video_at_order(ctx.pool(), session_row_id, video, segment_order)
                         .await?;
@@ -549,11 +565,29 @@ async fn recover_due_missing_segments(
                 row.update_all_fields(ctx.pool())
                     .await
                     .change_context(AppError::Unknown)?;
-                if let Err(e) = execute_postprocessor(vec![path], ctx).await {
-                    error!(
-                        row_id,
-                        "postprocessor failed after missing segment recovery: {:?}", e
-                    );
+                match outcome {
+                    RepairOutcome::Unfixable => {
+                        error!(row_id, file = ?path, "补传分段时间戳无法修复，保留本地文件待手动处理");
+                        notify_alert(
+                            ctx.config().cookie_health_webhook.as_deref(),
+                            "biliup 时间戳修复失败",
+                            &format!(
+                                "补传分段 {} 时间戳异常且无法自动修复，已保留本地文件，请手动处理。",
+                                path.display()
+                            ),
+                        );
+                    }
+                    RepairOutcome::Repaired(fixed) => {
+                        let _ = tokio::fs::remove_file(&fixed).await;
+                        if let Err(e) = execute_postprocessor(vec![path], ctx).await {
+                            error!(row_id, "postprocessor failed after missing segment recovery: {:?}", e);
+                        }
+                    }
+                    RepairOutcome::Clean => {
+                        if let Err(e) = execute_postprocessor(vec![path], ctx).await {
+                            error!(row_id, "postprocessor failed after missing segment recovery: {:?}", e);
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -798,10 +832,27 @@ pub async fn manual_recover_missing_segment(
         let upload_context =
             initialize_upload_context(config, &StatelessClient::default(), &upload_config).await?;
         let path = PathBuf::from(&row.file_path);
-        let video = {
+        let repair_enabled = config.timestamp_repair.unwrap_or(true);
+        let (video, outcome) = {
             let _permit = acquire_global_upload_permit().await;
-            upload_single_file(&path, &upload_context).await?
+            upload_single_file_with_repair(&path, &upload_context, repair_enabled).await?
         };
+        match &outcome {
+            RepairOutcome::Repaired(fixed) => {
+                let _ = tokio::fs::remove_file(fixed).await;
+            }
+            RepairOutcome::Unfixable => {
+                notify_alert(
+                    config.cookie_health_webhook.as_deref(),
+                    "biliup 时间戳修复失败",
+                    &format!(
+                        "手动补投分段 {} 时间戳异常且无法自动修复，本地文件已保留，请手动处理。",
+                        path.display()
+                    ),
+                );
+            }
+            RepairOutcome::Clean => {}
+        }
 
         if let Some(session_id) = row.upload_session_id {
             let session = crate::server::infrastructure::models::UploadSession::select()
