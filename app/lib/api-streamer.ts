@@ -114,6 +114,7 @@ export interface LiveStreamerEntity {
 	postprocessor?: (Record<'run' | 'mv', string> | 'rm')[];
 	opt_args?: string[];
 	override?: Record<string, any>;
+	recording_quality?: string;
 }
 
 export interface BiliType {

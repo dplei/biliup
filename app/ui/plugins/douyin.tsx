@@ -48,6 +48,26 @@ const Douyin: React.FC<Props> = props => {
           <Select.Option value="ld">标清（ld）</Select.Option>
           <Select.Option value="md">流畅（md）</Select.Option>
         </Form.Select>
+        <Form.Select
+          field="douyin_quality_alert"
+          extraText={
+            <div style={{ fontSize: '14px' }}>
+              实际录到的画质低于此档时，通过 cookie 健康 webhook 推送提醒（常见于 cookie 失效）。默认蓝光，可选「关闭通知」。
+            </div>
+          }
+          label="画质降级告警阈值（douyin_quality_alert）"
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+          showClear={true}
+        >
+          <Select.Option value="off">关闭通知</Select.Option>
+          <Select.Option value="origin">原画（origin）</Select.Option>
+          <Select.Option value="uhd">蓝光（uhd）</Select.Option>
+          <Select.Option value="hd">超清（hd）</Select.Option>
+          <Select.Option value="sd">高清（sd）</Select.Option>
+          <Select.Option value="ld">标清（ld）</Select.Option>
+          <Select.Option value="md">流畅（md）</Select.Option>
+        </Form.Select>
         <Form.Switch
           field="douyin_danmaku"
           extraText="录制抖音弹幕，默认关闭。"

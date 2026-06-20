@@ -80,11 +80,21 @@ export default function Home() {
           缺少投稿
         </Tag>
       ) : null
+    const qualityName: Record<string, string> = {
+      origin: '原画', uhd: '蓝光', hd: '超清', sd: '高清', ld: '标清', md: '流畅',
+    }
+    const recordingTag =
+      live.status === 'Working' && live.recording_quality ? (
+        <Tag color="light-blue" style={{ marginLeft: 4 }}>
+          {(qualityName[live.recording_quality] ?? live.recording_quality)} 录制中
+        </Tag>
+      ) : null
     return {
       ...handleEntityPostprocessor(live),
       statusTag: (
         <>
           {statusTag}
+          {recordingTag}
           {missingUpload}
         </>
       ),
