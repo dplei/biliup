@@ -313,6 +313,9 @@ pub struct LiveStream {
     pub danmaku: Option<DanmakuSource>,
     pub downloader_hint: DownloaderHint,
     pub runtime_options: Option<RuntimeOptions>,
+    /// 实际选中的画质代码（origin/uhd/...）。仅抖音填充，其它平台为 None。
+    #[serde(default)]
+    pub recording_quality: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -122,6 +122,7 @@ impl GeneralLive {
                     download_archive: None,
                     extra_ytdlp_args: Vec::new(),
                 })),
+                recording_quality: None,
             }),
         })
     }

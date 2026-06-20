@@ -94,6 +94,7 @@ impl CCLive {
                 danmaku: None,
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
+                recording_quality: None,
             }),
         })
     }

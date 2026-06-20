@@ -197,6 +197,7 @@ impl TwitchLive {
                         auth_token: self.twitch_auth_token.clone(),
                     },
                 })),
+                recording_quality: None,
             }),
         })
     }
@@ -318,6 +319,7 @@ impl TwitchVideosLive {
                     download_archive: Some(PathBuf::from("archive.txt")),
                     extra_ytdlp_args: self.auth_cookie_args(),
                 })),
+                recording_quality: None,
             }),
         })
     }

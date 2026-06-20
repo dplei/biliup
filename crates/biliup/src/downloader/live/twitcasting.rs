@@ -104,6 +104,7 @@ impl TwitcastingLive {
                 danmaku: self.danmaku_source(),
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
+                recording_quality: None,
             }),
         })
     }

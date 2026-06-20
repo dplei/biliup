@@ -148,6 +148,7 @@ impl YoutubeLive {
                         .then(|| std::path::PathBuf::from("archive.txt")),
                     extra_ytdlp_args: Vec::new(),
                 })),
+                recording_quality: None,
             }),
         })
     }

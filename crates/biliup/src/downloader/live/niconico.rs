@@ -94,6 +94,7 @@ impl NiconicoLive {
                         purge_credentials: self.purge_credentials.clone(),
                     },
                 })),
+                recording_quality: None,
             }),
         })
     }

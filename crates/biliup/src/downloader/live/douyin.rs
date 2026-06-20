@@ -95,7 +95,7 @@ impl DouyinLive {
         let Some(room_info) = self.get_room_info().await? else {
             return Ok(LiveStatus::Offline);
         };
-        let raw_stream_url = self.select_stream_url(&room_info)?;
+        let (raw_stream_url, recording_quality) = self.select_stream_url(&room_info)?;
         let title = room_info
             .get("title")
             .and_then(Value::as_str)
@@ -123,6 +123,7 @@ impl DouyinLive {
                 danmaku: self.danmaku_source(),
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
+                recording_quality: Some(recording_quality),
             }),
         })
     }
@@ -324,7 +325,7 @@ impl DouyinLive {
         Ok(Some(room_info))
     }
 
-    fn select_stream_url(&self, room_info: &Value) -> LiveResult<String> {
+    fn select_stream_url(&self, room_info: &Value) -> LiveResult<(String, String)> {
         let mut pull_data = room_info.pointer("/stream_url/live_core_sdk_data/pull_data");
         if self.douyin_double_screen
             && let Some(double_screen) = room_info
@@ -354,51 +355,26 @@ impl DouyinLive {
                 .and_then(Value::as_str)
                 .filter(|url| !url.is_empty())
         {
-            return Ok(url
-                .replace("&only_audio=1", "")
-                .replace("http://", "https://"));
+            return Ok((
+                url.replace("&only_audio=1", "").replace("http://", "https://"),
+                "origin".to_string(),
+            ));
         }
 
-        let quality_items = ["origin", "uhd", "hd", "sd", "ld", "md"];
-        let quality = if quality_items.contains(&self.douyin_quality.as_str()) {
-            self.douyin_quality.as_str()
-        } else {
-            "origin"
-        };
-        let quality_index = quality_items
-            .iter()
-            .position(|item| item == &quality)
-            .unwrap_or_default();
-        let selected_quality = if stream_data.contains_key(quality) {
-            quality
-        } else {
-            quality_items[quality_index + 1..]
-                .iter()
-                .copied()
-                .find(|item| stream_data.contains_key(*item))
-                .or_else(|| {
-                    quality_items[..quality_index]
-                        .iter()
-                        .rev()
-                        .copied()
-                        .find(|item| stream_data.contains_key(*item))
-                })
-                .ok_or_else(|| LiveError::custom("抖音没有可用清晰度"))?
-        };
+        let available: Vec<&str> = stream_data.keys().map(String::as_str).collect();
+        let selected_quality = select_quality_code(&available, &self.douyin_quality)
+            .ok_or_else(|| LiveError::custom("抖音没有可用清晰度"))?;
 
-        let protocol = if self.douyin_protocol == "hls" {
-            "hls"
-        } else {
-            "flv"
-        };
+        let protocol = if self.douyin_protocol == "hls" { "hls" } else { "flv" };
 
-        stream_data
+        let url = stream_data
             .get(selected_quality)
             .and_then(|quality| quality.pointer(&format!("/main/{protocol}")))
             .and_then(Value::as_str)
             .filter(|url| !url.is_empty())
             .map(|url| url.replace("http://", "https://"))
-            .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))
+            .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))?;
+        Ok((url, selected_quality.to_string()))
     }
 
     fn stream_headers(&self) -> HashMap<String, String> {
@@ -428,6 +404,23 @@ impl DouyinLive {
             password: None,
         })
     }
+}
+
+/// 在 available 列表中，按 origin>uhd>hd>sd>ld>md 的优先级为 requested 选一档可用画质：
+/// 命中则用之；否则先往更低档找，再往更高档找；都没有返回 None。
+fn select_quality_code(available: &[&str], requested: &str) -> Option<&'static str> {
+    const ITEMS: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+    let requested = if ITEMS.contains(&requested) { requested } else { "origin" };
+    let idx = ITEMS.iter().position(|i| *i == requested).unwrap_or(0);
+    let has = |q: &str| available.contains(&q);
+    if has(requested) {
+        return ITEMS.iter().copied().find(|i| *i == requested);
+    }
+    ITEMS[idx + 1..]
+        .iter()
+        .copied()
+        .find(|i| has(i))
+        .or_else(|| ITEMS[..idx].iter().rev().copied().find(|i| has(i)))
 }
 
 fn common_params() -> Vec<(String, String)> {
@@ -771,6 +764,33 @@ impl BrowserFingerprintGenerator {
         format!(
             "{inner_width}|{inner_height}|{outer_width}|{outer_height}|0|{screen_y}|0|0|{size_width}|{size_height}|{avail_width}|{avail_height}|{inner_width}|{inner_height}|24|24|Win32",
         )
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::select_quality_code;
+
+    #[test]
+    fn requested_available_returns_itself() {
+        assert_eq!(select_quality_code(&["origin", "hd"], "origin"), Some("origin"));
+    }
+
+    #[test]
+    fn missing_requested_falls_back_to_next_lower() {
+        // 请求 origin 不在，向低优先：uhd
+        assert_eq!(select_quality_code(&["uhd", "hd"], "origin"), Some("uhd"));
+    }
+
+    #[test]
+    fn falls_back_upward_when_only_higher_exists() {
+        // 请求 sd 不在、低档也没有，回退到更高档 hd
+        assert_eq!(select_quality_code(&["origin", "hd"], "sd"), Some("hd"));
+    }
+
+    #[test]
+    fn none_when_empty() {
+        assert_eq!(select_quality_code(&[], "origin"), None);
     }
 }
 
