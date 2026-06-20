@@ -41,8 +41,10 @@ url = "2.5"
 
 
 [profile.release]
-lto = true
-codegen-units = 1
+# thin LTO + 多 codegen 单元：对 I/O 密集型录播/上传服务运行性能影响可忽略，
+# 但显著缩短编译时间（尤其 QEMU 交叉构建）。如需极致运行性能可改回 lto=true/codegen-units=1。
+lto = "thin"
+codegen-units = 16
 strip = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

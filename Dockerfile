@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Build biliup's web-ui
 FROM node:lts AS webui-builder
 ARG repo_url=https://github.com/biliup/biliup
@@ -40,8 +41,16 @@ COPY --from=webui-builder /biliup/out /biliup/out
 
 WORKDIR /biliup
 
-RUN set -eux; \
-	maturin build --release;
+# cargo registry/git/target 用 BuildKit cache mount 跨次构建复用：改本地 crate 时
+# 依赖不再全量重编。注意 target/ 是临时挂载、不进镜像层，必须把产物 wheel 拷到普通目录
+# /wheels，否则下一阶段 COPY --from 取不到。
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+	--mount=type=cache,target=/usr/local/cargo/git \
+	--mount=type=cache,target=/biliup/target \
+	set -eux; \
+	maturin build --release; \
+	mkdir -p /wheels; \
+	cp target/wheels/*.whl /wheels/;
 
 
 # Deploy Biliup
@@ -54,8 +63,8 @@ ENV LC_ALL="C.UTF-8"
 EXPOSE 19159/tcp
 VOLUME /opt
 
-# 需要遵守 wheel 文件名规范
-COPY --from=wheel-builder /biliup/target/wheels/* /tmp/
+# 需要遵守 wheel 文件名规范（产物从 cache mount 外的 /wheels 取，见 wheel-builder 注释）
+COPY --from=wheel-builder /wheels/* /tmp/
 
 RUN set -eux; \
 	\
