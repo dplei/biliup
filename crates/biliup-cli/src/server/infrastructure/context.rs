@@ -146,6 +146,8 @@ pub struct Worker {
     config: Arc<RwLock<Config>>,
     /// HTTP客户端
     pub client: StatelessClient,
+    /// 当前录制的实际画质代码（仅录制中有值，用于前端 tag）
+    pub recording_quality: RwLock<Option<String>>,
 }
 
 impl Worker {
@@ -169,6 +171,7 @@ impl Worker {
             upload_streamer,
             config,
             client,
+            recording_quality: RwLock::new(None),
         }
     }
 
@@ -186,6 +189,14 @@ impl Worker {
     /// 返回当前工作器的上传配置（如果存在）
     pub fn get_upload_config(&self) -> &Option<UploadStreamer> {
         &self.upload_streamer
+    }
+
+    pub fn set_recording_quality(&self, q: Option<String>) {
+        *self.recording_quality.write().unwrap() = q;
+    }
+
+    pub fn recording_quality(&self) -> Option<String> {
+        self.recording_quality.read().unwrap().clone()
     }
 
     /// 获取覆写配置

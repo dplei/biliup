@@ -190,6 +190,7 @@ impl DownloadTask {
                 }) => {
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
                     stream = *next_stream;
+                    ctx.worker().set_recording_quality(stream.recording_quality.clone());
                     // 流恢复：重置下播计时，继续录进同一会话（不投稿、不分稿件）
                     offline_since = None;
                     retry_count = 0;
@@ -336,6 +337,35 @@ pub async fn start_download_workflow(
     ctx.change_status(Stage::Download, WorkerStatus::Working(task.clone()))
         .await;
 
+    // 记录实际画质供前端 tag 显示
+    let recording_quality = ctx.live_stream().recording_quality.clone();
+    ctx.worker().set_recording_quality(recording_quality.clone());
+
+    // 抖音画质降级告警：实际画质低于阈值则推送（每场开播仅此一次）
+    if ctx.live_stream().platform == "douyin"
+        && let Some(actual) = recording_quality.as_deref()
+    {
+        let cfg = ctx.config();
+        if crate::server::common::cookie_health::quality_below_alert(
+            actual,
+            cfg.douyin_quality_alert.as_deref(),
+        ) {
+            let threshold = cfg.douyin_quality_alert.as_deref().unwrap_or("uhd");
+            let threshold = if threshold.trim().is_empty() { "uhd" } else { threshold };
+            let actual_disp = crate::server::common::cookie_health::quality_display(actual);
+            let threshold_disp = crate::server::common::cookie_health::quality_display(threshold);
+            crate::server::common::cookie_health::notify_alert(
+                cfg.cookie_health_webhook.as_deref(),
+                "⚠️ 抖音 未录到蓝光画质",
+                &format!(
+                    "{}：当前录制画质为 {}({})，低于告警阈值 {}({})，可能是 cookie（sessionid）失效，建议检查更换。",
+                    ctx.live_streamer().url,
+                    actual_disp, actual, threshold_disp, threshold,
+                ),
+            );
+        }
+    }
+
     tokio::spawn({
         let streamer_info = ctx.streamer_info();
         let live_cover_url = streamer_info.live_cover_path.clone();
@@ -360,6 +390,8 @@ pub async fn start_download_workflow(
     process(&[], &ctx.live_streamer().preprocessor).await;
 
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
+
+    ctx.worker().set_recording_quality(None);
 
     process(&[], &ctx.live_streamer().downloaded_processor).await;
 
