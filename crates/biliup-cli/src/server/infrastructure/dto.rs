@@ -13,4 +13,6 @@ pub struct LiveStreamerResponse {
     pub status: String,
     /// 上传状态
     pub upload_status: String,
+    /// 当前录制的实际画质代码（录制中才有值）
+    pub recording_quality: Option<String>,
 }

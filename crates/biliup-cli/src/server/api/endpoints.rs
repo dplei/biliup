@@ -58,12 +58,15 @@ pub async fn get_streamers_endpoint(
             None => String::new(),
         };
 
+        let recording_quality = option.as_ref().and_then(|t| t.recording_quality());
+
         results.push(LiveStreamerResponse {
             status,
             inner: x,
             upload_status: option
                 .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
                 .unwrap_or_default(),
+            recording_quality,
         });
     }
     Ok(Json(results))
