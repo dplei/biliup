@@ -222,10 +222,23 @@ pub fn quality_display(code: &str) -> String {
     }
 }
 
+/// 默认告警阈值：抖音实际录到的画质低于此档即推送。
+/// 调整默认值或将来做成可配置项时，只需改这一处。
+pub const DEFAULT_QUALITY_ALERT: &str = "uhd";
+
+/// 解析生效的告警阈值：None/空白 → [`DEFAULT_QUALITY_ALERT`]；其余（含 "off"）trim 后原样返回。
+/// 判定与文案展示共用此函数，避免缺省逻辑多处重复。
+pub fn effective_quality_alert(threshold: Option<&str>) -> &str {
+    threshold
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_QUALITY_ALERT)
+}
+
 /// 实际画质是否低于告警阈值（应推送）。
-/// threshold 为 None/空 → 默认 "uhd"；"off" → 关闭（恒 false）。
+/// threshold 为 None/空 → 默认 [`DEFAULT_QUALITY_ALERT`]；"off" → 关闭（恒 false）。
 pub fn quality_below_alert(actual: &str, threshold: Option<&str>) -> bool {
-    let threshold = threshold.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("uhd");
+    let threshold = effective_quality_alert(threshold);
     if threshold == "off" {
         return false;
     }
@@ -246,7 +259,16 @@ mod alert_tests {
 
 #[cfg(test)]
 mod quality_alert_tests {
-    use super::{quality_below_alert, quality_display};
+    use super::{effective_quality_alert, quality_below_alert, quality_display};
+
+    #[test]
+    fn effective_threshold_resolves_default_and_passthrough() {
+        assert_eq!(effective_quality_alert(None), "uhd");
+        assert_eq!(effective_quality_alert(Some("")), "uhd");
+        assert_eq!(effective_quality_alert(Some("  ")), "uhd");
+        assert_eq!(effective_quality_alert(Some("hd")), "hd");
+        assert_eq!(effective_quality_alert(Some(" off ")), "off");
+    }
 
     #[test]
     fn below_threshold_triggers() {

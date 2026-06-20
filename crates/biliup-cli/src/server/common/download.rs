@@ -350,8 +350,9 @@ pub async fn start_download_workflow(
             actual,
             cfg.douyin_quality_alert.as_deref(),
         ) {
-            let threshold = cfg.douyin_quality_alert.as_deref().unwrap_or("uhd");
-            let threshold = if threshold.trim().is_empty() { "uhd" } else { threshold };
+            let threshold = crate::server::common::cookie_health::effective_quality_alert(
+                cfg.douyin_quality_alert.as_deref(),
+            );
             let actual_disp = crate::server::common::cookie_health::quality_display(actual);
             let threshold_disp = crate::server::common::cookie_health::quality_display(threshold);
             crate::server::common::cookie_health::notify_alert(
