@@ -203,6 +203,35 @@ pub fn notify_alert(webhook: Option<&str>, title: &str, content: &str) {
     notify(webhook, title, content);
 }
 
+/// 画质代码排名，越小越高；未知画质排到最低。
+fn quality_rank(code: &str) -> usize {
+    const ITEMS: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+    ITEMS.iter().position(|i| *i == code).unwrap_or(ITEMS.len())
+}
+
+/// 画质代码 → 中文展示名（未知码原样返回）。
+pub fn quality_display(code: &str) -> String {
+    match code {
+        "origin" => "原画".to_string(),
+        "uhd" => "蓝光".to_string(),
+        "hd" => "超清".to_string(),
+        "sd" => "高清".to_string(),
+        "ld" => "标清".to_string(),
+        "md" => "流畅".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 实际画质是否低于告警阈值（应推送）。
+/// threshold 为 None/空 → 默认 "uhd"；"off" → 关闭（恒 false）。
+pub fn quality_below_alert(actual: &str, threshold: Option<&str>) -> bool {
+    let threshold = threshold.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("uhd");
+    if threshold == "off" {
+        return false;
+    }
+    quality_rank(actual) > quality_rank(threshold)
+}
+
 #[cfg(test)]
 mod alert_tests {
     use super::notify_alert;
@@ -212,5 +241,40 @@ mod alert_tests {
         // 不应 panic；webhook 为 None 时静默返回
         notify_alert(None, "t", "c");
         notify_alert(Some(""), "t", "c");
+    }
+}
+
+#[cfg(test)]
+mod quality_alert_tests {
+    use super::{quality_below_alert, quality_display};
+
+    #[test]
+    fn below_threshold_triggers() {
+        assert!(quality_below_alert("hd", Some("uhd")));
+    }
+
+    #[test]
+    fn at_or_above_threshold_no_trigger() {
+        assert!(!quality_below_alert("uhd", Some("uhd")));
+        assert!(!quality_below_alert("origin", Some("uhd")));
+    }
+
+    #[test]
+    fn off_disables() {
+        assert!(!quality_below_alert("md", Some("off")));
+    }
+
+    #[test]
+    fn none_or_empty_defaults_to_uhd() {
+        assert!(quality_below_alert("hd", None));
+        assert!(quality_below_alert("hd", Some("")));
+        assert!(!quality_below_alert("uhd", None));
+    }
+
+    #[test]
+    fn display_maps_codes() {
+        assert_eq!(quality_display("uhd"), "蓝光");
+        assert_eq!(quality_display("hd"), "超清");
+        assert_eq!(quality_display("xxx"), "xxx");
     }
 }

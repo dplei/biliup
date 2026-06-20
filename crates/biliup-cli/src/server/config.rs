@@ -170,6 +170,10 @@ pub struct Config {
     /// 抖音真原画
     #[serde(default)]
     pub douyin_true_origin: Option<bool>,
+    /// 抖音画质降级告警阈值：实际录到的画质低于此档时 webhook 推送。
+    /// 取值同画质（origin/uhd/hd/sd/ld/md），"off"=关闭；缺省视为 "uhd"（蓝光）。
+    #[serde(default)]
+    pub douyin_quality_alert: Option<String>,
 
     // 快手平台设置
     /// 快手Cookie
