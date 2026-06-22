@@ -360,7 +360,7 @@ pub async fn start_download_workflow(
                 "⚠️ 抖音 未录到蓝光画质",
                 &format!(
                     "{}：当前录制画质为 {}({})，低于告警阈值 {}({})，可能是 cookie（sessionid）失效，建议检查更换。",
-                    ctx.live_streamer().url,
+                    ctx.live_streamer().remark,
                     actual_disp, actual, threshold_disp, threshold,
                 ),
             );
