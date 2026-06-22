@@ -56,6 +56,7 @@ cookies.json
 .cargo/
 logs/
 CLAUDE.md
+AGENTS.md
 .claude/
 # macOS
 .DS_Store
