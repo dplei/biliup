@@ -21,6 +21,10 @@ interface MissingSegment {
   last_error: string | null
   created_at: string
   updated_at: string
+  // 所属会话的投稿结果（后端 JOIN upload_session 得到，真正的番号在这里）
+  session_aid: number | null
+  session_bvid: string | null
+  session_status: string | null
 }
 
 const FALLBACK_LINES = ['bda2', 'tx', 'bldsa', 'auto']
@@ -108,18 +112,35 @@ export default function MissingRecovery() {
     {
       title: '去向',
       dataIndex: 'destination',
-      width: 200,
+      width: 220,
       render: (_: unknown, record: MissingSegment) => {
         if (record.status !== 'succeeded') return '—'
-        if (record.aid != null) {
+        // 番号优先看 missing 行自身 aid，没有再回退到所属会话的 aid/bvid。
+        const aid = record.aid ?? record.session_aid
+        if (aid != null) {
           return (
-            <a href={`https://www.bilibili.com/video/av${record.aid}`} target="_blank" rel="noreferrer">
-              已追加到稿件 av{record.aid}
+            <a href={`https://www.bilibili.com/video/av${aid}`} target="_blank" rel="noreferrer">
+              已投稿 av{aid}
+            </a>
+          )
+        }
+        if (record.session_bvid) {
+          return (
+            <a
+              href={`https://www.bilibili.com/video/${record.session_bvid}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              已投稿 {record.session_bvid}
             </a>
           )
         }
         if (record.upload_session_id != null) {
-          return <Text type="tertiary">已补进待提交会话 #{record.upload_session_id}</Text>
+          return (
+            <Text type="tertiary">
+              待提交（会话 #{record.upload_session_id}，尚未投稿）
+            </Text>
+          )
         }
         return '—'
       },

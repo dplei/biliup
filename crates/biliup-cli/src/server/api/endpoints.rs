@@ -615,10 +615,22 @@ pub struct MissingQuery {
     pub status: Option<String>,
 }
 
+/// 缺失补传行 + 其所属会话的投稿结果（aid/bvid/status）。
+/// missing 行自身的 aid 在方案B 下通常为空（入队时稿件还没建、投稿后也不回填），
+/// 真正的番号在 upload_session 上，这里 JOIN 出来供前端「去向」列直接给出 B 站链接。
+#[derive(serde::Serialize)]
+pub struct MissingSegmentView {
+    #[serde(flatten)]
+    pub segment: UploadMissingSegment,
+    pub session_aid: Option<i64>,
+    pub session_bvid: Option<String>,
+    pub session_status: Option<String>,
+}
+
 pub async fn get_missing_uploads(
     State(service_register): State<ServiceRegister>,
     Query(q): Query<MissingQuery>,
-) -> Result<Json<Vec<UploadMissingSegment>>, Response> {
+) -> Result<Json<Vec<MissingSegmentView>>, Response> {
     let where_clause = missing_status_where(q.status.as_deref());
     let sql = format!(
         "SELECT * FROM upload_missing_segment WHERE {where_clause} ORDER BY created_at DESC"
@@ -628,7 +640,44 @@ pub async fn get_missing_uploads(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    Ok(Json(rows))
+
+    // 取这批行涉及的会话，映射 id -> (aid, bvid, status)，再拼回每行（避免逐行查库）。
+    let session_ids: Vec<i64> = rows.iter().filter_map(|r| r.upload_session_id).collect();
+    let mut session_map: std::collections::HashMap<i64, (Option<i64>, Option<String>, String)> =
+        std::collections::HashMap::new();
+    if !session_ids.is_empty() {
+        // session_ids 全部来自 DB 的 i64 内部主键，非外部输入，直接拼 IN 列表安全。
+        let in_list = session_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("SELECT id, aid, bvid, status FROM upload_session WHERE id IN ({in_list})");
+        let sessions =
+            sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String)>(&sql)
+                .fetch_all(&service_register.pool)
+                .await
+                .change_context(AppError::Unknown)
+                .map_err(report_to_response)?;
+        for (id, aid, bvid, status) in sessions {
+            session_map.insert(id, (aid, bvid, status));
+        }
+    }
+
+    let views = rows
+        .into_iter()
+        .map(|r| {
+            let sess = r.upload_session_id.and_then(|id| session_map.get(&id));
+            MissingSegmentView {
+                session_aid: sess.and_then(|s| s.0),
+                session_bvid: sess.and_then(|s| s.1.clone()),
+                session_status: sess.map(|s| s.2.clone()),
+                segment: r,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(views))
 }
 
 pub async fn recover_missing_upload(
