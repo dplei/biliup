@@ -80,6 +80,14 @@ pub struct UploadSession {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 本场下播一次性投稿的累计尝试次数。
+    pub submit_attempts: i64,
+    /// 最近一次投稿时间。
+    pub last_submit_at: Option<DateTime<Utc>>,
+    /// 最近一次投稿异常摘要（成功且有 aid 时为 None）。
+    pub last_submit_error: Option<String>,
+    /// 投稿结果：ok_with_aid / ok_no_aid / failed；None=未投。
+    pub submit_state: Option<String>,
 }
 
 /// Missing segment recovery queue.

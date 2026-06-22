@@ -1,5 +1,5 @@
 'use client'
-import { Button, Layout, Popconfirm, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
+import { Button, Layout, Popconfirm, Select, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconRefresh, IconSendStroked } from '@douyinfe/semi-icons'
 import { useState } from 'react'
 import useSWR from 'swr'
@@ -39,11 +39,12 @@ const baseName = (p: string) => p.split(/[/\\]/).pop() || p
 export default function MissingRecovery() {
   const { Header, Content } = Layout
   const { Text } = Typography
+  const [statusFilter, setStatusFilter] = useState<'active' | 'succeeded' | 'all'>('active')
   const {
     data: rows,
     isLoading,
     mutate,
-  } = useSWR<MissingSegment[]>('/v1/uploads/missing', fetcher)
+  } = useSWR<MissingSegment[]>(`/v1/uploads/missing?status=${statusFilter}`, fetcher)
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
 
   const handleRecover = async (id: number) => {
@@ -105,6 +106,32 @@ export default function MissingRecovery() {
         ),
     },
     {
+      title: '去向',
+      dataIndex: 'destination',
+      width: 200,
+      render: (_: unknown, record: MissingSegment) => {
+        if (record.status !== 'succeeded') return '—'
+        if (record.aid != null) {
+          return (
+            <a href={`https://www.bilibili.com/video/av${record.aid}`} target="_blank" rel="noreferrer">
+              已追加到稿件 av{record.aid}
+            </a>
+          )
+        }
+        if (record.upload_session_id != null) {
+          return <Text type="tertiary">已补进待提交会话 #{record.upload_session_id}</Text>
+        }
+        return '—'
+      },
+    },
+    {
+      title: '完成时间',
+      dataIndex: 'updated_at',
+      width: 180,
+      render: (s: string, record: MissingSegment) =>
+        record.status === 'succeeded' ? fmtTime(s) : '—',
+    },
+    {
       title: '操作',
       dataIndex: 'operate',
       width: 110,
@@ -155,15 +182,28 @@ export default function MissingRecovery() {
             />
             <h4>缺失补传</h4>
           </div>
-          <Button icon={<IconRefresh />} type="tertiary" onClick={() => mutate()}>
-            刷新
-          </Button>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <Select
+              value={statusFilter}
+              onChange={(v) => setStatusFilter(v as 'active' | 'succeeded' | 'all')}
+              style={{ width: 130 }}
+              optionList={[
+                { value: 'active', label: '待补传' },
+                { value: 'succeeded', label: '已补传' },
+                { value: 'all', label: '全部' },
+              ]}
+            />
+            <Button icon={<IconRefresh />} type="tertiary" onClick={() => mutate()}>
+              刷新
+            </Button>
+          </div>
         </nav>
       </Header>
       <Content style={{ padding: '24px', backgroundColor: 'var(--semi-color-bg-0)' }}>
         <Text type="tertiary" style={{ display: 'block', marginBottom: 16 }}>
           录制期间上传失败、尚未补传的分段。下播提交前会自动换线重试到期的分段；这里可手动立即补传，
-          补传成功后会按原分 P 位置补进对应稿件或待提交会话。
+          补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，
+          其中「#会话号」即日志里的 session，可在「实时日志」按该号检索整条上传链路。
         </Text>
         <Table
           rowKey="id"

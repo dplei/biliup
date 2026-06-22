@@ -1,6 +1,7 @@
 use crate::server::common::upload::{
     build_studio, manual_recover_missing_segment, submit_to_bilibili, upload,
 };
+use crate::server::common::upload_session::missing_status_where;
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
@@ -22,7 +23,7 @@ use crate::server::infrastructure::repositories::{
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::{LogHandle, UploadLine};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use biliup::credential::Credential;
@@ -609,18 +610,24 @@ pub async fn post_uploads(
     Ok(Json(serde_json::json!({})))
 }
 
+#[derive(serde::Deserialize)]
+pub struct MissingQuery {
+    pub status: Option<String>,
+}
+
 pub async fn get_missing_uploads(
     State(service_register): State<ServiceRegister>,
+    Query(q): Query<MissingQuery>,
 ) -> Result<Json<Vec<UploadMissingSegment>>, Response> {
-    let rows = sqlx::query_as::<_, UploadMissingSegment>(
-        "SELECT * FROM upload_missing_segment \
-         WHERE status IN ('pending', 'failed', 'uploading') \
-         ORDER BY created_at DESC",
-    )
-    .fetch_all(&service_register.pool)
-    .await
-    .change_context(AppError::Unknown)
-    .map_err(report_to_response)?;
+    let where_clause = missing_status_where(q.status.as_deref());
+    let sql = format!(
+        "SELECT * FROM upload_missing_segment WHERE {where_clause} ORDER BY created_at DESC"
+    );
+    let rows = sqlx::query_as::<_, UploadMissingSegment>(&sql)
+        .fetch_all(&service_register.pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
     Ok(Json(rows))
 }
 

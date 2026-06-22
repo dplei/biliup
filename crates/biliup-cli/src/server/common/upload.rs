@@ -1,4 +1,5 @@
 use crate::UploadLine;
+use crate::server::common::cookie_health::notify_alert;
 use crate::server::common::cover_generator::{
     CoverOptions, render_to_tempfile, split_template_lines,
 };
@@ -6,13 +7,13 @@ use crate::server::common::missing_segment::{
     due_missing_segments_for_session, enqueue_missing_segment, mark_retry_failure,
     mark_retry_success, next_segment_order, patch_studio_videos, upload_line_for_recovery,
 };
+use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
-    insert_uploading_session, mark_submitted, parse_videos, reattach_session,
-    select_recovery_candidate, select_stale_session_indices, update_session_videos,
+    insert_uploading_session, mark_submit_anomaly, mark_submitted, parse_videos, reattach_session,
+    select_recovery_candidate, select_stale_session_indices, submit_state_label,
+    update_session_videos,
 };
-use crate::server::common::cookie_health::notify_alert;
-use crate::server::common::timestamp_repair::{normalize_timestamps, RepairOutcome, SystemFfmpeg};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
@@ -44,6 +45,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::pin;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::Instrument;
 use tracing::{error, info, warn};
 
 // 辅助结构体
@@ -88,39 +90,42 @@ where
 
     // 方案B：录制期间只上传分段并把 Video 引用累积落库（uploading 态），不投稿；
     // 下播后一次性提交（整场只审一次，避免「过审后追加→重新审核」）。
-    let archive =
-        pipeline_upload_videos(rx, &upload_context, upload_config, &segment_processors, ctx)
-            .await?;
+    let span = tracing::info_span!("session", session = tracing::field::Empty);
+    async {
+        let archive =
+            pipeline_upload_videos(rx, &upload_context, upload_config, &segment_processors, ctx)
+                .await?;
 
-    // 下播收尾：把本场累积的全部分段一次性提交。失败则保持 uploading，
-    // 下次该 room 开播时由 prepare_archive 补提交。
-    if let Some(mut archive) = archive
-        && !archive.videos.is_empty()
-        && let Some(row_id) = archive.session_row_id
-    {
-        if let Err(e) =
-            recover_due_missing_segments(&upload_context, ctx, row_id, &mut archive).await
+        if let Some(mut archive) = archive
+            && !archive.videos.is_empty()
+            && let Some(row_id) = archive.session_row_id
         {
-            error!(?e, row_id, "静默补传缺失分段失败，继续提交已成功分段");
+            tracing::Span::current().record("session", row_id);
+            if let Err(e) =
+                recover_due_missing_segments(&upload_context, ctx, row_id, &mut archive).await
+            {
+                error!(?e, row_id, "静默补传缺失分段失败，继续提交已成功分段");
+            }
+            let config = ctx.config();
+            if let Err(e) = submit_session(
+                &upload_context,
+                ctx.pool(),
+                upload_config,
+                config.season_section_id,
+                config.submit_api.as_deref(),
+                ctx.streamer_info(),
+                row_id,
+                &archive.videos,
+            )
+            .await
+            {
+                error!(?e, "下播一次性提交失败，保持 uploading 待下次补提交");
+            }
         }
-        let config = ctx.config();
-        if let Err(e) = submit_session(
-            &upload_context,
-            ctx.pool(),
-            upload_config,
-            config.season_section_id,
-            config.submit_api.as_deref(),
-            ctx.streamer_info(),
-            row_id,
-            &archive.videos,
-        )
-        .await
-        {
-            error!(?e, "下播一次性提交失败，保持 uploading 待下次补提交");
-        }
+        Ok::<(), error_stack::Report<AppError>>(())
     }
-
-    Ok(())
+    .instrument(span)
+    .await
 }
 
 /// 把稿件加入合集，带重试。新稿件审核中，view 接口取 cid 可能有几十秒延迟，故重试。
@@ -205,7 +210,23 @@ async fn submit_session(
     let bilibili = &upload_context.bilibili;
     let recorder = Recorder::new(upload_config.title.clone(), streamer_info.clone());
     let studio = build_studio(upload_config, bilibili, videos.to_vec(), &recorder).await?;
-    let resp = submit_to_bilibili(bilibili, &studio, submit_api).await?;
+    info!(
+        n_videos = videos.len(),
+        title = %recorder.format_filename(),
+        "submit_attempt：开始下播一次性投稿"
+    );
+    let resp = match submit_to_bilibili(bilibili, &studio, submit_api).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            let state = submit_state_label(None, true); // "failed"
+            error!(error = %msg, "submit_failed：投稿接口失败，保持 uploading 待补提交");
+            if let Err(db) = mark_submit_anomaly(pool, session_row_id, state, msg).await {
+                error!(?db, "写回 submit_state=failed 失败");
+            }
+            return Err(e);
+        }
+    };
     let aid = resp
         .data
         .as_ref()
@@ -220,16 +241,28 @@ async fn submit_session(
 
     match aid {
         Some(aid_val) => {
-            // 提交成功即 finalize；写回失败仅告警（稿件已在 B 站，重复提交风险大于收益）。
-            if let Err(e) = mark_submitted(pool, session_row_id, aid_val, bvid).await {
-                error!(?e, "提交成功但写回 upload_session 失败");
+            // 提交成功即 finalize（mark_submitted 内部写 submit_state="ok_with_aid"）；
+            // 写回失败仅告警（稿件已在 B 站，重复提交风险大于收益）。
+            if let Err(e) = mark_submitted(pool, session_row_id, aid_val, bvid.clone()).await {
+                error!(
+                    ?e,
+                    aid = aid_val,
+                    "aid_writeback_fail：提交成功但写回 upload_session 失败"
+                );
+            } else {
+                info!(aid = aid_val, bvid = ?bvid, "submit_ok_with_aid：投稿成功并已写回 aid");
             }
             if let Some(section_id) = season_section_id {
                 add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
             }
         }
         None => {
-            error!(?resp, "提交响应缺少 aid，未 finalize（待下次开播补提交）");
+            let state = submit_state_label(aid, false); // "ok_no_aid"
+            let msg = format!("submit_ok_no_aid: {resp:?}");
+            error!(resp = ?resp, "submit_ok_no_aid：投稿 code==0 但响应缺少 aid，未 finalize（待下次开播补提交）");
+            if let Err(db) = mark_submit_anomaly(pool, session_row_id, state, msg).await {
+                error!(?db, "写回 submit_state=ok_no_aid 失败");
+            }
         }
     }
     Ok(())
@@ -580,12 +613,18 @@ async fn recover_due_missing_segments(
                     RepairOutcome::Repaired(fixed) => {
                         let _ = tokio::fs::remove_file(&fixed).await;
                         if let Err(e) = execute_postprocessor(vec![path], ctx).await {
-                            error!(row_id, "postprocessor failed after missing segment recovery: {:?}", e);
+                            error!(
+                                row_id,
+                                "postprocessor failed after missing segment recovery: {:?}", e
+                            );
                         }
                     }
                     RepairOutcome::Clean => {
                         if let Err(e) = execute_postprocessor(vec![path], ctx).await {
-                            error!(row_id, "postprocessor failed after missing segment recovery: {:?}", e);
+                            error!(
+                                row_id,
+                                "postprocessor failed after missing segment recovery: {:?}", e
+                            );
                         }
                     }
                 }
@@ -820,6 +859,7 @@ pub async fn manual_recover_missing_segment(
 
     // Perform the upload + edit/insert inside a fallible scope so that any failure
     // resets the row to 'failed' and persists the error before returning.
+    let span = tracing::info_span!("session", session = row.upload_session_id);
     let upload_result: AppResult<()> = async {
         let _streamer_info = get_streamer_info(pool, row.streamer_info_id).await?;
         let upload_config = UploadStreamer::select()
@@ -872,8 +912,18 @@ pub async fn manual_recover_missing_segment(
                     .edit_by_app(&studio, None)
                     .await
                     .change_context(AppError::Unknown)?;
+                info!(
+                    aid,
+                    segment_order = row.segment_order,
+                    "manual_recover_edit_archive：手动补传已追加到稿件"
+                );
             } else {
                 insert_session_video_at_order(pool, session_id, video, row.segment_order).await?;
+                info!(
+                    session = session_id,
+                    segment_order = row.segment_order,
+                    "manual_recover_to_session：手动补传已补进待提交会话，待下播投稿"
+                );
             }
         } else if let Some(aid) = row.aid {
             let bilibili = &upload_context.bilibili;
@@ -886,6 +936,11 @@ pub async fn manual_recover_missing_segment(
                 .edit_by_app(&studio, None)
                 .await
                 .change_context(AppError::Unknown)?;
+            info!(
+                aid,
+                segment_order = row.segment_order,
+                "manual_recover_edit_archive：手动补传已追加到稿件"
+            );
         } else {
             return Err(error_stack::Report::new(AppError::Custom(
                 "missing segment has neither upload_session_id nor aid".to_string(),
@@ -894,6 +949,7 @@ pub async fn manual_recover_missing_segment(
 
         Ok(())
     }
+    .instrument(span)
     .await;
 
     match upload_result {

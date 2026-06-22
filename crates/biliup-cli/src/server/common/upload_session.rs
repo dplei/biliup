@@ -102,6 +102,10 @@ pub async fn insert_uploading_session(
         status: "uploading".to_string(),
         created_at: now,
         updated_at: now,
+        submit_attempts: 0,
+        last_submit_at: None,
+        last_submit_error: None,
+        submit_state: None,
     }
     .insert(pool)
     .await
@@ -116,6 +120,27 @@ pub async fn get_streamer_info(pool: &ConnectionPool, id: i64) -> AppResult<Stre
         .fetch_one(pool)
         .await
         .change_context(AppError::Unknown)
+}
+
+/// 把投稿结果映射为持久化标签。submit_failed=接口未返回成功（code!=0 或网络错误）。
+pub fn submit_state_label(aid: Option<u64>, submit_failed: bool) -> &'static str {
+    if submit_failed {
+        "failed"
+    } else if aid.is_some() {
+        "ok_with_aid"
+    } else {
+        "ok_no_aid"
+    }
+}
+
+/// 「缺失补传」列表 status 过滤参数 → SQL where 片段。非法值归一到 active。
+/// 返回静态串，杜绝拼接外部输入（防注入）。
+pub fn missing_status_where(status: Option<&str>) -> &'static str {
+    match status {
+        Some("succeeded") => "status = 'succeeded'",
+        Some("all") => "1 = 1",
+        _ => "status IN ('pending', 'failed', 'uploading')",
+    }
 }
 
 /// 公共：按 id 取行、就地修改、写回。
@@ -163,6 +188,29 @@ pub async fn mark_submitted(
         row.aid = Some(aid as i64);
         row.bvid = bvid;
         row.status = "finalized".to_string();
+        row.submit_state = Some("ok_with_aid".to_string());
+        row.last_submit_at = Some(chrono::Utc::now());
+        row.last_submit_error = None;
+        row.submit_attempts += 1;
+        Ok(())
+    })
+    .await
+}
+
+/// 记录一次投稿异常（ok_no_aid / failed）。不改 status/aid，仅落投稿状态，
+/// 使「投稿成功却无 aid」「投稿接口失败」可持久查证。
+pub async fn mark_submit_anomaly(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    state: &str,
+    error: String,
+) -> AppResult<()> {
+    let state = state.to_string();
+    mutate_session(pool, session_row_id, |row| {
+        row.submit_state = Some(state);
+        row.last_submit_error = Some(error);
+        row.last_submit_at = Some(chrono::Utc::now());
+        row.submit_attempts += 1;
         Ok(())
     })
     .await
@@ -215,6 +263,10 @@ mod tests {
             status: status.to_string(),
             created_at: updated_at,
             updated_at,
+            submit_attempts: 0,
+            last_submit_at: None,
+            last_submit_error: None,
+            submit_state: None,
         }
     }
 
@@ -304,5 +356,36 @@ mod tests {
 
         let names: Vec<_> = result.into_iter().map(|v| v.filename).collect();
         assert_eq!(names, vec!["p1", "p2", "p3", "p4"]);
+    }
+
+    #[test]
+    fn submit_state_label_classifies_three_outcomes() {
+        assert_eq!(submit_state_label(Some(123), false), "ok_with_aid");
+        assert_eq!(submit_state_label(None, false), "ok_no_aid");
+        assert_eq!(submit_state_label(None, true), "failed");
+        // submit_failed 优先于 aid 判定
+        assert_eq!(submit_state_label(Some(123), true), "failed");
+    }
+
+    #[test]
+    fn missing_status_where_maps_filter_to_sql() {
+        assert_eq!(
+            missing_status_where(None),
+            "status IN ('pending', 'failed', 'uploading')"
+        );
+        assert_eq!(
+            missing_status_where(Some("active")),
+            "status IN ('pending', 'failed', 'uploading')"
+        );
+        assert_eq!(
+            missing_status_where(Some("succeeded")),
+            "status = 'succeeded'"
+        );
+        assert_eq!(missing_status_where(Some("all")), "1 = 1");
+        // 非法值归一到 active，避免注入与意外全表
+        assert_eq!(
+            missing_status_where(Some("garbage")),
+            "status IN ('pending', 'failed', 'uploading')"
+        );
     }
 }
