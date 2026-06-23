@@ -79,6 +79,14 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
     let mut tick = interval(Duration::from_millis(500));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // 保活：日志安静期连接上零流量，前置代理(NPM/nginx，默认 proxy_read_timeout ~60s)会按
+    // 空闲超时把 WS 重置（表现为「Connection reset without closing handshake」）。每 30s 主动
+    // 发一个 Ping 制造流量，避免空闲期被掐断。
+    let mut ping_tick = interval(Duration::from_secs(30));
+    ping_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // 首拍立即触发，跳过以免一上来就发 Ping
+    ping_tick.tick().await;
+
     // 主循环：同时处理客户端消息和文件更新
     loop {
         tokio::select! {
@@ -96,13 +104,23 @@ async fn websocket_logs(mut ws: WebSocket, query: LogsQuery) {
                         // 其他消息不处理（Text/Binary等）
                     }
                     Some(Err(e)) => {
-                        error!("WebSocket连接错误: {}", e);
+                        // 客户端/代理无握手直接重置（如空闲超时、关页、刷新）是常见的良性断连，
+                        // 不是服务端错误，降为 debug，避免日志刷红。
+                        debug!("WebSocket连接断开: {}", e);
                         break;
                     }
                     None => {
                         info!("WebSocket连接已关闭");
                         break;
                     }
+                }
+            }
+
+            _ = ping_tick.tick() => {
+                // 空闲期主动发 Ping 保活；发送失败说明连接已断，退出
+                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    debug!("WebSocket保活Ping发送失败，连接已断开");
+                    break;
                 }
             }
 

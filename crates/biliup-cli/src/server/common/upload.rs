@@ -148,6 +148,33 @@ async fn add_archive_to_season_with_retry(bilibili: &BiliBili, section_id: i64, 
     );
 }
 
+/// 带退避重试的 B站 cookie 登录。
+///
+/// 失败时把**完整错误链**（`{:?}`）打进日志——此前 `change_context(AppError::Unknown)` + 用
+/// `{}`(Display) 打印会把底层原因（是超时/连接重置还是 cookie 真失效）全部吞掉，只剩 "Unknown Error"。
+async fn login_with_retry(cookie_file: &str) -> AppResult<BiliBili> {
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut backoff = std::time::Duration::from_secs(3);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match login_by_cookies(cookie_file, None).await {
+            Ok(bilibili) => return Ok(bilibili),
+            Err(e) => {
+                if attempt == MAX_ATTEMPTS {
+                    error!(cookie_file, attempt, "B站 cookie 登录最终失败: {e:?}");
+                    return Err(e).change_context(AppError::Unknown);
+                }
+                warn!(
+                    cookie_file,
+                    attempt, "B站 cookie 登录失败，{backoff:?} 后重试: {e:?}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+    }
+    unreachable!("login_with_retry 循环必然在最后一次尝试 return")
+}
+
 async fn initialize_upload_context(
     config: &Config,
     client: &StatelessClient,
@@ -158,9 +185,9 @@ async fn initialize_upload_context(
         .user_cookie
         .clone()
         .unwrap_or("cookies.json".to_string());
-    let bilibili = login_by_cookies(&cookie_file, None)
-        .await
-        .change_context(AppError::Unknown)?;
+    // login_by_cookies 内部会向 B站 发请求校验 token，瞬时网络抖动（超时/连接重置）
+    // 会直接返回 Err。此处带退避重试，避免一次网络抽风就把整场上传  rx 提前 drop、报销整场录像。
+    let bilibili = login_with_retry(&cookie_file).await?;
 
     // 获取上传线路
     let line = get_upload_line(&client.client, &config.lines).await?;
@@ -1086,7 +1113,8 @@ impl UActor {
                 };
 
                 if let Err(e) = &result {
-                    error!("Process segment event failed: {}", e);
+                    // 用 {:?} 打全 error_stack 错误链，便于定位底层原因（网络/cookie/转码…）
+                    error!("Process segment event failed: {:?}", e);
                     // 可以添加错误通知机制
                 }
                 info!(url=ctx.live_streamer().url, result=?result, "后处理执行完毕：Finished processing segment event");
