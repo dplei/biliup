@@ -443,7 +443,9 @@ pub async fn upload(
         // Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
-        _ => Probe::probe(&client.client).await.unwrap_or_default(),
+        _ => Probe::probe(&client.client)
+            .await
+            .change_context(AppError::Unknown)?,
     };
     // let line = line::kodo();
     for video_path in video_path {

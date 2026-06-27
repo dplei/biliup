@@ -12,7 +12,7 @@ use crate::error::Kind::{Custom, RateLimit};
 use crate::uploader::bilibili::{BiliBili, Video};
 use crate::uploader::line::upos::Upos;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod upos;
 
@@ -78,6 +78,17 @@ pub struct Probe {
     probe: serde_json::Value,
 }
 
+pub fn choose_fastest_successful_line<I>(candidates: I) -> Result<Line>
+where
+    I: IntoIterator<Item = (Line, bool)>,
+{
+    candidates
+        .into_iter()
+        .filter_map(|(line, ok)| ok.then_some(line))
+        .min_by_key(|line| line.cost)
+        .ok_or_else(|| Custom("no upload line probe succeeded".to_string()))
+}
+
 impl Probe {
     pub async fn probe(client: &reqwest::Client) -> Result<Line> {
         let res: Self = client
@@ -86,24 +97,31 @@ impl Probe {
             .await?
             .json()
             .await?;
-        // let client = res.ping(client);
-        let mut choice_line: Line = Default::default();
+
+        let mut candidates = Vec::new();
         for mut line in res.lines {
+            let url = format!("https:{}", line.probe_url);
             let instant = Instant::now();
-            if Probe::ping(&res.probe, &format!("https:{}", line.probe_url), client)
-                .send()
-                .await?
-                .status()
-                .is_success()
-            {
-                line.cost = instant.elapsed().as_millis();
-                info!("{}: {}", line.query, line.cost);
-                if choice_line.cost > line.cost {
-                    choice_line = line
+            let ping_result = Probe::ping(&res.probe, &url, client).send().await;
+            match ping_result {
+                Ok(resp) if resp.status().is_success() => {
+                    line.cost = instant.elapsed().as_millis();
+                    info!(query = %line.query, cost = line.cost, "upload line probe succeeded");
+                    candidates.push((line, true));
                 }
-            };
+                Ok(resp) => {
+                    let status = resp.status();
+                    warn!(query = %line.query, %status, "upload line probe returned non-success status");
+                    candidates.push((line, false));
+                }
+                Err(err) => {
+                    warn!(query = %line.query, error = %err, "upload line probe failed");
+                    candidates.push((line, false));
+                }
+            }
         }
-        Ok(choice_line)
+
+        choose_fastest_successful_line(candidates)
     }
 
     fn ping(probe: &serde_json::Value, url: &str, client: &reqwest::Client) -> RequestBuilder {
@@ -350,5 +368,45 @@ pub fn alia() -> Line {
         query: "zone=cs&upcdn=alia&probe_version=20221109".into(),
         probe_url: "//upos-cs-upcdnalia.bilivideo.com/OK".into(),
         cost: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_with_cost(query: &str, cost: u128) -> Line {
+        Line {
+            os: Uploader::Upos,
+            probe_url: format!("//{query}.example.com/OK"),
+            query: query.to_string(),
+            cost,
+        }
+    }
+
+    #[test]
+    fn choose_fastest_successful_line_ignores_failures() {
+        let candidates = vec![
+            (line_with_cost("slow", 300), true),
+            (line_with_cost("down", 10), false),
+            (line_with_cost("fast", 20), true),
+        ];
+
+        let selected = choose_fastest_successful_line(candidates).unwrap();
+
+        assert_eq!(selected.query, "fast");
+        assert_eq!(selected.cost, 20);
+    }
+
+    #[test]
+    fn choose_fastest_successful_line_fails_when_all_fail() {
+        let candidates = vec![
+            (line_with_cost("down-1", 10), false),
+            (line_with_cost("down-2", 20), false),
+        ];
+
+        let err = choose_fastest_successful_line(candidates).unwrap_err();
+
+        assert!(err.to_string().contains("no upload line probe succeeded"));
     }
 }

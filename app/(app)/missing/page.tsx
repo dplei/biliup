@@ -1,9 +1,9 @@
 'use client'
 import { Button, Layout, Popconfirm, Select, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
-import { IconRefresh, IconSendStroked } from '@douyinfe/semi-icons'
+import { IconDeleteStroked, IconRefresh, IconSendStroked } from '@douyinfe/semi-icons'
 import { useState } from 'react'
 import useSWR from 'swr'
-import { fetcher, sendRequest } from '../../lib/api-streamer'
+import { fetcher, requestDelete, sendRequest } from '../../lib/api-streamer'
 
 interface MissingSegment {
   id: number
@@ -50,6 +50,8 @@ export default function MissingRecovery() {
     mutate,
   } = useSWR<MissingSegment[]>(`/v1/uploads/missing?status=${statusFilter}`, fetcher)
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
+  const [retryingId, setRetryingId] = useState<number | null>(null)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
 
   const handleRecover = async (id: number) => {
     setRecoveringId(id)
@@ -61,6 +63,32 @@ export default function MissingRecovery() {
       Toast.error(`补传失败：${e?.message ?? e}`)
     } finally {
       setRecoveringId(null)
+    }
+  }
+
+  const handleRetry = async (id: number) => {
+    setRetryingId(id)
+    try {
+      await sendRequest(`/v1/uploads/missing/${id}/retry`, { arg: {} })
+      Toast.success('已重新发起补投')
+      await mutate()
+    } catch (e: any) {
+      Toast.error(`重新补投失败：${e?.message ?? e}`)
+    } finally {
+      setRetryingId(null)
+    }
+  }
+
+  const handleDelete = async (id: number) => {
+    setDeletingId(id)
+    try {
+      await requestDelete('/v1/uploads/missing', { arg: id })
+      Toast.success('已删除缺失记录和本地文件')
+      await mutate()
+    } catch (e: any) {
+      Toast.error(`删除失败：${e?.message ?? e}`)
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -119,7 +147,12 @@ export default function MissingRecovery() {
         const aid = record.aid ?? record.session_aid
         if (aid != null) {
           return (
-            <a href={`https://www.bilibili.com/video/av${aid}`} target="_blank" rel="noreferrer">
+            <a
+              href={`https://www.bilibili.com/video/av${aid}`}
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: 'inherit' }}
+            >
               已投稿 av{aid}
             </a>
           )
@@ -130,6 +163,7 @@ export default function MissingRecovery() {
               href={`https://www.bilibili.com/video/${record.session_bvid}`}
               target="_blank"
               rel="noreferrer"
+              style={{ color: 'inherit' }}
             >
               已投稿 {record.session_bvid}
             </a>
@@ -157,23 +191,61 @@ export default function MissingRecovery() {
       dataIndex: 'operate',
       width: 110,
       fixed: 'right' as const,
-      render: (_: unknown, record: MissingSegment) => (
-        <Popconfirm
-          title="补传这一段？"
-          content="将重新上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待提交会话。"
-          okText="补传"
-          onConfirm={() => handleRecover(record.id)}
-        >
-          <Button
-            theme="borderless"
-            icon={<IconSendStroked />}
-            loading={recoveringId === record.id}
-            disabled={record.status === 'uploading' && recoveringId !== record.id}
-          >
-            补传
-          </Button>
-        </Popconfirm>
-      ),
+      render: (_: unknown, record: MissingSegment) => {
+        if (record.status === 'succeeded') return '—'
+
+        if (record.status === 'uploading') {
+          return (
+            <Popconfirm
+              title="重新补投这一段？"
+              content="将重新上传该分段。旧的卡住请求不一定会被取消，目标是尽快把分 P 补进 B 站。"
+              okText="重新补投"
+              onConfirm={() => handleRetry(record.id)}
+            >
+              <Button
+                theme="borderless"
+                icon={<IconSendStroked />}
+                loading={retryingId === record.id}
+              >
+                重新补投
+              </Button>
+            </Popconfirm>
+          )
+        }
+
+        return (
+          <div style={{ display: 'flex', gap: 4 }}>
+            <Popconfirm
+              title="补传这一段？"
+              content="将重新上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待提交会话。"
+              okText="补传"
+              onConfirm={() => handleRecover(record.id)}
+            >
+              <Button
+                theme="borderless"
+                icon={<IconSendStroked />}
+                loading={recoveringId === record.id}
+              >
+                补传
+              </Button>
+            </Popconfirm>
+            <Popconfirm
+              title="删除这条缺失记录？"
+              content="将删除缺失补传记录，并同时删除对应本地视频文件和弹幕文件。此操作不会补投到 B 站。"
+              okText="删除"
+              okButtonProps={{ type: 'danger' }}
+              onConfirm={() => handleDelete(record.id)}
+            >
+              <Button
+                theme="borderless"
+                type="danger"
+                icon={<IconDeleteStroked />}
+                loading={deletingId === record.id}
+              />
+            </Popconfirm>
+          </div>
+        )
+      },
     },
   ]
 

@@ -1,5 +1,8 @@
+use crate::server::common::missing_segment::{
+    MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
+};
 use crate::server::common::upload::{
-    build_studio, manual_recover_missing_segment, submit_to_bilibili, upload,
+    build_studio, manual_recover_missing_segment, retry_missing_segment, submit_to_bilibili, upload,
 };
 use crate::server::common::upload_session::missing_status_where;
 use crate::server::common::util::Recorder;
@@ -38,7 +41,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 pub async fn get_streamers_endpoint(
@@ -654,12 +657,11 @@ pub async fn get_missing_uploads(
             .join(",");
         let sql =
             format!("SELECT id, aid, bvid, status FROM upload_session WHERE id IN ({in_list})");
-        let sessions =
-            sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String)>(&sql)
-                .fetch_all(&service_register.pool)
-                .await
-                .change_context(AppError::Unknown)
-                .map_err(report_to_response)?;
+        let sessions = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String)>(&sql)
+            .fetch_all(&service_register.pool)
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?;
         for (id, aid, bvid, status) in sessions {
             session_map.insert(id, (aid, bvid, status));
         }
@@ -686,6 +688,83 @@ pub async fn recover_missing_upload(
 ) -> Result<Json<serde_json::Value>, Response> {
     let config = service_register.config.read().unwrap().clone();
     manual_recover_missing_segment(&config, &service_register.pool, id)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn delete_missing_upload(
+    State(service_register): State<ServiceRegister>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let row = match claim_missing_segment_for_delete(&service_register.pool, id, Utc::now())
+        .await
+        .map_err(report_to_response)?
+    {
+        MissingSegmentDeleteClaim::Claimed(row) => row,
+        MissingSegmentDeleteClaim::NotFound => {
+            return Err((StatusCode::NOT_FOUND, "missing upload not found").into_response());
+        }
+        MissingSegmentDeleteClaim::NotDeletable { status } => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("missing upload status '{status}' cannot be deleted"),
+            )
+                .into_response());
+        }
+    };
+
+    let file_path = PathBuf::from(&row.file_path);
+    let danmaku_path = row.danmaku_file_path.as_deref().map(PathBuf::from);
+    if let Err(cleanup_error) =
+        remove_missing_segment_files(&file_path, danmaku_path.as_deref()).await
+    {
+        let cleanup_message = format!("{cleanup_error:?}");
+        if let Err(mark_error) = sqlx::query(
+            "UPDATE upload_missing_segment SET last_error = ?1, updated_at = ?2 \
+             WHERE id = ?3 AND status = 'deleting'",
+        )
+        .bind(cleanup_message)
+        .bind(Utc::now())
+        .bind(id)
+        .execute(&service_register.pool)
+        .await
+        .change_context(AppError::Unknown)
+        {
+            error!(
+                id,
+                error = ?mark_error,
+                "failed to record missing upload delete cleanup error"
+            );
+        }
+        return Err(report_to_response(cleanup_error));
+    }
+
+    let delete =
+        sqlx::query("DELETE FROM upload_missing_segment WHERE id = ? AND status = 'deleting'")
+            .bind(id)
+            .execute(&service_register.pool)
+            .await
+            .change_context(AppError::Unknown)
+            .map_err(report_to_response)?;
+    if delete.rows_affected() == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "missing upload delete claim was not available",
+        )
+            .into_response());
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn retry_missing_upload(
+    State(service_register): State<ServiceRegister>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let config = service_register.config.read().unwrap().clone();
+    retry_missing_segment(&config, &service_register.pool, id)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;

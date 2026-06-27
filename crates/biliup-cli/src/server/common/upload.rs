@@ -5,7 +5,8 @@ use crate::server::common::cover_generator::{
 };
 use crate::server::common::missing_segment::{
     due_missing_segments_for_session, enqueue_missing_segment, mark_retry_failure,
-    mark_retry_success, next_segment_order, patch_studio_videos, upload_line_for_recovery,
+    mark_retry_success, next_segment_order, patch_studio_videos, reset_for_manual_retry,
+    upload_line_for_recovery,
 };
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
 use crate::server::common::upload_session::{
@@ -208,7 +209,7 @@ async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line
         "txa" => line::txa(),
         "bldsa" => line::bldsa(),
         "alia" => line::alia(),
-        _ => Probe::probe(client).await.unwrap_or_default(),
+        _ => Probe::probe(client).await.change_context(AppError::Unknown)?,
     };
     Ok(line)
 }
@@ -602,7 +603,7 @@ async fn recover_due_missing_segments(
                 bilibili: upload_context.bilibili.clone(),
                 line: Probe::probe(&upload_context.client.client)
                     .await
-                    .unwrap_or_default(),
+                    .change_context(AppError::Unknown)?,
                 threads: upload_context.threads,
                 client: upload_context.client.clone(),
             }
@@ -811,7 +812,9 @@ pub async fn upload(
         // Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
-        _ => Probe::probe(&client.client).await.unwrap_or_default(),
+        _ => Probe::probe(&client.client)
+            .await
+            .change_context(AppError::Unknown)?,
     };
     for video_path in video_paths {
         println!(
@@ -997,6 +1000,33 @@ pub async fn manual_recover_missing_segment(
             Err(e)
         }
     }
+}
+
+pub async fn retry_missing_segment(
+    config: &Config,
+    pool: &ConnectionPool,
+    missing_id: i64,
+) -> AppResult<()> {
+    let mut row = UploadMissingSegment::select()
+        .where_("id = ?")
+        .bind(missing_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+
+    if row.status == "succeeded" {
+        return Ok(());
+    }
+
+    if row.status == "uploading" {
+        let now = chrono::Utc::now();
+        reset_for_manual_retry(&mut row, now);
+        row.update_all_fields(pool)
+            .await
+            .change_context(AppError::Unknown)?;
+    }
+
+    manual_recover_missing_segment(config, pool, missing_id).await
 }
 
 #[cfg(test)]

@@ -90,6 +90,11 @@ impl StreamGears {
         match header(&bytes) {
             Ok((_i, header)) => {
                 debug!("header: {header:#?}");
+                let stream_host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(ToString::to_string))
+                    .unwrap_or_default();
+                info!(stream_host = %stream_host, "selected stream url host");
                 info!("Downloading {}...", url);
                 // FLV流下载
                 let file = LifecycleFile::with_hook(&file_name, "flv", hook);

@@ -254,15 +254,24 @@ impl Connection {
             // BytesMut::with_capacity(0).deref_mut()
             // tokio::fs::File::open("").read()
             // self.resp.chunk()
-            match timeout(Duration::from_secs(30), self.resp.chunk()).await? {
-                Ok(Some(chunk)) => {
-                    // let n = chunk.len();
-                    // println!("Chunk: {:?}", chunk);
+            match timeout(Duration::from_secs(30), self.resp.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     self.buffer.put(chunk);
-                    // self.buffer.put_slice(&buf[..n]);
                 }
-                _ => {
+                Ok(Ok(None)) => {
+                    warn!(
+                        buffered = self.buffer.len(),
+                        "httpflv chunk stream ended before requested frame was complete"
+                    );
                     return Ok(self.buffer.split().freeze());
+                }
+                Ok(Err(err)) => {
+                    warn!(error = %err, buffered = self.buffer.len(), "httpflv chunk read failed");
+                    return Err(err.into());
+                }
+                Err(err) => {
+                    warn!(error = %err, buffered = self.buffer.len(), "httpflv chunk read timed out");
+                    return Err(err.into());
                 }
             }
             // let n = match self.resp.read(&mut buf).await {

@@ -184,7 +184,10 @@ impl DownloadTask {
                 break components;
             }
             // 检查流状态
-            match plugin.check_stream(live_request(ctx.worker())).await {
+            let check_started = std::time::Instant::now();
+            let check_result = plugin.check_stream(live_request(ctx.worker())).await;
+            let check_elapsed = check_started.elapsed();
+            match check_result {
                 Ok(LiveStatus::Live {
                     stream: next_stream,
                 }) => {
@@ -194,7 +197,7 @@ impl DownloadTask {
                     // 流恢复：重置下播计时，继续录进同一会话（不投稿、不分稿件）
                     offline_since = None;
                     retry_count = 0;
-                    info!(url = url, "Stream is still live, continuing same session");
+                    info!(url = url, check_elapsed = ?check_elapsed, "Stream is still live, continuing same session");
                 }
                 Ok(LiveStatus::Offline) => {
                     // 下播是一次成功的检查（cookie 正常）
@@ -204,12 +207,14 @@ impl DownloadTask {
                     if since.elapsed() >= grace {
                         info!(
                             url = url,
+                            check_elapsed = ?check_elapsed,
                             "连续离线超过宽限期 {:?}，确认下播，结束本场", grace
                         );
                         break components;
                     }
                     info!(
                         url = url,
+                        check_elapsed = ?check_elapsed,
                         "Stream went offline，宽限期内继续复查 ({:?}/{:?})",
                         since.elapsed(),
                         grace
@@ -227,12 +232,14 @@ impl DownloadTask {
                     if since.elapsed() >= grace {
                         warn!(
                             url = url,
+                            check_elapsed = ?check_elapsed,
                             "检查直播间持续失败超过宽限期 {:?}，结束本场: {:?}", grace, e
                         );
                         break components;
                     }
                     warn!(
                         url = url,
+                        check_elapsed = ?check_elapsed,
                         "Failed to check stream status: {:?}，宽限期内继续复查 ({:?}/{:?})",
                         e,
                         since.elapsed(),

@@ -6,6 +6,7 @@ use biliup::bilibili::{Studio, Video};
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
 use std::path::Path;
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryUploadLine {
@@ -81,6 +82,88 @@ pub fn is_due_for_silent_recovery(
     now: DateTime<Utc>,
 ) -> bool {
     matches!(status, "pending" | "failed") && next_retry_at <= now
+}
+
+pub fn can_delete_missing_segment(status: &str) -> bool {
+    matches!(status, "pending" | "failed")
+}
+
+pub fn reset_for_manual_retry(row: &mut UploadMissingSegment, now: DateTime<Utc>) {
+    row.status = "failed".to_string();
+    row.last_error = Some("manual retry requested from uploading state".to_string());
+    row.next_retry_at = now;
+    row.updated_at = now;
+}
+
+#[derive(Debug)]
+pub enum MissingSegmentDeleteClaim {
+    Claimed(UploadMissingSegment),
+    NotFound,
+    NotDeletable { status: String },
+}
+
+pub async fn claim_missing_segment_for_delete(
+    pool: &ConnectionPool,
+    id: i64,
+    now: DateTime<Utc>,
+) -> AppResult<MissingSegmentDeleteClaim> {
+    let claim = sqlx::query(
+        "UPDATE upload_missing_segment SET status = 'deleting', updated_at = ?1 \
+         WHERE id = ?2 AND status IN ('pending', 'failed')",
+    )
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+
+    if claim.rows_affected() == 1 {
+        let row = sqlx::query_as::<_, UploadMissingSegment>(
+            "SELECT * FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+        return Ok(MissingSegmentDeleteClaim::Claimed(row));
+    }
+
+    let status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM upload_missing_segment WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .change_context(AppError::Unknown)?;
+
+    Ok(match status {
+        Some(status) => MissingSegmentDeleteClaim::NotDeletable { status },
+        None => MissingSegmentDeleteClaim::NotFound,
+    })
+}
+
+pub async fn remove_missing_segment_files(
+    file_path: &Path,
+    danmaku_file_path: Option<&Path>,
+) -> AppResult<()> {
+    async fn remove_one(path: &Path) -> AppResult<()> {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {
+                info!(file = %path.display(), "deleted missing upload local file");
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(file = %path.display(), "missing upload local file already absent");
+                Ok(())
+            }
+            Err(e) => Err(e).change_context(AppError::Unknown),
+        }
+    }
+
+    remove_one(file_path).await?;
+    if let Some(path) = danmaku_file_path {
+        remove_one(path).await?;
+    }
+    Ok(())
 }
 
 pub async fn enqueue_missing_segment(
@@ -181,6 +264,7 @@ pub async fn due_missing_segments_for_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
 
     fn video(name: &str) -> Video {
@@ -210,6 +294,186 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    async fn test_pool() -> (tempfile::TempDir, ConnectionPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap();
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(20_i64)
+        .bind("test")
+        .bind("https://example.com/live")
+        .bind("test stream")
+        .bind(now)
+        .bind("")
+        .execute(&pool)
+        .await
+        .unwrap();
+        (dir, pool)
+    }
+
+    async fn insert_missing_row_with_status(
+        pool: &ConnectionPool,
+        status: &str,
+        file_name: &str,
+    ) -> i64 {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap();
+        let file_path = Path::new(file_name);
+        enqueue_missing_segment(
+            pool,
+            10,
+            20,
+            None,
+            None,
+            file_path,
+            None,
+            0,
+            "test".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM upload_missing_segment WHERE file_path = ?",
+        )
+        .bind(file_path.display().to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE upload_missing_segment SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        id
+    }
+
+    #[test]
+    fn delete_is_allowed_only_for_unrecovered_rows() {
+        assert!(can_delete_missing_segment("pending"));
+        assert!(can_delete_missing_segment("failed"));
+        assert!(!can_delete_missing_segment("uploading"));
+        assert!(!can_delete_missing_segment("succeeded"));
+    }
+
+    #[tokio::test]
+    async fn claim_missing_segment_for_delete_marks_failed_row_deleting() {
+        let (_dir, pool) = test_pool().await;
+        let id = insert_missing_row_with_status(&pool, "failed", "/tmp/delete-failed.flv").await;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+
+        let claim = claim_missing_segment_for_delete(&pool, id, now)
+            .await
+            .unwrap();
+
+        let MissingSegmentDeleteClaim::Claimed(row) = claim else {
+            panic!("failed row should be claimed for deletion");
+        };
+        assert_eq!(row.id, id);
+        assert_eq!(row.status, "deleting");
+        assert_eq!(row.updated_at, now);
+
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "deleting");
+    }
+
+    #[tokio::test]
+    async fn claim_missing_segment_for_delete_rejects_non_deletable_rows() {
+        let (_dir, pool) = test_pool().await;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+
+        for status in ["uploading", "succeeded"] {
+            let id =
+                insert_missing_row_with_status(&pool, status, &format!("/tmp/delete-{status}.flv"))
+                    .await;
+
+            let claim = claim_missing_segment_for_delete(&pool, id, now)
+                .await
+                .unwrap();
+
+            match claim {
+                MissingSegmentDeleteClaim::NotDeletable { status: actual } => {
+                    assert_eq!(actual, status);
+                }
+                other => panic!("expected non-deletable claim result, got {other:?}"),
+            }
+
+            let stored_status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM upload_missing_segment WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(stored_status, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_missing_segment_files_deletes_video_and_danmaku() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("part.flv");
+        let danmaku = dir.path().join("part.xml");
+        tokio::fs::write(&video, b"video").await.unwrap();
+        tokio::fs::write(&danmaku, b"danmaku").await.unwrap();
+
+        remove_missing_segment_files(&video, Some(&danmaku))
+            .await
+            .unwrap();
+
+        assert!(!video.exists());
+        assert!(!danmaku.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_missing_segment_files_ignores_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("missing.flv");
+        let danmaku = dir.path().join("missing.xml");
+
+        remove_missing_segment_files(&video, Some(&danmaku))
+            .await
+            .unwrap();
+
+        assert!(!video.exists());
+        assert!(!danmaku.exists());
+    }
+
+    #[test]
+    fn retry_reset_turns_uploading_into_due_failed_row() {
+        let mut row = missing_row();
+        row.status = "uploading".to_string();
+        row.attempts = 7;
+        row.next_retry_at = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 13, 0, 0).unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+
+        reset_for_manual_retry(&mut row, now);
+
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.attempts, 7);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("manual retry requested from uploading state")
+        );
+        assert_eq!(row.next_retry_at, now);
+        assert_eq!(row.updated_at, now);
     }
 
     #[test]
