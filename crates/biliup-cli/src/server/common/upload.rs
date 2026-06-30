@@ -209,7 +209,9 @@ async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line
         "txa" => line::txa(),
         "bldsa" => line::bldsa(),
         "alia" => line::alia(),
-        _ => Probe::probe(client).await.change_context(AppError::Unknown)?,
+        _ => Probe::probe(client)
+            .await
+            .change_context(AppError::Unknown)?,
     };
     Ok(line)
 }

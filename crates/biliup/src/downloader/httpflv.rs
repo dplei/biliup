@@ -12,14 +12,20 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
-pub async fn download(connection: Connection, file: LifecycleFile<'_>, segment: Segmentable) {
+pub async fn download(
+    connection: Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+) -> crate::downloader::error::Result<()> {
     let file_name = file.file_name.clone();
     match parse_flv(connection, file, segment).await {
         Ok(_) => {
             info!("Done... {}", file_name);
+            Ok(())
         }
         Err(e) => {
-            warn!("{e}")
+            warn!("{e}");
+            Err(e)
         }
     }
 }
@@ -259,19 +265,26 @@ impl Connection {
                     self.buffer.put(chunk);
                 }
                 Ok(Ok(None)) => {
+                    let buffered = self.buffer.len();
+                    if buffered == 0 {
+                        return Ok(self.buffer.split().freeze());
+                    }
                     warn!(
-                        buffered = self.buffer.len(),
+                        buffered,
                         "httpflv chunk stream ended before requested frame was complete"
                     );
-                    return Ok(self.buffer.split().freeze());
+                    return Err(crate::downloader::error::Error::HttpFlvIncompleteFrame {
+                        buffered,
+                    });
                 }
                 Ok(Err(err)) => {
                     warn!(error = %err, buffered = self.buffer.len(), "httpflv chunk read failed");
                     return Err(err.into());
                 }
                 Err(err) => {
-                    warn!(error = %err, buffered = self.buffer.len(), "httpflv chunk read timed out");
-                    return Err(err.into());
+                    let buffered = self.buffer.len();
+                    warn!(error = %err, buffered, "httpflv chunk read timed out");
+                    return Err(crate::downloader::error::Error::HttpFlvReadTimeout { buffered });
                 }
             }
             // let n = match self.resp.read(&mut buf).await {

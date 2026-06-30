@@ -193,7 +193,8 @@ impl DownloadTask {
                 }) => {
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
                     stream = *next_stream;
-                    ctx.worker().set_recording_quality(stream.recording_quality.clone());
+                    ctx.worker()
+                        .set_recording_quality(stream.recording_quality.clone());
                     // 流恢复：重置下播计时，继续录进同一会话（不投稿、不分稿件）
                     offline_since = None;
                     retry_count = 0;
@@ -346,7 +347,8 @@ pub async fn start_download_workflow(
 
     // 记录实际画质供前端 tag 显示
     let recording_quality = ctx.live_stream().recording_quality.clone();
-    ctx.worker().set_recording_quality(recording_quality.clone());
+    ctx.worker()
+        .set_recording_quality(recording_quality.clone());
 
     // 抖音画质降级告警：实际画质低于阈值则推送（每场开播仅此一次）
     if ctx.live_stream().platform == "douyin"
@@ -368,7 +370,10 @@ pub async fn start_download_workflow(
                 &format!(
                     "{}：当前录制画质为 {}({})，低于告警阈值 {}({})，可能是 cookie（sessionid）失效，建议检查更换。",
                     ctx.live_streamer().remark,
-                    actual_disp, actual, threshold_disp, threshold,
+                    actual_disp,
+                    actual,
+                    threshold_disp,
+                    threshold,
                 ),
             );
         }

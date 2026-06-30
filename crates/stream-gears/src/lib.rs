@@ -50,7 +50,9 @@ pub async fn download_with_hook(
             debug!("header: {header:#?}");
             info!("Downloading {}...", url);
             let file = LifecycleFile::with_hook(file_name, "flv", file_name_hook);
-            httpflv::download(connection, file, segment).await;
+            httpflv::download(connection, file, segment)
+                .await
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
         }
         Err(nom::Err::Incomplete(needed)) => {
             error!("needed: {needed:?}")

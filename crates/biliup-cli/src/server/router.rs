@@ -67,10 +67,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             "/v1/uploads/missing/{id}/recover",
             post(recover_missing_upload),
         )
-        .route(
-            "/v1/uploads/missing/{id}/retry",
-            post(retry_missing_upload),
-        )
+        .route("/v1/uploads/missing/{id}/retry", post(retry_missing_upload))
         .route("/v1/uploads", post(post_uploads))
         .route_service("/static/{path}", get(using_serve_file_from_a_route))
         .with_state(service_register) // 注入服务注册器状态

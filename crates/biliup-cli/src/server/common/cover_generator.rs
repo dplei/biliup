@@ -22,10 +22,7 @@ pub fn split_template_lines(text: &str) -> Vec<String> {
 /// 为单个字符挑选字体：主字体有该字形则用主字体，否则按顺序回退。
 /// 都没有时返回 0（主字体），让其画出 .notdef 占位，避免吞字。
 fn font_index_for_char(fonts: &[FontRef], c: char) -> usize {
-    fonts
-        .iter()
-        .position(|f| f.glyph_id(c).0 != 0)
-        .unwrap_or(0)
+    fonts.iter().position(|f| f.glyph_id(c).0 != 0).unwrap_or(0)
 }
 
 /// 把一行文字按字体切成连续片段：相邻、同字体的字符合并为一段。
@@ -195,15 +192,7 @@ fn draw_runs(
     let mut cur_x = x;
     for (fi, s) in runs {
         let font = &fonts[*fi];
-        draw_text_mut(
-            img,
-            color,
-            cur_x as i32 + dx,
-            y as i32 + dy,
-            scale,
-            font,
-            s,
-        );
+        draw_text_mut(img, color, cur_x as i32 + dx, y as i32 + dy, scale, font, s);
         cur_x += text_size(scale, font, s).0 as f32;
     }
 }
@@ -268,7 +257,10 @@ mod tests {
     // 无换行标记时返回单行。
     #[test]
     fn split_template_lines_single_line() {
-        assert_eq!(split_template_lines("只有一行"), vec!["只有一行".to_string()]);
+        assert_eq!(
+            split_template_lines("只有一行"),
+            vec!["只有一行".to_string()]
+        );
     }
 
     // Bug 2：思源黑体没有的 emoji（如 🚥）应回退到内嵌 emoji 字体，而非主字体的 .notdef。

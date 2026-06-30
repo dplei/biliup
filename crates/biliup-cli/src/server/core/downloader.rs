@@ -174,6 +174,12 @@ pub enum DownloadStatus {
     SegmentCompleted,
     /// 直播流结束
     StreamEnded,
+    /// 直播流在一帧未读完整时结束
+    IncompleteFrame { buffered: usize },
+    /// 直播流读取超时
+    ReadTimeout { buffered: usize },
+    /// 拉流 URL 返回 HTTP 错误状态
+    HttpStatus { status: u16 },
     /// 错误
     Error(String),
 }

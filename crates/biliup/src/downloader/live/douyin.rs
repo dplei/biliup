@@ -356,7 +356,8 @@ impl DouyinLive {
                 .filter(|url| !url.is_empty())
         {
             return Ok((
-                url.replace("&only_audio=1", "").replace("http://", "https://"),
+                url.replace("&only_audio=1", "")
+                    .replace("http://", "https://"),
                 "origin".to_string(),
             ));
         }
@@ -365,7 +366,11 @@ impl DouyinLive {
         let selected_quality = select_quality_code(&available, &self.douyin_quality)
             .ok_or_else(|| LiveError::custom("抖音没有可用清晰度"))?;
 
-        let protocol = if self.douyin_protocol == "hls" { "hls" } else { "flv" };
+        let protocol = if self.douyin_protocol == "hls" {
+            "hls"
+        } else {
+            "flv"
+        };
 
         let url = stream_data
             .get(selected_quality)
@@ -410,7 +415,11 @@ impl DouyinLive {
 /// 命中则用之；否则先往更低档找，再往更高档找；都没有返回 None。
 fn select_quality_code(available: &[&str], requested: &str) -> Option<&'static str> {
     const ITEMS: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
-    let requested = if ITEMS.contains(&requested) { requested } else { "origin" };
+    let requested = if ITEMS.contains(&requested) {
+        requested
+    } else {
+        "origin"
+    };
     let idx = ITEMS.iter().position(|i| *i == requested).unwrap_or(0);
     let has = |q: &str| available.contains(&q);
     if has(requested) {
@@ -773,7 +782,10 @@ mod quality_tests {
 
     #[test]
     fn requested_available_returns_itself() {
-        assert_eq!(select_quality_code(&["origin", "hd"], "origin"), Some("origin"));
+        assert_eq!(
+            select_quality_code(&["origin", "hd"], "origin"),
+            Some("origin")
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use nom::Needed;
+use reqwest::StatusCode;
 use std::io;
 use thiserror::Error;
 use tokio::time::error::Elapsed;
@@ -10,6 +11,15 @@ pub enum Error {
 
     #[error(transparent)]
     ElapsedError(#[from] Elapsed),
+
+    #[error("httpflv chunk stream ended before requested frame was complete, buffered={buffered}")]
+    HttpFlvIncompleteFrame { buffered: usize },
+
+    #[error("httpflv chunk read timed out, buffered={buffered}")]
+    HttpFlvReadTimeout { buffered: usize },
+
+    #[error("http status client error {status} for url ({url})")]
+    HttpStatus { status: StatusCode, url: String },
 
     #[error(transparent)]
     IOError(#[from] io::Error),

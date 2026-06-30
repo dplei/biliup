@@ -23,7 +23,10 @@ pub trait FfmpegRunner {
 }
 
 pub fn repaired_temp_path(src: &Path) -> PathBuf {
-    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("segment");
+    let stem = src
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("segment");
     let dir = src.parent().unwrap_or_else(|| Path::new("."));
     dir.join(format!("{stem}.{}.fixed.mp4", std::process::id()))
 }
@@ -114,9 +117,11 @@ impl FfmpegRunner for SystemFfmpeg {
         let output = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
-                "-loglevel", "verbose",
+                "-loglevel",
+                "verbose",
                 "-nostats",
-                "-fflags", "+igndts",
+                "-fflags",
+                "+igndts",
                 "-i",
             ])
             .arg(path)
@@ -144,16 +149,28 @@ impl FfmpegRunner for SystemFfmpeg {
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
         let status = Command::new("ffmpeg")
             .args([
-                "-hide_banner", "-loglevel", "warning", "-y",
-                "-fflags", "+genpts+igndts", "-i",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-fflags",
+                "+genpts+igndts",
+                "-i",
             ])
             .arg(src)
             .args([
-                "-c", "copy",
-                "-bsf:a", "aac_adtstoasc",
-                "-movflags", "+faststart",
-                "-avoid_negative_ts", "make_zero",
-                "-muxdelay", "0", "-muxpreload", "0",
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-muxdelay",
+                "0",
+                "-muxpreload",
+                "0",
             ])
             .arg(dst)
             .kill_on_drop(true)
@@ -184,15 +201,28 @@ impl FfmpegRunner for SystemFfmpeg {
     async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()> {
         let status = Command::new("ffmpeg")
             .args([
-                "-hide_banner", "-loglevel", "warning", "-y",
-                "-fflags", "+genpts", "-i",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-i",
             ])
             .arg(src)
             .args([
-                "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-                "-c:a", "aac",
-                "-movflags", "+faststart",
-                "-avoid_negative_ts", "make_zero",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "18",
+                "-preset",
+                "veryfast",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
             ])
             .arg(dst)
             .kill_on_drop(true)
@@ -258,9 +288,9 @@ mod tests {
                 tokio::fs::write(dst, b"x").await.ok();
                 Ok(())
             } else {
-                Err(error_stack::Report::new(crate::server::errors::AppError::Custom(
-                    "remux fail".into(),
-                )))
+                Err(error_stack::Report::new(
+                    crate::server::errors::AppError::Custom("remux fail".into()),
+                ))
             }
         }
         async fn reencode(&self, _src: &Path, dst: &Path) -> AppResult<()> {
@@ -268,9 +298,9 @@ mod tests {
                 tokio::fs::write(dst, b"x").await.ok();
                 Ok(())
             } else {
-                Err(error_stack::Report::new(crate::server::errors::AppError::Custom(
-                    "reencode fail".into(),
-                )))
+                Err(error_stack::Report::new(
+                    crate::server::errors::AppError::Custom("reencode fail".into()),
+                ))
             }
         }
     }
@@ -313,7 +343,10 @@ mod tests {
         // detect: 原异常 → copy 仍异常 → reencode 仍异常
         let path = p("unfixable_when_reencode_still_anomalous");
         let f = FakeFfmpeg::new(vec![Ok(true), Ok(true), Ok(true)], true, true);
-        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Unfixable);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Unfixable
+        );
     }
 
     #[tokio::test]
@@ -346,7 +379,13 @@ mod tests {
         let good = dir.join("tsr_good.mp4");
         // 生成 2 秒正常测试视频
         let st = tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10"])
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=320x240:rate=10",
+            ])
             .arg(&good)
             .status()
             .await
@@ -358,7 +397,10 @@ mod tests {
         assert!(!anomaly, "正常文件不应报时间戳异常");
 
         // 正常文件走整条流程应得 Clean
-        assert_eq!(normalize_timestamps(&good, &runner).await, RepairOutcome::Clean);
+        assert_eq!(
+            normalize_timestamps(&good, &runner).await,
+            RepairOutcome::Clean
+        );
         let _ = tokio::fs::remove_file(&good).await;
     }
 }

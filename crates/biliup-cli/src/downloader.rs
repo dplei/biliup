@@ -106,7 +106,9 @@ async fn download_stream(
                 .await
                 .change_context_lazy(|| AppError::Unknown)?;
             let file = LifecycleFile::new(&output, "flv");
-            httpflv::download(connection, file, segmentable).await;
+            httpflv::download(connection, file, segmentable)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?;
             Ok(())
         }
     }

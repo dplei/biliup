@@ -3,6 +3,7 @@ use crate::server::common::util::parse_time;
 use crate::server::core::downloader::{DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo};
 use crate::server::errors::{AppError, AppResult};
 use biliup::client::StatelessClient;
+use biliup::downloader::error::Error as DownloadError;
 use biliup::downloader::flv_parser::header;
 use biliup::downloader::httpflv::Connection;
 use biliup::downloader::util::{LifecycleFile, Segmentable};
@@ -12,7 +13,7 @@ use nom::Err;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Stream-gears下载器实现
 /// 使用stream-gears库进行直播流下载
@@ -56,17 +57,25 @@ impl StreamGears {
         // 创建HTTP客户端
         let client = StatelessClient::new(headers_in, proxy.as_deref());
         // 获取可重试的响应
-        let response = client
-            .retryable(&url)
-            .await
-            .change_context(AppError::Unknown)?;
+        let response = match client.retryable(&url).await {
+            Ok(response) => response,
+            Err(err) => {
+                let status = classify_reqwest_error(err);
+                warn!(result = ?status, "download stream request failed");
+                return Ok(status);
+            }
+        };
         // 创建连接
         let mut connection = Connection::new(response);
         // 读取帧头
-        let bytes = connection
-            .read_frame(9)
-            .await
-            .change_context(AppError::Unknown)?;
+        let bytes = match connection.read_frame(9).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let status = classify_download_error(err);
+                warn!(result = ?status, "download stream header read failed");
+                return Ok(status);
+            }
+        };
         // let mut i = 0;
         // let mut prev_file_path = None;
         // 创建分段回调钩子
@@ -98,10 +107,20 @@ impl StreamGears {
                 info!("Downloading {}...", url);
                 // FLV流下载
                 let file = LifecycleFile::with_hook(&file_name, "flv", hook);
-                httpflv::download(connection, file, segment.clone()).await;
+                match httpflv::download(connection, file, segment.clone()).await {
+                    Ok(()) => Ok(DownloadStatus::StreamEnded),
+                    Err(err) => {
+                        let status = classify_download_error(err);
+                        warn!(result = ?status, "download stream ended with classified error");
+                        Ok(status)
+                    }
+                }
             }
             Err(Err::Incomplete(needed)) => {
-                error!("needed: {needed:?}")
+                error!("needed: {needed:?}");
+                Ok(DownloadStatus::IncompleteFrame {
+                    buffered: bytes.len(),
+                })
             }
             Err(e) => {
                 error!("{e}");
@@ -110,9 +129,32 @@ impl StreamGears {
                 hls::download(&url, &client, file, segment.clone())
                     .await
                     .change_context(AppError::Unknown)?;
+                Ok(DownloadStatus::StreamEnded)
             }
         }
-        Ok(DownloadStatus::StreamEnded)
+    }
+}
+
+fn classify_reqwest_error(err: reqwest::Error) -> DownloadStatus {
+    if let Some(status) = err.status() {
+        DownloadStatus::HttpStatus {
+            status: status.as_u16(),
+        }
+    } else if err.is_timeout() {
+        DownloadStatus::ReadTimeout { buffered: 0 }
+    } else {
+        DownloadStatus::Error(err.to_string())
+    }
+}
+
+fn classify_download_error(err: DownloadError) -> DownloadStatus {
+    match err {
+        DownloadError::HttpFlvIncompleteFrame { buffered } => {
+            DownloadStatus::IncompleteFrame { buffered }
+        }
+        DownloadError::HttpFlvReadTimeout { buffered } => DownloadStatus::ReadTimeout { buffered },
+        DownloadError::ReqwestError(err) => classify_reqwest_error(err),
+        other => DownloadStatus::Error(other.to_string()),
     }
 }
 

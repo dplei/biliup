@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::uploader::{Uploader, VideoFile, VideoStream};
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::{Body, RequestBuilder};
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,8 @@ use crate::client::StatelessClient;
 use crate::error::Kind::{Custom, RateLimit};
 use crate::uploader::bilibili::{BiliBili, Video};
 use crate::uploader::line::upos::Upos;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tracing::{info, warn};
 
 pub mod upos;
@@ -89,39 +90,84 @@ where
         .ok_or_else(|| Custom("no upload line probe succeeded".to_string()))
 }
 
+const PROBE_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_LINE_TIMEOUT: Duration = Duration::from_secs(4);
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_CONCURRENCY: usize = 4;
+
 impl Probe {
     pub async fn probe(client: &reqwest::Client) -> Result<Line> {
         let res: Self = client
             .get("https://member.bilibili.com/preupload?r=probe")
+            .timeout(PROBE_INDEX_TIMEOUT)
             .send()
             .await?
             .json()
             .await?;
 
+        let total_lines = res.lines.len();
+        let probe = res.probe;
+        let client = client.clone();
+        let probe_lines = futures::stream::iter(res.lines.into_iter().map(|line| {
+            let probe = probe.clone();
+            let client = client.clone();
+            async move { Probe::probe_line(probe, line, client).await }
+        }))
+        .buffer_unordered(PROBE_CONCURRENCY);
+
+        let deadline = TokioInstant::now() + PROBE_TOTAL_TIMEOUT;
         let mut candidates = Vec::new();
-        for mut line in res.lines {
-            let url = format!("https:{}", line.probe_url);
-            let instant = Instant::now();
-            let ping_result = Probe::ping(&res.probe, &url, client).send().await;
-            match ping_result {
-                Ok(resp) if resp.status().is_success() => {
-                    line.cost = instant.elapsed().as_millis();
-                    info!(query = %line.query, cost = line.cost, "upload line probe succeeded");
-                    candidates.push((line, true));
+        tokio::pin!(probe_lines);
+        loop {
+            tokio::select! {
+                _ = sleep_until(deadline) => {
+                    warn!(
+                        completed = candidates.len(),
+                        total = total_lines,
+                        timeout_ms = PROBE_TOTAL_TIMEOUT.as_millis(),
+                        "upload line probe total deadline elapsed"
+                    );
+                    break;
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    warn!(query = %line.query, %status, "upload line probe returned non-success status");
-                    candidates.push((line, false));
-                }
-                Err(err) => {
-                    warn!(query = %line.query, error = %err, "upload line probe failed");
-                    candidates.push((line, false));
+                candidate = probe_lines.next() => {
+                    match candidate {
+                        Some(candidate) => candidates.push(candidate),
+                        None => break,
+                    }
                 }
             }
         }
 
         choose_fastest_successful_line(candidates)
+    }
+
+    async fn probe_line(
+        probe: serde_json::Value,
+        mut line: Line,
+        client: reqwest::Client,
+    ) -> (Line, bool) {
+        let url = format!("https:{}", line.probe_url);
+        let instant = Instant::now();
+        let ping_result = Probe::ping(&probe, &url, &client)
+            .timeout(PROBE_LINE_TIMEOUT)
+            .send()
+            .await;
+        match ping_result {
+            Ok(resp) if resp.status().is_success() => {
+                line.cost = instant.elapsed().as_millis();
+                info!(query = %line.query, cost = line.cost, "upload line probe succeeded");
+                (line, true)
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                warn!(query = %line.query, %status, "upload line probe returned non-success status");
+                (line, false)
+            }
+            Err(err) => {
+                warn!(query = %line.query, error = %err, "upload line probe failed");
+                (line, false)
+            }
+        }
     }
 
     fn ping(probe: &serde_json::Value, url: &str, client: &reqwest::Client) -> RequestBuilder {
