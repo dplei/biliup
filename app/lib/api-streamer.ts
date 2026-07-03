@@ -97,7 +97,7 @@ export interface LiveStreamerEntity {
 	id: number;
 	url: string;
 	remark: string;
-	filename: string;
+	filename_prefix?: string;
 	split_time?: number;
 	split_size?: number;
 	upload_id?: number;

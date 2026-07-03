@@ -47,6 +47,13 @@ const removeCircularReferences = (obj: any, seen = new WeakSet()): any => {
   return result
 }
 
+const serializeTimeRange = (timeRange: LiveStreamerEntity['time_range']) => {
+  if (Array.isArray(timeRange)) {
+    return JSON.stringify(timeRange.map(date => date.toISOString()))
+  }
+  return timeRange
+}
+
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
   const [isOpen, setOpen] = useState(false)
 
@@ -86,18 +93,18 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   }
   const handleOk = async () => {
     let values = await api.current?.validate()
-    // 从 LiveStreamerEntity 接口定义中获取所有字段
     const entityFields = new Set([
       'id',
       'url',
       'remark',
-      'filename',
-      'split_time',
-      'split_size',
-      'upload_id',
-      'status',
-      'format',
+      'filename_prefix',
       'time_range',
+      'upload_streamers_id',
+      'status',
+      'upload_status',
+      'statusTag',
+      'recording_quality',
+      'format',
       'excluded_keywords',
       'preprocessor',
       'segment_processor',
@@ -108,11 +115,30 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     ])
 
     if (values) {
+      const baseValues: Record<string, any> = {
+        id: entity?.id,
+        url: entity?.url,
+        remark: entity?.remark,
+        filename_prefix: entity?.filename_prefix,
+        time_range: serializeTimeRange(entity?.time_range),
+        upload_streamers_id: entity?.upload_streamers_id ?? null,
+        format: entity?.format,
+        excluded_keywords: entity?.excluded_keywords,
+        preprocessor: entity?.preprocessor,
+        segment_processor: entity?.segment_processor,
+        downloaded_processor: entity?.downloaded_processor,
+        postprocessor: entity?.postprocessor,
+        opt_args: entity?.opt_args,
+      }
+      const nextValues = Object.fromEntries(
+        Object.entries(baseValues).filter(([, value]) => value !== undefined)
+      )
+
       // 处理 override_text
+      let textOverride: Record<string, any> = {}
       if (values.override_text) {
         try {
-          values.override = JSON.parse(values.override_text)
-          delete values.override_text
+          textOverride = JSON.parse(values.override_text)
         } catch (e) {
           Notification.error({
             title: '错误',
@@ -122,20 +148,16 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         }
       }
 
-      const overrideConfig = { ...(values.override || {}) }
+      const overrideConfig: Record<string, any> = { ...textOverride }
       Object.keys(values).forEach(key => {
-        console.log(key, values[key])
-        if (!entityFields.has(key)) {
-          if (values[key] !== undefined) {
-            overrideConfig[key] = values[key] === '' ? null : values[key]
-          }
-          delete values[key]
+        if (key !== 'override_text' && !entityFields.has(key) && values[key] !== undefined) {
+          overrideConfig[key] = values[key] === '' ? null : values[key]
         }
       })
-      values.override = overrideConfig
+      nextValues.override = overrideConfig
 
       // 处理循环引用
-      const cleanValues = removeCircularReferences(values)
+      const cleanValues = removeCircularReferences(nextValues)
       await onOk(cleanValues)
       setVisible(false)
       return
