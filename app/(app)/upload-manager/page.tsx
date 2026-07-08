@@ -7,6 +7,7 @@ import {
   Nav,
   Popconfirm,
   Notification,
+  Toast,
   Typography,
   Modal,
   Transfer,
@@ -64,12 +65,31 @@ export default function Union() {
     setVisibleModal(true)
   }
   const handleOk = async () => {
-    await sendRequest('/v1/uploads', {
-      arg: {
-        files: selectFiles,
-        params: selectEntity,
-      },
-    })
+    try {
+      const res = await sendRequest('/v1/uploads', {
+        arg: {
+          files: selectFiles,
+          params: selectEntity,
+        },
+      })
+      if (res?.matched) {
+        Toast.success(`将以主播【${res.streamer_name}】的信息投稿`)
+      } else {
+        Notification.warning({
+          title: '未匹配到主播',
+          content: '这批文件不在录制记录中，将使用模板默认值上传',
+          position: 'top',
+          duration: 5,
+        })
+      }
+    } catch (e: any) {
+      Notification.error({
+        title: '上传请求失败',
+        content: String(e?.message ?? e),
+        position: 'top',
+        duration: 5,
+      })
+    }
     setVisibleModal(false)
   }
   const handleCancel = () => {

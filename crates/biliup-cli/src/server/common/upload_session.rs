@@ -1,11 +1,14 @@
 use crate::server::common::missing_segment::insert_video_at_order;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use crate::server::infrastructure::models::{InsertUploadSession, StreamerInfo, UploadSession};
+use crate::server::infrastructure::models::{
+    FileItem, InsertUploadSession, StreamerInfo, UploadSession,
+};
 use biliup::bilibili::Video;
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
 use ormlite::{Insert, Model};
+use std::path::Path;
 
 /// 从候选会话中选出可续接的那条：同 room、未 finalize、updated_at 在窗口内、取最新。
 /// 返回选中项在 `sessions` 中的下标，便于调用方按需取用（避免借用纠纷）。
@@ -120,6 +123,39 @@ pub async fn get_streamer_info(pool: &ConnectionPool, id: i64) -> AppResult<Stre
         .fetch_one(pool)
         .await
         .change_context(AppError::Unknown)
+}
+
+/// 取文件路径的「词干」：basename 去掉最后一级扩展名。
+/// 用于把 get_videos 列出的磁盘文件名与 filelist.file 归一化后比对，
+/// 容忍路径前缀差异与扩展名有无（stream_gears 带扩展名 / ffmpeg 去扩展名都归一到同一词干）。
+pub fn filename_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// 按磁盘文件名反查它属于哪个主播（streamer_info_id）。
+/// 录制时每段都往 filelist 写了 `file → streamer_info_id` 映射（见 upload.rs 的 InsertFileItem）。
+/// 这里按「词干」匹配，命中返回对应 streamer_info_id；无命中返回 None（调用方据此走占位兜底）。
+pub async fn match_streamer_by_filename(
+    pool: &ConnectionPool,
+    file: &Path,
+) -> AppResult<Option<i64>> {
+    let stem = filename_stem(file);
+    if stem.is_empty() {
+        return Ok(None);
+    }
+    // 先用 LIKE 把词干作为子串粗筛，再在 Rust 里按词干精确比对，避免子串误命中。
+    let candidates = FileItem::select()
+        .where_("file LIKE ?")
+        .bind(format!("%{stem}%"))
+        .fetch_all(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    Ok(candidates
+        .into_iter()
+        .find(|c| filename_stem(Path::new(&c.file)) == stem)
+        .map(|c| c.streamer_info_id))
 }
 
 /// 把投稿结果映射为持久化标签。submit_failed=接口未返回成功（code!=0 或网络错误）。
@@ -386,6 +422,80 @@ mod tests {
         assert_eq!(
             missing_status_where(Some("garbage")),
             "status IN ('pending', 'failed', 'uploading')"
+        );
+    }
+
+    #[test]
+    fn filename_stem_normalizes_prefix_and_extension() {
+        // 带扩展名（stream_gears）与不带扩展名（ffmpeg 去扩展名）归一到同一词干
+        assert_eq!(
+            filename_stem(Path::new("小黄人2026-07-08T12_00_00.flv")),
+            "小黄人2026-07-08T12_00_00"
+        );
+        assert_eq!(
+            filename_stem(Path::new("小黄人2026-07-08T12_00_00")),
+            "小黄人2026-07-08T12_00_00"
+        );
+        // 带路径前缀也归一到同一词干
+        assert_eq!(
+            filename_stem(Path::new("./data/小黄人2026-07-08T12_00_00.mp4")),
+            "小黄人2026-07-08T12_00_00"
+        );
+        // 空/无文件名
+        assert_eq!(filename_stem(Path::new("")), "");
+    }
+
+    #[tokio::test]
+    async fn match_streamer_by_filename_resolves_via_filelist() {
+        use crate::server::infrastructure::connection_pool::ConnectionManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        // filelist.streamer_info_id 外键指向 streamerinfo，先建对应主播行
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(42_i64)
+        .bind("小黄人")
+        .bind("https://example.com/live")
+        .bind("直播标题")
+        .bind(Utc::now())
+        .bind("")
+        .execute(&pool)
+        .await
+        .unwrap();
+        // filelist 存的是录制时的文件名（带扩展名，stream_gears）
+        sqlx::query("INSERT INTO filelist (file, streamer_info_id) VALUES (?1, ?2)")
+            .bind("小黄人2026-07-08T12_00_00.flv")
+            .bind(42_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 磁盘列表给的同名 basename → 命中 42
+        assert_eq!(
+            match_streamer_by_filename(&pool, Path::new("小黄人2026-07-08T12_00_00.flv"))
+                .await
+                .unwrap(),
+            Some(42)
+        );
+        // 扩展名不同/带路径前缀 → 仍按词干命中 42
+        assert_eq!(
+            match_streamer_by_filename(&pool, Path::new("./小黄人2026-07-08T12_00_00.mp4"))
+                .await
+                .unwrap(),
+            Some(42)
+        );
+        // 不存在的文件 → None（调用方走占位兜底）
+        assert_eq!(
+            match_streamer_by_filename(&pool, Path::new("别人2099-01-01T00_00_00.flv"))
+                .await
+                .unwrap(),
+            None
         );
     }
 }

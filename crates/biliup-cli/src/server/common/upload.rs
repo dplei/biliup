@@ -24,6 +24,7 @@ use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::hook_step::{
     HookStep, process_video, process_video_paths,
 };
+use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use crate::server::infrastructure::models::{InsertFileItem, StreamerInfo, UploadMissingSegment};
 use async_channel::Receiver;
@@ -900,6 +901,13 @@ pub async fn manual_recover_missing_segment(
             .fetch_one(pool)
             .await
             .change_context(AppError::Unknown)?;
+        // 载入主播配置，取其 postprocessor 用于补传成功后清理本地文件（对齐自动补传路径）。
+        let live_streamer = LiveStreamer::select()
+            .where_("id = ?")
+            .bind(row.live_streamer_id)
+            .fetch_one(pool)
+            .await
+            .change_context(AppError::Unknown)?;
 
         let upload_context =
             initialize_upload_context(config, &StatelessClient::default(), &upload_config).await?;
@@ -977,6 +985,18 @@ pub async fn manual_recover_missing_segment(
             return Err(error_stack::Report::new(AppError::Custom(
                 "missing segment has neither upload_session_id nor aid".to_string(),
             )));
+        }
+
+        // 补传成功并入稿/入会话后，按主播 postprocessor 清理本地文件，对齐自动补传路径
+        // recover_due_missing_segments。Unfixable（时间戳无法修复）保留本地文件，留待手动处理。
+        if !matches!(outcome, RepairOutcome::Unfixable)
+            && let Some(processor) = &live_streamer.postprocessor
+            && let Err(e) = process_video(&[path.as_path()], processor).await
+        {
+            error!(
+                row_id = row.id,
+                "postprocessor failed after manual missing segment recovery: {:?}", e
+            );
         }
 
         Ok(())

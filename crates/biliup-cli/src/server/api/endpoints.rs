@@ -4,7 +4,9 @@ use crate::server::common::missing_segment::{
 use crate::server::common::upload::{
     build_studio, manual_recover_missing_segment, retry_missing_segment, submit_to_bilibili, upload,
 };
-use crate::server::common::upload_session::missing_status_where;
+use crate::server::common::upload_session::{
+    get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
+};
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
@@ -568,9 +570,11 @@ pub struct PostUploads {
 // #[debug_handler]
 pub async fn post_uploads(
     State(config): State<Arc<RwLock<Config>>>,
+    State(pool): State<ConnectionPool>,
     Json(json_data): Json<PostUploads>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let upload_config = json_data.params;
+    let files = json_data.files;
     let (line, limit, submit_api) = {
         let config = config.read().unwrap();
         let line = UploadLine::from_str(&config.lines, true).ok();
@@ -578,7 +582,40 @@ pub async fn post_uploads(
         let submit_api = config.submit_api.clone();
         (line, limit, submit_api)
     };
-    info!("通过页面开始上传");
+
+    // 按第一段文件（P1）反查它属于哪个主播，用真实 StreamerInfo 填标题/简介模板。
+    // 未命中（手动拷入、不在 filelist 的文件）沿用占位兜底，不阻断上传。
+    let placeholder = || {
+        StreamerInfo::new(
+            &upload_config.template_name,
+            "stream_title",
+            "",
+            Utc::now(),
+            "",
+        )
+    };
+    let (streamer_info, matched, streamer_name) = match files.first() {
+        Some(first) => match match_streamer_by_filename(&pool, first).await {
+            Ok(Some(sid)) => match load_streamer_info(&pool, sid).await {
+                Ok(info) => {
+                    let name = info.name.clone();
+                    (info, true, Some(name))
+                }
+                Err(e) => {
+                    error!(?e, "历史文件上传：streamer_info 载入失败，回退占位");
+                    (placeholder(), false, None)
+                }
+            },
+            Ok(None) => (placeholder(), false, None),
+            Err(e) => {
+                error!(?e, "历史文件上传：反查主播失败，回退占位");
+                (placeholder(), false, None)
+            }
+        },
+        None => (placeholder(), false, None),
+    };
+
+    info!(matched, ?streamer_name, "通过页面开始上传");
     tokio::spawn(async move {
         let (bilibili, videos) = upload(
             upload_config
@@ -587,21 +624,12 @@ pub async fn post_uploads(
                 .unwrap_or("cookies.json"),
             None,
             line,
-            &json_data.files,
+            &files,
             limit as usize,
         )
         .await?;
         if !videos.is_empty() {
-            let recorder = Recorder::new(
-                upload_config.title.clone(),
-                StreamerInfo::new(
-                    &upload_config.template_name,
-                    "stream_title",
-                    "",
-                    Utc::now(),
-                    "",
-                ),
-            );
+            let recorder = Recorder::new(upload_config.title.clone(), streamer_info);
             let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
             let response_data =
                 submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
@@ -610,7 +638,10 @@ pub async fn post_uploads(
         Ok::<_, Report<AppError>>(())
     });
 
-    Ok(Json(serde_json::json!({})))
+    Ok(Json(serde_json::json!({
+        "matched": matched,
+        "streamer_name": streamer_name,
+    })))
 }
 
 #[derive(serde::Deserialize)]
