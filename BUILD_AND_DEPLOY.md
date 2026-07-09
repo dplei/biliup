@@ -9,8 +9,15 @@
 ## 0. 为什么是这套流程
 
 - 服务器是 **amd64**，开发机是 **arm64** → 必须 `buildx --platform linux/amd64` 交叉构建，否则服务器拉下来跑不了。
-- amd64 在 arm Mac 上靠 **QEMU 模拟**编译，且 release profile 开了 `lto=true, codegen-units=1`（见 workspace `Cargo.toml`），编译慢（M2 Air 8 核全满约 **15–20 分钟**），属一次性成本，无法绕过。
+- amd64 在 arm Mac 上靠 **QEMU 模拟**编译。release profile 现为 `lto="thin", codegen-units=16`（见 workspace `Cargo.toml`，对 I/O 密集型服务运行性能影响可忽略，但显著缩短交叉编译）。**冷构建**（首次 / 缓存失效）M2 Air 约 **15–20 分钟**；**增量构建**（复用缓存，只改了少量 Rust/前端）约 **9–10 分钟**。详见下方「构建缓存机制」。
 - 构建上下文 = 本仓库根目录（含本地改动）。`Dockerfile` 有 `if [ ! -f biliup.spec ]` 守卫：本地存在 `biliup.spec` → 用本地源码而非 clone 上游，**本地改动会进镜像**。
+
+### 构建缓存机制（为什么增量只要 ~10 分钟）
+两层缓存共同作用，日常发版基本都走增量：
+1. **BuildKit cargo cache mount**（`Dockerfile` 编译阶段）：`--mount=type=cache` 挂了 `/usr/local/cargo/registry`、`/usr/local/cargo/git`、`/biliup/target` 三处。依赖 crate 与已编译产物跨构建复用，改几个文件时只重编受影响的 crate，不再全量重编。⚠️ `target/` 是临时挂载**不进镜像层**，产物 wheel 必须拷到 `/wheels` 普通目录，否则下一阶段 `COPY --from` 取不到。
+2. **持久化 buildx 构建器 `biliup-builder`**（docker-container 驱动）：cache mount 存活在这个构建器里，**复用构建器**才有缓存命中，别每次重建。构建器健在即可，`docker buildx ls` 看它在。
+- 缓存失效（→ 退回冷构建）的常见诱因：改了 `Cargo.toml`/`Cargo.lock`（依赖树变动触发 `cargo fetch`+重编）、Dockerfile 前置层变动、或删了 `biliup-builder`。
+- 提速可复用同一构建器，无需清缓存；只有怀疑缓存损坏时才 `docker buildx prune`。
 
 ### 运行架构提醒（改 bug 前必看）
 - **Rust 是现役路径**：`crates/biliup-cli`、`crates/biliup`、`crates/stream-gears`。
@@ -115,6 +122,7 @@ docker compose pull && docker compose up -d
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
+| `1bef1de1` | `1.2.2-histfill` | 修两处上传遗漏：①**手动缺失补传后不删本地文件**：`manual_recover_missing_segment` 补传成功后只删了时间戳修复临时文件、从不删原始录像（与自动路径 `recover_due_missing_segments` 不一致，磁盘堆积）。修复：补传成功并入稿/入会话后，载入主播 `LiveStreamer.postprocessor` 跑 `process_video` 清理本地文件（`Unfixable` 保留待手动处理），对齐自动路径。②**投稿管理历史文件上传丢主播信息**：`post_uploads` 硬编码伪造占位 `StreamerInfo`（name=模板名、url="stream_title"、title=空），标题/简介模板 `{streamer}`/`{title}`/`{url}` 退化为通用模板。修复：新增纯函数 `filename_stem` + `match_streamer_by_filename`（按 `files[0]` 的 basename 词干在 `filelist` 反查 `streamer_info_id`），`post_uploads` 载入真实 `StreamerInfo` 填模板、未命中占位兜底，返回 `{matched, streamer_name}`，前端 Semi `Toast`/`Notification` 提示匹配到的主播。前提：下载器用 **stream-gears**（文件名带扩展名可匹配；ffmpeg 去扩展名不在范围）。含 `filename_stem`/`match_streamer_by_filename` 单测；`SQLX_OFFLINE=true cargo check -p biliup-cli` 通过；buildx `linux/amd64` 增量构建 ~10.4min（缓存命中），推送 `latest`+`1.2.2-histfill`，远端 digest=`sha256:1bef1de1707c348efb55f6f653534f03f3359369330bf4bbaf354edd6de98ff1`。 |
 | `e038a020` | `1.2.2-overridefix` | 修复录播管理「配置覆写」保存后清空投稿模板/既有录播字段：覆写弹窗提交时保留当前主播的 `upload_streamers_id`、`filename_prefix`、`time_range`、处理器等持久字段，只把下载/平台设置写入 `override`，并修正前端类型字段 `filename_prefix`。验证：`SQLX_OFFLINE=true cargo check -p biliup-cli` 通过；Docker buildx `linux/amd64` 增量构建并推送 `latest` + `1.2.2-overridefix`，远端 digest=`sha256:e038a02026518bcd77fdcf149516f0db7dc323a85316a7129478e357a449f78b`。 |
 | `a7af970d` | `1.2.2-probeclass` | 上传自动选线探测加并发和 maxtime：列表探测 5s、单线探测 4s、总探测 10s、并发 4，避免预先 ping 长时间拖累整体上传进度；下载侧先做原因分类，不改变重连/切片策略，区分 `IncompleteFrame`/`ReadTimeout`/`HttpStatus`/通用错误，便于后续按真实原因优化。验证：`SQLX_OFFLINE=true cargo check -p biliup-cli` 通过；Docker buildx `linux/amd64` 构建并推送 `latest` + `1.2.2-probeclass`，远端 digest=`sha256:a7af970d304949269e3cdbdbcd96b6462b8e2e4aa68d7607c8f9db4cedd3c699`。 |
 | `03a508f7` | `1.2.2-missingctl` | 缺失补传删除/重试控制 + 严格选路 + 小分段诊断：①状态助手 `can_delete_missing_segment`(仅 pending/failed)、`reset_for_manual_retry`(uploading→failed 置 next_retry_at=now)、幂等清理 `remove_missing_segment_files`(视频+弹幕，缺文件不报错)。②`DELETE /v1/uploads/missing/{id}` 删缺失记录：先 claim 置 deleting 原子占用再删本地文件与 DB 行，清理失败回写 last_error。③`POST /v1/uploads/missing/{id}/retry` 重试卡住的 uploading 行：先 reset 为 failed 再复用 manual_recover，绕开原子 claim 的 no-op。④严格自动选路：`Probe::probe` 逐条记录每条线路探测，全部失败即报 "no upload line probe succeeded"，不再 `unwrap_or_default()` 静默退回默认线（纯函数 `choose_fastest_successful_line` 含单测，替换 server/CLI 共 4 处静默回退）。⑤前端 missing 页 uploading 行「重新补投」、pending/failed 行「补传+删除」。⑥小分段诊断：httpflv chunk 读取拆四分支(正常/EOF/读错/超时)分别告警、stream_gears 记录流 host、download check_stream 记录 check_elapsed。cargo test missing_segment 16 passed + choose_fastest_successful_line 2 passed。⚠️前端在本机 pnpm 半安装(blockExoticSubdeps 拦 mpegts.js git 子依赖)未跑 build，待部署机验证。 |
