@@ -5,5 +5,5 @@ pub mod config;
 pub mod core;
 pub mod errors;
 pub mod infrastructure;
-mod router;
+pub mod router;
 // use tokio::sync::mpsc::Receiver;

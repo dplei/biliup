@@ -57,7 +57,9 @@ error-stack = { workspace = true }
 bon = { workspace = true }
 axum-login = "0.18.0"
 password-auth = "1.0.0"
-tower = "0.5.2"
+# util 提供 ServiceExt::oneshot：路由与集成测试都直接用到，
+# 显式开启以免依赖特性统一的偶然结果。
+tower = { version = "0.5.2", features = ["util"] }
 tower-sessions = { version = "0.14.0", default-features = false, features = [
     "signed",
 ] }
