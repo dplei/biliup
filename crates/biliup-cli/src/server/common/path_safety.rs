@@ -8,6 +8,7 @@
 //! 日志与录播视频，而后续的封面背景图上传要限定在背景图目录。两者规则相同、根不同，
 //! 共用一个函数可确保规则不会漂移。
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 /// 路径被拒绝的原因。
@@ -80,6 +81,22 @@ pub fn resolve_within(root: &Path, user_path: &str) -> Result<PathBuf, PathRejec
     }
 
     Ok(parent.join(file_name))
+}
+
+/// 用户给的值是不是「一个纯文件名」——单段、不带任何目录。
+///
+/// 与 `resolve_within` 分工不同，两者都需要：那个管「不许越界」，这个管「必须是一个
+/// 文件名」。背景图的解析侧（`upload::background_path`）只认单段文件名，带子目录的值
+/// 即便安全、即便文件真的存在，投稿时也会被当成「没填」而悄悄回退纯黑。
+///
+/// 收在这里而不是各处各写一遍：上传、投稿解析、预览三处必须是同一条规则，
+/// 否则「上传得进去、投稿用不上」这类哑失败迟早从缝里漏出来。
+pub fn single_segment_name(value: &str) -> Option<&OsStr> {
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => Some(name),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -243,5 +260,24 @@ mod tests {
             resolve_within(&logs, "../images/b.jpg"),
             Err(PathRejection::Traversal)
         );
+    }
+
+    #[test]
+    fn single_segment_accepts_plain_file_name() {
+        assert_eq!(
+            single_segment_name("aurora.png"),
+            Some(OsStr::new("aurora.png"))
+        );
+    }
+
+    /// 带目录的值走不到背景解析侧，必须在此判否——注意这不是越界防线，
+    /// 那道在 `resolve_within`。这里拦的是「即使安全也用不了」的写法。
+    #[test]
+    fn single_segment_rejects_anything_with_directories() {
+        assert_eq!(single_segment_name("nested/aurora.png"), None);
+        assert_eq!(single_segment_name("../aurora.png"), None);
+        assert_eq!(single_segment_name("/etc/aurora.png"), None);
+        assert_eq!(single_segment_name("./aurora.png"), None);
+        assert_eq!(single_segment_name(""), None);
     }
 }

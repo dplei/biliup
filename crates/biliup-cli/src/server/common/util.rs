@@ -1,6 +1,7 @@
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::StreamerInfo;
 use crate::server::infrastructure::models::hook_step::HookStep;
+use chrono::format::{Item, StrftimeItems};
 use chrono::{Duration, Local};
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
@@ -72,12 +73,36 @@ impl Recorder {
             .to_string()
     }
 
+    /// 展开 `{streamer}` 等占位符与时间格式；时间格式串非法时返回 None。
+    ///
+    /// 独立于 `format` 存在，是因为 chrono 对非法格式串（例如落单的 `%`）不是报错而是
+    /// **panic**：`DelayedFormat` 的 Display 返回 Err，`to_string()` 直接炸。模板一旦来自
+    /// 用户当场输入——封面预览接口正是如此——手滑一个 `%` 就能把请求打崩。
+    ///
+    /// 校验的是**替换之后**的串：主播名、直播标题里都可能带 `%`，只验模板原文会漏。
+    pub fn try_format(&self, template: &str) -> Option<String> {
+        let substituted = self.template_with(template);
+
+        if StrftimeItems::new(&substituted).any(|item| matches!(item, Item::Error)) {
+            return None;
+        }
+
+        Some(
+            self.streamer_info
+                .date
+                .with_timezone(&Local)
+                .format(&substituted)
+                .to_string(),
+        )
+    }
+
+    /// 非法格式串退化成「占位符原样保留」而非 panic：封面只是稿件的附属品，
+    /// 不值得让一整场录播的提交因为模板里一个 `%` 而炸掉整个上传任务。
     pub fn format(&self, template: &str) -> String {
-        self.streamer_info
-            .date
-            .with_timezone(&Local)
-            .format(&self.template_with(template))
-            .to_string()
+        self.try_format(template).unwrap_or_else(|| {
+            error!(template, "时间格式串不合法，占位符按原样保留");
+            self.template_with(template)
+        })
     }
 
     /// 直接生成带扩展名的完整路径（当前目录下）
@@ -290,6 +315,57 @@ mod tests {
             ),
             "小桐人_备注 %H:%M:%S"
         );
+    }
+
+    /// 固定时刻的录制器，供下面几条格式化用例共用。
+    fn recorder_at(template: Option<&str>) -> Recorder {
+        let date = Local
+            .with_ymd_and_hms(2026, 7, 23, 20, 5, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        Recorder::new(
+            template.map(str::to_string),
+            StreamerInfo::new("小桐人", "https://example.com", "直播标题", date, ""),
+        )
+    }
+
+    #[test]
+    fn try_format_expands_placeholders_and_time() {
+        let recorder = recorder_at(None);
+
+        assert_eq!(
+            recorder.try_format("{streamer}\\n%Y-%m-%d %H点场"),
+            Some("小桐人\\n2026-07-23 20点场".to_string())
+        );
+    }
+
+    /// 落单的 `%` 不是合法的时间格式说明符。
+    #[test]
+    fn try_format_rejects_dangling_percent() {
+        assert_eq!(recorder_at(None).try_format("主播 %"), None);
+    }
+
+    /// 这条同时证明了 `try_format` 为什么必须存在：chrono 对非法格式串是 **panic**
+    /// 而非报错，`format` 若直接调 `to_string()`，本用例会当场炸掉而不是失败。
+    /// 现在它退化成「占位符原样保留」，投稿流程不会被模板里一个 `%` 拖垮。
+    #[test]
+    fn format_degrades_instead_of_panicking_on_invalid_specifier() {
+        assert_eq!(recorder_at(None).format("主播 %"), "主播 %");
+    }
+
+    /// 主播名里带 `%` 时，校验必须发生在**替换之后**——只验模板原文会漏掉它。
+    #[test]
+    fn try_format_validates_after_substitution() {
+        let date = Local
+            .with_ymd_and_hms(2026, 7, 23, 20, 5, 0)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let recorder = Recorder::new(
+            None,
+            StreamerInfo::new("100%", "https://example.com", "直播标题", date, ""),
+        );
+
+        assert_eq!(recorder.try_format("{streamer}"), None);
     }
 
     #[test]

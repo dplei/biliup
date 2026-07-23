@@ -6,7 +6,7 @@
 //! 路径安全一律走 `path_safety::resolve_within`，与静态文件接口同一个函数、
 //! 只是根目录不同——两处规则共用一份实现才不会随时间漂移。
 
-use crate::server::common::path_safety::resolve_within;
+use crate::server::common::path_safety::{resolve_within, single_segment_name};
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Multipart, State};
@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde_json::json;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use tracing::{error, warn};
 
 /// 单个背景图的体积上限。背景图渲染出来是 1146×717，正常成品也就几百 KB；
@@ -129,15 +129,12 @@ async fn next_file_field(multipart: &mut Multipart) -> Option<UploadedFile> {
 /// 解析侧对齐：`upload::background_path` 只认单段文件名，带子目录的即使落了盘，
 /// 投稿时也会被当成「没填」而悄悄回退纯黑。在入口就拒绝，把哑失败变成明确的报错。
 fn expected_format(file_name: &str) -> Option<image::ImageFormat> {
-    let path = Path::new(file_name);
+    single_segment_name(file_name)?;
 
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => {}
-        _ => return None,
-    }
-
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let extension = Path::new(file_name)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
     ALLOWED_EXTENSIONS
         .iter()
         .find(|(name, _)| *name == extension)

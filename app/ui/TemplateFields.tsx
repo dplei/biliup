@@ -26,6 +26,7 @@ import {
 import useSWR from 'swr'
 import { API_BASE, BiliType, fetcher, StudioEntity } from '../lib/api-streamer'
 import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
+import CoverPreviewButton from './CoverPreviewButton'
 
 /** 背景图体积上限，与服务端的 MAX_UPLOAD_BYTES 一致；超限在选择时就拦下，省一次白跑的请求。 */
 const BACKGROUND_MAX_MB = 10
@@ -303,6 +304,12 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
           placeholder="留空为纯黑底；示例：aurora.jpg"
           extraText="仅在填了「封面文字模板」时生效，文字压在这张图上。填文件名即可，可用下方按钮直接上传"
         />
+        <Form.Slot label={{ text: '预览封面' }}>
+          <CoverPreviewButton
+            template={values.cover_template}
+            background={values.cover_background}
+          />
+        </Form.Slot>
         <Form.Slot label={{ text: '上传背景图' }}>
           <Upload
             action={`${API_BASE}/v1/cover-backgrounds`}

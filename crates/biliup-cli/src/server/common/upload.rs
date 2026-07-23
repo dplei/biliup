@@ -8,6 +8,7 @@ use crate::server::common::missing_segment::{
     mark_retry_success, next_segment_order, patch_studio_videos, reset_for_manual_retry,
     upload_line_for_recovery,
 };
+use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
@@ -41,7 +42,7 @@ use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
 use ormlite::Model;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -733,14 +734,11 @@ pub(crate) const BACKGROUND_DIR: &str = "data/cover-backgrounds";
 fn background_path(value: Option<&str>) -> Option<PathBuf> {
     let name = value.map(str::trim).filter(|s| !s.is_empty())?;
 
-    let mut components = Path::new(name).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(file_name)), None) => {
-            Some(Path::new(BACKGROUND_DIR).join(file_name))
-        }
+    match single_segment_name(name) {
+        Some(file_name) => Some(Path::new(BACKGROUND_DIR).join(file_name)),
         // 配了值却用不了，比压根没配更难排查：不留一行日志的话，
         // 用户只会看到封面莫名其妙变黑，还以为是自己没保存成功。
-        _ => {
+        None => {
             warn!(value = name, "封面背景图配置的不是一个文件名，按未配置处理");
             None
         }
