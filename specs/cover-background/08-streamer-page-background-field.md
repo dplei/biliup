@@ -13,4 +13,20 @@
 - [ ] 复用 06 的上传接口，不新增第二个上传接口
 - [ ] 预览按钮传入主播级的背景值（复用 07 的接口）
 - [ ] 清空该字段后回退到模板的背景，与 05 的解析逻辑一致
+- [ ] 该字段清空时必须**提交上来一个空字符串**，不能整项缺失（见下方约束）
+- [ ] 把 `cover_background` 加进 `OverrideModal` 的 `baseValues` 白名单，否则该字段在主播页保存时不参与提交
 - [ ] 沿用现有表单组件库，不引入新的 UI 依赖
+
+## 来自 05 的约束（务必先读）
+
+`put_streamers_endpoint` 有一条守卫：**载荷里 `cover_background` 整项缺失就沿用库里的值**。
+它存在的理由是本票落地前旧前端会把该字段清成 NULL（`OverrideModal` 用显式白名单拼载荷，
+字段不在白名单里就等于缺项）。
+
+副作用是：**清空必须是一个显式的值**。Semi 的 Form 默认 `allowEmpty: false`，空字符串会被
+当成 undefined、键不进 `values`；`OverrideModal` 还额外 `filter(value !== undefined)`。
+照常写的话，用户点清空提交的是缺项 → 被守卫还原 → 字段永远清不掉。
+
+二选一：给该字段设 `allowEmpty`（空串会被解析函数当作未配置，语义正好对，端点不用动，
+**推荐**），或者显式发 `null` 并同时改端点判定（目前 serde 把缺项与显式 null 都读成 `None`，
+要区分得上 `Option<Option<String>>`）。

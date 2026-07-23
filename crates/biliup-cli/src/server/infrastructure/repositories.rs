@@ -195,6 +195,36 @@ pub async fn upsert_upload_streamer_by_template_name(
     }
 }
 
+/// 按 id 取主播行；没有对应行时返回 None。
+///
+/// 与 `get_streamer` 的区别只在「查不到」：那个报错，这个返回 None。
+/// 调用方需要区分「行不存在」与「查库失败」时用这个——把两者混为一谈会让
+/// 一次数据库抖动被当成「这行没配」，进而覆盖掉真实配置。
+pub async fn find_streamer(pool: &ConnectionPool, id: i64) -> AppResult<Option<LiveStreamer>> {
+    LiveStreamer::select()
+        .where_("id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)
+}
+
+/// 按直播间 URL 取主播行；没有对应主播时返回 None。
+///
+/// 历史文件上传这条路径只反查得到 `StreamerInfo`（它带 URL），拿它再取主播行，
+/// 是为了让封面背景的「主播 → 模板 → 纯黑」优先级在手动上传时同样成立。
+pub async fn get_streamer_by_url(
+    pool: &ConnectionPool,
+    url: &str,
+) -> AppResult<Option<LiveStreamer>> {
+    LiveStreamer::select()
+        .where_("url = ?")
+        .bind(url)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)
+}
+
 /// 插入或更新直播间配置，按 URL 保持幂等。
 pub async fn upsert_live_streamer_by_url(
     pool: &ConnectionPool,

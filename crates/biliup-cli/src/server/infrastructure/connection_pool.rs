@@ -59,3 +59,20 @@ impl ConnectionManager {
         Ok(pool)
     }
 }
+
+/// 测试专用工具，供各模型模块的迁移往返测试共用。
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+
+    /// 建一个跑完全部迁移的空库。返回的临时目录须由调用方持有——它一旦被丢弃，
+    /// 库文件就没了。
+    pub async fn migrated_pool() -> (tempfile::TempDir, ConnectionPool) {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        let pool = ConnectionManager::new_pool(db_path.to_str().expect("临时路径非法 UTF-8"))
+            .await
+            .expect("建库或跑迁移失败");
+        (dir, pool)
+    }
+}

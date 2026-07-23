@@ -23,7 +23,7 @@ use crate::server::infrastructure::models::{
     Configuration, FileItem, InsertConfiguration, StreamerInfo,
 };
 use crate::server::infrastructure::repositories::{
-    del_streamer, get_all_streamer, get_upload_config,
+    del_streamer, find_streamer, get_all_streamer, get_streamer_by_url, get_upload_config,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::{LogHandle, UploadLine};
@@ -110,8 +110,21 @@ pub async fn put_streamers_endpoint(
     State(service_register): State<ServiceRegister>,
     State(managers): State<Arc<DownloadManager>>,
     State(pool): State<ConnectionPool>,
-    Json(payload): Json<LiveStreamer>,
+    Json(mut payload): Json<LiveStreamer>,
 ) -> Result<Json<LiveStreamer>, Response> {
+    // 载荷里整项缺失就沿用库里的值。这条路由收的是 LiveStreamer 本身，而主播编辑页
+    // 拼载荷用的是显式白名单（见 OverrideModal 的 baseValues），背景字段那一票落地前
+    // 不会出现在里面；缺项被 serde 读成 None，直接 update_all_fields 就把配好的背景清空了。
+    //
+    // 查库失败必须往上抛，不能降级成「按载荷原样更新」——那会把一次数据库抖动
+    // 变成一次配置丢失。查不到行（None）则维持载荷原样，交给 update_all_fields 空转。
+    if payload.cover_background.is_none() {
+        payload.cover_background = find_streamer(&pool, payload.id)
+            .await
+            .map_err(report_to_response)?
+            .and_then(|row| row.cover_background);
+    }
+
     let streamer = payload
         .update_all_fields(&pool)
         .await
@@ -615,6 +628,21 @@ pub async fn post_uploads(
         None => (placeholder(), false, None),
     };
 
+    // 主播级背景覆盖模板级。只在真的反查到主播时才查它的背景——未命中时 streamer_info
+    // 是占位对象，它的 url 不是真实直播间地址，拿去查库等于赌「不会撞上任何一行」。
+    // 查库失败退到模板级，不阻断上传。
+    let streamer_background = if matched {
+        match get_streamer_by_url(&pool, &streamer_info.url).await {
+            Ok(streamer) => streamer.and_then(|s| s.cover_background),
+            Err(e) => {
+                error!(?e, "历史文件上传：取主播背景失败，回退到模板级背景");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(matched, ?streamer_name, "通过页面开始上传");
     tokio::spawn(async move {
         let (bilibili, videos) = upload(
@@ -630,7 +658,14 @@ pub async fn post_uploads(
         .await?;
         if !videos.is_empty() {
             let recorder = Recorder::new(upload_config.title.clone(), streamer_info);
-            let studio = build_studio(&upload_config, &bilibili, videos, &recorder).await?;
+            let studio = build_studio(
+                &upload_config,
+                streamer_background.as_deref(),
+                &bilibili,
+                videos,
+                &recorder,
+            )
+            .await?;
             let response_data =
                 submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
             info!("通过页面上传成功 {:?}", response_data);

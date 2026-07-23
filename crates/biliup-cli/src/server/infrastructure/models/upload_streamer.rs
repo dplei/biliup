@@ -98,17 +98,7 @@ pub struct InsertUploadStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::infrastructure::connection_pool::{ConnectionManager, ConnectionPool};
-
-    /// 建一个跑完全部迁移的空库。
-    async fn migrated_pool() -> (tempfile::TempDir, ConnectionPool) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
-            .await
-            .unwrap();
-        (dir, pool)
-    }
+    use crate::server::infrastructure::connection_pool::test_support::migrated_pool;
 
     /// 迁移建出来的列名、类型要与模型对得上，否则线上一读就炸。
     /// 这条是迁移本身唯一的验证——它跑通才说明 7_add_cover_background.sql 真的生效了。

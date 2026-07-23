@@ -113,6 +113,7 @@ where
                 &upload_context,
                 ctx.pool(),
                 upload_config,
+                ctx.live_streamer().cover_background.as_deref(),
                 config.season_section_id,
                 config.submit_api.as_deref(),
                 ctx.streamer_info(),
@@ -232,6 +233,7 @@ async fn submit_session(
     upload_context: &UploadContext,
     pool: &ConnectionPool,
     upload_config: &UploadStreamer,
+    streamer_background: Option<&str>,
     season_section_id: Option<i64>,
     submit_api: Option<&str>,
     streamer_info: &StreamerInfo,
@@ -240,7 +242,14 @@ async fn submit_session(
 ) -> AppResult<()> {
     let bilibili = &upload_context.bilibili;
     let recorder = Recorder::new(upload_config.title.clone(), streamer_info.clone());
-    let studio = build_studio(upload_config, bilibili, videos.to_vec(), &recorder).await?;
+    let studio = build_studio(
+        upload_config,
+        streamer_background,
+        bilibili,
+        videos.to_vec(),
+        &recorder,
+    )
+    .await?;
     info!(
         n_videos = videos.len(),
         title = %recorder.format_filename(),
@@ -360,6 +369,7 @@ async fn prepare_archive(
             upload_context,
             ctx.pool(),
             upload_config,
+            ctx.live_streamer().cover_background.as_deref(),
             config.season_section_id,
             config.submit_api.as_deref(),
             &streamer_info,
@@ -712,29 +722,51 @@ fn resolve_source(copyright_source: Option<&str>, fallback_url: &str) -> String 
 /// 换挂载点或迁移部署时数据库里存的文件名无需跟着改。
 const BACKGROUND_DIR: &str = "data/cover-backgrounds";
 
-// 解析封面背景：模板配了文件名就用那张图，否则纯黑。
+// 把库里存的一个值变成可用的背景图路径，值不可用时返回 None（等同于「没填」）。
+//
 // 空值语义与上面的 resolve_source 一致——NULL 和空白字符串都算「没填」，
 // 因为前端表单留空提交的是 Some("")，不做 trim 就会当成配了一张名为空的图。
-// 纯函数：只做路径拼接，不碰数据库也不读文件；图存不存在由渲染器判断（读不到会退回纯黑）。
-fn resolve_background(template_background: Option<&str>) -> Background {
-    let Some(name) = template_background.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Background::Black;
-    };
+//
+// 库里存的必须是「一个文件名」。带目录、`..`、绝对路径一律按没填处理：
+// Path::join 碰上绝对路径会把基路径整段丢掉（join("/etc/x") 就是 "/etc/x"），
+// 不在这里拦住，库里一个值就能让渲染器去读目录外的文件。
+fn background_path(value: Option<&str>) -> Option<PathBuf> {
+    let name = value.map(str::trim).filter(|s| !s.is_empty())?;
 
-    // 库里存的必须是「一个文件名」。带目录、`..`、绝对路径一律按没填处理：
-    // Path::join 碰上绝对路径会把基路径整段丢掉（join("/etc/x") 就是 "/etc/x"），
-    // 不在这里拦住，库里一个值就能让渲染器去读目录外的文件。
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(file_name)), None) => {
-            Background::Image(Path::new(BACKGROUND_DIR).join(file_name))
+            Some(Path::new(BACKGROUND_DIR).join(file_name))
         }
-        _ => Background::Black,
+        // 配了值却用不了，比压根没配更难排查：不留一行日志的话，
+        // 用户只会看到封面莫名其妙变黑，还以为是自己没保存成功。
+        _ => {
+            warn!(value = name, "封面背景图配置的不是一个文件名，按未配置处理");
+            None
+        }
     }
 }
 
+// 解析封面背景，三级回退：主播 → 模板 → 纯黑。
+//
+// 不可用的值等同于没填，继续往下一级走而不是断在原地——主播那一级写错一个路径，
+// 不该把模板配好的背景一起废掉。
+//
+// 纯函数：只做路径拼接，不碰数据库也不读文件；图存不存在由渲染器判断（读不到会退回纯黑）。
+fn resolve_background(
+    streamer_background: Option<&str>,
+    template_background: Option<&str>,
+) -> Background {
+    background_path(streamer_background)
+        .or_else(|| background_path(template_background))
+        .map_or(Background::Black, Background::Image)
+}
+
+/// `streamer_background` 是主播那一级的背景图文件名，覆盖模板的同名设置；
+/// 取不到主播行时传 None，行为与只有模板级时一致。
 pub(crate) async fn build_studio(
     upload_config: &UploadStreamer,
+    streamer_background: Option<&str>,
     bilibili: &BiliBili,
     videos: Vec<Video>,
     recorder: &Recorder,
@@ -780,7 +812,10 @@ pub(crate) async fn build_studio(
         let text = recorder.format(tpl);
         let lines = split_template_lines(&text);
         let opts = CoverOptions {
-            background: resolve_background(upload_config.cover_background.as_deref()),
+            background: resolve_background(
+                streamer_background,
+                upload_config.cover_background.as_deref(),
+            ),
             ..CoverOptions::default()
         };
         match render_to_tempfile(&lines, &opts) {
@@ -1150,38 +1185,78 @@ mod tests {
     }
 
     #[test]
-    fn resolve_background_falls_back_to_black_when_none() {
-        // 模板未配置背景 —— 升级前的既有模板全都是这种状态，产出维持纯黑底
-        assert_black(resolve_background(None));
+    fn resolve_background_falls_back_to_black_when_both_levels_empty() {
+        // 两级都没配 —— 升级前的既有配置全都是这种状态，产出维持纯黑底
+        assert_black(resolve_background(None, None));
     }
 
     #[test]
-    fn resolve_background_uses_image_when_configured() {
+    fn resolve_background_uses_template_when_only_template_set() {
         // 存的是文件名，实际路径在运行时拼出来
-        assert_image(resolve_background(Some("aurora.jpg")), "aurora.jpg");
+        assert_image(resolve_background(None, Some("aurora.jpg")), "aurora.jpg");
+    }
+
+    #[test]
+    fn resolve_background_uses_streamer_when_only_streamer_set() {
+        assert_image(resolve_background(Some("nebula.jpg"), None), "nebula.jpg");
+    }
+
+    #[test]
+    fn resolve_background_prefers_streamer_over_template() {
+        // 主播级覆盖模板级——这是本级配置存在的全部意义
+        assert_image(
+            resolve_background(Some("nebula.jpg"), Some("aurora.jpg")),
+            "nebula.jpg",
+        );
     }
 
     #[test]
     fn resolve_background_trims_surrounding_whitespace() {
-        assert_image(resolve_background(Some("  aurora.jpg  ")), "aurora.jpg");
+        assert_image(
+            resolve_background(None, Some("  aurora.jpg  ")),
+            "aurora.jpg",
+        );
     }
 
     #[test]
     fn resolve_background_treats_blank_as_unset() {
         // 与 resolve_source 同一套空值语义：NULL（None）与空白字符串等价，都是「没填」
-        assert_black(resolve_background(Some("")));
-        assert_black(resolve_background(Some("   ")));
+        assert_black(resolve_background(None, Some("")));
+        assert_black(resolve_background(None, Some("   ")));
+    }
+
+    // 主播级填空白 = 没配，回退到模板。
+    // 已知限制：因此主播这一级无法表达「我就是要纯黑，别用模板那张图」——
+    // 见 spec 的 Further Notes，这是为与 resolve_source 语义一致而接受的代价。
+    #[test]
+    fn resolve_background_blank_streamer_falls_back_to_template() {
+        assert_image(
+            resolve_background(Some("   "), Some("aurora.jpg")),
+            "aurora.jpg",
+        );
+        assert_image(resolve_background(Some(""), Some("aurora.jpg")), "aurora.jpg");
     }
 
     // 库里存的必须是「一个文件名」。绝对路径尤其危险：Path::join 会把基路径整段丢掉，
     // 不拦的话库里一个值就能把渲染器指到背景图目录之外。
     #[test]
     fn resolve_background_rejects_anything_but_a_bare_file_name() {
-        assert_black(resolve_background(Some("/etc/passwd")));
-        assert_black(resolve_background(Some("../../etc/passwd")));
-        assert_black(resolve_background(Some("sub/aurora.jpg")));
-        assert_black(resolve_background(Some("..")));
-        assert_black(resolve_background(Some(".")));
+        assert_black(resolve_background(None, Some("/etc/passwd")));
+        assert_black(resolve_background(None, Some("../../etc/passwd")));
+        assert_black(resolve_background(None, Some("sub/aurora.jpg")));
+        assert_black(resolve_background(None, Some("..")));
+        assert_black(resolve_background(None, Some(".")));
+        assert_black(resolve_background(Some("/etc/passwd"), None));
+    }
+
+    // 不可用的值等同于没填，因此继续往下一级回退，而不是把整条链断在这里。
+    // 主播那一级写错一个路径，不该把模板配好的背景也一起废掉。
+    #[test]
+    fn resolve_background_unusable_streamer_value_falls_back_to_template() {
+        assert_image(
+            resolve_background(Some("/etc/passwd"), Some("aurora.jpg")),
+            "aurora.jpg",
+        );
     }
 }
 

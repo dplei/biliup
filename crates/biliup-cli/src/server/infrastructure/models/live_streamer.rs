@@ -47,6 +47,8 @@ pub struct LiveStreamer {
     pub opt_args: Option<Value>,
     /// 排除关键词
     pub excluded_keywords: Option<Value>,
+    /// 封面背景图文件名（留空=用所属模板的设置）。存文件名不存路径，实际路径运行时拼接。
+    pub cover_background: Option<String>,
 }
 
 /// 插入直播主播的数据结构
@@ -78,4 +80,93 @@ pub struct InsertLiveStreamer {
     pub postprocessor: Option<Vec<HookStep>>,
     pub opt_args: Option<Value>,
     pub excluded_keywords: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::infrastructure::connection_pool::{ConnectionPool, test_support::migrated_pool};
+
+    /// PUT /streamers 收的是 `LiveStreamer` 本身（见 `put_streamers_endpoint`），
+    /// 而前端在背景字段那一票落地前不会带上 cover_background。
+    /// 这条锁住「缺这一项仍能反序列化」——否则主播编辑页会整个 422。
+    #[test]
+    fn deserializes_when_frontend_omits_cover_background() {
+        let payload = r#"{"id":1,"url":"https://live.bilibili.com/1","remark":"甲"}"#;
+        let streamer: LiveStreamer = serde_json::from_str(payload).unwrap();
+
+        assert_eq!(streamer.cover_background, None);
+    }
+
+    async fn fetch_by_remark(pool: &ConnectionPool, remark: &str) -> LiveStreamer {
+        LiveStreamer::select()
+            .where_("remark = ?")
+            .bind(remark)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// 迁移建出来的列要与模型对得上，否则线上一读就炸。
+    /// 这是 8_add_streamer_cover_background.sql 唯一的验证。
+    #[tokio::test]
+    async fn cover_background_round_trips_through_database() {
+        let (_dir, pool) = migrated_pool().await;
+
+        sqlx::query(
+            "INSERT INTO livestreamers (url, remark, cover_background) VALUES (?1, ?2, ?3)",
+        )
+        .bind("https://live.bilibili.com/1")
+        .bind("甲主播")
+        .bind("nebula.jpg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = fetch_by_remark(&pool, "甲主播").await;
+        assert_eq!(row.cover_background.as_deref(), Some("nebula.jpg"));
+    }
+
+    /// 升级路径：既有主播不会因为多了一列而读不出来，未配置即 NULL。
+    #[tokio::test]
+    async fn existing_streamer_without_background_reads_as_none() {
+        let (_dir, pool) = migrated_pool().await;
+
+        sqlx::query("INSERT INTO livestreamers (url, remark) VALUES (?1, ?2)")
+            .bind("https://live.bilibili.com/2")
+            .bind("乙主播")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_by_remark(&pool, "乙主播").await.cover_background, None);
+    }
+
+    /// `update_all_fields` 会把模型里每一列都写回去——这正是主播编辑页可能清空背景的原因。
+    /// 这条锁住那个行为本身：载荷带着 None 更新，库里的值确实会没。
+    /// `put_streamers_endpoint` 因此在更新前把缺失的这一项补回来。
+    #[tokio::test]
+    async fn update_all_fields_overwrites_background_with_none() {
+        let (_dir, pool) = migrated_pool().await;
+
+        sqlx::query(
+            "INSERT INTO livestreamers (url, remark, cover_background) VALUES (?1, ?2, ?3)",
+        )
+        .bind("https://live.bilibili.com/3")
+        .bind("丙主播")
+        .bind("nebula.jpg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut row = fetch_by_remark(&pool, "丙主播").await;
+        row.cover_background = None;
+        row.update_all_fields(&pool).await.unwrap();
+
+        assert_eq!(
+            fetch_by_remark(&pool, "丙主播").await.cover_background,
+            None,
+            "update_all_fields 应当写回 None —— 端点必须自己补上缺失项"
+        );
+    }
 }
