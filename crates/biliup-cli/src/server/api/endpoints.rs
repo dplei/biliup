@@ -598,15 +598,7 @@ pub async fn post_uploads(
 
     // 按第一段文件（P1）反查它属于哪个主播，用真实 StreamerInfo 填标题/简介模板。
     // 未命中（手动拷入、不在 filelist 的文件）沿用占位兜底，不阻断上传。
-    let placeholder = || {
-        StreamerInfo::new(
-            &upload_config.template_name,
-            "stream_title",
-            "",
-            Utc::now(),
-            "",
-        )
-    };
+    let placeholder = || StreamerInfo::placeholder(&upload_config.template_name, Utc::now());
     let (streamer_info, matched, streamer_name) = match files.first() {
         Some(first) => match match_streamer_by_filename(&pool, first).await {
             Ok(Some(sid)) => match load_streamer_info(&pool, sid).await {

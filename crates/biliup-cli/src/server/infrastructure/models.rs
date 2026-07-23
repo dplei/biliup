@@ -44,6 +44,34 @@ impl StreamerInfo {
             live_cover_path: live_cover_path.to_string(),
         }
     }
+
+    /// 反查不到主播时的占位信息：名字取自上传模板名，其余字段一律留空。
+    ///
+    /// 留空是有意的。这些字段会流进投稿：`url` 是「转载来源」在未显式配置时的兜底值，
+    /// `title` 会展开进标题与简介模板。宁可空着让人看出「这里没信息」，
+    /// 也不要塞一个看起来像数据的假值——那会被原样提交到 B 站。
+    ///
+    /// 单独开一个构造器，是因为 `new` 有三个相邻的 `&str` 参数，顺序写错照样编译。
+    pub fn placeholder(name: &str, date: DateTime<Utc>) -> Self {
+        Self::new(name, "", "", date, "")
+    }
+}
+
+#[cfg(test)]
+mod streamer_info_tests {
+    use super::*;
+
+    /// 锁住占位信息的字段映射。历史上这里的位置参数被写错过一位，
+    /// 结果「转载来源」被提交成了字面量 `stream_title`。
+    #[test]
+    fn placeholder_leaves_everything_but_name_empty() {
+        let info = StreamerInfo::placeholder("我的模板", Utc::now());
+
+        assert_eq!(info.name, "我的模板");
+        assert_eq!(info.url, "", "url 会成为转载来源的兜底值，必须留空");
+        assert_eq!(info.title, "", "title 会展开进标题与简介模板，必须留空");
+        assert_eq!(info.live_cover_path, "");
+    }
 }
 
 /// 文件列表模型
