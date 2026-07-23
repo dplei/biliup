@@ -69,7 +69,9 @@ docker buildx inspect biliup-builder --bootstrap   # 拉 buildkit 镜像，可�
 cd /Users/leii/Code/record/biliup
 
 # (1) 先本地 check，过了再 build，省一次几十分钟的白跑
-SQLX_OFFLINE=true cargo check -p biliup-cli
+#     必须 --workspace：镜像里 maturin 编的是 stream-gears，
+#     只 check biliup-cli 看不到它（见下方「check 的盲区」）
+SQLX_OFFLINE=true cargo check --workspace
 
 # (2) 交叉构建 amd64，--load 先入本地验证
 docker buildx build --builder biliup-builder --platform linux/amd64 \
@@ -81,6 +83,15 @@ docker buildx build --builder biliup-builder --platform linux/amd64 \
 ```
 - `<版本tag>` 用语义化标签，如 `1.2.1-season`、`1.2.1-segfix`（版本号取自 workspace `Cargo.toml` 的 `version`）。
 - **不要把 build 命令接 `| tail`**：tail 的退出码会被当成结果，失败也报 exit 0。
+
+### check 的盲区（曾让一次发版白跑 7 分钟）
+`cargo check -p biliup-cli` **检查不到 `stream-gears`**，而镜像里 `maturin build` 编的正是它
+（运行链路 `biliup server` → python wheel → `stream_gears` → biliup-cli `run()`）。
+两边各有一处对 `Commands` 枚举的穷举 match：`biliup-cli/src/main.rs` 和
+`stream-gears/src/server.rs::_main`。**给 CLI 加子命令必须同时改两处**，只改前者的话
+`-p biliup-cli` 照样通过，要等到 Docker 构建才报 `E0004: non-exhaustive patterns`。
+封面预览子命令就这么漏过一次，从 `c6e69cf` 起每次构建都会炸、直到 `1.2.2-coverbg` 才发现。
+→ 所以第 (1) 步固定用 `--workspace`。
 
 ---
 
@@ -115,6 +126,7 @@ docker compose pull && docker compose up -d
 | `apt-get` / npm `Unable to connect to host.docker.internal:7890` | 代理瞬时掉线。确认 Clash Allow LAN 开着、容器能连代理后重试。 |
 | build 中途 Docker Desktop 自己挂 | `open -a Docker` 重启，build 前先 `docker info` 确认。 |
 | 公共镜像源（docker.1ms.run 等）拉用户私有仓库 403 | 公共源对用户私有仓库无权，已弃用，统一走 ACR。 |
+| 构建到 `maturin build` 才报 `E0004: non-exhaustive patterns: Commands::X not covered` | 给 CLI 加了子命令但只改了 `biliup-cli/src/main.rs`，漏了 `stream-gears/src/server.rs::_main` 里的同一个 match。本地 `-p biliup-cli` 查不出来，见 §2「check 的盲区」。补上分支，并用 `cargo check --workspace` 复验。 |
 
 ---
 

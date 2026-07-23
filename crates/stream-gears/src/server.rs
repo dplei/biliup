@@ -286,6 +286,32 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
         } => {
             biliup_cli::run((&bind, port), auth, reload_handle, config).await?;
         }
+        // 与 biliup-cli 的 main.rs 保持一致。生产走的是 python wheel → stream_gears
+        // 这条链路（不是 main.rs），子命令只加在那边的话，这里就编不过——
+        // 而 `cargo check -p biliup-cli` 看不到本 crate，问题会一直藏到 Docker 构建才炸。
+        Commands::CoverPreview {
+            text,
+            background,
+            output,
+            dim,
+            blur,
+            background_only,
+        } => {
+            biliup_cli::cover_preview::cover_preview(
+                &text,
+                background,
+                &output,
+                dim,
+                blur,
+                background_only,
+            )?;
+            let what = if background_only {
+                "背景图"
+            } else {
+                "封面预览"
+            };
+            println!("已生成{what}：{}", output.display());
+        }
         Commands::List {
             is_pubing,
             pubed,
