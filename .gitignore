@@ -57,6 +57,11 @@ cookies.json
 logs/
 CLAUDE.md
 AGENTS.md
-.claude/
+# .claude/ 整体不入库（settings.local.json 等是个人配置），但仓库级 skill 例外：
+# 它与本仓库的子命令强绑定，必须随仓库一起版本管理。
+# 写成 .claude/* 而非 .claude/ 才能让下面这条否定生效——被排除的是目录本身时，
+# git 不会再看目录里的内容。
+.claude/*
+!.claude/skills/
 # macOS
 .DS_Store
