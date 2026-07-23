@@ -5,7 +5,6 @@ import {
   IconChevronUp,
   IconMinusCircle,
   IconPlusCircle,
-  IconUpload,
 } from '@douyinfe/semi-icons'
 import {
   Avatar,
@@ -19,17 +18,14 @@ import {
   Notification,
   ScrollList,
   ScrollItem,
-  Upload,
   // TextArea,
   useFormState,
 } from '@douyinfe/semi-ui'
 import useSWR from 'swr'
-import { API_BASE, BiliType, fetcher, StudioEntity } from '../lib/api-streamer'
+import { BiliType, fetcher, StudioEntity } from '../lib/api-streamer'
 import { useBiliUsers, useTypeTree } from '../lib/use-streamers'
 import CoverPreviewButton from './CoverPreviewButton'
-
-/** 背景图体积上限，与服务端的 MAX_UPLOAD_BYTES 一致；超限在选择时就拦下，省一次白跑的请求。 */
-const BACKGROUND_MAX_MB = 10
+import CoverBackgroundField from './CoverBackgroundField'
 
 const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>> = ({
   formState,
@@ -297,11 +293,8 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
           placeholder="留空用上方封面图；示例：{streamer}\n%Y-%m-%d %H点场"
           extraText="填写后自动生成黑底封面，优先于「视频封面」。支持 {streamer}/{title}/{url} 与时间占位符，\n 换行，emoji 以单色显示"
         />
-        <Input
-          field="cover_background"
-          label="封面背景图"
+        <CoverBackgroundField
           style={{ width: 464 }}
-          placeholder="留空为纯黑底；示例：aurora.jpg"
           extraText="仅在填了「封面文字模板」时生效，文字压在这张图上。填文件名即可，可用下方按钮直接上传"
         />
         <Form.Slot label={{ text: '预览封面' }}>
@@ -309,46 +302,6 @@ const TemplateFields: React.FC<FormFCChild<StudioEntity & { isDtime: boolean }>>
             template={values.cover_template}
             background={values.cover_background}
           />
-        </Form.Slot>
-        <Form.Slot label={{ text: '上传背景图' }}>
-          <Upload
-            action={`${API_BASE}/v1/cover-backgrounds`}
-            name="file"
-            accept=".jpg,.jpeg,.png,.webp"
-            limit={1}
-            // 文件名上传成功后就填进上面的输入框了，再挂一份文件列表只是重复信息
-            showUploadList={false}
-            // Semi 的 maxSize 单位是 KB
-            maxSize={BACKGROUND_MAX_MB * 1024}
-            onSuccess={(response: { file_name?: string }) => {
-              if (!response?.file_name) return
-              formApi.setValue('cover_background', response.file_name)
-              Notification.success({
-                title: '背景图已上传',
-                content: `已填入「${response.file_name}」，保存模板后生效`,
-                position: 'top',
-                duration: 3,
-              })
-            }}
-            onError={() => {
-              Notification.error({
-                title: '背景图上传失败',
-                content: `请确认是 jpg / png / webp 图片且不超过 ${BACKGROUND_MAX_MB} MB`,
-                position: 'top',
-                duration: 5,
-              })
-            }}
-            onSizeError={() => {
-              Notification.error({
-                title: '背景图过大',
-                content: `单张背景图不能超过 ${BACKGROUND_MAX_MB} MB`,
-                position: 'top',
-                duration: 5,
-              })
-            }}
-          >
-            <Button icon={<IconUpload />}>选择图片上传</Button>
-          </Upload>
         </Form.Slot>
         <TextArea
           style={{ maxWidth: 560 }}

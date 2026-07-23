@@ -78,6 +78,9 @@ const Edit = () => {
                 tid: values?.tid[1],
                 cover_path: values?.cover_path ?? '',
                 cover_template: values?.cover_template ?? '',
+                // 载荷是显式白名单，漏一项就等于该字段永远保存不上——
+                // 背景图此前正是这么丢的：输入框里填好了，提交时压根没带。
+                cover_background: values?.cover_background ?? '',
                 title: values?.title ?? '',
                 description: values?.description ?? '',
                 dynamic: values?.dynamic ?? '',

@@ -10,6 +10,11 @@ type CoverPreviewButtonProps = {
   template?: string
   /** 背景图文件名，留空为纯黑底 */
   background?: string
+  /**
+   * 模板为空时的提示语。主播页的模板来自所属上传模板而非当前表单，
+   * 照搬模板页那句话会把用户支使到错误的地方去改。
+   */
+  emptyTemplateHint?: string
 }
 
 /**
@@ -24,7 +29,11 @@ type CoverPreviewButtonProps = {
  * 做成独立组件是为了主播页能原样复用——预览接口不读数据库，
  * 两边各把自己那一级的值传进来即可。
  */
-const CoverPreviewButton: React.FC<CoverPreviewButtonProps> = ({ template, background }) => {
+const CoverPreviewButton: React.FC<CoverPreviewButtonProps> = ({
+  template,
+  background,
+  emptyTemplateHint = '「封面文字模板」留空时不会生成自动封面，投稿用的是上方的「视频封面」',
+}) => {
   const [visible, setVisible] = useState(false)
   const [loading, setLoading] = useState(false)
   const [imageUrl, setImageUrl] = useState<string>()
@@ -51,7 +60,7 @@ const CoverPreviewButton: React.FC<CoverPreviewButtonProps> = ({ template, backg
     if (!template?.trim()) {
       Notification.warning({
         title: '还没有封面文字模板',
-        content: '「封面文字模板」留空时不会生成自动封面，投稿用的是上方的「视频封面」',
+        content: emptyTemplateHint,
         position: 'top',
         duration: 5,
       })

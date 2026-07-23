@@ -117,6 +117,8 @@ export interface LiveStreamerEntity {
 	opt_args?: string[];
 	override?: Record<string, any>;
 	recording_quality?: string;
+	/** 主播级封面背景图文件名，覆盖所属上传模板的同名设置；留空则回退到模板的背景。 */
+	cover_background?: string;
 }
 
 export interface BiliType {

@@ -5,13 +5,17 @@ import {
   Collapse,
   Select,
   Avatar,
+  useFormState,
 } from '@douyinfe/semi-ui'
 import { FormApi } from '@douyinfe/semi-ui/lib/es/form'
 import React, { useRef } from 'react'
 import { useState } from 'react'
-import { LiveStreamerEntity } from '../lib/api-streamer'
+import useSWR from 'swr'
+import { fetcher, LiveStreamerEntity, StudioEntity } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
+import CoverBackgroundField from './CoverBackgroundField'
+import CoverPreviewButton from './CoverPreviewButton'
 
 type PluginProps = {
   entity?: LiveStreamerEntity
@@ -54,8 +58,64 @@ const serializeTimeRange = (timeRange: LiveStreamerEntity['time_range']) => {
   return timeRange
 }
 
+/**
+ * 封面设置区：主播级的背景图，覆盖所属上传模板的同名设置。
+ *
+ * 刻意放在下面那个 Collapse **之外**：Semi 的折叠面板未展开时 children 不挂载，
+ * 字段也就不进 values，提交时「用户没展开过」与「用户主动清空」看起来一模一样——
+ * 而这两者一个要保持原值、一个要清空，判错方向就是把用户配好的背景悄悄抹掉。
+ */
+const CoverSection: React.FC<{ template?: StudioEntity; templatesLoading: boolean }> = ({
+  template,
+  templatesLoading,
+}) => {
+  const { values } = useFormState()
+
+  // 主播级留空时回退到模板的背景——与投稿时的三级回退（主播 → 模板 → 纯黑）一致，
+  // 预览才真的等于产出。
+  const background = values.cover_background?.trim() || template?.cover_background
+
+  // 模板列表还在路上时 template 必然是 undefined，与「真的没绑模板」长得一样。
+  // 不区分的话，弹窗刚打开就点预览会收到一句错误的「还没绑定投稿模板」。
+  const emptyTemplateHint = templatesLoading
+    ? '投稿模板还在加载，请稍候再点一次'
+    : template
+      ? `所属模板「${template.template_name}」没有填「封面文字模板」，投稿不会生成自动封面`
+      : '该主播还没有绑定投稿模板；封面文字模板取自模板，请先在「录播管理」里绑定'
+
+  return (
+    <Form.Section text="封面">
+      <CoverBackgroundField
+        style={{ width: '100%' }}
+        fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        extraText={
+          <>
+            <strong>覆盖</strong>所属上传模板的封面背景；留空则回退到模板的设置。
+            仅在模板填了「封面文字模板」时生效。
+          </>
+        }
+      />
+      <Form.Slot label={{ text: '预览封面' }}>
+        <CoverPreviewButton
+          template={template?.cover_template}
+          background={background}
+          emptyTemplateHint={emptyTemplateHint}
+        />
+      </Form.Slot>
+    </Form.Section>
+  )
+}
+
 const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk }) => {
   const [isOpen, setOpen] = useState(false)
+
+  // 封面文字模板是模板级的设置，主播这边只覆盖背景。预览要用文字模板，
+  // 所以得把所属模板捞出来——`upload_streamers_id` 为空则没有可预览的文字。
+  const { data: templates, isLoading: templatesLoading } = useSWR<StudioEntity[]>(
+    '/v1/upload/streamers',
+    fetcher
+  )
+  const boundTemplate = templates?.find(item => item.id === entity?.upload_streamers_id)
 
   const toggle = () => {
     setOpen(!isOpen)
@@ -112,6 +172,10 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       'postprocessor',
       'opt_args',
       'override',
+      // 它是 livestreamers 表上的真实列，不是覆写 JSON 里的一项。
+      // 不列在这里的话，下面那圈循环会把它一并塞进 override，
+      // 库里于是同时存在「列上的值」和「override 里的值」，投稿只认前者。
+      'cover_background',
     ])
 
     if (values) {
@@ -129,6 +193,13 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         downloaded_processor: entity?.downloaded_processor,
         postprocessor: entity?.postprocessor,
         opt_args: entity?.opt_args,
+        // 取表单当前值而非 entity——这一项是本弹窗里可编辑的，别的都不是。
+        //
+        // `?? ''` 不是防御性写法，是必需的：Semi 默认 allowEmpty=false，用户清空输入框后
+        // 该键会从 values 里消失；而服务端有条守卫是「载荷里整项缺失就沿用库里的值」，
+        // 直接透传 undefined 会被 filter 掉 → 守卫还原 → 字段永远清不掉。
+        // 显式提交空字符串，服务端的解析侧会把空白当作「未配置」，正好回退到模板的背景。
+        cover_background: values.cover_background ?? '',
       }
       const nextValues = Object.fromEntries(
         Object.entries(baseValues).filter(([, value]) => value !== undefined)
@@ -298,6 +369,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
               },
             ]}
           />
+          <CoverSection template={boundTemplate} templatesLoading={templatesLoading} />
           <Form.Section>
             <Collapse defaultActiveKey={['plugin']}>
               {downloadSettings}

@@ -62,6 +62,8 @@ export default function Add() {
                 tid: values.tid[1],
                 cover_path: values.cover_path ?? '',
                 cover_template: values.cover_template ?? '',
+                // 载荷是显式白名单，漏一项就等于该字段永远保存不上。
+                cover_background: values.cover_background ?? '',
                 title: values.title ?? '',
                 description: values.description ?? '',
                 dynamic: values.dynamic ?? '',
