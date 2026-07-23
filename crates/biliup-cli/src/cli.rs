@@ -174,6 +174,36 @@ pub enum Commands {
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
+    /// 本地渲染一张封面看效果，用于挑背景图与试参数
+    ///
+    /// 复用线上同一套渲染逻辑，因此本地调好的效果就是实际投稿的效果。
+    /// --dim 与 --blur 只作用于这里的输出：把满意的效果烘焙进成品图后再上传，
+    /// 服务端不保存也不认识这两个参数。
+    CoverPreview {
+        /// 封面文字，用 \n 分行（与网页「封面文字模板」同样的写法）
+        #[arg(short, long)]
+        text: String,
+
+        /// 背景图路径，省略则为纯黑底
+        #[arg(short, long)]
+        background: Option<PathBuf>,
+
+        /// 输出的 JPG 路径
+        #[arg(short, long, default_value = "cover-preview.jpg")]
+        output: PathBuf,
+
+        /// 背景压暗百分比 0-100，越大越暗，便于白字浮出来
+        #[arg(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=100))]
+        dim: u8,
+
+        /// 背景高斯模糊半径，0 为不模糊；数值越大越糊、也越慢
+        #[arg(long, default_value = "0", value_parser = non_negative_blur)]
+        blur: f32,
+
+        /// 只输出处理好的背景图、不画文字——调满意后用它导出可直接上传的成品背景
+        #[arg(long)]
+        background_only: bool,
+    },
     /// 列出所有已上传的视频
     List {
         /// 只包含进行中的视频
@@ -196,6 +226,16 @@ pub enum Commands {
         #[arg(short, long)]
         max_pages: Option<u32>,
     },
+}
+
+/// 模糊半径必须是非负的有限数。放任负值或 NaN 会被静默忽略，
+/// 用户以为调了参数、实际什么也没发生。
+fn non_negative_blur(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        Ok(_) => Err(format!("模糊半径需为非负有限数，收到 {s}")),
+        Err(e) => Err(format!("{s} 不是合法数字: {e}")),
+    }
 }
 
 fn human_size(s: &str) -> Result<u64, String> {

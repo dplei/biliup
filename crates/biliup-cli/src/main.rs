@@ -2,6 +2,7 @@ use time::macros::format_description;
 
 use biliup::uploader::util::SubmitOption;
 use biliup_cli::cli::{Cli, Commands, expand_path};
+use biliup_cli::cover_preview::cover_preview;
 use biliup_cli::downloader::{download, generate_json};
 use biliup_cli::uploader::{
     append, comments, list, login, renew, reply, show, upload_by_command, upload_by_config,
@@ -136,6 +137,22 @@ async fn main() -> AppResult<()> {
             auth,
             config,
         } => biliup_cli::run((&bind, port), auth, console_reload_handle, config).await?,
+        Commands::CoverPreview {
+            text,
+            background,
+            output,
+            dim,
+            blur,
+            background_only,
+        } => {
+            cover_preview(&text, background, &output, dim, blur, background_only)?;
+            let what = if background_only {
+                "背景图"
+            } else {
+                "封面预览"
+            };
+            println!("已生成{what}：{}", output.display());
+        }
         Commands::List {
             is_pubing,
             pubed,
