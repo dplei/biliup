@@ -1,7 +1,7 @@
 use crate::UploadLine;
 use crate::server::common::cookie_health::notify_alert;
 use crate::server::common::cover_generator::{
-    CoverOptions, render_to_tempfile, split_template_lines,
+    Background, CoverOptions, render_to_tempfile, split_template_lines,
 };
 use crate::server::common::missing_segment::{
     due_missing_segments_for_session, enqueue_missing_segment, mark_retry_failure,
@@ -41,7 +41,7 @@ use futures::StreamExt;
 use futures::stream::Inspect;
 use ormlite::Insert;
 use ormlite::Model;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -706,6 +706,33 @@ fn resolve_source(copyright_source: Option<&str>, fallback_url: &str) -> String 
     }
 }
 
+/// 封面背景图所在目录。与数据库同在 `data/` 下，因此随现有备份一起被覆盖。
+///
+/// 与数据库路径（`data/data.sqlite3`）一样是相对工作目录的——容器里工作目录即挂载卷，
+/// 换挂载点或迁移部署时数据库里存的文件名无需跟着改。
+const BACKGROUND_DIR: &str = "data/cover-backgrounds";
+
+// 解析封面背景：模板配了文件名就用那张图，否则纯黑。
+// 空值语义与上面的 resolve_source 一致——NULL 和空白字符串都算「没填」，
+// 因为前端表单留空提交的是 Some("")，不做 trim 就会当成配了一张名为空的图。
+// 纯函数：只做路径拼接，不碰数据库也不读文件；图存不存在由渲染器判断（读不到会退回纯黑）。
+fn resolve_background(template_background: Option<&str>) -> Background {
+    let Some(name) = template_background.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Background::Black;
+    };
+
+    // 库里存的必须是「一个文件名」。带目录、`..`、绝对路径一律按没填处理：
+    // Path::join 碰上绝对路径会把基路径整段丢掉（join("/etc/x") 就是 "/etc/x"），
+    // 不在这里拦住，库里一个值就能让渲染器去读目录外的文件。
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(file_name)), None) => {
+            Background::Image(Path::new(BACKGROUND_DIR).join(file_name))
+        }
+        _ => Background::Black,
+    }
+}
+
 pub(crate) async fn build_studio(
     upload_config: &UploadStreamer,
     bilibili: &BiliBili,
@@ -752,7 +779,11 @@ pub(crate) async fn build_studio(
     {
         let text = recorder.format(tpl);
         let lines = split_template_lines(&text);
-        match render_to_tempfile(&lines, &CoverOptions::default()) {
+        let opts = CoverOptions {
+            background: resolve_background(upload_config.cover_background.as_deref()),
+            ..CoverOptions::default()
+        };
+        match render_to_tempfile(&lines, &opts) {
             Ok(f) => {
                 studio.cover = f.path().to_string_lossy().into_owned();
                 _auto_cover_tmp = Some(f);
@@ -1099,6 +1130,58 @@ mod tests {
             resolve_source(Some("  https://b23.tv/abc  "), LIVE_URL),
             "https://b23.tv/abc"
         );
+    }
+
+    // 断言解析结果，失败时打印实际取到的变体便于定位
+    fn assert_black(background: Background) {
+        match background {
+            Background::Black => {}
+            other => panic!("应回退为纯黑背景，实际 {other:?}"),
+        }
+    }
+
+    fn assert_image(background: Background, expected_file_name: &str) {
+        match background {
+            Background::Image(path) => {
+                assert_eq!(path, Path::new(BACKGROUND_DIR).join(expected_file_name));
+            }
+            other => panic!("应解析为图片背景，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_background_falls_back_to_black_when_none() {
+        // 模板未配置背景 —— 升级前的既有模板全都是这种状态，产出维持纯黑底
+        assert_black(resolve_background(None));
+    }
+
+    #[test]
+    fn resolve_background_uses_image_when_configured() {
+        // 存的是文件名，实际路径在运行时拼出来
+        assert_image(resolve_background(Some("aurora.jpg")), "aurora.jpg");
+    }
+
+    #[test]
+    fn resolve_background_trims_surrounding_whitespace() {
+        assert_image(resolve_background(Some("  aurora.jpg  ")), "aurora.jpg");
+    }
+
+    #[test]
+    fn resolve_background_treats_blank_as_unset() {
+        // 与 resolve_source 同一套空值语义：NULL（None）与空白字符串等价，都是「没填」
+        assert_black(resolve_background(Some("")));
+        assert_black(resolve_background(Some("   ")));
+    }
+
+    // 库里存的必须是「一个文件名」。绝对路径尤其危险：Path::join 会把基路径整段丢掉，
+    // 不拦的话库里一个值就能把渲染器指到背景图目录之外。
+    #[test]
+    fn resolve_background_rejects_anything_but_a_bare_file_name() {
+        assert_black(resolve_background(Some("/etc/passwd")));
+        assert_black(resolve_background(Some("../../etc/passwd")));
+        assert_black(resolve_background(Some("sub/aurora.jpg")));
+        assert_black(resolve_background(Some("..")));
+        assert_black(resolve_background(Some(".")));
     }
 }
 

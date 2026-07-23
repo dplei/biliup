@@ -23,6 +23,11 @@ pub struct UploadStreamer {
     pub cover_path: Option<String>,
     /// 封面文字模板（留空=用 cover_path；填写=生成黑底封面，优先）
     pub cover_template: Option<String>,
+    /// 封面背景图文件名（留空=纯黑底）。存文件名不存路径，实际路径运行时拼接。
+    ///
+    /// 刻意不在 `InsertUploadStreamer` 里：前端尚未认识这个字段，写入侧一旦有它，
+    /// 编辑模板提交的 JSON 缺项就会把配好的背景清成 NULL。
+    pub cover_background: Option<String>,
     /// 视频简介
     pub description: Option<String>,
     /// 动态内容
@@ -88,4 +93,68 @@ pub struct InsertUploadStreamer {
     pub up_close_danmu: Option<u8>,
     pub extra_fields: Option<String>,
     pub is_only_self: Option<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::infrastructure::connection_pool::{ConnectionManager, ConnectionPool};
+
+    /// 建一个跑完全部迁移的空库。
+    async fn migrated_pool() -> (tempfile::TempDir, ConnectionPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        (dir, pool)
+    }
+
+    /// 迁移建出来的列名、类型要与模型对得上，否则线上一读就炸。
+    /// 这条是迁移本身唯一的验证——它跑通才说明 7_add_cover_background.sql 真的生效了。
+    #[tokio::test]
+    async fn cover_background_round_trips_through_database() {
+        let (_dir, pool) = migrated_pool().await;
+
+        sqlx::query(
+            "INSERT INTO uploadstreamers (template_name, tags, cover_template, cover_background)
+             VALUES (?1, '[]', ?2, ?3)",
+        )
+        .bind("模板A")
+        .bind("{streamer}\\n%Y-%m-%d")
+        .bind("aurora.jpg")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = UploadStreamer::select()
+            .where_("template_name = ?")
+            .bind("模板A")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.cover_background.as_deref(), Some("aurora.jpg"));
+    }
+
+    /// 升级路径：既有模板不会因为多了一列而读不出来，未配置即 NULL。
+    #[tokio::test]
+    async fn existing_template_without_background_reads_as_none() {
+        let (_dir, pool) = migrated_pool().await;
+
+        sqlx::query("INSERT INTO uploadstreamers (template_name, tags) VALUES (?1, '[]')")
+            .bind("模板B")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row = UploadStreamer::select()
+            .where_("template_name = ?")
+            .bind("模板B")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.cover_background, None);
+    }
 }
