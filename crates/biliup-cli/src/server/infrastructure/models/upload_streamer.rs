@@ -24,9 +24,6 @@ pub struct UploadStreamer {
     /// 封面文字模板（留空=用 cover_path；填写=生成黑底封面，优先）
     pub cover_template: Option<String>,
     /// 封面背景图文件名（留空=纯黑底）。存文件名不存路径，实际路径运行时拼接。
-    ///
-    /// 刻意不在 `InsertUploadStreamer` 里：前端尚未认识这个字段，写入侧一旦有它，
-    /// 编辑模板提交的 JSON 缺项就会把配好的背景清成 NULL。
     pub cover_background: Option<String>,
     /// 视频简介
     pub description: Option<String>,
@@ -76,6 +73,9 @@ pub struct InsertUploadStreamer {
     pub copyright_source: Option<String>,
     pub cover_path: Option<String>,
     pub cover_template: Option<String>,
+    /// 与表单的背景图字段一起加进写入侧：前端现在会带上这一项，
+    /// `update_all_fields` 不再会把它清成 NULL。
+    pub cover_background: Option<String>,
     pub description: Option<String>,
     pub dynamic: Option<String>,
     pub dtime: Option<u32>,

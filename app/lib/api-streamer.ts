@@ -73,6 +73,8 @@ export interface StudioEntity {
 	tid: number;
 	cover_path: string;
 	cover_template?: string;
+	/** 封面背景图文件名（留空=纯黑底）。存文件名不存路径，实际路径由服务端拼接。 */
+	cover_background?: string;
 	title: string;
 	description: string;
 	dynamic: string;

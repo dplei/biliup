@@ -1,6 +1,7 @@
 use crate::server::api::bilibili_endpoints::{
     archive_pre_endpoint, get_myinfo_endpoint, get_proxy_endpoint, get_seasons_endpoint,
 };
+use crate::server::api::cover_background::cover_background_router;
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_missing_upload,
     delete_streamers_endpoint, delete_template_endpoint, delete_user_endpoint, get_configuration,
@@ -11,6 +12,7 @@ use crate::server::api::endpoints::{
     put_streamers_endpoint, recover_missing_upload, retry_missing_upload,
 };
 use crate::server::common::path_safety::{PathRejection, resolve_within};
+use crate::server::common::upload::BACKGROUND_DIR;
 use crate::server::infrastructure::service_register::ServiceRegister;
 use axum::Router;
 use axum::body::Body;
@@ -74,6 +76,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/uploads", post(post_uploads))
         .with_state(service_register) // 注入服务注册器状态
         .merge(static_file_router(default_static_root()))
+        .merge(cover_background_router(PathBuf::from(BACKGROUND_DIR)))
 }
 
 /// 静态文件子路由：服务工作目录下的日志与录播视频。

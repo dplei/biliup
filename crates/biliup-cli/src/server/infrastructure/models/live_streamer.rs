@@ -85,7 +85,9 @@ pub struct InsertLiveStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::infrastructure::connection_pool::{ConnectionPool, test_support::migrated_pool};
+    use crate::server::infrastructure::connection_pool::{
+        ConnectionPool, test_support::migrated_pool,
+    };
 
     /// PUT /streamers 收的是 `LiveStreamer` 本身（见 `put_streamers_endpoint`），
     /// 而前端在背景字段那一票落地前不会带上 cover_background。
@@ -139,7 +141,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(fetch_by_remark(&pool, "乙主播").await.cover_background, None);
+        assert_eq!(
+            fetch_by_remark(&pool, "乙主播").await.cover_background,
+            None
+        );
     }
 
     /// `update_all_fields` 会把模型里每一列都写回去——这正是主播编辑页可能清空背景的原因。

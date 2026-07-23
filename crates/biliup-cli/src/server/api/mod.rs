@@ -2,6 +2,8 @@
 pub mod auth;
 /// B站API端点
 pub mod bilibili_endpoints;
+/// 封面背景图上传
+pub mod cover_background;
 /// 通用API端点
 pub mod endpoints;
 /// 单页应用静态文件处理

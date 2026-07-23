@@ -323,6 +323,13 @@ pub struct StreamerConfig {
     #[serde(default)]
     pub cover_template: Option<String>,
 
+    /// 封面背景图文件名（留空=纯黑底）。文件需在背景图目录下，可用网页上传。
+    ///
+    /// config.toml 导入走的是 upsert，模型里有的列都会被写一遍；这里若不给
+    /// 配置项，导入就会把 `config:` 模板已配的背景清成 NULL。
+    #[serde(default)]
+    pub cover_background: Option<String>,
+
     /// 视频描述（保留缩进和多行格式）
     #[serde(default)]
     pub description: Option<String>,

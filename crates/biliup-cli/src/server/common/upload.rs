@@ -720,7 +720,7 @@ fn resolve_source(copyright_source: Option<&str>, fallback_url: &str) -> String 
 ///
 /// 与数据库路径（`data/data.sqlite3`）一样是相对工作目录的——容器里工作目录即挂载卷，
 /// 换挂载点或迁移部署时数据库里存的文件名无需跟着改。
-const BACKGROUND_DIR: &str = "data/cover-backgrounds";
+pub(crate) const BACKGROUND_DIR: &str = "data/cover-backgrounds";
 
 // 把库里存的一个值变成可用的背景图路径，值不可用时返回 None（等同于「没填」）。
 //
@@ -1234,7 +1234,10 @@ mod tests {
             resolve_background(Some("   "), Some("aurora.jpg")),
             "aurora.jpg",
         );
-        assert_image(resolve_background(Some(""), Some("aurora.jpg")), "aurora.jpg");
+        assert_image(
+            resolve_background(Some(""), Some("aurora.jpg")),
+            "aurora.jpg",
+        );
     }
 
     // 库里存的必须是「一个文件名」。绝对路径尤其危险：Path::join 会把基路径整段丢掉，
