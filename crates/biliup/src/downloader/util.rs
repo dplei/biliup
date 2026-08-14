@@ -1,11 +1,47 @@
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 use tracing::{error, info};
 
-pub type CallbackFn<'a> = Box<dyn FnMut(&str) + Send + Sync + 'a>;
+pub type CallbackFn<'a> = Box<dyn FnMut(&str, SegmentCloseReason) + Send + Sync + 'a>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SegmentCloseReason {
+    TimedSplit,
+    SizeSplit,
+    StreamEnded,
+    TransportError,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentCloseHandle(Arc<Mutex<SegmentCloseReason>>);
+
+impl Default for SegmentCloseHandle {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(SegmentCloseReason::Unknown)))
+    }
+}
+
+impl SegmentCloseHandle {
+    pub fn set(&self, reason: SegmentCloseReason) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = reason;
+        }
+    }
+
+    pub fn get(&self) -> SegmentCloseReason {
+        self.0
+            .lock()
+            .map(|reason| *reason)
+            .unwrap_or(SegmentCloseReason::Unknown)
+    }
+}
 
 #[derive(Debug)]
 pub enum Segment {
@@ -232,16 +268,35 @@ pub struct LifecycleFile<'a> {
     pub path: PathBuf,
     pub hook: CallbackFn<'a>,
     pub extension: &'static str,
+    active: bool,
+    close_handle: SegmentCloseHandle,
 }
 
 impl<'a> LifecycleFile<'a> {
     pub fn new(fmt_file_name: &str, extension: &'static str) -> Self {
-        Self::with_hook(fmt_file_name, extension, |_| {})
+        Self::with_hook(fmt_file_name, extension, |_, _| {})
     }
 
     pub fn with_hook<F>(fmt_file_name: &str, extension: &'static str, hook: F) -> Self
     where
-        F: FnMut(&str) + Send + Sync + 'a,
+        F: FnMut(&str, SegmentCloseReason) + Send + Sync + 'a,
+    {
+        Self::with_hook_and_close_handle(
+            fmt_file_name,
+            extension,
+            SegmentCloseHandle::default(),
+            hook,
+        )
+    }
+
+    pub fn with_hook_and_close_handle<F>(
+        fmt_file_name: &str,
+        extension: &'static str,
+        close_handle: SegmentCloseHandle,
+        hook: F,
+    ) -> Self
+    where
+        F: FnMut(&str, SegmentCloseReason) + Send + Sync + 'a,
     {
         Self {
             fmt_file_name: fmt_file_name.to_string(),
@@ -249,6 +304,8 @@ impl<'a> LifecycleFile<'a> {
             path: Default::default(),
             hook: Box::new(hook),
             extension,
+            active: false,
+            close_handle,
         }
     }
 
@@ -270,16 +327,36 @@ impl<'a> LifecycleFile<'a> {
         }
 
         info!("Save to {}", self.path.display());
+        self.active = true;
         Ok(self.path.as_path())
     }
 
-    pub fn rename(&mut self) {
+    pub fn finalize(&mut self, reason: SegmentCloseReason) -> Result<(), std::io::Error> {
+        if !self.active {
+            return Ok(());
+        }
         // 去掉 .part 后缀
         match fs::rename(&self.path, &self.file_name) {
-            Ok(_) => (self.hook)(&self.file_name),
-            Err(e) => {
-                error!("drop {} {e}", self.path.display())
+            Ok(_) => {
+                self.active = false;
+                (self.hook)(&self.file_name, reason);
+                Ok(())
             }
+            Err(e) => {
+                error!("finalize {} {e}", self.path.display());
+                Err(e)
+            }
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn fallback_reason(&self, default: SegmentCloseReason) -> SegmentCloseReason {
+        match self.close_handle.get() {
+            SegmentCloseReason::Unknown => default,
+            reason => reason,
         }
     }
 }
@@ -350,5 +427,17 @@ mod tests {
         assert!(seg.size_needed());
 
         Ok(())
+    }
+
+    #[test]
+    fn cancellation_close_reason_is_shared_with_active_file() {
+        let handle = SegmentCloseHandle::default();
+        let file =
+            LifecycleFile::with_hook_and_close_handle("unused", "flv", handle.clone(), |_, _| {});
+        handle.set(SegmentCloseReason::Cancelled);
+        assert_eq!(
+            file.fallback_reason(SegmentCloseReason::TransportError),
+            SegmentCloseReason::Cancelled
+        );
     }
 }

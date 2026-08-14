@@ -195,12 +195,12 @@ const Global: React.FC = () => {
           field="filtering_threshold"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              小于此大小的视频文件将会被过滤删除。
+              小于此大小的文件会进一步探测媒体内容；有效短片默认保留，无有效媒体才删除。
               <br />
               单位：MB
             </div>
           }
-          label="碎片过滤（filtering_threshold）"
+          label="短片探测阈值（filtering_threshold）"
           suffix={'MB'}
           style={{ width: '100%' }}
           fieldStyle={{
@@ -208,6 +208,12 @@ const Global: React.FC = () => {
             padding: 0,
           }}
           showClear={true}
+        />
+        <Form.Switch
+          field="preserve_recoverable_short_segments"
+          label="保留有效短分段（preserve_recoverable_short_segments）"
+          extraText={<div style={{ fontSize: '14px' }}>默认开启；关闭后恢复旧的按体积过滤行为。</div>}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
 
         <Form.InputNumber

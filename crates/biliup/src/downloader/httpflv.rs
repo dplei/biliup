@@ -3,19 +3,45 @@ use crate::downloader::flv_parser::{
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
-use crate::downloader::util::{LifecycleFile, Segmentable};
+use crate::downloader::util::{LifecycleFile, SegmentCloseReason, Segmentable};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
 use reqwest::Response;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 pub async fn download(
-    connection: Connection,
+    mut connection: Connection,
     file: LifecycleFile<'_>,
     segment: Segmentable,
+) -> crate::downloader::error::Result<()> {
+    download_inner(&mut connection, file, segment, None).await
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpFlvLogContext {
+    pub attempt_id: String,
+    pub stream_host: String,
+    pub protocol: String,
+    pub quality: Option<String>,
+}
+
+pub async fn download_with_context(
+    mut connection: Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+    log_context: HttpFlvLogContext,
+) -> crate::downloader::error::Result<()> {
+    download_inner(&mut connection, file, segment, Some(&log_context)).await
+}
+
+async fn download_inner(
+    connection: &mut Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+    log_context: Option<&HttpFlvLogContext>,
 ) -> crate::downloader::error::Result<()> {
     let file_name = file.file_name.clone();
     match parse_flv(connection, file, segment).await {
@@ -24,14 +50,28 @@ pub async fn download(
             Ok(())
         }
         Err(e) => {
-            warn!("{e}");
+            let diagnostics = connection.diagnostics();
+            warn!(
+                error = ?e,
+                http_status = diagnostics.http_status,
+                content_encoding = diagnostics.content_encoding.as_deref().unwrap_or("none"),
+                transfer_encoding = diagnostics.transfer_encoding.as_deref().unwrap_or("none"),
+                received_bytes = diagnostics.received_bytes,
+                connected_for = ?diagnostics.connected_for,
+                buffered = diagnostics.buffered,
+                attempt_id = log_context.map(|context| context.attempt_id.as_str()).unwrap_or("untracked"),
+                stream_host = log_context.map(|context| context.stream_host.as_str()).unwrap_or("unknown"),
+                protocol = log_context.map(|context| context.protocol.as_str()).unwrap_or("flv"),
+                quality = log_context.and_then(|context| context.quality.as_deref()).unwrap_or("unknown"),
+                "httpflv download failed"
+            );
             Err(e)
         }
     }
 }
 
 pub(crate) async fn parse_flv(
-    mut connection: Connection,
+    connection: &mut Connection,
     file: LifecycleFile<'_>,
     mut segment: Segmentable,
 ) -> crate::downloader::error::Result<()> {
@@ -40,6 +80,7 @@ pub(crate) async fn parse_flv(
     let _previous_tag_size = connection.read_frame(4).await?;
 
     let mut out = FlvFile::new(file)?;
+    let result: crate::downloader::error::Result<()> = async {
     segment.set_size_position(9 + 4);
     // let mut downloaded_size = 9 + 4;
     let mut on_meta_data = None;
@@ -201,7 +242,14 @@ pub(crate) async fn parse_flv(
                         );
                     }
                     info!("{} splitting.{segment:?}", out.file.file_name);
-                    out.create_new()?;
+                    let reason = if segment.size_needed() {
+                        SegmentCloseReason::SizeSplit
+                    } else if segment.time_needed() {
+                        SegmentCloseReason::TimedSplit
+                    } else {
+                        SegmentCloseReason::Unknown
+                    };
+                    out.create_new(reason)?;
                     create_new = false;
                 }
                 flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
@@ -212,6 +260,22 @@ pub(crate) async fn parse_flv(
         }
     }
     Ok(())
+    }
+    .await;
+    let close_reason = if result.is_ok() {
+        SegmentCloseReason::StreamEnded
+    } else {
+        SegmentCloseReason::TransportError
+    };
+    let finalize_result = out.finish(close_reason);
+    match (result, finalize_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(finalize_error)) => Err(finalize_error.into()),
+        (Err(download_error), Ok(())) => Err(download_error),
+        (Err(download_error), Err(finalize_error)) => Err(crate::downloader::error::Error::Custom(
+            format!("{download_error}; additionally failed to finalize segment: {finalize_error}"),
+        )),
+    }
 }
 
 pub fn map_parse_err<'a, T>(
@@ -236,13 +300,47 @@ pub fn map_parse_err<'a, T>(
 pub struct Connection {
     resp: Response,
     buffer: BytesMut,
+    http_status: u16,
+    content_encoding: Option<String>,
+    transfer_encoding: Option<String>,
+    received_bytes: u64,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionDiagnostics {
+    pub http_status: u16,
+    pub content_encoding: Option<String>,
+    pub transfer_encoding: Option<String>,
+    pub received_bytes: u64,
+    pub connected_for: Duration,
+    pub buffered: usize,
 }
 
 impl Connection {
     pub fn new(resp: Response) -> Connection {
+        let http_status = resp.status().as_u16();
+        let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
+        let transfer_encoding = header_value(&resp, reqwest::header::TRANSFER_ENCODING);
         Connection {
             resp,
             buffer: BytesMut::with_capacity(8 * 1024),
+            http_status,
+            content_encoding,
+            transfer_encoding,
+            received_bytes: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub fn diagnostics(&self) -> ConnectionDiagnostics {
+        ConnectionDiagnostics {
+            http_status: self.http_status,
+            content_encoding: self.content_encoding.clone(),
+            transfer_encoding: self.transfer_encoding.clone(),
+            received_bytes: self.received_bytes,
+            connected_for: self.started_at.elapsed(),
+            buffered: self.buffer.len(),
         }
     }
 
@@ -262,6 +360,7 @@ impl Connection {
             // self.resp.chunk()
             match timeout(Duration::from_secs(30), self.resp.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
+                    self.received_bytes = self.received_bytes.saturating_add(chunk.len() as u64);
                     self.buffer.put(chunk);
                 }
                 Ok(Ok(None)) => {
@@ -278,7 +377,8 @@ impl Connection {
                     });
                 }
                 Ok(Err(err)) => {
-                    warn!(error = %err, buffered = self.buffer.len(), "httpflv chunk read failed");
+                    let err = err.without_url();
+                    warn!(error = ?err, buffered = self.buffer.len(), "httpflv chunk read failed");
                     return Err(err.into());
                 }
                 Err(err) => {
@@ -299,6 +399,13 @@ impl Connection {
             // self.buffer.put_slice(&buf[..n]);
         }
     }
+}
+
+fn header_value(resp: &Response, name: reqwest::header::HeaderName) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]

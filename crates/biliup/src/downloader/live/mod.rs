@@ -316,6 +316,9 @@ pub struct LiveStream {
     /// 实际选中的画质代码（origin/uhd/...）。仅抖音填充，其它平台为 None。
     #[serde(default)]
     pub recording_quality: Option<String>,
+    /// 一次选流/下载尝试的脱敏关联 ID；不包含 URL、Cookie 或签名参数。
+    #[serde(default)]
+    pub attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

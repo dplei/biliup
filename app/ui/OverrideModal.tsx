@@ -318,7 +318,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
 
       <Form.InputNumber
         field="filtering_threshold"
-        label="碎片过滤（filtering_threshold）"
+        label="短片探测阈值（filtering_threshold）"
         suffix={'MB'}
         style={{ width: '100%' }}
         fieldStyle={{
@@ -326,6 +326,12 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           padding: 0,
         }}
         showClear={true}
+      />
+      <Form.Switch
+        field="preserve_recoverable_short_segments"
+        label="保留有效短分段（preserve_recoverable_short_segments）"
+        extraText="默认开启；关闭后恢复旧的按体积过滤行为。"
+        fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
       />
     </Collapse.Panel>
   )

@@ -218,6 +218,9 @@ impl FfmpegDownloader {
             danmaku_file_path: None,
             segment_index: 0,
             next_file_path: None,
+            close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
+            attempt_id: download_config.attempt_id.clone(),
+            recovery_source_paths: Vec::new(),
         }));
         // 根据退出码判断状态
         match status.code() {
@@ -283,6 +286,9 @@ impl FfmpegDownloader {
                 danmaku_file_path: None,
                 next_file_path: None,
                 segment_index,
+                close_reason: biliup::downloader::util::SegmentCloseReason::TimedSplit,
+                attempt_id: download_config.attempt_id.clone(),
+                recovery_source_paths: Vec::new(),
                 // start_time: std::time::SystemTime::now(),
                 // end_time: std::time::SystemTime::now(),
             }));
@@ -303,6 +309,9 @@ impl FfmpegDownloader {
                 danmaku_file_path: None,
                 next_file_path: None,
                 segment_index,
+                close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
+                attempt_id: download_config.attempt_id.clone(),
+                recovery_source_paths: Vec::new(),
                 // start_time: std::time::SystemTime::now(),
                 // end_time: std::time::SystemTime::now(),
             }));

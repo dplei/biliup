@@ -30,6 +30,10 @@ pub struct Config {
     #[serde(default = "default_filtering_threshold")]
     pub filtering_threshold: u64,
 
+    /// 保留通过媒体探测的短分段。None/true = 新的止损行为；false = 恢复旧的体积过滤。
+    #[serde(default)]
+    pub preserve_recoverable_short_segments: Option<bool>,
+
     /// 文件名前缀
     #[serde(default)]
     pub filename_prefix: Option<String>,
@@ -594,6 +598,21 @@ mod timestamp_repair_config_tests {
     fn timestamp_repair_can_be_disabled() {
         let cfg: Config = serde_yaml::from_str("timestamp_repair: false").expect("parse");
         assert_eq!(cfg.timestamp_repair, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod recoverable_short_segment_config_tests {
+    use super::Config;
+
+    #[test]
+    fn preservation_defaults_on_and_can_be_rolled_back() {
+        let default: Config = serde_yaml::from_str("{}").expect("default config");
+        assert!(default.preserve_recoverable_short_segments.unwrap_or(true));
+
+        let disabled: Config =
+            serde_yaml::from_str("preserve_recoverable_short_segments: false").expect("config");
+        assert_eq!(disabled.preserve_recoverable_short_segments, Some(false));
     }
 }
 

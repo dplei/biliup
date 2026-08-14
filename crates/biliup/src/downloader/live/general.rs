@@ -123,6 +123,7 @@ impl GeneralLive {
                     extra_ytdlp_args: Vec::new(),
                 })),
                 recording_quality: None,
+                attempt_id: None,
             }),
         })
     }

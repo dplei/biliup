@@ -1,13 +1,14 @@
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::StreamerInfo;
-use crate::server::infrastructure::models::hook_step::HookStep;
 use chrono::format::{Item, StrftimeItems};
 use chrono::{Duration, Local};
-use error_stack::{ResultExt, bail};
+use error_stack::ResultExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use tracing::{error, info};
+use std::time::Duration as StdDuration;
+use tracing::error;
 use url::Url;
 
 /// 录制器配置结构体
@@ -386,6 +387,28 @@ pub struct FileValidator {
     check_format: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaValidation {
+    Valid,
+    RecoverableShort { duration: Option<StdDuration> },
+    Invalid { reason: InvalidMediaReason },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidMediaReason {
+    Empty,
+    HeaderOnly,
+    UnsupportedFormat(String),
+    MalformedContainer(String),
+    NoMediaTrack,
+    ProbeFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MediaProbe {
+    duration: Option<StdDuration>,
+}
+
 impl FileValidator {
     pub fn new(min_size: u64, check_format: bool) -> Self {
         Self {
@@ -406,47 +429,347 @@ impl Default for FileValidator {
 
 impl FileValidator {
     /// 验证文件有效性
-    pub fn validate(&self, path: &Path) -> AppResult<()> {
+    pub fn validate(&self, path: &Path) -> AppResult<MediaValidation> {
         let metadata = fs::metadata(path).change_context(AppError::Unknown)?;
 
         let size = metadata.len();
-
-        if size < self.min_size {
-            let display = path.display();
-            let path = path.to_owned();
-            tokio::spawn(async move {
-                let Ok(()) = HookStep::remove_file(&[&path])
-                    .await
-                    .inspect_err(|e| error!(e=?e))
-                else {
-                    return;
-                };
-                info!("过滤删除 - {}", path.display());
+        if size == 0 {
+            return Ok(MediaValidation::Invalid {
+                reason: InvalidMediaReason::Empty,
             });
-            bail!(AppError::Custom(format!(
-                "File {display} too small: {size} bytes, minimum: {} bytes",
-                self.min_size
-            )));
         }
 
-        // 可选：检查文件格式
-        if self.check_format {
-            self.validate_format(path)?;
-        }
-
-        Ok(())
-    }
-
-    fn validate_format(&self, path: &Path) -> AppResult<()> {
-        // 简单的格式验证 - 检查扩展名
-        if let Some(extension) = path.extension() {
-            let ext = extension.to_string_lossy().to_lowercase();
-            match ext.as_str() {
-                "mp4" | "flv" | "ts" | "m3u8" | "mkv" => Ok(()),
-                _ => bail!(AppError::Custom(format!("Unsupported format: {}", ext))),
+        let probe = if self.check_format {
+            match self.probe_media(path) {
+                Ok(probe) => probe,
+                Err(reason) => return Ok(MediaValidation::Invalid { reason }),
             }
         } else {
-            bail!(AppError::Custom("No file extension found".to_string()))
+            MediaProbe { duration: None }
+        };
+
+        if size < self.min_size {
+            return Ok(MediaValidation::RecoverableShort {
+                duration: probe.duration,
+            });
         }
+
+        Ok(MediaValidation::Valid)
+    }
+
+    fn probe_media(&self, path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .ok_or_else(|| InvalidMediaReason::UnsupportedFormat("missing extension".into()))?;
+        match extension.as_str() {
+            "flv" => probe_flv(path),
+            "ts" => probe_mpeg_ts(path),
+            "mp4" => probe_mp4(path),
+            "mkv" => probe_matroska(path),
+            "m3u8" => probe_m3u8(path),
+            _ => Err(InvalidMediaReason::UnsupportedFormat(extension)),
+        }
+    }
+}
+
+fn read_probe_bytes(path: &Path) -> Result<Vec<u8>, InvalidMediaReason> {
+    let file =
+        fs::File::open(path).map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+    Ok(bytes)
+}
+
+fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+    let mut file =
+        fs::File::open(path).map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?
+        .len();
+    if file_len <= 13 {
+        return Err(InvalidMediaReason::HeaderOnly);
+    }
+    let mut header = [0_u8; 9];
+    file.read_exact(&mut header)
+        .map_err(|error| InvalidMediaReason::MalformedContainer(error.to_string()))?;
+    if header.get(..3) != Some(b"FLV") {
+        return Err(InvalidMediaReason::MalformedContainer(
+            "missing FLV signature".into(),
+        ));
+    }
+    let data_offset = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as u64;
+    let mut offset = data_offset
+        .checked_add(4)
+        .ok_or_else(|| InvalidMediaReason::MalformedContainer("invalid data offset".into()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+    while offset < file_len {
+        if file_len.saturating_sub(offset) < 15 {
+            return Err(InvalidMediaReason::MalformedContainer(
+                "truncated FLV tag header".into(),
+            ));
+        }
+        let mut tag_header = [0_u8; 11];
+        file.read_exact(&mut tag_header)
+            .map_err(|error| InvalidMediaReason::MalformedContainer(error.to_string()))?;
+        let tag_type = tag_header[0];
+        let data_size =
+            ((tag_header[1] as u64) << 16) | ((tag_header[2] as u64) << 8) | tag_header[3] as u64;
+        let timestamp = ((tag_header[7] as u32) << 24)
+            | ((tag_header[4] as u32) << 16)
+            | ((tag_header[5] as u32) << 8)
+            | tag_header[6] as u32;
+        let next = offset
+            .checked_add(11)
+            .and_then(|body_start| body_start.checked_add(data_size))
+            .and_then(|body_end| body_end.checked_add(4))
+            .ok_or_else(|| InvalidMediaReason::MalformedContainer("tag size overflow".into()))?;
+        if next > file_len {
+            return Err(InvalidMediaReason::MalformedContainer(
+                "truncated FLV tag body".into(),
+            ));
+        }
+        let prefix_len = usize::try_from(data_size.min(6)).unwrap_or(6);
+        let mut body = [0_u8; 6];
+        file.read_exact(&mut body[..prefix_len])
+            .map_err(|error| InvalidMediaReason::MalformedContainer(error.to_string()))?;
+        let is_media = match tag_type {
+            // AAC packet type 0 is only a sequence header; 1 contains raw media.
+            8 if prefix_len > 0 => (body[0] >> 4) != 10 || body.get(1) == Some(&1),
+            // AVC packet type 0 is only a sequence header; 1 contains NAL units.
+            9 if prefix_len > 0 => (body[0] & 0x0f) != 7 || body.get(1) == Some(&1),
+            _ => false,
+        };
+        if is_media {
+            return Ok(MediaProbe {
+                duration: Some(StdDuration::from_millis(timestamp as u64)),
+            });
+        }
+        file.seek(SeekFrom::Start(next))
+            .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+        offset = next;
+    }
+    Err(InvalidMediaReason::NoMediaTrack)
+}
+
+fn probe_mpeg_ts(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+    let bytes = read_probe_bytes(path)?;
+    if bytes.windows(4).any(|window| window == b"ftyp") {
+        return probe_mp4(path);
+    }
+    if bytes.len() < 188 {
+        return Err(InvalidMediaReason::HeaderOnly);
+    }
+    let packet_count = bytes.len() / 188;
+    let synced = (0..packet_count).all(|index| bytes[index * 188] == 0x47);
+    if !synced {
+        return Err(InvalidMediaReason::MalformedContainer(
+            "invalid MPEG-TS sync byte".into(),
+        ));
+    }
+    for packet in bytes[..packet_count * 188].chunks_exact(188) {
+        let payload_unit_start = packet[1] & 0x40 != 0;
+        let adaptation_control = (packet[3] >> 4) & 0x03;
+        if !payload_unit_start || adaptation_control == 0 || adaptation_control == 2 {
+            continue;
+        }
+        let mut payload_offset = 4;
+        if adaptation_control == 3 {
+            payload_offset += 1 + packet[4] as usize;
+        }
+        let Some(payload) = packet.get(payload_offset..) else {
+            continue;
+        };
+        if payload.len() >= 4 && payload[..3] == [0, 0, 1] {
+            let stream_id = payload[3];
+            if (0xc0..=0xef).contains(&stream_id) || stream_id == 0xbd {
+                return Ok(MediaProbe { duration: None });
+            }
+        }
+    }
+    Err(InvalidMediaReason::NoMediaTrack)
+}
+
+fn probe_mp4(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+    let bytes = read_probe_bytes(path)?;
+    let has_ftyp = bytes.windows(4).any(|window| window == b"ftyp");
+    let has_media = bytes.windows(4).any(|window| window == b"mdat")
+        || bytes.windows(4).any(|window| window == b"moof");
+    if !has_ftyp {
+        return Err(InvalidMediaReason::MalformedContainer(
+            "missing MP4 ftyp box".into(),
+        ));
+    }
+    if !has_media {
+        return Err(InvalidMediaReason::NoMediaTrack);
+    }
+    Ok(MediaProbe { duration: None })
+}
+
+fn probe_matroska(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+    let bytes = read_probe_bytes(path)?;
+    if !bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Err(InvalidMediaReason::MalformedContainer(
+            "missing Matroska EBML header".into(),
+        ));
+    }
+    if !bytes
+        .windows(4)
+        .any(|window| window == [0x1f, 0x43, 0xb6, 0x75])
+    {
+        return Err(InvalidMediaReason::NoMediaTrack);
+    }
+    Ok(MediaProbe { duration: None })
+}
+
+fn probe_m3u8(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
+    let bytes = read_probe_bytes(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| InvalidMediaReason::MalformedContainer(error.to_string()))?;
+    if !text.trim_start().starts_with("#EXTM3U") {
+        return Err(InvalidMediaReason::MalformedContainer(
+            "missing M3U8 header".into(),
+        ));
+    }
+    if !text.lines().any(|line| line.starts_with("#EXTINF:")) {
+        return Err(InvalidMediaReason::NoMediaTrack);
+    }
+    Ok(MediaProbe { duration: None })
+}
+
+#[cfg(test)]
+mod media_validation_tests {
+    use super::{FileValidator, InvalidMediaReason, MediaValidation};
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn flv_with_video_payload(payload_size: usize, timestamp_ms: u32) -> Vec<u8> {
+        let payload_size = payload_size.max(6);
+        let mut bytes = vec![
+            b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, // header
+            0, 0, 0, 0, // PreviousTagSize0
+        ];
+        bytes.push(9); // video tag
+        bytes.extend_from_slice(&[
+            ((payload_size >> 16) & 0xff) as u8,
+            ((payload_size >> 8) & 0xff) as u8,
+            (payload_size & 0xff) as u8,
+            ((timestamp_ms >> 16) & 0xff) as u8,
+            ((timestamp_ms >> 8) & 0xff) as u8,
+            (timestamp_ms & 0xff) as u8,
+            ((timestamp_ms >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+        ]);
+        bytes.extend_from_slice(&[0x17, 1, 0, 0, 0, 0x65]);
+        bytes.resize(bytes.len() + payload_size - 6, 0);
+        bytes.extend_from_slice(&((11 + payload_size) as u32).to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn zero_byte_flv_is_invalid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.flv");
+        fs::write(&path, []).unwrap();
+        assert_eq!(
+            FileValidator::new(20_000_000, true)
+                .validate(&path)
+                .unwrap(),
+            MediaValidation::Invalid {
+                reason: InvalidMediaReason::Empty
+            }
+        );
+    }
+
+    #[test]
+    fn flv_header_only_is_invalid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("header.flv");
+        fs::write(&path, [b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0]).unwrap();
+        assert_eq!(
+            FileValidator::new(20_000_000, true)
+                .validate(&path)
+                .unwrap(),
+            MediaValidation::Invalid {
+                reason: InvalidMediaReason::HeaderOnly
+            }
+        );
+    }
+
+    #[test]
+    fn two_megabyte_flv_with_media_is_recoverable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("short.flv");
+        fs::write(&path, flv_with_video_payload(2_000_000, 9_000)).unwrap();
+        assert_eq!(
+            FileValidator::new(20_000_000, true)
+                .validate(&path)
+                .unwrap(),
+            MediaValidation::RecoverableShort {
+                duration: Some(Duration::from_secs(9))
+            }
+        );
+    }
+
+    #[test]
+    fn normal_sized_media_remains_valid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("normal.flv");
+        fs::write(&path, flv_with_video_payload(1024, 30 * 60 * 1000)).unwrap();
+        assert_eq!(
+            FileValidator::new(512, true).validate(&path).unwrap(),
+            MediaValidation::Valid
+        );
+    }
+
+    #[test]
+    fn repeated_recoverable_segments_are_never_reclassified_as_invalid() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fault-window.flv");
+        fs::write(&path, flv_with_video_payload(2048, 2_000)).unwrap();
+        let validator = FileValidator::new(20_000_000, true);
+        for _ in 0..37 {
+            assert!(matches!(
+                validator.validate(&path).unwrap(),
+                MediaValidation::RecoverableShort { .. }
+            ));
+        }
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn transport_stream_requires_an_audio_or_video_pes_packet() {
+        let dir = tempdir().unwrap();
+        let invalid_path = dir.path().join("tables-only.ts");
+        let mut tables_only = vec![0xff; 188];
+        tables_only[..4].copy_from_slice(&[0x47, 0x40, 0x00, 0x10]);
+        fs::write(&invalid_path, &tables_only).unwrap();
+        assert_eq!(
+            FileValidator::new(1_000, true)
+                .validate(&invalid_path)
+                .unwrap(),
+            MediaValidation::Invalid {
+                reason: InvalidMediaReason::NoMediaTrack
+            }
+        );
+
+        let valid_path = dir.path().join("video.ts");
+        let mut video = vec![0xff; 188];
+        video[..8].copy_from_slice(&[0x47, 0x40, 0x00, 0x10, 0, 0, 1, 0xe0]);
+        fs::write(&valid_path, &video).unwrap();
+        assert!(matches!(
+            FileValidator::new(1_000, true)
+                .validate(&valid_path)
+                .unwrap(),
+            MediaValidation::RecoverableShort { .. }
+        ));
     }
 }

@@ -95,6 +95,7 @@ impl NiconicoLive {
                     },
                 })),
                 recording_quality: None,
+                attempt_id: None,
             }),
         })
     }

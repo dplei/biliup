@@ -1,6 +1,6 @@
 use crate::server::common::cookie_health;
 use crate::server::common::upload::UploaderMessage;
-use crate::server::common::util::FileValidator;
+use crate::server::common::util::{FileValidator, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
 use crate::server::core::downloader::{
     DanmakuClient, DownloadStatus, DownloaderRuntime, SegmentEvent, SegmentInfo,
@@ -12,7 +12,7 @@ use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
 use crate::server::infrastructure::models::hook_step::process;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
-use error_stack::ResultExt;
+use error_stack::{ResultExt, bail};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -43,27 +43,113 @@ pub struct SegmentEventProcessor {
     uploader: Sender<UploaderMessage>,
     ctx: Context,
     file_validator: FileValidator,
+    preserve_recoverable_short_segments: bool,
+    pending_short_segments: Vec<SegmentInfo>,
 }
 
 impl SegmentEventProcessor {
     /// 创建处理器
     pub fn new(uploader: Sender<UploaderMessage>, ctx: Context) -> Self {
+        let config = ctx.config();
         Self {
             channel: None,
             uploader,
-            file_validator: FileValidator::new(
-                ctx.config().filtering_threshold * 1000 * 1000,
-                true,
-            ),
+            file_validator: FileValidator::new(config.filtering_threshold * 1000 * 1000, true),
+            preserve_recoverable_short_segments: config
+                .preserve_recoverable_short_segments
+                .unwrap_or(true),
+            pending_short_segments: Vec::new(),
             ctx,
         }
     }
 
     /// 处理分段事件
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
-        // 验证文件有效性
-        self.file_validator.validate(&event.prev_file_path)?;
+        // 删除决定只能发生在媒体内容探测之后；体积本身不再代表文件无效。
+        match self.file_validator.validate(&event.prev_file_path)? {
+            MediaValidation::Valid => {
+                info!(
+                    file = %event.prev_file_path.display(),
+                    close_reason = ?event.close_reason,
+                    attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
+                    "validated media segment"
+                );
+                self.flush_pending_short_segments()?;
+                self.enqueue(event)
+            }
+            MediaValidation::RecoverableShort { duration } => {
+                if self.preserve_recoverable_short_segments {
+                    warn!(
+                        file = %event.prev_file_path.display(),
+                        duration = ?duration,
+                        close_reason = ?event.close_reason,
+                        attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
+                        "queueing recoverable short media segment"
+                    );
+                    self.pending_short_segments.push(event);
+                    Ok(())
+                } else {
+                    self.remove_invalid_segment(
+                        &event.prev_file_path,
+                        "recoverable short segment rejected by rollback configuration",
+                    );
+                    Ok(())
+                }
+            }
+            MediaValidation::Invalid { reason } => {
+                warn!(
+                    file = %event.prev_file_path.display(),
+                    reason = ?reason,
+                    close_reason = ?event.close_reason,
+                    attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
+                    "discarding invalid media segment"
+                );
+                self.remove_invalid_segment(&event.prev_file_path, &format!("{reason:?}"));
+                Ok(())
+            }
+        }
+    }
 
+    pub fn finish(&mut self) -> AppResult<()> {
+        self.flush_pending_short_segments()
+    }
+
+    fn flush_pending_short_segments(&mut self) -> AppResult<()> {
+        if self.pending_short_segments.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_short_segments);
+        for group in compatible_segment_groups(pending) {
+            if group.len() > 1 {
+                match merge_compatible_segments(&group, &self.file_validator) {
+                    Ok(merged) => {
+                        let original_files: Vec<_> = group
+                            .iter()
+                            .map(|event| event.prev_file_path.display().to_string())
+                            .collect();
+                        info!(
+                            output = %merged.prev_file_path.display(),
+                            originals = ?original_files,
+                            "merged compatible recoverable short segments; originals retained"
+                        );
+                        self.enqueue(merged)?;
+                        continue;
+                    }
+                    Err(error) => warn!(
+                        error = ?error,
+                        files = ?group.iter().map(|event| &event.prev_file_path).collect::<Vec<_>>(),
+                        "failed to merge recoverable segments; preserving and uploading originals"
+                    ),
+                }
+            }
+            for event in group {
+                self.enqueue(event)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue(&mut self, event: SegmentInfo) -> AppResult<()> {
         // 上一轮 process_with_upload 可能因上传失败提前返回，UActor 已 drop rx，
         // 这里挂着的 tx 是死的；丢弃后下面会重建一条新的管道。
         if let Some(tx) = &self.channel
@@ -78,7 +164,8 @@ impl SegmentEventProcessor {
 
         match &self.channel {
             None => {
-                let (tx, rx) = async_channel::bounded(32); // Use tokio channel for async
+                // 故障窗口可能一次释放几十个不可合并的短片；不能因 32 项上限静默顶掉旧事件。
+                let (tx, rx) = async_channel::unbounded();
 
                 // 发送到上传器
                 let res = self
@@ -111,6 +198,171 @@ impl SegmentEventProcessor {
 
         Ok(())
     }
+
+    fn remove_invalid_segment(&self, path: &std::path::Path, reason: &str) {
+        let path = path.to_owned();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            match crate::server::infrastructure::models::hook_step::HookStep::remove_file(&[&path])
+                .await
+            {
+                Ok(()) => info!(file = %path.display(), reason, "removed invalid media segment"),
+                Err(error) => error!(
+                    file = %path.display(),
+                    reason,
+                    error = ?error,
+                    "failed to remove invalid media segment; original preserved"
+                ),
+            }
+        });
+    }
+}
+
+fn compatible_segment_groups(events: Vec<SegmentInfo>) -> Vec<Vec<SegmentInfo>> {
+    let mut groups: Vec<(Option<u64>, Vec<SegmentInfo>)> = Vec::new();
+    for event in events {
+        let key = media_compatibility_key(&event);
+        let joins_previous = key.is_some()
+            && groups
+                .last()
+                .is_some_and(|(previous_key, _)| previous_key == &key);
+        if joins_previous {
+            groups.last_mut().expect("group exists").1.push(event);
+        } else {
+            groups.push((key, vec![event]));
+        }
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
+}
+
+fn media_compatibility_key(event: &SegmentInfo) -> Option<u64> {
+    if event.danmaku_file_path.is_some()
+        || !event
+            .prev_file_path
+            .extension()?
+            .to_str()?
+            .eq_ignore_ascii_case("flv")
+    {
+        return None;
+    }
+    let bytes = std::fs::read(&event.prev_file_path).ok()?;
+    if bytes.len() <= 13 || bytes.get(..3) != Some(b"FLV") {
+        return None;
+    }
+    let mut offset = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize + 4;
+    let mut headers: Vec<(u8, Vec<u8>)> = Vec::new();
+    while offset < bytes.len() {
+        if bytes.len().saturating_sub(offset) < 15 {
+            return None;
+        }
+        let tag_type = bytes[offset];
+        let size = ((bytes[offset + 1] as usize) << 16)
+            | ((bytes[offset + 2] as usize) << 8)
+            | bytes[offset + 3] as usize;
+        let body_start = offset + 11;
+        let body_end = body_start.checked_add(size)?;
+        let next = body_end.checked_add(4)?;
+        if next > bytes.len() {
+            return None;
+        }
+        let body = &bytes[body_start..body_end];
+        let is_sequence_header = match tag_type {
+            8 => body.len() > 2 && (body[0] >> 4) == 10 && body[1] == 0,
+            9 => body.len() > 5 && (body[0] & 0x0f) == 7 && body[1] == 0,
+            _ => false,
+        };
+        if is_sequence_header {
+            headers.push((tag_type, body.to_vec()));
+        }
+        offset = next;
+    }
+    if headers.is_empty() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    headers.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn merge_compatible_segments(
+    events: &[SegmentInfo],
+    validator: &FileValidator,
+) -> AppResult<SegmentInfo> {
+    let first = events
+        .first()
+        .ok_or_else(|| AppError::Custom("cannot merge an empty segment group".into()))?;
+    let last = events.last().expect("non-empty segment group");
+    let parent = first
+        .prev_file_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = first
+        .prev_file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("segment");
+    let suffix = format!("{}-{}", std::process::id(), first.segment_index);
+    let list_path = parent.join(format!(".{stem}.{suffix}.concat.txt"));
+    let output_path = parent.join(format!("{stem}.{suffix}.recovered.flv"));
+    let mut concat_list = String::new();
+    for event in events {
+        let absolute = event
+            .prev_file_path
+            .canonicalize()
+            .change_context(AppError::Unknown)?;
+        let escaped = absolute.to_string_lossy().replace('\'', "'\\''");
+        concat_list.push_str(&format!("file '{escaped}'\n"));
+    }
+    std::fs::write(&list_path, concat_list).change_context(AppError::Unknown)?;
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+        ])
+        .arg(&list_path)
+        .args(["-c", "copy"])
+        .arg(&output_path)
+        .status()
+        .change_context(AppError::Custom(
+            "failed to spawn ffmpeg for short segment merge".into(),
+        ));
+    let _ = std::fs::remove_file(&list_path);
+    let status = status?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        bail!(AppError::Custom(format!(
+            "ffmpeg short segment merge failed with {status}"
+        )));
+    }
+    if matches!(
+        validator.validate(&output_path)?,
+        MediaValidation::Invalid { .. }
+    ) {
+        let _ = std::fs::remove_file(&output_path);
+        bail!(AppError::Custom(
+            "merged short segment failed media validation".into()
+        ));
+    }
+    Ok(SegmentInfo {
+        prev_file_path: output_path,
+        danmaku_file_path: None,
+        next_file_path: None,
+        segment_index: first.segment_index,
+        close_reason: last.close_reason,
+        attempt_id: first.attempt_id.clone(),
+        recovery_source_paths: events
+            .iter()
+            .map(|event| event.prev_file_path.clone())
+            .collect(),
+    })
 }
 
 /// 下载任务
@@ -256,6 +508,12 @@ impl DownloadTask {
             info!("Retrying download in {:?}...", backoff);
             tokio::time::sleep(backoff).await;
         };
+        if let Err(error) = processor.finish() {
+            error!(
+                error = ?error,
+                "failed to flush queued recoverable segments; original files preserved"
+            );
+        }
         // 异步清理任务
         if let Some(client) = danmaku_client.clone()
             && let Err(e) = client.stop().await
@@ -413,4 +671,77 @@ pub async fn start_download_workflow(
         ctx.live_streamer().url,
         ctx.status(Stage::Download)
     );
+}
+
+#[cfg(test)]
+mod short_segment_group_tests {
+    use super::compatible_segment_groups;
+    use crate::server::core::downloader::SegmentInfo;
+    use biliup::downloader::util::SegmentCloseReason;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn append_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
+        bytes.push(tag_type);
+        bytes.extend_from_slice(&[
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+            ((timestamp >> 16) & 0xff) as u8,
+            ((timestamp >> 8) & 0xff) as u8,
+            (timestamp & 0xff) as u8,
+            ((timestamp >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+        ]);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    fn flv_fixture(codec_marker: u8) -> Vec<u8> {
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        append_tag(&mut bytes, 9, &[0x17, 0, 0, 0, 0, 1, 0x64, codec_marker], 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 1, 0, 0, 0, 0x65], 1000);
+        bytes
+    }
+
+    fn event(path: std::path::PathBuf, index: usize) -> SegmentInfo {
+        SegmentInfo {
+            prev_file_path: path,
+            danmaku_file_path: None,
+            next_file_path: None,
+            segment_index: index,
+            close_reason: SegmentCloseReason::TransportError,
+            attempt_id: Some(format!("attempt-{index}")),
+            recovery_source_paths: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn thirty_seven_compatible_segments_form_one_merge_group() {
+        let dir = tempdir().unwrap();
+        let mut events = Vec::new();
+        for index in 0..37 {
+            let path = dir.path().join(format!("segment-{index}.flv"));
+            fs::write(&path, flv_fixture(1)).unwrap();
+            events.push(event(path, index));
+        }
+        let groups = compatible_segment_groups(events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 37);
+    }
+
+    #[test]
+    fn incompatible_codec_parameters_remain_independent() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.flv");
+        let second = dir.path().join("second.flv");
+        fs::write(&first, flv_fixture(1)).unwrap();
+        fs::write(&second, flv_fixture(2)).unwrap();
+        let groups = compatible_segment_groups(vec![event(first, 0), event(second, 1)]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|group| group.len() == 1));
+    }
 }

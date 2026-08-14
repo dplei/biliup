@@ -10,9 +10,11 @@ use rand::seq::SliceRandom;
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, REFERER, USER_AGENT};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 const DOUYIN_LIVE_URL: &str = "https://live.douyin.com/";
 const DOUYIN_WEBCAST_ENTER_URL: &str = "https://live.douyin.com/webcast/room/web/enter/";
@@ -95,7 +97,26 @@ impl DouyinLive {
         let Some(room_info) = self.get_room_info().await? else {
             return Ok(LiveStatus::Offline);
         };
-        let (raw_stream_url, recording_quality) = self.select_stream_url(&room_info)?;
+        let attempt_id = generate_attempt_id();
+        let (raw_stream_url, recording_quality, candidates) = self.select_stream_url(&room_info)?;
+        info!(
+            attempt_id,
+            candidate_count = candidates.len(),
+            "douyin stream candidates observed"
+        );
+        for candidate in &candidates {
+            info!(
+                attempt_id,
+                candidate_host = candidate.host.as_deref().unwrap_or("unknown"),
+                protocol = candidate.protocol,
+                quality = candidate.quality,
+                codec = candidate.codec.as_deref().unwrap_or("unknown"),
+                resolution = candidate.resolution.as_deref().unwrap_or("unknown"),
+                bitrate = candidate.bitrate,
+                selected = candidate.selected,
+                "douyin stream candidate"
+            );
+        }
         let title = room_info
             .get("title")
             .and_then(Value::as_str)
@@ -124,6 +145,7 @@ impl DouyinLive {
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
                 recording_quality: Some(recording_quality),
+                attempt_id: Some(attempt_id),
             }),
         })
     }
@@ -325,7 +347,10 @@ impl DouyinLive {
         Ok(Some(room_info))
     }
 
-    fn select_stream_url(&self, room_info: &Value) -> LiveResult<(String, String)> {
+    fn select_stream_url(
+        &self,
+        room_info: &Value,
+    ) -> LiveResult<(String, String, Vec<ObservedStreamCandidate>)> {
         let mut pull_data = room_info.pointer("/stream_url/live_core_sdk_data/pull_data");
         if self.douyin_double_screen
             && let Some(double_screen) = room_info
@@ -355,11 +380,18 @@ impl DouyinLive {
                 .and_then(Value::as_str)
                 .filter(|url| !url.is_empty())
         {
-            return Ok((
-                url.replace("&only_audio=1", "")
-                    .replace("http://", "https://"),
-                "origin".to_string(),
-            ));
+            let url = url
+                .replace("&only_audio=1", "")
+                .replace("http://", "https://");
+            let mut candidates = observe_stream_candidates(stream_data, "origin", "flv");
+            for candidate in &mut candidates {
+                candidate.selected = false;
+            }
+            let ao_main = stream_data
+                .get("ao")
+                .and_then(|quality| quality.get("main"));
+            candidates.insert(0, observe_candidate(&url, "origin", "flv", ao_main, true));
+            return Ok((url, "origin".to_string(), candidates));
         }
 
         let available: Vec<&str> = stream_data.keys().map(String::as_str).collect();
@@ -379,7 +411,8 @@ impl DouyinLive {
             .filter(|url| !url.is_empty())
             .map(|url| url.replace("http://", "https://"))
             .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))?;
-        Ok((url, selected_quality.to_string()))
+        let candidates = observe_stream_candidates(stream_data, selected_quality, protocol);
+        Ok((url, selected_quality.to_string(), candidates))
     }
 
     fn stream_headers(&self) -> HashMap<String, String> {
@@ -411,25 +444,154 @@ impl DouyinLive {
     }
 }
 
+const QUALITY_CODES: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+
+/// 只用于可观测性的数据模型。刻意不保存 URL/query，避免后续 Debug/JSON 日志误泄露签名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ObservedStreamCandidate {
+    host: Option<String>,
+    protocol: &'static str,
+    quality: String,
+    codec: Option<String>,
+    resolution: Option<String>,
+    bitrate: Option<u64>,
+    selected: bool,
+}
+
+fn observe_stream_candidates(
+    stream_data: &serde_json::Map<String, Value>,
+    selected_quality: &str,
+    selected_protocol: &str,
+) -> Vec<ObservedStreamCandidate> {
+    let Some(selected_index) = QUALITY_CODES.iter().position(|q| *q == selected_quality) else {
+        return Vec::new();
+    };
+    let mut qualities = vec![selected_quality];
+    if let Some(quality) = QUALITY_CODES[..selected_index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|quality| stream_data.contains_key(*quality))
+    {
+        qualities.push(quality);
+    }
+    if let Some(quality) = QUALITY_CODES[selected_index + 1..]
+        .iter()
+        .copied()
+        .find(|quality| stream_data.contains_key(*quality))
+    {
+        qualities.push(quality);
+    }
+
+    qualities
+        .into_iter()
+        .flat_map(|quality| {
+            ["flv", "hls"].into_iter().filter_map(move |protocol| {
+                let main = stream_data.get(quality)?.get("main")?;
+                let url = main.get(protocol)?.as_str()?.trim();
+                if url.is_empty() {
+                    return None;
+                }
+                Some(observe_candidate(
+                    url,
+                    quality,
+                    protocol,
+                    Some(main),
+                    quality == selected_quality && protocol == selected_protocol,
+                ))
+            })
+        })
+        .collect()
+}
+
+fn observe_candidate(
+    url: &str,
+    quality: &str,
+    protocol: &'static str,
+    main: Option<&Value>,
+    selected: bool,
+) -> ObservedStreamCandidate {
+    let sdk_params = parse_sdk_params(main.and_then(|main| main.get("sdk_params")));
+    ObservedStreamCandidate {
+        host: url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(ToString::to_string)),
+        protocol,
+        quality: quality.to_string(),
+        codec: sdk_string(&sdk_params, &["vcodec", "codec", "VCodec"]),
+        resolution: sdk_resolution(&sdk_params),
+        bitrate: sdk_u64(&sdk_params, &["vbitrate", "bitrate", "VBitrate"]),
+        selected,
+    }
+}
+
+fn parse_sdk_params(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or(Value::Null),
+        Some(value @ Value::Object(_)) => value.clone(),
+        _ => Value::Null,
+    }
+}
+
+fn sdk_value<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    let object = value.as_object()?;
+    object.iter().find_map(|(key, value)| {
+        names
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+            .then_some(value)
+    })
+}
+
+fn sdk_string(value: &Value, names: &[&str]) -> Option<String> {
+    let value = sdk_value(value, names)?;
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+}
+
+fn sdk_u64(value: &Value, names: &[&str]) -> Option<u64> {
+    let value = sdk_value(value, names)?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn sdk_resolution(value: &Value) -> Option<String> {
+    sdk_string(value, &["resolution", "Resolution"]).or_else(|| {
+        let width = sdk_u64(value, &["width", "vwidth", "Width"])?;
+        let height = sdk_u64(value, &["height", "vheight", "Height"])?;
+        Some(format!("{width}x{height}"))
+    })
+}
+
+fn generate_attempt_id() -> String {
+    let mut rng = rand::thread_rng();
+    format!("dy-{:016x}", rng.r#gen::<u64>())
+}
+
 /// 在 available 列表中，按 origin>uhd>hd>sd>ld>md 的优先级为 requested 选一档可用画质：
 /// 命中则用之；否则先往更低档找，再往更高档找；都没有返回 None。
 fn select_quality_code(available: &[&str], requested: &str) -> Option<&'static str> {
-    const ITEMS: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
-    let requested = if ITEMS.contains(&requested) {
+    let requested = if QUALITY_CODES.contains(&requested) {
         requested
     } else {
         "origin"
     };
-    let idx = ITEMS.iter().position(|i| *i == requested).unwrap_or(0);
+    let idx = QUALITY_CODES
+        .iter()
+        .position(|i| *i == requested)
+        .unwrap_or(0);
     let has = |q: &str| available.contains(&q);
     if has(requested) {
-        return ITEMS.iter().copied().find(|i| *i == requested);
+        return QUALITY_CODES.iter().copied().find(|i| *i == requested);
     }
-    ITEMS[idx + 1..]
+    QUALITY_CODES[idx + 1..]
         .iter()
         .copied()
         .find(|i| has(i))
-        .or_else(|| ITEMS[..idx].iter().rev().copied().find(|i| has(i)))
+        .or_else(|| QUALITY_CODES[..idx].iter().rev().copied().find(|i| has(i)))
 }
 
 fn common_params() -> Vec<(String, String)> {
@@ -778,7 +940,8 @@ impl BrowserFingerprintGenerator {
 
 #[cfg(test)]
 mod quality_tests {
-    use super::select_quality_code;
+    use super::{observe_stream_candidates, select_quality_code};
+    use serde_json::json;
 
     #[test]
     fn requested_available_returns_itself() {
@@ -803,6 +966,85 @@ mod quality_tests {
     #[test]
     fn none_when_empty() {
         assert_eq!(select_quality_code(&[], "origin"), None);
+    }
+
+    fn stream_data(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("fixture object").clone()
+    }
+
+    #[test]
+    fn observes_flv_only_without_retaining_signed_url() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "flv": "https://pull-flv-q13.example/live/abc.flv?sign=secret&expire=9",
+                "sdk_params": "{\"VCodec\":\"h264\",\"vwidth\":1920,\"vheight\":1080,\"vbitrate\":6000}"
+            }}
+        }));
+        let candidates = observe_stream_candidates(&data, "origin", "flv");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].host.as_deref(), Some("pull-flv-q13.example"));
+        assert_eq!(candidates[0].codec.as_deref(), Some("h264"));
+        assert_eq!(candidates[0].resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(candidates[0].bitrate, Some(6000));
+        let logged = serde_json::to_string(&candidates).unwrap();
+        assert!(!logged.contains("sign"));
+        assert!(!logged.contains("expire"));
+        assert!(!logged.contains("secret"));
+        assert!(!logged.contains('?'));
+    }
+
+    #[test]
+    fn observes_flv_and_hls_for_selected_quality() {
+        let data = stream_data(json!({
+            "hd": {"main": {
+                "flv": "https://flv.example/live.flv?sign=x",
+                "hls": "https://hls.example/live.m3u8?sign=y"
+            }}
+        }));
+        let candidates = observe_stream_candidates(&data, "hd", "flv");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.selected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn observes_selected_and_adjacent_available_qualities() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "https://origin.example/live.flv"}},
+            "hd": {"main": {"flv": "https://hd.example/live.flv"}},
+            "ld": {"main": {"flv": "https://ld.example/live.flv"}},
+            "md": {"main": {"flv": "https://md.example/live.flv"}}
+        }));
+        let candidates = observe_stream_candidates(&data, "ld", "flv");
+        let qualities: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.quality.as_str())
+            .collect();
+        assert_eq!(qualities, vec!["ld", "hd", "md"]);
+    }
+
+    #[test]
+    fn missing_sdk_params_keeps_optional_metadata_empty() {
+        let data = stream_data(json!({
+            "sd": {"main": {"flv": "https://sd.example/live.flv"}}
+        }));
+        let candidates = observe_stream_candidates(&data, "sd", "flv");
+        assert_eq!(candidates[0].codec, None);
+        assert_eq!(candidates[0].resolution, None);
+        assert_eq!(candidates[0].bitrate, None);
+    }
+
+    #[test]
+    fn empty_urls_are_not_candidates() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "", "hls": "  "}}
+        }));
+        assert!(observe_stream_candidates(&data, "origin", "flv").is_empty());
     }
 }
 

@@ -6,7 +6,9 @@ use biliup::client::StatelessClient;
 use biliup::downloader::error::Error as DownloadError;
 use biliup::downloader::flv_parser::header;
 use biliup::downloader::httpflv::Connection;
-use biliup::downloader::util::{LifecycleFile, Segmentable};
+use biliup::downloader::util::{
+    LifecycleFile, SegmentCloseHandle, SegmentCloseReason, Segmentable,
+};
 use biliup::downloader::{hls, httpflv};
 use error_stack::{ResultExt, bail};
 use nom::Err;
@@ -44,8 +46,24 @@ impl StreamGears {
         &self,
         mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
         download_config: DownloadConfig,
+        close_handle: SegmentCloseHandle,
     ) -> AppResult<DownloadStatus> {
         let url = download_config.url.clone();
+        let attempt_id = download_config
+            .attempt_id
+            .clone()
+            .unwrap_or_else(|| "untracked".to_string());
+        let stream_host = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(ToString::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        let requested_protocol = if download_config.suffix.eq_ignore_ascii_case("m3u8")
+            || download_config.suffix.eq_ignore_ascii_case("ts")
+        {
+            "hls"
+        } else {
+            "flv"
+        };
         let file_name = download_config.recorder.filename_template();
         let headers_in = construct_headers(&download_config.headers).map_err(AppError::Custom)?;
         let proxy = self.proxy.clone();
@@ -61,7 +79,14 @@ impl StreamGears {
             Ok(response) => response,
             Err(err) => {
                 let status = classify_reqwest_error(err);
-                warn!(result = ?status, "download stream request failed");
+                warn!(
+                    attempt_id,
+                    stream_host,
+                    protocol = requested_protocol,
+                    quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                    result = ?status,
+                    "download stream request failed"
+                );
                 return Ok(status);
             }
         };
@@ -71,8 +96,22 @@ impl StreamGears {
         let bytes = match connection.read_frame(9).await {
             Ok(bytes) => bytes,
             Err(err) => {
+                let diagnostics = connection.diagnostics();
                 let status = classify_download_error(err);
-                warn!(result = ?status, "download stream header read failed");
+                warn!(
+                    attempt_id,
+                    http_status = diagnostics.http_status,
+                    content_encoding = diagnostics.content_encoding.as_deref().unwrap_or("none"),
+                    transfer_encoding = diagnostics.transfer_encoding.as_deref().unwrap_or("none"),
+                    received_bytes = diagnostics.received_bytes,
+                    connected_for = ?diagnostics.connected_for,
+                    buffered = diagnostics.buffered,
+                    stream_host,
+                    protocol = requested_protocol,
+                    quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                    result = ?status,
+                    "download stream header read failed"
+                );
                 return Ok(status);
             }
         };
@@ -81,7 +120,8 @@ impl StreamGears {
         // 创建分段回调钩子
         let hook = {
             let mut i = 0;
-            move |s: &str| {
+            let attempt_id = attempt_id.clone();
+            move |s: &str, close_reason| {
                 let file_path = PathBuf::from(s);
 
                 let event = SegmentInfo {
@@ -89,6 +129,9 @@ impl StreamGears {
                     danmaku_file_path: None,
                     next_file_path: None,
                     segment_index: i,
+                    close_reason,
+                    attempt_id: Some(attempt_id.clone()),
+                    recovery_source_paths: Vec::new(),
                 };
                 callback(SegmentEvent::Segment(event));
 
@@ -99,19 +142,40 @@ impl StreamGears {
         match header(&bytes) {
             Ok((_i, header)) => {
                 debug!("header: {header:#?}");
-                let stream_host = url::Url::parse(&url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(ToString::to_string))
-                    .unwrap_or_default();
-                info!(stream_host = %stream_host, "selected stream url host");
-                info!("Downloading {}...", url);
+                info!(
+                    attempt_id,
+                    stream_host = %stream_host,
+                    protocol = "flv",
+                    quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                    "starting stream download"
+                );
                 // FLV流下载
-                let file = LifecycleFile::with_hook(&file_name, "flv", hook);
-                match httpflv::download(connection, file, segment.clone()).await {
+                let file = LifecycleFile::with_hook_and_close_handle(
+                    &file_name,
+                    "flv",
+                    close_handle,
+                    hook,
+                );
+                let log_context = httpflv::HttpFlvLogContext {
+                    attempt_id: attempt_id.clone(),
+                    stream_host: stream_host.clone(),
+                    protocol: "flv".to_string(),
+                    quality: download_config.quality.clone(),
+                };
+                match httpflv::download_with_context(connection, file, segment.clone(), log_context)
+                    .await
+                {
                     Ok(()) => Ok(DownloadStatus::StreamEnded),
                     Err(err) => {
                         let status = classify_download_error(err);
-                        warn!(result = ?status, "download stream ended with classified error");
+                        warn!(
+                            attempt_id,
+                            stream_host,
+                            protocol = "flv",
+                            quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                            result = ?status,
+                            "download stream ended with classified error"
+                        );
                         Ok(status)
                     }
                 }
@@ -125,7 +189,15 @@ impl StreamGears {
             Err(e) => {
                 error!("{e}");
                 // HLS流下载
-                let file = LifecycleFile::with_hook(&file_name, "ts", hook);
+                info!(
+                    attempt_id,
+                    stream_host,
+                    protocol = "hls",
+                    quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                    "starting stream download"
+                );
+                let file =
+                    LifecycleFile::with_hook_and_close_handle(&file_name, "ts", close_handle, hook);
                 hls::download(&url, &client, file, segment.clone())
                     .await
                     .change_context(AppError::Unknown)?;
@@ -136,6 +208,7 @@ impl StreamGears {
 }
 
 fn classify_reqwest_error(err: reqwest::Error) -> DownloadStatus {
+    let err = err.without_url();
     if let Some(status) = err.status() {
         DownloadStatus::HttpStatus {
             status: status.as_u16(),
@@ -170,11 +243,13 @@ impl StreamGears {
     ) -> AppResult<DownloadStatus> {
         *self.token.write().unwrap() = CancellationToken::new();
         let token = self.token.read().unwrap().clone();
+        let close_handle = SegmentCloseHandle::default();
         tokio::select! {
             _ = token.cancelled() => {
+                close_handle.set(SegmentCloseReason::Cancelled);
                 bail!(AppError::Custom("StreamGears token cancelled".into()))
             }
-            res = self.start_download(callback, download_config) => {res}
+            res = self.start_download(callback, download_config, close_handle.clone()) => {res}
         }
     }
 

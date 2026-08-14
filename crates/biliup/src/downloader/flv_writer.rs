@@ -3,7 +3,7 @@ use crate::downloader::flv_parser::{
     SoundSize, SoundType, TagHeader,
 };
 
-use crate::downloader::util::LifecycleFile;
+use crate::downloader::util::{LifecycleFile, SegmentCloseReason};
 use byteorder::{BigEndian, WriteBytesExt};
 use serde::Serialize;
 use std::fs::File;
@@ -35,11 +35,17 @@ impl<'a> FlvFile<'a> {
         })
     }
 
-    pub fn create_new(&mut self) -> std::io::Result<()> {
-        self.file.rename();
+    pub fn create_new(&mut self, reason: SegmentCloseReason) -> std::io::Result<()> {
+        self.buf_writer.flush()?;
+        self.file.finalize(reason)?;
         let path = self.file.create()?;
         self.buf_writer = Self::create(path)?;
         Ok(())
+    }
+
+    pub fn finish(&mut self, reason: SegmentCloseReason) -> std::io::Result<()> {
+        self.buf_writer.flush()?;
+        self.file.finalize(reason)
     }
 
     fn create<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<BufWriter<File>> {
@@ -92,7 +98,11 @@ impl<'a> FlvFile<'a> {
 
 impl Drop for FlvFile<'_> {
     fn drop(&mut self) {
-        self.file.rename()
+        if self.file.is_active() {
+            let _ = self.buf_writer.flush();
+            let reason = self.file.fallback_reason(SegmentCloseReason::Unknown);
+            let _ = self.file.finalize(reason);
+        }
     }
 }
 

@@ -198,6 +198,7 @@ impl TwitchLive {
                     },
                 })),
                 recording_quality: None,
+                attempt_id: None,
             }),
         })
     }
@@ -320,6 +321,7 @@ impl TwitchVideosLive {
                     extra_ytdlp_args: self.auth_cookie_args(),
                 })),
                 recording_quality: None,
+                attempt_id: None,
             }),
         })
     }

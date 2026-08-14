@@ -127,6 +127,8 @@ impl Context {
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
             suffix,
+            attempt_id: stream.attempt_id.clone(),
+            quality: stream.recording_quality.clone(),
         }
     }
 }

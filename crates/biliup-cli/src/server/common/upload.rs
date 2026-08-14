@@ -419,6 +419,7 @@ where
     let mut missing_count = 0usize;
     pin!(rx);
     while let Some(event) = rx.next().await {
+        let recovery_source_paths = event.recovery_source_paths.clone();
         let mut paths = segment_paths(&event);
         if !segment_processors.is_empty()
             && let Err(e) = process_video_paths(&mut paths, segment_processors).await
@@ -462,11 +463,13 @@ where
                     RepairOutcome::Repaired(fixed) => {
                         // 先删修复临时件，再删原始 paths（原片+弹幕）。
                         let _ = tokio::fs::remove_file(&fixed).await;
+                        paths.extend(recovery_source_paths);
                         if let Err(e) = execute_postprocessor(paths, ctx).await {
                             error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
                         }
                     }
                     RepairOutcome::Clean => {
+                        paths.extend(recovery_source_paths);
                         if let Err(e) = execute_postprocessor(paths, ctx).await {
                             error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
                         }

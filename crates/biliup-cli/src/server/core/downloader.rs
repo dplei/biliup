@@ -13,6 +13,7 @@ use crate::server::core::downloader::streamlink::Streamlink;
 use crate::server::core::downloader::ytdlp::YouTubeDownloader;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
+use biliup::downloader::util::SegmentCloseReason;
 use danmaku_client::{DanmakuRecorder, RecorderConfig, RecorderHandle};
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,10 @@ pub struct DownloadConfig {
     pub output_dir: PathBuf,
 
     pub suffix: String,
+
+    /// 脱敏的单次选流/下载关联 ID。
+    pub attempt_id: Option<String>,
+    pub quality: Option<String>,
 }
 
 impl DownloadConfig {
@@ -131,6 +136,10 @@ pub struct SegmentInfo {
     pub next_file_path: Option<PathBuf>,
     /// 分段序号
     pub segment_index: usize,
+    pub close_reason: SegmentCloseReason,
+    pub attempt_id: Option<String>,
+    /// 合并成功后保留的原始短片；上传 durable 后才允许交给后处理清理。
+    pub recovery_source_paths: Vec<PathBuf>,
     // /// 分段开始时间戳
     // start_time: std::time::SystemTime,
     // /// 分段结束时间戳
@@ -149,6 +158,9 @@ impl SegmentInfo {
             danmaku_file_path,
             next_file_path,
             segment_index,
+            close_reason: SegmentCloseReason::Unknown,
+            attempt_id: None,
+            recovery_source_paths: Vec::new(),
         }
     }
 }

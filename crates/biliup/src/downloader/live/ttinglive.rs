@@ -88,6 +88,7 @@ impl TTingLiveLive {
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
                 recording_quality: None,
+                attempt_id: None,
             }),
         })
     }
