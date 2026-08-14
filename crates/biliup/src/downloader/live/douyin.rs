@@ -1,6 +1,6 @@
 use super::{
     DanmakuSource, DownloaderHint, LiveError, LivePlugin, LiveRequest, LiveResult, LiveStatus,
-    LiveStream, media_ext_from_url,
+    LiveStream, StreamCandidate, StreamProtocol, media_ext_from_url,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -67,6 +67,10 @@ struct DouyinLive {
     douyin_true_origin: bool,
     cookie: String,
     douyin_danmaku: bool,
+    douyin_route_failover: bool,
+    douyin_protocol_fallback: bool,
+    douyin_quality_fallback: bool,
+    douyin_min_fallback_quality: String,
     web_rid: Option<String>,
     room_id: Option<String>,
     sec_uid: Option<String>,
@@ -85,6 +89,10 @@ impl DouyinLive {
             douyin_true_origin: options.true_origin,
             cookie: request.credentials.douyin_cookie.unwrap_or_default(),
             douyin_danmaku: options.danmaku,
+            douyin_route_failover: options.route_failover,
+            douyin_protocol_fallback: options.protocol_fallback,
+            douyin_quality_fallback: options.quality_fallback,
+            douyin_min_fallback_quality: options.min_fallback_quality,
             web_rid: None,
             room_id: None,
             sec_uid: None,
@@ -98,13 +106,15 @@ impl DouyinLive {
             return Ok(LiveStatus::Offline);
         };
         let attempt_id = generate_attempt_id();
-        let (raw_stream_url, recording_quality, candidates) = self.select_stream_url(&room_info)?;
+        let (raw_stream_url, recording_quality, stream_candidates, observations) =
+            self.select_stream_url(&room_info)?;
         info!(
             attempt_id,
-            candidate_count = candidates.len(),
+            candidate_count = observations.len(),
+            enabled_candidate_count = stream_candidates.len(),
             "douyin stream candidates observed"
         );
-        for candidate in &candidates {
+        for candidate in &observations {
             info!(
                 attempt_id,
                 candidate_host = candidate.host.as_deref().unwrap_or("unknown"),
@@ -144,6 +154,7 @@ impl DouyinLive {
                 danmaku: self.danmaku_source(),
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
+                stream_candidates,
                 recording_quality: Some(recording_quality),
                 attempt_id: Some(attempt_id),
             }),
@@ -350,7 +361,12 @@ impl DouyinLive {
     fn select_stream_url(
         &self,
         room_info: &Value,
-    ) -> LiveResult<(String, String, Vec<ObservedStreamCandidate>)> {
+    ) -> LiveResult<(
+        String,
+        String,
+        Vec<StreamCandidate>,
+        Vec<ObservedStreamCandidate>,
+    )> {
         let mut pull_data = room_info.pointer("/stream_url/live_core_sdk_data/pull_data");
         if self.douyin_double_screen
             && let Some(double_screen) = room_info
@@ -377,21 +393,39 @@ impl DouyinLive {
             && let Some(url) = stream_data
                 .get("ao")
                 .and_then(|quality| quality.pointer("/main/flv"))
-                .and_then(Value::as_str)
-                .filter(|url| !url.is_empty())
+                .and_then(|value| response_urls(Some(value)).into_iter().next())
         {
-            let url = url
-                .replace("&only_audio=1", "")
-                .replace("http://", "https://");
-            let mut candidates = observe_stream_candidates(stream_data, "origin", "flv");
-            for candidate in &mut candidates {
-                candidate.selected = false;
-            }
+            let url = normalize_stream_url(&url.replace("&only_audio=1", ""));
+            let mut stream_candidates = if self.douyin_route_failover {
+                build_stream_candidates(
+                    stream_data,
+                    "origin",
+                    "flv",
+                    true,
+                    self.douyin_protocol_fallback,
+                    self.douyin_quality_fallback,
+                    &self.douyin_min_fallback_quality,
+                )
+            } else {
+                Vec::new()
+            };
             let ao_main = stream_data
                 .get("ao")
                 .and_then(|quality| quality.get("main"));
-            candidates.insert(0, observe_candidate(&url, "origin", "flv", ao_main, true));
-            return Ok((url, "origin".to_string(), candidates));
+            stream_candidates.retain(|candidate| candidate.url != url);
+            stream_candidates.insert(
+                0,
+                stream_candidate(&url, "origin", StreamProtocol::Flv, ao_main, 0),
+            );
+            for (priority, candidate) in stream_candidates.iter_mut().enumerate() {
+                candidate.priority = u16::try_from(priority).unwrap_or(u16::MAX);
+            }
+            let mut observations = observe_stream_candidates(stream_data, "origin", "flv");
+            for candidate in &mut observations {
+                candidate.selected = false;
+            }
+            observations.insert(0, observe_candidate(&url, "origin", "flv", ao_main, true));
+            return Ok((url, "origin".to_string(), stream_candidates, observations));
         }
 
         let available: Vec<&str> = stream_data.keys().map(String::as_str).collect();
@@ -407,12 +441,25 @@ impl DouyinLive {
         let url = stream_data
             .get(selected_quality)
             .and_then(|quality| quality.pointer(&format!("/main/{protocol}")))
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-            .map(|url| url.replace("http://", "https://"))
+            .and_then(|value| response_urls(Some(value)).into_iter().next())
+            .map(normalize_stream_url)
             .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))?;
-        let candidates = observe_stream_candidates(stream_data, selected_quality, protocol);
-        Ok((url, selected_quality.to_string(), candidates))
+        let stream_candidates = build_stream_candidates(
+            stream_data,
+            selected_quality,
+            protocol,
+            self.douyin_route_failover,
+            self.douyin_protocol_fallback,
+            self.douyin_quality_fallback,
+            &self.douyin_min_fallback_quality,
+        );
+        let observations = observe_stream_candidates(stream_data, selected_quality, protocol);
+        Ok((
+            url,
+            selected_quality.to_string(),
+            stream_candidates,
+            observations,
+        ))
     }
 
     fn stream_headers(&self) -> HashMap<String, String> {
@@ -445,6 +492,122 @@ impl DouyinLive {
 }
 
 const QUALITY_CODES: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+
+fn normalize_stream_url(url: &str) -> String {
+    url.strip_prefix("http://")
+        .map(|rest| format!("https://{rest}"))
+        .unwrap_or_else(|| url.to_string())
+}
+
+fn build_stream_candidates(
+    stream_data: &serde_json::Map<String, Value>,
+    selected_quality: &str,
+    selected_protocol: &str,
+    route_failover: bool,
+    protocol_fallback: bool,
+    quality_fallback: bool,
+    min_fallback_quality: &str,
+) -> Vec<StreamCandidate> {
+    let mut qualities = vec![selected_quality];
+    if route_failover && quality_fallback {
+        let selected_index = QUALITY_CODES
+            .iter()
+            .position(|quality| *quality == selected_quality);
+        let min_index = QUALITY_CODES
+            .iter()
+            .position(|quality| *quality == min_fallback_quality)
+            .or_else(|| QUALITY_CODES.iter().position(|quality| *quality == "hd"));
+        if let (Some(selected_index), Some(min_index)) = (selected_index, min_index)
+            && min_index > selected_index
+        {
+            qualities.extend(
+                QUALITY_CODES[selected_index + 1..=min_index]
+                    .iter()
+                    .copied()
+                    .filter(|quality| stream_data.contains_key(*quality)),
+            );
+        }
+    }
+
+    let selected_protocol = if selected_protocol == "hls" {
+        StreamProtocol::Hls
+    } else {
+        StreamProtocol::Flv
+    };
+    let protocols = if route_failover && protocol_fallback {
+        vec![StreamProtocol::Flv, StreamProtocol::Hls]
+    } else {
+        vec![selected_protocol]
+    };
+
+    let mut candidates = Vec::new();
+    for quality in qualities {
+        let Some(main) = stream_data.get(quality).and_then(|value| value.get("main")) else {
+            continue;
+        };
+        for protocol in &protocols {
+            let key = match protocol {
+                StreamProtocol::Flv => "flv",
+                StreamProtocol::Hls => "hls",
+            };
+            for url in response_urls(main.get(key)) {
+                let url = normalize_stream_url(url);
+                if candidates
+                    .iter()
+                    .any(|candidate: &StreamCandidate| candidate.url == url)
+                {
+                    continue;
+                }
+                let priority = u16::try_from(candidates.len()).unwrap_or(u16::MAX);
+                candidates.push(stream_candidate(
+                    &url,
+                    quality,
+                    *protocol,
+                    Some(main),
+                    priority,
+                ));
+            }
+        }
+    }
+    candidates
+}
+
+fn response_urls(value: Option<&Value>) -> Vec<&str> {
+    match value {
+        Some(Value::String(url)) => (!url.trim().is_empty())
+            .then_some(url.trim())
+            .into_iter()
+            .collect(),
+        Some(Value::Array(urls)) => urls
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn stream_candidate(
+    url: &str,
+    quality: &str,
+    protocol: StreamProtocol,
+    main: Option<&Value>,
+    priority: u16,
+) -> StreamCandidate {
+    let sdk_params = parse_sdk_params(main.and_then(|main| main.get("sdk_params")));
+    StreamCandidate {
+        url: url.to_string(),
+        host: url::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(ToString::to_string)),
+        protocol,
+        quality: Some(quality.to_string()),
+        codec: sdk_string(&sdk_params, &["vcodec", "codec", "VCodec"]),
+        resolution: sdk_resolution(&sdk_params),
+        priority,
+    }
+}
 
 /// 只用于可观测性的数据模型。刻意不保存 URL/query，避免后续 Debug/JSON 日志误泄露签名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -483,25 +646,27 @@ fn observe_stream_candidates(
         qualities.push(quality);
     }
 
-    qualities
-        .into_iter()
-        .flat_map(|quality| {
-            ["flv", "hls"].into_iter().filter_map(move |protocol| {
-                let main = stream_data.get(quality)?.get("main")?;
-                let url = main.get(protocol)?.as_str()?.trim();
-                if url.is_empty() {
-                    return None;
-                }
-                Some(observe_candidate(
+    let mut observations = Vec::new();
+    for quality in qualities {
+        let Some(main) = stream_data
+            .get(quality)
+            .and_then(|quality| quality.get("main"))
+        else {
+            continue;
+        };
+        for protocol in ["flv", "hls"] {
+            for (url_index, url) in response_urls(main.get(protocol)).into_iter().enumerate() {
+                observations.push(observe_candidate(
                     url,
                     quality,
                     protocol,
                     Some(main),
-                    quality == selected_quality && protocol == selected_protocol,
-                ))
-            })
-        })
-        .collect()
+                    quality == selected_quality && protocol == selected_protocol && url_index == 0,
+                ));
+            }
+        }
+    }
+    observations
 }
 
 fn observe_candidate(
@@ -940,7 +1105,10 @@ impl BrowserFingerprintGenerator {
 
 #[cfg(test)]
 mod quality_tests {
-    use super::{observe_stream_candidates, select_quality_code};
+    use super::{
+        DouyinLive, build_stream_candidates, observe_stream_candidates, select_quality_code,
+    };
+    use crate::downloader::live::StreamProtocol;
     use serde_json::json;
 
     #[test]
@@ -970,6 +1138,30 @@ mod quality_tests {
 
     fn stream_data(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().expect("fixture object").clone()
+    }
+
+    fn selector() -> DouyinLive {
+        DouyinLive {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("fixture client"),
+            url: "https://live.douyin.com/fixture".to_string(),
+            name: "fixture".to_string(),
+            douyin_quality: "origin".to_string(),
+            douyin_protocol: "flv".to_string(),
+            douyin_double_screen: false,
+            douyin_true_origin: false,
+            cookie: String::new(),
+            douyin_danmaku: false,
+            douyin_route_failover: true,
+            douyin_protocol_fallback: true,
+            douyin_quality_fallback: false,
+            douyin_min_fallback_quality: "hd".to_string(),
+            web_rid: None,
+            room_id: None,
+            sec_uid: None,
+        }
     }
 
     #[test]
@@ -1045,6 +1237,165 @@ mod quality_tests {
             "origin": {"main": {"flv": "", "hls": "  "}}
         }));
         assert!(observe_stream_candidates(&data, "origin", "flv").is_empty());
+    }
+
+    #[test]
+    fn candidate_urls_only_come_from_the_response() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "flv": "https://flv.example/live.flv?sign=one",
+                "hls": "https://hls.example/live.m3u8?sign=two",
+                "unrelated": "https://invented.example/not-a-candidate"
+            }}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, true, false, "hd");
+        let urls: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://flv.example/live.flv?sign=one",
+                "https://hls.example/live.m3u8?sign=two"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_candidate_room_keeps_legacy_primary_url() {
+        let signed_url = "https://only.example/live.flv?sign=legacy";
+        let stream_data = json!({
+            "data": {"origin": {"main": {"flv": signed_url}}}
+        })
+        .to_string();
+        let room_info = json!({
+            "stream_url": {"live_core_sdk_data": {"pull_data": {
+                "stream_data": stream_data
+            }}}
+        });
+        let (primary, quality, candidates, _) = selector()
+            .select_stream_url(&room_info)
+            .expect("select stream");
+        assert_eq!(primary, signed_url);
+        assert_eq!(quality, "origin");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].url, signed_url);
+    }
+
+    #[test]
+    fn same_quality_flv_is_prioritized_before_hls() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "hls": "https://hls.example/live.m3u8",
+                "flv": "https://flv.example/live.flv"
+            }}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, true, false, "hd");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].protocol, StreamProtocol::Flv);
+        assert_eq!(candidates[0].priority, 0);
+        assert_eq!(candidates[1].protocol, StreamProtocol::Hls);
+        assert_eq!(candidates[1].priority, 1);
+    }
+
+    #[test]
+    fn disabling_protocol_fallback_excludes_hls_for_flv_primary() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "flv": "https://flv.example/live.flv",
+                "hls": "https://hls.example/live.m3u8"
+            }}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, false, false, "hd");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].protocol, StreamProtocol::Flv);
+    }
+
+    #[test]
+    fn disabling_quality_fallback_excludes_lower_qualities() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "https://origin.example/live.flv"}},
+            "uhd": {"main": {"flv": "https://uhd.example/live.flv"}},
+            "hd": {"main": {"flv": "https://hd.example/live.flv"}}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, true, false, "hd");
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.quality.as_deref() == Some("origin"))
+        );
+    }
+
+    #[test]
+    fn quality_fallback_stops_at_configured_minimum() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": "https://origin.example/live.flv"}},
+            "uhd": {"main": {"flv": "https://uhd.example/live.flv"}},
+            "hd": {"main": {"flv": "https://hd.example/live.flv"}},
+            "sd": {"main": {"flv": "https://sd.example/live.flv"}}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, false, true, "hd");
+        let qualities: Vec<_> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.quality.as_deref())
+            .collect();
+        assert_eq!(qualities, vec!["origin", "uhd", "hd"]);
+    }
+
+    #[test]
+    fn multiple_response_urls_keep_their_order_without_host_rewriting() {
+        let data = stream_data(json!({
+            "origin": {"main": {"flv": [
+                "http://first.example/live.flv?sign=a",
+                "https://second.example/live.flv?sign=b"
+            ]}}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, false, false, "hd");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].host.as_deref(), Some("first.example"));
+        assert_eq!(candidates[1].host.as_deref(), Some("second.example"));
+        assert_eq!(candidates[0].url, "https://first.example/live.flv?sign=a");
+        let observations = observe_stream_candidates(&data, "origin", "flv");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].host.as_deref(), Some("first.example"));
+        assert_eq!(observations[1].host.as_deref(), Some("second.example"));
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|candidate| candidate.selected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn disabling_route_failover_keeps_only_the_legacy_primary() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "flv": "https://flv.example/live.flv",
+                "hls": "https://hls.example/live.m3u8"
+            }},
+            "hd": {"main": {"flv": "https://hd.example/live.flv"}}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", false, true, true, "md");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].url, "https://flv.example/live.flv");
+    }
+
+    #[test]
+    fn candidate_debug_redacts_signed_url() {
+        let data = stream_data(json!({
+            "origin": {"main": {
+                "flv": "https://flv.example/live.flv?sign=secret&expire=9"
+            }}
+        }));
+        let candidates = build_stream_candidates(&data, "origin", "flv", true, false, false, "hd");
+        let debug = format!("{:?}", candidates);
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("sign="));
+        assert!(!debug.contains("expire="));
+        assert!(debug.contains("<redacted>"));
     }
 }
 

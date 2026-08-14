@@ -110,6 +110,38 @@ const Douyin: React.FC<Props> = props => {
           <Select.Option value="hls">hls</Select.Option>
         </Form.Select>
         <Form.Switch
+          field="douyin_route_failover"
+          extraText="候选线路总开关，默认开启；关闭后始终只使用原有主选 URL。"
+          label="候选线路回退（douyin_route_failover）"
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.Switch
+          field="douyin_protocol_fallback"
+          extraText="默认开启，为当前画质保留 HLS 备用候选。"
+          label="协议回退（douyin_protocol_fallback）"
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.Switch
+          field="douyin_quality_fallback"
+          extraText="默认关闭；开启后才生成低画质候选，避免无感知掉档。"
+          label="画质回退（douyin_quality_fallback）"
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.Select
+          field="douyin_min_fallback_quality"
+          label="回退最低画质（douyin_min_fallback_quality）"
+          extraText="仅开启画质回退时生效，默认超清（hd）。"
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+          showClear={true}
+        >
+          <Select.Option value="uhd">蓝光（uhd）</Select.Option>
+          <Select.Option value="hd">超清（hd）</Select.Option>
+          <Select.Option value="sd">高清（sd）</Select.Option>
+          <Select.Option value="ld">标清（ld）</Select.Option>
+          <Select.Option value="md">流畅（md）</Select.Option>
+        </Form.Select>
+        <Form.Switch
           field="douyin_double_screen"
           extraText={
             <div style={{ fontSize: '14px' }}>

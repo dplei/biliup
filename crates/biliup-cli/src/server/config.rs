@@ -178,6 +178,18 @@ pub struct Config {
     /// 抖音真原画
     #[serde(default)]
     pub douyin_true_origin: Option<bool>,
+    /// 抖音候选线路模型与后续自动切线总开关。
+    #[serde(default)]
+    pub douyin_route_failover: Option<bool>,
+    /// 是否保留同画质的备用协议候选（默认 FLV 后 HLS）。
+    #[serde(default)]
+    pub douyin_protocol_fallback: Option<bool>,
+    /// 是否允许生成低一档画质候选；默认关闭。
+    #[serde(default)]
+    pub douyin_quality_fallback: Option<bool>,
+    /// 自动降画质允许到达的最低档，默认 hd。
+    #[serde(default)]
+    pub douyin_min_fallback_quality: Option<String>,
     /// 抖音画质降级告警阈值：实际录到的画质低于此档时 webhook 推送。
     /// 取值同画质（origin/uhd/hd/sd/ld/md），"off"=关闭；缺省视为 "uhd"（蓝光）。
     #[serde(default)]
@@ -631,6 +643,28 @@ mod route_health_config_tests {
 
         let disabled: Config = serde_yaml::from_str("route_health_enabled: false").expect("config");
         assert_eq!(disabled.route_health_enabled, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod douyin_candidate_config_tests {
+    use super::Config;
+
+    #[test]
+    fn candidate_fallback_options_deserialize_independently() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+douyin_route_failover: false
+douyin_protocol_fallback: false
+douyin_quality_fallback: true
+douyin_min_fallback_quality: sd
+"#,
+        )
+        .expect("douyin candidate config");
+        assert_eq!(config.douyin_route_failover, Some(false));
+        assert_eq!(config.douyin_protocol_fallback, Some(false));
+        assert_eq!(config.douyin_quality_fallback, Some(true));
+        assert_eq!(config.douyin_min_fallback_quality.as_deref(), Some("sd"));
     }
 }
 

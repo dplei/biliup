@@ -152,6 +152,10 @@ pub struct DouyinOptions {
     pub double_screen: bool,
     pub true_origin: bool,
     pub danmaku: bool,
+    pub route_failover: bool,
+    pub protocol_fallback: bool,
+    pub quality_fallback: bool,
+    pub min_fallback_quality: String,
 }
 
 impl Default for DouyinOptions {
@@ -162,6 +166,10 @@ impl Default for DouyinOptions {
             double_screen: false,
             true_origin: false,
             danmaku: false,
+            route_failover: true,
+            protocol_fallback: true,
+            quality_fallback: false,
+            min_fallback_quality: "hd".to_string(),
         }
     }
 }
@@ -313,12 +321,60 @@ pub struct LiveStream {
     pub danmaku: Option<DanmakuSource>,
     pub downloader_hint: DownloaderHint,
     pub runtime_options: Option<RuntimeOptions>,
+    /// 平台响应真实提供的可选下载路线。`raw_stream_url` 仍是兼容主选。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stream_candidates: Vec<StreamCandidate>,
     /// 实际选中的画质代码（origin/uhd/...）。仅抖音填充，其它平台为 None。
     #[serde(default)]
     pub recording_quality: Option<String>,
     /// 一次选流/下载尝试的脱敏关联 ID；不包含 URL、Cookie 或签名参数。
     #[serde(default)]
     pub attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamProtocol {
+    Flv,
+    Hls,
+}
+
+impl std::fmt::Display for StreamProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Flv => formatter.write_str("flv"),
+            Self::Hls => formatter.write_str("hls"),
+        }
+    }
+}
+
+/// 一条由平台响应提供并已签名的真实下载路线。
+///
+/// Debug 刻意隐藏完整 URL，避免 `LiveStream` 的普通诊断日志泄露签名 query。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCandidate {
+    pub url: String,
+    pub host: Option<String>,
+    pub protocol: StreamProtocol,
+    pub quality: Option<String>,
+    pub codec: Option<String>,
+    pub resolution: Option<String>,
+    pub priority: u16,
+}
+
+impl std::fmt::Debug for StreamCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamCandidate")
+            .field("url", &"<redacted>")
+            .field("host", &self.host)
+            .field("protocol", &self.protocol)
+            .field("quality", &self.quality)
+            .field("codec", &self.codec)
+            .field("resolution", &self.resolution)
+            .field("priority", &self.priority)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +473,55 @@ pub fn builtin_plugins() -> Vec<Arc<dyn LivePlugin + Send + Sync>> {
         Arc::new(YY::new()),
         Arc::new(General::new()),
     ]
+}
+
+#[cfg(test)]
+mod stream_candidate_compatibility_tests {
+    use super::{DouyinOptions, DownloaderHint, LiveStream};
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn non_douyin_stream() -> LiveStream {
+        LiveStream {
+            name: "fixture".to_string(),
+            url: "https://example.com/room".to_string(),
+            title: "fixture".to_string(),
+            date: Utc::now(),
+            live_cover_url: String::new(),
+            raw_stream_url: "https://cdn.example/live.flv".to_string(),
+            platform: "general".to_string(),
+            stream_headers: HashMap::new(),
+            suffix: "flv".to_string(),
+            danmaku: None,
+            downloader_hint: DownloaderHint::StreamGears,
+            runtime_options: None,
+            stream_candidates: Vec::new(),
+            recording_quality: None,
+            attempt_id: None,
+        }
+    }
+
+    #[test]
+    fn old_non_douyin_payload_defaults_candidates_to_empty() {
+        let mut value = serde_json::to_value(non_douyin_stream()).expect("serialize fixture");
+        assert!(value.get("stream_candidates").is_none());
+        value
+            .as_object_mut()
+            .expect("fixture object")
+            .remove("stream_candidates");
+        let decoded: LiveStream = serde_json::from_value(value).expect("deserialize old payload");
+        assert!(decoded.stream_candidates.is_empty());
+        assert_eq!(decoded.raw_stream_url, "https://cdn.example/live.flv");
+    }
+
+    #[test]
+    fn douyin_candidate_defaults_match_phase_three_policy() {
+        let options = DouyinOptions::default();
+        assert!(options.route_failover);
+        assert!(options.protocol_fallback);
+        assert!(!options.quality_fallback);
+        assert_eq!(options.min_fallback_quality, "hd");
+    }
 }
 
 pub fn media_ext_from_url(input: &str) -> Option<String> {

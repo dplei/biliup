@@ -934,6 +934,7 @@ mod route_health_tests {
             danmaku: None,
             downloader_hint: DownloaderHint::StreamGears,
             runtime_options: None,
+            stream_candidates: Vec::new(),
             recording_quality: Some("origin".to_string()),
             attempt_id: Some("attempt-fixture".to_string()),
         }

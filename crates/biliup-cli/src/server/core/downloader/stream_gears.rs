@@ -64,6 +64,7 @@ impl StreamGears {
         } else {
             "flv"
         };
+        let candidate_count = download_config.stream_candidates.len();
         let file_name = download_config.recorder.filename_template();
         let headers_in = construct_headers(&download_config.headers).map_err(AppError::Custom)?;
         let proxy = self.proxy.clone();
@@ -83,6 +84,7 @@ impl StreamGears {
                     attempt_id,
                     stream_host,
                     protocol = requested_protocol,
+                    candidate_count,
                     quality = download_config.quality.as_deref().unwrap_or("unknown"),
                     result = ?status,
                     "download stream request failed"
@@ -146,6 +148,7 @@ impl StreamGears {
                     attempt_id,
                     stream_host = %stream_host,
                     protocol = "flv",
+                    candidate_count,
                     quality = download_config.quality.as_deref().unwrap_or("unknown"),
                     "starting stream download"
                 );
@@ -193,6 +196,7 @@ impl StreamGears {
                     attempt_id,
                     stream_host,
                     protocol = "hls",
+                    candidate_count,
                     quality = download_config.quality.as_deref().unwrap_or("unknown"),
                     "starting stream download"
                 );

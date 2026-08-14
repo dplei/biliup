@@ -65,6 +65,13 @@ fn live_options(config: &Config) -> LiveOptions {
             double_screen: config.douyin_double_screen.unwrap_or(false),
             true_origin: config.douyin_true_origin.unwrap_or(false),
             danmaku: config.douyin_danmaku.unwrap_or(false),
+            route_failover: config.douyin_route_failover.unwrap_or(true),
+            protocol_fallback: config.douyin_protocol_fallback.unwrap_or(true),
+            quality_fallback: config.douyin_quality_fallback.unwrap_or(false),
+            min_fallback_quality: config
+                .douyin_min_fallback_quality
+                .clone()
+                .unwrap_or_else(|| "hd".to_string()),
         },
         douyu: DouyuOptions {
             cdn: config

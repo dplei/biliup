@@ -94,6 +94,7 @@ impl NiconicoLive {
                         purge_credentials: self.purge_credentials.clone(),
                     },
                 })),
+                stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
             }),

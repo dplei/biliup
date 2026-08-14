@@ -91,6 +91,14 @@ check_sourcecode = 15
 ### origin 原画,uhd 蓝光,hd 超清,sd 高清,ld 标清,md 流畅
 ### 没有选中的画质则会自动选择相近的画质优先低清晰度
 #douyin_quality = 'origin'
+### 抖音候选线路总开关；false 时只保留 raw_stream_url 主选
+#douyin_route_failover = true
+### 允许同画质 FLV → HLS 协议回退
+#douyin_protocol_fallback = true
+### 允许自动生成低画质候选，默认关闭避免无感知掉档
+#douyin_quality_fallback = false
+### 自动降画质最低档，仅 douyin_quality_fallback=true 时生效
+#douyin_min_fallback_quality = 'hd'
 
 #------哔哩哔哩------#
 ### 录制BILIBILI弹幕，目前暂时不支持视频按时长分段下的弹幕文件自动分段，默认关闭

@@ -120,6 +120,7 @@ impl Context {
         DownloadConfig {
             // 流URL
             url: stream.raw_stream_url.to_string(),
+            stream_candidates: stream.stream_candidates.clone(),
             segment_time: config.segment_time,
             file_size: config.file_size,
             headers: stream.stream_headers.clone(),

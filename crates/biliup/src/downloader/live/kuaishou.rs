@@ -102,6 +102,7 @@ impl KuaishouLive {
                 danmaku: None,
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
+                stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
             }),
