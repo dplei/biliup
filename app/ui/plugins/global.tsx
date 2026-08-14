@@ -215,6 +215,12 @@ const Global: React.FC = () => {
           extraText={<div style={{ fontSize: '14px' }}>默认开启；关闭后恢复旧的按体积过滤行为。</div>}
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
+        <Form.Switch
+          field="route_health_enabled"
+          label="拉流线路健康退避（route_health_enabled）"
+          extraText={<div style={{ fontSize: '14px' }}>默认开启；直播仍在线时，同一路线连续失败按 2/4/8/16/30 秒退避。</div>}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
 
         <Form.InputNumber
           field="delay"

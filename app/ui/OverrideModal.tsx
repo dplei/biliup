@@ -333,6 +333,12 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         extraText="默认开启；关闭后恢复旧的按体积过滤行为。"
         fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
       />
+      <Form.Switch
+        field="route_health_enabled"
+        label="拉流线路健康退避（route_health_enabled）"
+        extraText="默认开启；关闭后恢复旧的直播状态重试流程。"
+        fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+      />
     </Collapse.Panel>
   )
 

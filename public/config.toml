@@ -14,6 +14,8 @@ file_size = 2621440000
 filtering_threshold = 20
 ### 是否保留探测有效的短分段；false 可回滚到旧的按体积过滤行为
 #preserve_recoverable_short_segments = true
+### 是否独立记录拉流线路失败并按 2/4/8/16/30 秒退避；false 可回滚旧重试流程
+#route_health_enabled = true
 ### 自定义录播文件名模板, 支持变量 {streamer}:你在配置里设置的直播间名, {title}:当场直播间标题, {colon}:字面冒号
 ### 如果上传文件，文件名必须包含设定的模板名。其次，如果没有定义时间，文件分片可能会互相覆盖，所以推荐设置时间来避免分段文件名重复。
 ### 普通冒号会被替换为 _；如需输出冒号，使用 {colon}，例如 %H{colon}%M{colon}%S。

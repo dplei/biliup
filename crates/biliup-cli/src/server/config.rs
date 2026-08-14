@@ -34,6 +34,10 @@ pub struct Config {
     #[serde(default)]
     pub preserve_recoverable_short_segments: Option<bool>,
 
+    /// 是否启用独立的拉流线路健康计数与指数退避。None/true = 开启；false = 旧流程。
+    #[serde(default)]
+    pub route_health_enabled: Option<bool>,
+
     /// 文件名前缀
     #[serde(default)]
     pub filename_prefix: Option<String>,
@@ -613,6 +617,20 @@ mod recoverable_short_segment_config_tests {
         let disabled: Config =
             serde_yaml::from_str("preserve_recoverable_short_segments: false").expect("config");
         assert_eq!(disabled.preserve_recoverable_short_segments, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod route_health_config_tests {
+    use super::Config;
+
+    #[test]
+    fn route_health_defaults_on_and_can_be_rolled_back() {
+        let default: Config = serde_yaml::from_str("{}").expect("default config");
+        assert!(default.route_health_enabled.unwrap_or(true));
+
+        let disabled: Config = serde_yaml::from_str("route_health_enabled: false").expect("config");
+        assert_eq!(disabled.route_health_enabled, Some(false));
     }
 }
 

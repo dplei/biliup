@@ -14,27 +14,183 @@ use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::{ResultExt, bail};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-// Configuration and retry policy
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    pub base_delay: Duration,
-    pub max_delay: Duration,
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const ROUTE_STABLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteKey {
+    host: Option<String>,
+    protocol: &'static str,
+    quality: Option<String>,
 }
 
-impl RetryPolicy {
-    pub fn exponential(max_attempts: u32) -> Self {
+impl RouteKey {
+    fn from_stream(stream: &LiveStream) -> Self {
+        let parsed = url::Url::parse(&stream.raw_stream_url).ok();
+        let host = parsed
+            .as_ref()
+            .and_then(|url| url.host_str())
+            .map(ToString::to_string);
+        let path = parsed.as_ref().map(url::Url::path).unwrap_or_default();
+        let protocol = if stream.suffix.eq_ignore_ascii_case("m3u8")
+            || stream.suffix.eq_ignore_ascii_case("ts")
+            || path.ends_with(".m3u8")
+        {
+            "hls"
+        } else {
+            "flv"
+        };
         Self {
-            max_attempts,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(30),
+            host,
+            protocol,
+            quality: stream.recording_quality.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteHealthUpdate {
+    Unchanged,
+    Failure(u32),
+    Recovered,
+}
+
+/// 拉流线路健康状态。它只在直播状态确认仍为 Live 后接收终止结果，因而不会把
+/// 正常下播（包括 404 + Offline）误计为 CDN 线路故障。
+#[derive(Debug)]
+struct RouteHealthState {
+    enabled: bool,
+    consecutive_transport_failures: u32,
+    last_failure_at: Option<Instant>,
+    stable_since: Option<Instant>,
+    current_route_key: Option<RouteKey>,
+}
+
+impl RouteHealthState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            consecutive_transport_failures: 0,
+            last_failure_at: None,
+            stable_since: None,
+            current_route_key: None,
+        }
+    }
+
+    fn begin_attempt(&mut self, stream: &LiveStream, now: Instant) {
+        if !self.enabled {
+            return;
+        }
+        let route = RouteKey::from_stream(stream);
+        if self.current_route_key.as_ref() != Some(&route) {
+            self.current_route_key = Some(route);
+        }
+        self.stable_since = Some(now);
+    }
+
+    fn observe_live_attempt(
+        &mut self,
+        status: Option<&DownloadStatus>,
+        connected_for: Duration,
+        completed_configured_segment: bool,
+        now: Instant,
+    ) -> RouteHealthUpdate {
+        if !self.enabled || matches!(status, Some(DownloadStatus::Cancelled)) {
+            return RouteHealthUpdate::Unchanged;
+        }
+
+        let was_unhealthy = self.consecutive_transport_failures > 0;
+        if connected_for >= ROUTE_STABLE_THRESHOLD || completed_configured_segment {
+            self.consecutive_transport_failures = 0;
+            self.last_failure_at = None;
+        }
+
+        // AppResult::Err 也属于传输失败；具体错误已经由下载器日志脱敏记录。
+        let is_transport_failure = status
+            .map(DownloadStatus::is_transport_failure)
+            .unwrap_or(true);
+        if is_transport_failure {
+            self.consecutive_transport_failures =
+                self.consecutive_transport_failures.saturating_add(1);
+            self.last_failure_at = Some(now);
+            self.stable_since = None;
+            RouteHealthUpdate::Failure(self.consecutive_transport_failures)
+        } else if was_unhealthy && self.consecutive_transport_failures == 0 {
+            RouteHealthUpdate::Recovered
+        } else {
+            RouteHealthUpdate::Unchanged
+        }
+    }
+
+    /// 记录刷新签名后实际选中的路线。阶段 2 尚没有候选集合；当平台真实返回的
+    /// Host/协议/画质已经变化时，将它视作可立即尝试的新路线。
+    fn select_next_route(&mut self, stream: &LiveStream) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let next = RouteKey::from_stream(stream);
+        let changed = self
+            .current_route_key
+            .as_ref()
+            .is_some_and(|key| key != &next);
+        if changed {
+            self.current_route_key = Some(next);
+            self.stable_since = None;
+        }
+        changed
+    }
+
+    fn retry_delay(&self, route_changed: bool) -> Duration {
+        if route_changed {
+            return Duration::ZERO;
+        }
+        exponential_backoff(self.consecutive_transport_failures.max(1))
+    }
+}
+
+#[derive(Debug, Default)]
+struct OfflineRetryState {
+    offline_since: Option<Instant>,
+    offline_retry_count: u32,
+}
+
+impl OfflineRetryState {
+    fn record_live(&mut self) {
+        self.offline_since = None;
+        self.offline_retry_count = 0;
+    }
+
+    fn record_unavailable(&mut self, now: Instant, grace: Duration) -> bool {
+        let since = *self.offline_since.get_or_insert(now);
+        self.offline_retry_count = self.offline_retry_count.saturating_add(1);
+        now.saturating_duration_since(since) >= grace
+    }
+
+    /// 保持阶段 2 之前的下播宽限复查间隔：首次不可用后等待 4 秒。
+    fn retry_delay(&self) -> Duration {
+        RETRY_BASE_DELAY
+            .saturating_mul(2_u32.saturating_pow(self.offline_retry_count.min(5)))
+            .min(RETRY_MAX_DELAY)
+    }
+}
+
+fn exponential_backoff(failure_count: u32) -> Duration {
+    RETRY_BASE_DELAY
+        .saturating_mul(2_u32.saturating_pow(failure_count.saturating_sub(1).min(5)))
+        .min(RETRY_MAX_DELAY)
+}
+
+struct DownloadAttempt {
+    result: AppResult<DownloadStatus>,
+    connected_for: Duration,
+    completed_configured_segment: bool,
 }
 
 /// 分段事件处理器
@@ -393,10 +549,9 @@ impl DownloadTask {
         // 超过 grace」才判定真下播 → 投稿。避免抖音等 flv 短暂中断（CDN/签名轮换）被当成
         // 下播，结果一场直播被切成多个稿件。grace=0（默认）→ 一离线立即结束，保持老行为。
         let grace = Duration::from_secs(ctx.config().delay);
-        let base_delay = Duration::from_secs(2); // 复查退避基数
-        let max_backoff = Duration::from_secs(30); // 单次复查间隔上限，保证宽限窗口内多次复查
-        let mut retry_count: u32 = 0; // 仅用于退避递增与日志
-        let mut offline_since: Option<std::time::Instant> = None; // 连续离线的起点
+        let route_health_enabled = ctx.config().route_health_enabled.unwrap_or(true);
+        let mut route_health = RouteHealthState::new(route_health_enabled);
+        let mut offline_retry = OfflineRetryState::default();
         let url = ctx.live_streamer().url.clone();
         // cookie 健康监测：录制中断流复查时同样喂给健康统计（录制时检测）
         let platform = plugin.name();
@@ -425,9 +580,11 @@ impl DownloadTask {
             // 创建守卫确保清理
             // 创建事件处理器
             // 执行下载
-            let components = self
+            route_health.begin_attempt(&stream, Instant::now());
+            let attempt = self
                 .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
                 .await;
+            let components = attempt.result;
 
             info!("initialize_components completed: {url}");
 
@@ -439,25 +596,85 @@ impl DownloadTask {
             let check_started = std::time::Instant::now();
             let check_result = plugin.check_stream(live_request(ctx.worker())).await;
             let check_elapsed = check_started.elapsed();
-            match check_result {
+            let backoff = match check_result {
                 Ok(LiveStatus::Live {
                     stream: next_stream,
                 }) => {
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
+                    offline_retry.record_live();
+                    let health_update = route_health.observe_live_attempt(
+                        components.as_ref().ok(),
+                        attempt.connected_for,
+                        attempt.completed_configured_segment,
+                        Instant::now(),
+                    );
+                    match health_update {
+                        RouteHealthUpdate::Failure(failures) => warn!(
+                            url = url,
+                            failures,
+                            host = route_health
+                                .current_route_key
+                                .as_ref()
+                                .and_then(|key| key.host.as_deref())
+                                .unwrap_or("unknown"),
+                            protocol = route_health
+                                .current_route_key
+                                .as_ref()
+                                .map(|key| key.protocol)
+                                .unwrap_or("unknown"),
+                            quality = route_health
+                                .current_route_key
+                                .as_ref()
+                                .and_then(|key| key.quality.as_deref())
+                                .unwrap_or("unknown"),
+                            "stream is live but route transport failed"
+                        ),
+                        RouteHealthUpdate::Recovered => info!(
+                            url = url,
+                            connected_for = ?attempt.connected_for,
+                            "stream route recovered after stable download"
+                        ),
+                        RouteHealthUpdate::Unchanged => {}
+                    }
                     stream = *next_stream;
                     ctx.worker()
                         .set_recording_quality(stream.recording_quality.clone());
-                    // 流恢复：重置下播计时，继续录进同一会话（不投稿、不分稿件）
-                    offline_since = None;
-                    retry_count = 0;
+                    // Live 只重置下播状态；线路失败历史由 RouteHealthState 独立维护。
+                    let route_changed = route_health.select_next_route(&stream);
                     info!(url = url, check_elapsed = ?check_elapsed, "Stream is still live, continuing same session");
+                    if route_changed {
+                        info!(
+                            url = url,
+                            host = route_health
+                                .current_route_key
+                                .as_ref()
+                                .and_then(|key| key.host.as_deref())
+                                .unwrap_or("unknown"),
+                            protocol = route_health
+                                .current_route_key
+                                .as_ref()
+                                .map(|key| key.protocol)
+                                .unwrap_or("unknown"),
+                            quality = route_health
+                                .current_route_key
+                                .as_ref()
+                                .and_then(|key| key.quality.as_deref())
+                                .unwrap_or("unknown"),
+                            "refreshed stream selected a new route; retrying immediately"
+                        );
+                    }
+                    if route_health_enabled {
+                        route_health.retry_delay(route_changed)
+                    } else {
+                        // 回滚开关：保留旧流程中 Live 后固定 2 秒重试的行为。
+                        RETRY_BASE_DELAY
+                    }
                 }
                 Ok(LiveStatus::Offline) => {
                     // 下播是一次成功的检查（cookie 正常）
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
-                    let since = *offline_since.get_or_insert_with(std::time::Instant::now);
-                    retry_count += 1;
-                    if since.elapsed() >= grace {
+                    let now = Instant::now();
+                    if offline_retry.record_unavailable(now, grace) {
                         info!(
                             url = url,
                             check_elapsed = ?check_elapsed,
@@ -465,13 +682,15 @@ impl DownloadTask {
                         );
                         break components;
                     }
+                    let since = offline_retry.offline_since.expect("offline timestamp set");
                     info!(
                         url = url,
                         check_elapsed = ?check_elapsed,
                         "Stream went offline，宽限期内继续复查 ({:?}/{:?})",
-                        since.elapsed(),
+                        now.saturating_duration_since(since),
                         grace
                     );
+                    offline_retry.retry_delay()
                 }
                 Err(e) => {
                     // 检查出错 = cookie 可能失效（去抖后累计，达阈值才提示）
@@ -480,9 +699,8 @@ impl DownloadTask {
                         &format!("{e:?}"),
                         cookie_webhook.as_deref(),
                     );
-                    let since = *offline_since.get_or_insert_with(std::time::Instant::now);
-                    retry_count += 1;
-                    if since.elapsed() >= grace {
+                    let now = Instant::now();
+                    if offline_retry.record_unavailable(now, grace) {
                         warn!(
                             url = url,
                             check_elapsed = ?check_elapsed,
@@ -490,23 +708,23 @@ impl DownloadTask {
                         );
                         break components;
                     }
+                    let since = offline_retry.offline_since.expect("offline timestamp set");
                     warn!(
                         url = url,
                         check_elapsed = ?check_elapsed,
                         "Failed to check stream status: {:?}，宽限期内继续复查 ({:?}/{:?})",
                         e,
-                        since.elapsed(),
+                        now.saturating_duration_since(since),
                         grace
                     );
+                    offline_retry.retry_delay()
                 }
-            }
+            };
 
-            // 复查退避：指数增长但封顶 max_backoff，保证宽限窗口内多次复查
-            let backoff = base_delay
-                .saturating_mul(2_u32.saturating_pow(retry_count.min(5)))
-                .min(max_backoff);
             info!("Retrying download in {:?}...", backoff);
-            tokio::time::sleep(backoff).await;
+            if !backoff.is_zero() {
+                tokio::time::sleep(backoff).await;
+            }
         };
         if let Err(error) = processor.finish() {
             error!(
@@ -534,18 +752,27 @@ impl DownloadTask {
         ctx: Context,
         danmaku_client: Option<Arc<dyn DanmakuClient + Send + Sync>>,
         stream: &LiveStream,
-    ) -> AppResult<DownloadStatus> {
+    ) -> DownloadAttempt {
         // 获取配置和主播信息
         let streamer = ctx.live_streamer();
 
         // 执行下载
         // let hook = processor.create_hook(danmaku_client.clone());
-        let hook = |event| {
+        let completed_configured_segment = Arc::new(AtomicBool::new(false));
+        let completed_configured_segment_for_hook = completed_configured_segment.clone();
+        let hook = move |event| {
             match event {
                 SegmentEvent::Start { .. } => {
                     warn!("Ignoring unexpected segment start event");
                 }
                 SegmentEvent::Segment(mut event) => {
+                    if matches!(
+                        event.close_reason,
+                        biliup::downloader::util::SegmentCloseReason::TimedSplit
+                            | biliup::downloader::util::SegmentCloseReason::SizeSplit
+                    ) {
+                        completed_configured_segment_for_hook.store(true, Ordering::Relaxed);
+                    }
                     // 分段时，获取到的是已下载的文件名
                     // 触发弹幕滚动保存
                     if let Some(ref client) = danmaku_client {
@@ -565,15 +792,23 @@ impl DownloadTask {
             }
         };
 
+        let started_at = Instant::now();
         let result = self
             .downloader
             .download(Box::new(hook), ctx.download_config(stream))
             .await
-            .change_context(AppError::Custom("Failed to download segment".into()))?;
+            .change_context(AppError::Custom("Failed to download segment".into()));
+        let connected_for = started_at.elapsed();
+        let completed_configured_segment = completed_configured_segment.load(Ordering::Relaxed)
+            || matches!(result.as_ref().ok(), Some(DownloadStatus::SegmentCompleted));
 
         // 处理结果
         info!(url=streamer.url,result=?result, "finished downloading");
-        Ok(result)
+        DownloadAttempt {
+            result,
+            connected_for,
+            completed_configured_segment,
+        }
     }
 
     pub(crate) async fn stop(&self) -> AppResult<()> {
@@ -671,6 +906,208 @@ pub async fn start_download_workflow(
         ctx.live_streamer().url,
         ctx.status(Stage::Download)
     );
+}
+
+#[cfg(test)]
+mod route_health_tests {
+    use super::{
+        OfflineRetryState, ROUTE_STABLE_THRESHOLD, RouteHealthState, RouteHealthUpdate,
+        exponential_backoff,
+    };
+    use crate::server::core::downloader::DownloadStatus;
+    use biliup::downloader::live::{DownloaderHint, LiveStream};
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    fn stream(host: &str, suffix: &str) -> LiveStream {
+        LiveStream {
+            name: "fixture".to_string(),
+            url: "https://live.douyin.com/fixture".to_string(),
+            title: "fixture".to_string(),
+            date: Utc::now(),
+            live_cover_url: String::new(),
+            raw_stream_url: format!("https://{host}/live/fixture.{suffix}?sign=secret"),
+            platform: "douyin".to_string(),
+            stream_headers: HashMap::new(),
+            suffix: suffix.to_string(),
+            danmaku: None,
+            downloader_hint: DownloaderHint::StreamGears,
+            runtime_options: None,
+            recording_quality: Some("origin".to_string()),
+            attempt_id: Some("attempt-fixture".to_string()),
+        }
+    }
+
+    #[test]
+    fn consecutive_error_plus_live_keeps_failure_history() {
+        let stream = stream("pull-flv.example.com", "flv");
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(true);
+
+        health.begin_attempt(&stream, start);
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::Error("broken body".to_string())),
+                Duration::from_secs(20),
+                false,
+                start + Duration::from_secs(20),
+            ),
+            RouteHealthUpdate::Failure(1)
+        );
+        assert!(!health.select_next_route(&stream));
+
+        health.begin_attempt(&stream, start + Duration::from_secs(22));
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::ReadTimeout { buffered: 128 }),
+                Duration::from_secs(15),
+                false,
+                start + Duration::from_secs(37),
+            ),
+            RouteHealthUpdate::Failure(2)
+        );
+        assert_eq!(health.consecutive_transport_failures, 2);
+        assert_eq!(health.retry_delay(false), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn backoff_is_two_four_eight_sixteen_then_capped_at_thirty() {
+        let delays: Vec<_> = (1..=8).map(exponential_backoff).collect();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn stable_connection_recovers_route_health() {
+        let stream = stream("pull-flv.example.com", "flv");
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        health.begin_attempt(&stream, start);
+        let _ = health.observe_live_attempt(
+            Some(&DownloadStatus::Error("reset".to_string())),
+            Duration::from_secs(10),
+            false,
+            start + Duration::from_secs(10),
+        );
+
+        let stable_start = start + Duration::from_secs(12);
+        health.begin_attempt(&stream, stable_start);
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::Downloading),
+                ROUTE_STABLE_THRESHOLD,
+                false,
+                stable_start + ROUTE_STABLE_THRESHOLD,
+            ),
+            RouteHealthUpdate::Recovered
+        );
+        assert_eq!(health.consecutive_transport_failures, 0);
+        assert!(health.last_failure_at.is_none());
+    }
+
+    #[test]
+    fn configured_segment_completion_recovers_route_health() {
+        let stream = stream("pull-flv.example.com", "flv");
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        health.begin_attempt(&stream, start);
+        let _ = health.observe_live_attempt(
+            Some(&DownloadStatus::Error("reset".to_string())),
+            Duration::from_secs(10),
+            false,
+            start + Duration::from_secs(10),
+        );
+        health.begin_attempt(&stream, start + Duration::from_secs(12));
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::SegmentCompleted),
+                Duration::from_secs(30),
+                true,
+                start + Duration::from_secs(42),
+            ),
+            RouteHealthUpdate::Recovered
+        );
+        assert_eq!(health.consecutive_transport_failures, 0);
+    }
+
+    #[test]
+    fn cancellation_does_not_count_as_failure() {
+        let stream = stream("pull-flv.example.com", "flv");
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        health.begin_attempt(&stream, start);
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::Cancelled),
+                Duration::from_secs(1),
+                false,
+                start + Duration::from_secs(1),
+            ),
+            RouteHealthUpdate::Unchanged
+        );
+        assert_eq!(health.consecutive_transport_failures, 0);
+        assert!(health.last_failure_at.is_none());
+    }
+
+    #[test]
+    fn a_real_route_change_retries_immediately() {
+        let first = stream("pull-flv-a.example.com", "flv");
+        let second = stream("pull-hls-b.example.com", "m3u8");
+        let mut health = RouteHealthState::new(true);
+        health.begin_attempt(&first, Instant::now());
+        health.consecutive_transport_failures = 4;
+
+        assert!(health.select_next_route(&second));
+        assert_eq!(health.retry_delay(true), Duration::ZERO);
+        assert_eq!(health.consecutive_transport_failures, 4);
+    }
+
+    #[test]
+    fn offline_grace_state_keeps_existing_semantics() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(10);
+        let mut offline = OfflineRetryState::default();
+
+        assert!(!offline.record_unavailable(start, grace));
+        assert_eq!(offline.retry_delay(), Duration::from_secs(4));
+        assert!(!offline.record_unavailable(start + Duration::from_secs(9), grace));
+        assert!(offline.record_unavailable(start + Duration::from_secs(10), grace));
+
+        offline.record_live();
+        assert!(offline.offline_since.is_none());
+        assert_eq!(offline.offline_retry_count, 0);
+        assert!(!offline.record_unavailable(start + Duration::from_secs(30), grace));
+    }
+
+    #[test]
+    fn rollback_switch_disables_route_failure_tracking() {
+        let stream = stream("pull-flv.example.com", "flv");
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(false);
+        health.begin_attempt(&stream, start);
+        assert_eq!(
+            health.observe_live_attempt(
+                Some(&DownloadStatus::Error("failure".to_string())),
+                Duration::ZERO,
+                false,
+                start,
+            ),
+            RouteHealthUpdate::Unchanged
+        );
+        assert_eq!(health.consecutive_transport_failures, 0);
+    }
 }
 
 #[cfg(test)]

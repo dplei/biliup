@@ -192,8 +192,27 @@ pub enum DownloadStatus {
     ReadTimeout { buffered: usize },
     /// 拉流 URL 返回 HTTP 错误状态
     HttpStatus { status: u16 },
+    /// 用户主动取消下载。
+    Cancelled,
     /// 错误
     Error(String),
+}
+
+impl DownloadStatus {
+    /// 返回该终止状态是否应计入线路传输失败。
+    ///
+    /// `StreamEnded` 后直播间仍为 Live 时同样属于线路提前结束；调用方会在完成
+    /// 直播状态检查后再使用本分类，因此正常下播不会污染线路健康状态。
+    pub fn is_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::StreamEnded
+                | Self::IncompleteFrame { .. }
+                | Self::ReadTimeout { .. }
+                | Self::HttpStatus { .. }
+                | Self::Error(_)
+        )
+    }
 }
 
 #[async_trait]

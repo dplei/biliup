@@ -10,7 +10,7 @@ use biliup::downloader::util::{
     LifecycleFile, SegmentCloseHandle, SegmentCloseReason, Segmentable,
 };
 use biliup::downloader::{hls, httpflv};
-use error_stack::{ResultExt, bail};
+use error_stack::ResultExt;
 use nom::Err;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -247,7 +247,7 @@ impl StreamGears {
         tokio::select! {
             _ = token.cancelled() => {
                 close_handle.set(SegmentCloseReason::Cancelled);
-                bail!(AppError::Custom("StreamGears token cancelled".into()))
+                Ok(DownloadStatus::Cancelled)
             }
             res = self.start_download(callback, download_config, close_handle.clone()) => {res}
         }
