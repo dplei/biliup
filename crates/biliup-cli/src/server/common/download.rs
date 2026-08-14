@@ -1,4 +1,5 @@
 use crate::server::common::cookie_health;
+use crate::server::common::route_health::{HealthUpdate, RouteHealthState, RouteSelection};
 use crate::server::common::upload::UploaderMessage;
 use crate::server::common::util::{FileValidator, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
@@ -22,138 +23,6 @@ use tracing::{error, info, warn};
 
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-const ROUTE_STABLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteKey {
-    host: Option<String>,
-    protocol: &'static str,
-    quality: Option<String>,
-}
-
-impl RouteKey {
-    fn from_stream(stream: &LiveStream) -> Self {
-        let parsed = url::Url::parse(&stream.raw_stream_url).ok();
-        let host = parsed
-            .as_ref()
-            .and_then(|url| url.host_str())
-            .map(ToString::to_string);
-        let path = parsed.as_ref().map(url::Url::path).unwrap_or_default();
-        let protocol = if stream.suffix.eq_ignore_ascii_case("m3u8")
-            || stream.suffix.eq_ignore_ascii_case("ts")
-            || path.ends_with(".m3u8")
-        {
-            "hls"
-        } else {
-            "flv"
-        };
-        Self {
-            host,
-            protocol,
-            quality: stream.recording_quality.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteHealthUpdate {
-    Unchanged,
-    Failure(u32),
-    Recovered,
-}
-
-/// 拉流线路健康状态。它只在直播状态确认仍为 Live 后接收终止结果，因而不会把
-/// 正常下播（包括 404 + Offline）误计为 CDN 线路故障。
-#[derive(Debug)]
-struct RouteHealthState {
-    enabled: bool,
-    consecutive_transport_failures: u32,
-    last_failure_at: Option<Instant>,
-    stable_since: Option<Instant>,
-    current_route_key: Option<RouteKey>,
-}
-
-impl RouteHealthState {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            consecutive_transport_failures: 0,
-            last_failure_at: None,
-            stable_since: None,
-            current_route_key: None,
-        }
-    }
-
-    fn begin_attempt(&mut self, stream: &LiveStream, now: Instant) {
-        if !self.enabled {
-            return;
-        }
-        let route = RouteKey::from_stream(stream);
-        if self.current_route_key.as_ref() != Some(&route) {
-            self.current_route_key = Some(route);
-        }
-        self.stable_since = Some(now);
-    }
-
-    fn observe_live_attempt(
-        &mut self,
-        status: Option<&DownloadStatus>,
-        connected_for: Duration,
-        completed_configured_segment: bool,
-        now: Instant,
-    ) -> RouteHealthUpdate {
-        if !self.enabled || matches!(status, Some(DownloadStatus::Cancelled)) {
-            return RouteHealthUpdate::Unchanged;
-        }
-
-        let was_unhealthy = self.consecutive_transport_failures > 0;
-        if connected_for >= ROUTE_STABLE_THRESHOLD || completed_configured_segment {
-            self.consecutive_transport_failures = 0;
-            self.last_failure_at = None;
-        }
-
-        // AppResult::Err 也属于传输失败；具体错误已经由下载器日志脱敏记录。
-        let is_transport_failure = status
-            .map(DownloadStatus::is_transport_failure)
-            .unwrap_or(true);
-        if is_transport_failure {
-            self.consecutive_transport_failures =
-                self.consecutive_transport_failures.saturating_add(1);
-            self.last_failure_at = Some(now);
-            self.stable_since = None;
-            RouteHealthUpdate::Failure(self.consecutive_transport_failures)
-        } else if was_unhealthy && self.consecutive_transport_failures == 0 {
-            RouteHealthUpdate::Recovered
-        } else {
-            RouteHealthUpdate::Unchanged
-        }
-    }
-
-    /// 记录刷新签名后实际选中的路线。阶段 2 尚没有候选集合；当平台真实返回的
-    /// Host/协议/画质已经变化时，将它视作可立即尝试的新路线。
-    fn select_next_route(&mut self, stream: &LiveStream) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let next = RouteKey::from_stream(stream);
-        let changed = self
-            .current_route_key
-            .as_ref()
-            .is_some_and(|key| key != &next);
-        if changed {
-            self.current_route_key = Some(next);
-            self.stable_since = None;
-        }
-        changed
-    }
-
-    fn retry_delay(&self, route_changed: bool) -> Duration {
-        if route_changed {
-            return Duration::ZERO;
-        }
-        exponential_backoff(self.consecutive_transport_failures.max(1))
-    }
-}
 
 #[derive(Debug, Default)]
 struct OfflineRetryState {
@@ -201,6 +70,17 @@ pub struct SegmentEventProcessor {
     file_validator: FileValidator,
     preserve_recoverable_short_segments: bool,
     pending_short_segments: Vec<SegmentInfo>,
+    stats: SegmentProcessingStats,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentProcessingStats {
+    valid_segments: u64,
+    recoverable_short_segments: u64,
+    recoverable_short_bytes: u64,
+    merged_recovery_outputs: u64,
+    invalid_segments: u64,
+    segments_queued_for_upload: u64,
 }
 
 impl SegmentEventProcessor {
@@ -215,15 +95,20 @@ impl SegmentEventProcessor {
                 .preserve_recoverable_short_segments
                 .unwrap_or(true),
             pending_short_segments: Vec::new(),
+            stats: SegmentProcessingStats::default(),
             ctx,
         }
     }
 
     /// 处理分段事件
     pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
+        let file_bytes = std::fs::metadata(&event.prev_file_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         // 删除决定只能发生在媒体内容探测之后；体积本身不再代表文件无效。
         match self.file_validator.validate(&event.prev_file_path)? {
             MediaValidation::Valid => {
+                self.stats.valid_segments += 1;
                 info!(
                     file = %event.prev_file_path.display(),
                     close_reason = ?event.close_reason,
@@ -235,8 +120,14 @@ impl SegmentEventProcessor {
             }
             MediaValidation::RecoverableShort { duration } => {
                 if self.preserve_recoverable_short_segments {
+                    self.stats.recoverable_short_segments += 1;
+                    self.stats.recoverable_short_bytes = self
+                        .stats
+                        .recoverable_short_bytes
+                        .saturating_add(file_bytes);
                     warn!(
                         file = %event.prev_file_path.display(),
+                        file_bytes,
                         duration = ?duration,
                         close_reason = ?event.close_reason,
                         attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
@@ -253,8 +144,10 @@ impl SegmentEventProcessor {
                 }
             }
             MediaValidation::Invalid { reason } => {
+                self.stats.invalid_segments += 1;
                 warn!(
                     file = %event.prev_file_path.display(),
+                    file_bytes,
                     reason = ?reason,
                     close_reason = ?event.close_reason,
                     attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
@@ -279,6 +172,7 @@ impl SegmentEventProcessor {
             if group.len() > 1 {
                 match merge_compatible_segments(&group, &self.file_validator) {
                     Ok(merged) => {
+                        self.stats.merged_recovery_outputs += 1;
                         let original_files: Vec<_> = group
                             .iter()
                             .map(|event| event.prev_file_path.display().to_string())
@@ -352,6 +246,7 @@ impl SegmentEventProcessor {
             }
         }
 
+        self.stats.segments_queued_for_upload += 1;
         Ok(())
     }
 
@@ -576,95 +471,150 @@ impl DownloadTask {
 
         // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
-        let result = loop {
-            // 创建守卫确保清理
-            // 创建事件处理器
-            // 执行下载
-            route_health.begin_attempt(&stream, Instant::now());
-            let attempt = self
-                .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
-                .await;
-            let components = attempt.result;
-
-            info!("initialize_components completed: {url}");
+        let failover_enabled = platform == "douyin"
+            && ctx.config().douyin_route_failover.unwrap_or(false)
+            && route_health_enabled;
+        let mut can_download = true;
+        let mut route_failure_count = 0_u32;
+        let mut estimated_missing = Duration::ZERO;
+        let mut result = Ok(DownloadStatus::StreamEnded);
+        loop {
+            let attempt = if can_download {
+                route_health.begin_attempt(&stream);
+                let attempt = self
+                    .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
+                    .await;
+                result = attempt.result;
+                info!("initialize_components completed: {url}");
+                Some((attempt.connected_for, attempt.completed_configured_segment))
+            } else {
+                None
+            };
+            let interrupted = attempt.is_some()
+                && result
+                    .as_ref()
+                    .map_or(true, DownloadStatus::is_transport_failure);
 
             if self.token.is_cancelled() {
                 info!(url = url, "task is cancelled");
-                break components;
+                break;
             }
             // 检查流状态
             let check_started = std::time::Instant::now();
             let check_result = plugin.check_stream(live_request(ctx.worker())).await;
             let check_elapsed = check_started.elapsed();
+            let mut confirmed_live = false;
             let backoff = match check_result {
                 Ok(LiveStatus::Live {
                     stream: next_stream,
                 }) => {
+                    confirmed_live = true;
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
                     offline_retry.record_live();
-                    let health_update = route_health.observe_live_attempt(
-                        components.as_ref().ok(),
-                        attempt.connected_for,
-                        attempt.completed_configured_segment,
-                        Instant::now(),
-                    );
-                    match health_update {
-                        RouteHealthUpdate::Failure(failures) => warn!(
-                            url = url,
-                            failures,
-                            host = route_health
-                                .current_route_key
-                                .as_ref()
-                                .and_then(|key| key.host.as_deref())
-                                .unwrap_or("unknown"),
-                            protocol = route_health
-                                .current_route_key
-                                .as_ref()
-                                .map(|key| key.protocol)
-                                .unwrap_or("unknown"),
-                            quality = route_health
-                                .current_route_key
-                                .as_ref()
-                                .and_then(|key| key.quality.as_deref())
-                                .unwrap_or("unknown"),
-                            "stream is live but route transport failed"
-                        ),
-                        RouteHealthUpdate::Recovered => info!(
-                            url = url,
-                            connected_for = ?attempt.connected_for,
-                            "stream route recovered after stable download"
-                        ),
-                        RouteHealthUpdate::Unchanged => {}
+                    if let Some((connected_for, completed_configured_segment)) = attempt {
+                        let health_update = route_health.observe_live_attempt(
+                            result.as_ref().ok(),
+                            connected_for,
+                            completed_configured_segment,
+                            Instant::now(),
+                        );
+                        match health_update {
+                            HealthUpdate::Failure {
+                                ref key,
+                                failures,
+                                circuit_opened,
+                                alert,
+                            } => {
+                                route_failure_count = failures;
+                                warn!(
+                                    url = url,
+                                    failures,
+                                    circuit_opened,
+                                    host = key.host.as_deref().unwrap_or("unknown"),
+                                    protocol = key.protocol,
+                                    quality = key.quality.as_deref().unwrap_or("unknown"),
+                                    codec = key.codec.as_deref().unwrap_or("unknown"),
+                                    "stream is live but route transport failed"
+                                );
+                                if alert && failover_enabled {
+                                    cookie_health::notify_alert(
+                                        cookie_webhook.as_deref(),
+                                        "⚠️ 直播拉流线路故障，正在自动切换",
+                                        &format!(
+                                            "{}：当前 {} / {} / {} 线路连续失败，已熔断并尝试备用线路。后续同一轮故障不再重复告警。",
+                                            ctx.live_streamer().remark,
+                                            key.host.as_deref().unwrap_or("unknown"),
+                                            key.protocol,
+                                            key.quality.as_deref().unwrap_or("unknown"),
+                                        ),
+                                    );
+                                }
+                            }
+                            HealthUpdate::AuthRefresh { ref key } => info!(
+                                url = url,
+                                host = key.host.as_deref().unwrap_or("unknown"),
+                                protocol = key.protocol,
+                                "stream authorization failed; refreshed signed candidates before counting route failure"
+                            ),
+                            HealthUpdate::Recovered { ref key } => {
+                                route_failure_count = 0;
+                                info!(
+                                    url = url,
+                                    connected_for = ?connected_for,
+                                    host = key.host.as_deref().unwrap_or("unknown"),
+                                    protocol = key.protocol,
+                                    "stream route recovered after stable download"
+                                );
+                            }
+                            HealthUpdate::Unchanged => {}
+                        }
                     }
+                    let previous_quality = stream.recording_quality.clone();
                     stream = *next_stream;
+                    // 上一次 download future 已返回并关闭 LifecycleFile；这里才改写候选，
+                    // 下一轮必然重新创建媒体文件，不会在同一分段内混接 Host/协议/Codec。
+                    let selection =
+                        route_health.select_route(&mut stream, Instant::now(), failover_enabled);
+                    let (route_changed, selection_backoff) = match selection {
+                        RouteSelection::Selected { ref key, changed } => {
+                            can_download = true;
+                            if changed {
+                                info!(
+                                    url = url,
+                                    host = key.host.as_deref().unwrap_or("unknown"),
+                                    protocol = key.protocol,
+                                    quality = key.quality.as_deref().unwrap_or("unknown"),
+                                    codec = key.codec.as_deref().unwrap_or("unknown"),
+                                    "selected a different healthy stream route"
+                                );
+                            }
+                            (changed, None)
+                        }
+                        RouteSelection::Unavailable { retry_after } => {
+                            can_download = false;
+                            warn!(
+                                url = url,
+                                retry_after = ?retry_after,
+                                "all refreshed stream routes are cooling down; checking again after backoff"
+                            );
+                            (false, Some(retry_after.min(RETRY_MAX_DELAY)))
+                        }
+                    };
                     ctx.worker()
                         .set_recording_quality(stream.recording_quality.clone());
-                    // Live 只重置下播状态；线路失败历史由 RouteHealthState 独立维护。
-                    let route_changed = route_health.select_next_route(&stream);
                     info!(url = url, check_elapsed = ?check_elapsed, "Stream is still live, continuing same session");
-                    if route_changed {
-                        info!(
-                            url = url,
-                            host = route_health
-                                .current_route_key
-                                .as_ref()
-                                .and_then(|key| key.host.as_deref())
-                                .unwrap_or("unknown"),
-                            protocol = route_health
-                                .current_route_key
-                                .as_ref()
-                                .map(|key| key.protocol)
-                                .unwrap_or("unknown"),
-                            quality = route_health
-                                .current_route_key
-                                .as_ref()
-                                .and_then(|key| key.quality.as_deref())
-                                .unwrap_or("unknown"),
-                            "refreshed stream selected a new route; retrying immediately"
-                        );
+                    if previous_quality != stream.recording_quality
+                        && stream.platform == "douyin"
+                        && stream.recording_quality.is_some()
+                    {
+                        notify_douyin_quality_fallback(ctx, stream.recording_quality.as_deref());
                     }
-                    if route_health_enabled {
-                        route_health.retry_delay(route_changed)
+                    if let Some(delay) = selection_backoff {
+                        delay
+                    } else if route_changed {
+                        Duration::ZERO
+                    } else if route_health_enabled {
+                        exponential_backoff(route_failure_count.max(1))
                     } else {
                         // 回滚开关：保留旧流程中 Live 后固定 2 秒重试的行为。
                         RETRY_BASE_DELAY
@@ -680,7 +630,7 @@ impl DownloadTask {
                             check_elapsed = ?check_elapsed,
                             "连续离线超过宽限期 {:?}，确认下播，结束本场", grace
                         );
-                        break components;
+                        break;
                     }
                     let since = offline_retry.offline_since.expect("offline timestamp set");
                     info!(
@@ -706,7 +656,7 @@ impl DownloadTask {
                             check_elapsed = ?check_elapsed,
                             "检查直播间持续失败超过宽限期 {:?}，结束本场: {:?}", grace, e
                         );
-                        break components;
+                        break;
                     }
                     let since = offline_retry.offline_since.expect("offline timestamp set");
                     warn!(
@@ -721,15 +671,75 @@ impl DownloadTask {
                 }
             };
 
+            if confirmed_live && (interrupted || !can_download) {
+                estimated_missing = estimated_missing
+                    .saturating_add(check_elapsed)
+                    .saturating_add(backoff);
+            }
+
             info!("Retrying download in {:?}...", backoff);
             if !backoff.is_zero() {
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = self.token.cancelled() => {
+                        info!(url = url, "task was cancelled during retry backoff");
+                        break;
+                    }
+                    _ = tokio::time::sleep(backoff) => {}
+                }
             }
-        };
+        }
         if let Err(error) = processor.finish() {
             error!(
                 error = ?error,
                 "failed to flush queued recoverable segments; original files preserved"
+            );
+        }
+        let health_metrics = route_health.metrics_snapshot();
+        info!(
+            event = "download_resilience_session_summary",
+            url = url,
+            platform,
+            route_failover_enabled = failover_enabled,
+            connection_failures = health_metrics.connection_failures,
+            route_switches = health_metrics.route_switches,
+            successful_route_switches = health_metrics.successful_switches,
+            flv_to_hls_switches = health_metrics.flv_to_hls_switches,
+            successful_flv_to_hls_switches = health_metrics.successful_flv_to_hls_switches,
+            flv_to_hls_connected_ms = health_metrics.flv_to_hls_connected_for.as_millis(),
+            all_routes_backoffs = health_metrics.all_routes_backoffs,
+            estimated_missing_ms = estimated_missing.as_millis(),
+            valid_segments = processor.stats.valid_segments,
+            recoverable_short_segments = processor.stats.recoverable_short_segments,
+            recoverable_short_bytes = processor.stats.recoverable_short_bytes,
+            merged_recovery_outputs = processor.stats.merged_recovery_outputs,
+            invalid_segments = processor.stats.invalid_segments,
+            segments_queued_for_upload = processor.stats.segments_queued_for_upload,
+            "download resilience session summary"
+        );
+        for route in health_metrics.routes {
+            let failure_rate = if route.attempts == 0 {
+                0.0
+            } else {
+                route.failures as f64 / route.attempts as f64
+            };
+            let average_connected_ms = if route.attempts == 0 {
+                0
+            } else {
+                route.connected_for.as_millis() / u128::from(route.attempts)
+            };
+            info!(
+                event = "download_resilience_route_summary",
+                url = url,
+                host = route.key.host.as_deref().unwrap_or("unknown"),
+                protocol = route.key.protocol,
+                quality = route.key.quality.as_deref().unwrap_or("unknown"),
+                codec = route.key.codec.as_deref().unwrap_or("unknown"),
+                attempts = route.attempts,
+                failures = route.failures,
+                failure_rate,
+                stable_attempts = route.stable_attempts,
+                average_connected_ms,
+                "download resilience route summary"
             );
         }
         // 异步清理任务
@@ -825,6 +835,31 @@ impl DownloadTask {
 ///
 /// 只能由 `Monitor` 在取得下载池许可后调用；调用方必须把许可移动到同一个任务中，
 /// 并持有到本函数返回，保证 `pool1_size` 是下载并发的唯一限制。
+fn notify_douyin_quality_fallback(ctx: &Context, actual: Option<&str>) {
+    let Some(actual) = actual else {
+        return;
+    };
+    let cfg = ctx.config();
+    if !cookie_health::quality_below_alert(actual, cfg.douyin_quality_alert.as_deref()) {
+        return;
+    }
+    let threshold = cookie_health::effective_quality_alert(cfg.douyin_quality_alert.as_deref());
+    let actual_disp = cookie_health::quality_display(actual);
+    let threshold_disp = cookie_health::quality_display(threshold);
+    cookie_health::notify_alert(
+        cfg.cookie_health_webhook.as_deref(),
+        "⚠️ 抖音录制画质已降级",
+        &format!(
+            "{}：当前录制画质为 {}({})，低于告警阈值 {}({})。可能由候选线路熔断或 cookie（sessionid）失效触发，建议检查。",
+            ctx.live_streamer().remark,
+            actual_disp,
+            actual,
+            threshold_disp,
+            threshold,
+        ),
+    );
+}
+
 pub async fn start_download_workflow(
     downloader: Arc<dyn LivePlugin + Send + Sync>,
     ctx: Context,
@@ -843,33 +878,9 @@ pub async fn start_download_workflow(
     ctx.worker()
         .set_recording_quality(recording_quality.clone());
 
-    // 抖音画质降级告警：实际画质低于阈值则推送（每场开播仅此一次）
-    if ctx.live_stream().platform == "douyin"
-        && let Some(actual) = recording_quality.as_deref()
-    {
-        let cfg = ctx.config();
-        if crate::server::common::cookie_health::quality_below_alert(
-            actual,
-            cfg.douyin_quality_alert.as_deref(),
-        ) {
-            let threshold = crate::server::common::cookie_health::effective_quality_alert(
-                cfg.douyin_quality_alert.as_deref(),
-            );
-            let actual_disp = crate::server::common::cookie_health::quality_display(actual);
-            let threshold_disp = crate::server::common::cookie_health::quality_display(threshold);
-            crate::server::common::cookie_health::notify_alert(
-                cfg.cookie_health_webhook.as_deref(),
-                "⚠️ 抖音 未录到蓝光画质",
-                &format!(
-                    "{}：当前录制画质为 {}({})，低于告警阈值 {}({})，可能是 cookie（sessionid）失效，建议检查更换。",
-                    ctx.live_streamer().remark,
-                    actual_disp,
-                    actual,
-                    threshold_disp,
-                    threshold,
-                ),
-            );
-        }
+    // 抖音画质降级告警：实际画质低于阈值则推送（初始选流与自动降档共用）。
+    if ctx.live_stream().platform == "douyin" {
+        notify_douyin_quality_fallback(&ctx, recording_quality.as_deref());
     }
 
     tokio::spawn({
@@ -909,68 +920,9 @@ pub async fn start_download_workflow(
 }
 
 #[cfg(test)]
-mod route_health_tests {
-    use super::{
-        OfflineRetryState, ROUTE_STABLE_THRESHOLD, RouteHealthState, RouteHealthUpdate,
-        exponential_backoff,
-    };
-    use crate::server::core::downloader::DownloadStatus;
-    use biliup::downloader::live::{DownloaderHint, LiveStream};
-    use chrono::Utc;
-    use std::collections::HashMap;
+mod retry_state_tests {
+    use super::{OfflineRetryState, exponential_backoff};
     use std::time::{Duration, Instant};
-
-    fn stream(host: &str, suffix: &str) -> LiveStream {
-        LiveStream {
-            name: "fixture".to_string(),
-            url: "https://live.douyin.com/fixture".to_string(),
-            title: "fixture".to_string(),
-            date: Utc::now(),
-            live_cover_url: String::new(),
-            raw_stream_url: format!("https://{host}/live/fixture.{suffix}?sign=secret"),
-            platform: "douyin".to_string(),
-            stream_headers: HashMap::new(),
-            suffix: suffix.to_string(),
-            danmaku: None,
-            downloader_hint: DownloaderHint::StreamGears,
-            runtime_options: None,
-            stream_candidates: Vec::new(),
-            recording_quality: Some("origin".to_string()),
-            attempt_id: Some("attempt-fixture".to_string()),
-        }
-    }
-
-    #[test]
-    fn consecutive_error_plus_live_keeps_failure_history() {
-        let stream = stream("pull-flv.example.com", "flv");
-        let start = Instant::now();
-        let mut health = RouteHealthState::new(true);
-
-        health.begin_attempt(&stream, start);
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::Error("broken body".to_string())),
-                Duration::from_secs(20),
-                false,
-                start + Duration::from_secs(20),
-            ),
-            RouteHealthUpdate::Failure(1)
-        );
-        assert!(!health.select_next_route(&stream));
-
-        health.begin_attempt(&stream, start + Duration::from_secs(22));
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::ReadTimeout { buffered: 128 }),
-                Duration::from_secs(15),
-                false,
-                start + Duration::from_secs(37),
-            ),
-            RouteHealthUpdate::Failure(2)
-        );
-        assert_eq!(health.consecutive_transport_failures, 2);
-        assert_eq!(health.retry_delay(false), Duration::from_secs(4));
-    }
 
     #[test]
     fn backoff_is_two_four_eight_sixteen_then_capped_at_thirty() {
@@ -991,91 +943,6 @@ mod route_health_tests {
     }
 
     #[test]
-    fn stable_connection_recovers_route_health() {
-        let stream = stream("pull-flv.example.com", "flv");
-        let start = Instant::now();
-        let mut health = RouteHealthState::new(true);
-        health.begin_attempt(&stream, start);
-        let _ = health.observe_live_attempt(
-            Some(&DownloadStatus::Error("reset".to_string())),
-            Duration::from_secs(10),
-            false,
-            start + Duration::from_secs(10),
-        );
-
-        let stable_start = start + Duration::from_secs(12);
-        health.begin_attempt(&stream, stable_start);
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::Downloading),
-                ROUTE_STABLE_THRESHOLD,
-                false,
-                stable_start + ROUTE_STABLE_THRESHOLD,
-            ),
-            RouteHealthUpdate::Recovered
-        );
-        assert_eq!(health.consecutive_transport_failures, 0);
-        assert!(health.last_failure_at.is_none());
-    }
-
-    #[test]
-    fn configured_segment_completion_recovers_route_health() {
-        let stream = stream("pull-flv.example.com", "flv");
-        let start = Instant::now();
-        let mut health = RouteHealthState::new(true);
-        health.begin_attempt(&stream, start);
-        let _ = health.observe_live_attempt(
-            Some(&DownloadStatus::Error("reset".to_string())),
-            Duration::from_secs(10),
-            false,
-            start + Duration::from_secs(10),
-        );
-        health.begin_attempt(&stream, start + Duration::from_secs(12));
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::SegmentCompleted),
-                Duration::from_secs(30),
-                true,
-                start + Duration::from_secs(42),
-            ),
-            RouteHealthUpdate::Recovered
-        );
-        assert_eq!(health.consecutive_transport_failures, 0);
-    }
-
-    #[test]
-    fn cancellation_does_not_count_as_failure() {
-        let stream = stream("pull-flv.example.com", "flv");
-        let start = Instant::now();
-        let mut health = RouteHealthState::new(true);
-        health.begin_attempt(&stream, start);
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::Cancelled),
-                Duration::from_secs(1),
-                false,
-                start + Duration::from_secs(1),
-            ),
-            RouteHealthUpdate::Unchanged
-        );
-        assert_eq!(health.consecutive_transport_failures, 0);
-        assert!(health.last_failure_at.is_none());
-    }
-
-    #[test]
-    fn a_real_route_change_retries_immediately() {
-        let first = stream("pull-flv-a.example.com", "flv");
-        let second = stream("pull-hls-b.example.com", "m3u8");
-        let mut health = RouteHealthState::new(true);
-        health.begin_attempt(&first, Instant::now());
-        health.consecutive_transport_failures = 4;
-
-        assert!(health.select_next_route(&second));
-        assert_eq!(health.retry_delay(true), Duration::ZERO);
-        assert_eq!(health.consecutive_transport_failures, 4);
-    }
-
-    #[test]
     fn offline_grace_state_keeps_existing_semantics() {
         let start = Instant::now();
         let grace = Duration::from_secs(10);
@@ -1090,24 +957,6 @@ mod route_health_tests {
         assert!(offline.offline_since.is_none());
         assert_eq!(offline.offline_retry_count, 0);
         assert!(!offline.record_unavailable(start + Duration::from_secs(30), grace));
-    }
-
-    #[test]
-    fn rollback_switch_disables_route_failure_tracking() {
-        let stream = stream("pull-flv.example.com", "flv");
-        let start = Instant::now();
-        let mut health = RouteHealthState::new(false);
-        health.begin_attempt(&stream, start);
-        assert_eq!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::Error("failure".to_string())),
-                Duration::ZERO,
-                false,
-                start,
-            ),
-            RouteHealthUpdate::Unchanged
-        );
-        assert_eq!(health.consecutive_transport_failures, 0);
     }
 }
 

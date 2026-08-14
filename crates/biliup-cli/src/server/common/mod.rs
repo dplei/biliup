@@ -9,6 +9,7 @@ pub mod download;
 pub mod missing_segment;
 /// 用户提供路径的安全解析（静态文件接口与后续的图片上传共用）
 pub mod path_safety;
+pub mod route_health;
 /// 上传前时间戳异常检测与修复
 pub mod timestamp_repair;
 pub mod upload;

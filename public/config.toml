@@ -92,7 +92,7 @@ check_sourcecode = 15
 ### 没有选中的画质则会自动选择相近的画质优先低清晰度
 #douyin_quality = 'origin'
 ### 抖音候选线路总开关；false 时只保留 raw_stream_url 主选
-#douyin_route_failover = true
+#douyin_route_failover = false # 灰度开关：先按单个主播开启
 ### 允许同画质 FLV → HLS 协议回退
 #douyin_protocol_fallback = true
 ### 允许自动生成低画质候选，默认关闭避免无感知掉档

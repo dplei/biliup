@@ -65,7 +65,7 @@ fn live_options(config: &Config) -> LiveOptions {
             double_screen: config.douyin_double_screen.unwrap_or(false),
             true_origin: config.douyin_true_origin.unwrap_or(false),
             danmaku: config.douyin_danmaku.unwrap_or(false),
-            route_failover: config.douyin_route_failover.unwrap_or(true),
+            route_failover: config.douyin_route_failover.unwrap_or(false),
             protocol_fallback: config.douyin_protocol_fallback.unwrap_or(true),
             quality_fallback: config.douyin_quality_fallback.unwrap_or(false),
             min_fallback_quality: config
@@ -286,4 +286,22 @@ pub fn danmaku_client(
     .with_detail(source.detail);
 
     Some(Arc::new(RustDanmakuClient::new(config)))
+}
+
+#[cfg(test)]
+mod rollout_defaults_tests {
+    use super::live_options;
+    use crate::server::config::Config;
+
+    #[test]
+    fn douyin_route_failover_is_opt_in_during_gray_rollout() {
+        let default: Config = serde_yaml::from_str("{}").expect("default config");
+        let enabled: Config =
+            serde_yaml::from_str("douyin_route_failover: true").expect("enabled config");
+
+        assert!(!live_options(&default).douyin.route_failover);
+        assert!(live_options(&enabled).douyin.route_failover);
+        assert!(live_options(&default).douyin.protocol_fallback);
+        assert!(!live_options(&default).douyin.quality_fallback);
+    }
 }

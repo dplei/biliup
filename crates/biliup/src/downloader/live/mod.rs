@@ -166,7 +166,8 @@ impl Default for DouyinOptions {
             double_screen: false,
             true_origin: false,
             danmaku: false,
-            route_failover: true,
+            // 自动切线先按主播灰度；满足阶段 6 的观测门槛后再考虑默认开启。
+            route_failover: false,
             protocol_fallback: true,
             quality_fallback: false,
             min_fallback_quality: "hd".to_string(),
@@ -515,9 +516,9 @@ mod stream_candidate_compatibility_tests {
     }
 
     #[test]
-    fn douyin_candidate_defaults_match_phase_three_policy() {
+    fn douyin_candidate_defaults_match_phase_six_rollout_policy() {
         let options = DouyinOptions::default();
-        assert!(options.route_failover);
+        assert!(!options.route_failover);
         assert!(options.protocol_fallback);
         assert!(!options.quality_fallback);
         assert_eq!(options.min_fallback_quality, "hd");

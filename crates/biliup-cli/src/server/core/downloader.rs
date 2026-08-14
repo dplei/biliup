@@ -28,7 +28,7 @@ use std::sync::Mutex;
 pub struct DownloadConfig {
     /// 流 URL
     pub(crate) url: String,
-    /// 平台响应真实提供的备用下载路线；当前阶段仍使用 `url` 作为主选。
+    /// 平台响应真实提供的下载路线；上层熔断器把本次选中的候选写入 `url`。
     pub(crate) stream_candidates: Vec<StreamCandidate>,
     /// 分段时长 (格式: "HH:MM:SS")
     pub segment_time: Option<String>,

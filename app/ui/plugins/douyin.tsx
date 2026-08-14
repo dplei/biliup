@@ -111,7 +111,7 @@ const Douyin: React.FC<Props> = props => {
         </Form.Select>
         <Form.Switch
           field="douyin_route_failover"
-          extraText="候选线路总开关，默认开启；关闭后始终只使用原有主选 URL。"
+          extraText="灰度开关，默认关闭；建议先对单个主播开启，稳定后再扩大范围。"
           label="候选线路回退（douyin_route_failover）"
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />

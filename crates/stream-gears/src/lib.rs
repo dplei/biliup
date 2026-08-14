@@ -149,7 +149,7 @@ fn download_with_callback(
         };
 
         let file_name_hook = file_name_callback_fn.map(|callback_fn| -> CallbackFn {
-            Box::new(move |fmt_file_name| {
+            Box::new(move |fmt_file_name, _close_reason| {
                 Python::attach(|py| match callback_fn.call1(py, (fmt_file_name,)) {
                     Ok(_) => {}
                     Err(_) => {
@@ -166,7 +166,7 @@ fn download_with_callback(
                 map,
                 file_name,
                 segmentable,
-                file_name_hook.unwrap_or(Box::new(|_| {})),
+                file_name_hook.unwrap_or(Box::new(|_, _| {})),
                 proxy.as_deref(),
             ) {
                 Ok(res) => Ok(res),

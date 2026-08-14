@@ -130,7 +130,47 @@ docker compose pull && docker compose up -d
 
 ---
 
-## 5. 镜像版本历史（最新在前）
+## 5. 抖音断流韧性灰度
+
+阶段 5 的备用网络出口暂不实施。本轮只发布短分段止损、线路健康退避和抖音真实候选切换。
+
+### 安全默认值
+
+- `preserve_recoverable_short_segments`：默认开启。
+- `route_health_enabled`：默认开启，只影响线路计数和有界退避。
+- `douyin_route_failover`：**默认关闭**，避免发布后一次性影响全部主播。
+- `douyin_protocol_fallback`：默认开启；只有同时开启 `douyin_route_failover` 才会切到 HLS。
+- `douyin_quality_fallback`：默认关闭，不允许无感知降画质。
+
+先在单个测试主播的「配置覆写」中设置：
+
+```yaml
+douyin_route_failover: true
+douyin_protocol_fallback: true
+douyin_quality_fallback: false
+```
+
+至少观察 7 天或 20 场抖音直播，确认没有错误下播、重复投稿、不可播放分 P 或磁盘异常后，
+才能扩大到全部抖音主播；自动降画质仍需单独评估和显式开启。
+
+### 观测口径
+
+每场结束会写一条 `event=download_resilience_session_summary`，包含连接失败数、自动切线及成功数、
+FLV→HLS 次数和持续时间、全线路熔断退避次数、估算缺失时间、有效/可恢复/合并/无效分段数与
+进入上传队列的数量。每个 RouteKey 另写一条 `event=download_resilience_route_summary`，包含：
+
+- `host` / `protocol` / `quality` / `codec`（签名 query 不记录）；
+- `attempts` / `failures` / `failure_rate`；
+- `stable_attempts` / `average_connected_ms`。
+
+上传成功率继续按同场的上传/投稿日志统计；`segments_queued_for_upload` 只表示已交给上传队列，
+不能当作上传成功数。灰度期间重点比较 FLV→HLS 前后的持续时间、短分段保留数量和同期上传错误。
+
+回滚时在空间或主播覆写中设置 `douyin_route_failover: false`；已落盘分段仍照常上传。
+
+---
+
+## 6. 镜像版本历史（最新在前）
 
 | digest 前缀 | tag | 内容 |
 |---|---|---|
