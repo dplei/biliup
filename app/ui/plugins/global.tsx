@@ -195,7 +195,7 @@ const Global: React.FC = () => {
           field="filtering_threshold"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              小于此大小的文件会进一步探测媒体内容；有效短片默认保留，无有效媒体才删除。
+              小于此大小的文件会进一步探测媒体内容；开启下方保留开关后，有效短片会保留，无有效媒体才删除。
               <br />
               单位：MB
             </div>
@@ -212,13 +212,13 @@ const Global: React.FC = () => {
         <Form.Switch
           field="preserve_recoverable_short_segments"
           label="保留有效短分段（preserve_recoverable_short_segments）"
-          extraText={<div style={{ fontSize: '14px' }}>默认开启；关闭后恢复旧的按体积过滤行为。</div>}
+          extraText={<div style={{ fontSize: '14px' }}>默认关闭；开启后保留通过媒体探测的有效短分段。</div>}
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
         <Form.Switch
           field="route_health_enabled"
           label="拉流线路健康退避（route_health_enabled）"
-          extraText={<div style={{ fontSize: '14px' }}>默认开启；直播仍在线时，同一路线连续失败按 2/4/8/16/30 秒退避。</div>}
+          extraText={<div style={{ fontSize: '14px' }}>默认关闭；开启后，直播仍在线时同一路线连续失败按 2/4/8/16/30 秒退避。</div>}
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
 

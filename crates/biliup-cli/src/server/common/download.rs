@@ -91,9 +91,7 @@ impl SegmentEventProcessor {
             channel: None,
             uploader,
             file_validator: FileValidator::new(config.filtering_threshold * 1000 * 1000, true),
-            preserve_recoverable_short_segments: config
-                .preserve_recoverable_short_segments
-                .unwrap_or(true),
+            preserve_recoverable_short_segments: config.preserve_recoverable_short_segments,
             pending_short_segments: Vec::new(),
             stats: SegmentProcessingStats::default(),
             ctx,
@@ -444,7 +442,7 @@ impl DownloadTask {
         // 超过 grace」才判定真下播 → 投稿。避免抖音等 flv 短暂中断（CDN/签名轮换）被当成
         // 下播，结果一场直播被切成多个稿件。grace=0（默认）→ 一离线立即结束，保持老行为。
         let grace = Duration::from_secs(ctx.config().delay);
-        let route_health_enabled = ctx.config().route_health_enabled.unwrap_or(true);
+        let route_health_enabled = ctx.config().route_health_enabled;
         let mut route_health = RouteHealthState::new(route_health_enabled);
         let mut offline_retry = OfflineRetryState::default();
         let url = ctx.live_streamer().url.clone();

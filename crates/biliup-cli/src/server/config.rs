@@ -30,13 +30,15 @@ pub struct Config {
     #[serde(default = "default_filtering_threshold")]
     pub filtering_threshold: u64,
 
-    /// 保留通过媒体探测的短分段。None/true = 新的止损行为；false = 恢复旧的体积过滤。
+    /// 保留通过媒体探测的短分段。true = 新的止损行为；false = 旧的体积过滤。
+    #[builder(default)]
     #[serde(default)]
-    pub preserve_recoverable_short_segments: Option<bool>,
+    pub preserve_recoverable_short_segments: bool,
 
-    /// 是否启用独立的拉流线路健康计数与指数退避。None/true = 开启；false = 旧流程。
+    /// 是否启用独立的拉流线路健康计数与指数退避。true = 开启；false = 旧流程。
+    #[builder(default)]
     #[serde(default)]
-    pub route_health_enabled: Option<bool>,
+    pub route_health_enabled: bool,
 
     /// 文件名前缀
     #[serde(default)]
@@ -622,13 +624,17 @@ mod recoverable_short_segment_config_tests {
     use super::Config;
 
     #[test]
-    fn preservation_defaults_on_and_can_be_rolled_back() {
+    fn preservation_is_opt_in_and_matches_the_switch_default() {
         let default: Config = serde_yaml::from_str("{}").expect("default config");
-        assert!(default.preserve_recoverable_short_segments.unwrap_or(true));
+        assert!(!default.preserve_recoverable_short_segments);
+        assert_eq!(
+            serde_json::to_value(&default).expect("serialize config")["preserve_recoverable_short_segments"],
+            false
+        );
 
-        let disabled: Config =
-            serde_yaml::from_str("preserve_recoverable_short_segments: false").expect("config");
-        assert_eq!(disabled.preserve_recoverable_short_segments, Some(false));
+        let enabled: Config =
+            serde_yaml::from_str("preserve_recoverable_short_segments: true").expect("config");
+        assert!(enabled.preserve_recoverable_short_segments);
     }
 }
 
@@ -637,12 +643,16 @@ mod route_health_config_tests {
     use super::Config;
 
     #[test]
-    fn route_health_defaults_on_and_can_be_rolled_back() {
+    fn route_health_is_opt_in_and_matches_the_switch_default() {
         let default: Config = serde_yaml::from_str("{}").expect("default config");
-        assert!(default.route_health_enabled.unwrap_or(true));
+        assert!(!default.route_health_enabled);
+        assert_eq!(
+            serde_json::to_value(&default).expect("serialize config")["route_health_enabled"],
+            false
+        );
 
-        let disabled: Config = serde_yaml::from_str("route_health_enabled: false").expect("config");
-        assert_eq!(disabled.route_health_enabled, Some(false));
+        let enabled: Config = serde_yaml::from_str("route_health_enabled: true").expect("config");
+        assert!(enabled.route_health_enabled);
     }
 }
 
@@ -742,5 +752,30 @@ mod tests {
         assert_eq!(config.file_size, None);
         assert_eq!(config.segment_time, Some("01:00:00".to_string()));
         assert!(config.validate_segment_limits().is_ok());
+    }
+
+    #[test]
+    fn config_patch_can_explicitly_disable_resilience_switches() {
+        let mut config = Config {
+            preserve_recoverable_short_segments: true,
+            route_health_enabled: true,
+            ..Config::default()
+        };
+
+        config.apply(serde_json::from_str::<ConfigPatch>(r#"{}"#).unwrap());
+        assert!(config.preserve_recoverable_short_segments);
+        assert!(config.route_health_enabled);
+
+        let patch: ConfigPatch = serde_json::from_str(
+            r#"{
+                "preserve_recoverable_short_segments": false,
+                "route_health_enabled": false
+            }"#,
+        )
+        .unwrap();
+        config.apply(patch);
+
+        assert!(!config.preserve_recoverable_short_segments);
+        assert!(!config.route_health_enabled);
     }
 }

@@ -136,8 +136,8 @@ docker compose pull && docker compose up -d
 
 ### 安全默认值
 
-- `preserve_recoverable_short_segments`：默认开启。
-- `route_health_enabled`：默认开启，只影响线路计数和有界退避。
+- `preserve_recoverable_short_segments`：默认关闭，与网页开关显示一致；灰度主播显式开启。
+- `route_health_enabled`：默认关闭，与网页开关显示一致；开启后启用线路计数和有界退避。
 - `douyin_route_failover`：**默认关闭**，避免发布后一次性影响全部主播。
 - `douyin_protocol_fallback`：默认开启；只有同时开启 `douyin_route_failover` 才会切到 HLS。
 - `douyin_quality_fallback`：默认关闭，不允许无感知降画质。

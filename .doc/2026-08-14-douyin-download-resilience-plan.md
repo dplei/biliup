@@ -508,6 +508,9 @@ download_egresses = [
 
 ## 阶段 6：灰度发布与默认值调整
 
+本轮发布采用显式启用：`preserve_recoverable_short_segments` 和 `route_health_enabled`
+在未配置时均为关闭，与网页 Switch 的默认显示保持一致，灰度主播按下述顺序逐项开启。
+
 ### 灰度顺序
 
 1. 只开启阶段 0 日志。
