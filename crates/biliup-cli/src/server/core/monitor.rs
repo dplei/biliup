@@ -157,14 +157,19 @@ impl Monitor {
                     debug!(url = room.get_streamer().url, "未开播")
                 }
                 Err(e) => {
-                    // 检查出错（取流/检测失败或风控）= cookie 可能失效的信号
+                    // 健康模块会区分鉴权失败与普通传输/服务端错误。
+                    let sanitized_error = cookie_health::redact_sensitive(&format!("{e:?}"));
                     cookie_health::record_error(
                         platform_name,
-                        &format!("{e:?}"),
+                        &sanitized_error,
                         webhook.as_deref(),
                     );
                     self.wake_waker(room.id()).await;
-                    error!(e=?e, ctx=room.get_streamer().url,"检查直播间出错")
+                    error!(
+                        error = sanitized_error,
+                        ctx = room.get_streamer().url,
+                        "检查直播间出错"
+                    )
                 }
             };
             // 等待下一次检查

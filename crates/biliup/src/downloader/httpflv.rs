@@ -57,7 +57,7 @@ async fn download_inner(
                 content_encoding = diagnostics.content_encoding.as_deref().unwrap_or("none"),
                 transfer_encoding = diagnostics.transfer_encoding.as_deref().unwrap_or("none"),
                 received_bytes = diagnostics.received_bytes,
-                connected_for = ?diagnostics.connected_for,
+                connected_ms = diagnostics.connected_for.as_millis() as u64,
                 buffered = diagnostics.buffered,
                 attempt_id = log_context.map(|context| context.attempt_id.as_str()).unwrap_or("untracked"),
                 stream_host = log_context.map(|context| context.stream_host.as_str()).unwrap_or("unknown"),

@@ -390,8 +390,14 @@ pub struct FileValidator {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaValidation {
     Valid,
-    RecoverableShort { duration: Option<StdDuration> },
-    Invalid { reason: InvalidMediaReason },
+    RecoverableShort {
+        duration: Option<StdDuration>,
+        first_media_timestamp_ms: Option<u64>,
+        last_media_timestamp_ms: Option<u64>,
+    },
+    Invalid {
+        reason: InvalidMediaReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +413,8 @@ pub enum InvalidMediaReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MediaProbe {
     duration: Option<StdDuration>,
+    first_media_timestamp_ms: Option<u64>,
+    last_media_timestamp_ms: Option<u64>,
 }
 
 impl FileValidator {
@@ -445,12 +453,18 @@ impl FileValidator {
                 Err(reason) => return Ok(MediaValidation::Invalid { reason }),
             }
         } else {
-            MediaProbe { duration: None }
+            MediaProbe {
+                duration: None,
+                first_media_timestamp_ms: None,
+                last_media_timestamp_ms: None,
+            }
         };
 
         if size < self.min_size {
             return Ok(MediaValidation::RecoverableShort {
                 duration: probe.duration,
+                first_media_timestamp_ms: probe.first_media_timestamp_ms,
+                last_media_timestamp_ms: probe.last_media_timestamp_ms,
             });
         }
 
@@ -508,6 +522,10 @@ fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
         .ok_or_else(|| InvalidMediaReason::MalformedContainer("invalid data offset".into()))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
+    let mut first_media_timestamp = None;
+    let mut last_media_timestamp = None;
+    let mut previous_raw_timestamp = None;
+    let mut timestamp_epoch = 0_u64;
     while offset < file_len {
         if file_len.saturating_sub(offset) < 15 {
             return Err(InvalidMediaReason::MalformedContainer(
@@ -546,15 +564,32 @@ fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
             _ => false,
         };
         if is_media {
-            return Ok(MediaProbe {
-                duration: Some(StdDuration::from_millis(timestamp as u64)),
-            });
+            if let Some(previous) = previous_raw_timestamp
+                && timestamp < previous
+                && previous.wrapping_sub(timestamp) > (u32::MAX / 2)
+            {
+                timestamp_epoch = timestamp_epoch.saturating_add(1_u64 << 32);
+            }
+            let unwrapped = timestamp_epoch.saturating_add(timestamp as u64);
+            first_media_timestamp.get_or_insert(unwrapped);
+            // Small A/V timestamp reordering is normal. Keep the greatest observed media
+            // timestamp so it cannot turn a short segment into a multi-hour duration.
+            last_media_timestamp =
+                Some(last_media_timestamp.map_or(unwrapped, |last: u64| last.max(unwrapped)));
+            previous_raw_timestamp = Some(timestamp);
         }
         file.seek(SeekFrom::Start(next))
             .map_err(|error| InvalidMediaReason::ProbeFailed(error.to_string()))?;
         offset = next;
     }
-    Err(InvalidMediaReason::NoMediaTrack)
+    match (first_media_timestamp, last_media_timestamp) {
+        (Some(first), Some(last)) => Ok(MediaProbe {
+            duration: Some(StdDuration::from_millis(last.saturating_sub(first))),
+            first_media_timestamp_ms: Some(first),
+            last_media_timestamp_ms: Some(last),
+        }),
+        _ => Err(InvalidMediaReason::NoMediaTrack),
+    }
 }
 
 fn probe_mpeg_ts(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
@@ -588,7 +623,11 @@ fn probe_mpeg_ts(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
         if payload.len() >= 4 && payload[..3] == [0, 0, 1] {
             let stream_id = payload[3];
             if (0xc0..=0xef).contains(&stream_id) || stream_id == 0xbd {
-                return Ok(MediaProbe { duration: None });
+                return Ok(MediaProbe {
+                    duration: None,
+                    first_media_timestamp_ms: None,
+                    last_media_timestamp_ms: None,
+                });
             }
         }
     }
@@ -608,7 +647,11 @@ fn probe_mp4(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
     if !has_media {
         return Err(InvalidMediaReason::NoMediaTrack);
     }
-    Ok(MediaProbe { duration: None })
+    Ok(MediaProbe {
+        duration: None,
+        first_media_timestamp_ms: None,
+        last_media_timestamp_ms: None,
+    })
 }
 
 fn probe_matroska(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
@@ -624,7 +667,11 @@ fn probe_matroska(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
     {
         return Err(InvalidMediaReason::NoMediaTrack);
     }
-    Ok(MediaProbe { duration: None })
+    Ok(MediaProbe {
+        duration: None,
+        first_media_timestamp_ms: None,
+        last_media_timestamp_ms: None,
+    })
 }
 
 fn probe_m3u8(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
@@ -639,7 +686,11 @@ fn probe_m3u8(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
     if !text.lines().any(|line| line.starts_with("#EXTINF:")) {
         return Err(InvalidMediaReason::NoMediaTrack);
     }
-    Ok(MediaProbe { duration: None })
+    Ok(MediaProbe {
+        duration: None,
+        first_media_timestamp_ms: None,
+        last_media_timestamp_ms: None,
+    })
 }
 
 #[cfg(test)]
@@ -714,7 +765,30 @@ mod media_validation_tests {
                 .validate(&path)
                 .unwrap(),
             MediaValidation::RecoverableShort {
-                duration: Some(Duration::from_secs(9))
+                duration: Some(Duration::ZERO),
+                first_media_timestamp_ms: Some(9_000),
+                last_media_timestamp_ms: Some(9_000),
+            }
+        );
+    }
+
+    #[test]
+    fn flv_duration_is_media_span_not_absolute_timestamp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("absolute-timestamps.flv");
+        let mut bytes = flv_with_video_payload(64, 9_192_000);
+        let second = flv_with_video_payload(64, 9_198_000);
+        bytes.extend_from_slice(&second[13..]);
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            FileValidator::new(20_000_000, true)
+                .validate(&path)
+                .unwrap(),
+            MediaValidation::RecoverableShort {
+                duration: Some(Duration::from_secs(6)),
+                first_media_timestamp_ms: Some(9_192_000),
+                last_media_timestamp_ms: Some(9_198_000),
             }
         );
     }

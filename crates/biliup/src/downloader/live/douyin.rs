@@ -199,7 +199,9 @@ impl DouyinLive {
                 .headers(self.headers())
                 .send()
                 .await
-                .map_err(|err| LiveError::custom(format!("解析抖音短链接失败: {err}")))?;
+                .map_err(|err| {
+                    LiveError::custom(format!("解析抖音短链接失败: {}", redact_reqwest_error(err)))
+                })?;
             let url = resp.url().to_string();
             if url.contains("webcast.amemv") {
                 self.sec_uid = capture(&url, r"[?&]sec_user_id=([^&]+)");
@@ -232,10 +234,14 @@ impl DouyinLive {
                 .headers(self.headers())
                 .send()
                 .await
-                .map_err(|err| LiveError::custom(format!("获取抖音用户页失败: {err}")))?
+                .map_err(|err| {
+                    LiveError::custom(format!("获取抖音用户页失败: {}", redact_reqwest_error(err)))
+                })?
                 .text()
                 .await
-                .map_err(|err| LiveError::custom(format!("读取抖音用户页失败: {err}")))?;
+                .map_err(|err| {
+                    LiveError::custom(format!("读取抖音用户页失败: {}", redact_reqwest_error(err)))
+                })?;
             let render_data = text
                 .split(r#"<script id="RENDER_DATA" type="application/json">"#)
                 .nth(1)
@@ -271,10 +277,20 @@ impl DouyinLive {
             .headers(self.headers())
             .send()
             .await
-            .map_err(|err| LiveError::custom(format!("获取抖音直播间信息失败: {err}")))?
+            .map_err(|err| {
+                LiveError::custom(format!(
+                    "获取抖音直播间信息失败: {}",
+                    redact_reqwest_error(err)
+                ))
+            })?
             .json()
             .await
-            .map_err(|err| LiveError::custom(format!("解析抖音直播间信息失败: {err}")))
+            .map_err(|err| {
+                LiveError::custom(format!(
+                    "解析抖音直播间信息失败: {}",
+                    redact_reqwest_error(err)
+                ))
+            })
     }
 
     async fn get_h5_room_info(&self) -> LiveResult<Value> {
@@ -303,10 +319,20 @@ impl DouyinLive {
             .headers(self.headers())
             .send()
             .await
-            .map_err(|err| LiveError::custom(format!("获取抖音 H5 直播间信息失败: {err}")))?
+            .map_err(|err| {
+                LiveError::custom(format!(
+                    "获取抖音 H5 直播间信息失败: {}",
+                    redact_reqwest_error(err)
+                ))
+            })?
             .json()
             .await
-            .map_err(|err| LiveError::custom(format!("解析抖音 H5 直播间信息失败: {err}")))
+            .map_err(|err| {
+                LiveError::custom(format!(
+                    "解析抖音 H5 直播间信息失败: {}",
+                    redact_reqwest_error(err)
+                ))
+            })
     }
 
     async fn get_room_info(&mut self) -> LiveResult<Option<Value>> {
@@ -497,6 +523,14 @@ fn normalize_stream_url(url: &str) -> String {
     url.strip_prefix("http://")
         .map(|rest| format!("https://{rest}"))
         .unwrap_or_else(|| url.to_string())
+}
+
+fn redact_reqwest_error(mut error: reqwest::Error) -> String {
+    if let Some(url) = error.url_mut() {
+        url.set_query(None);
+        url.set_fragment(None);
+    }
+    error.to_string()
 }
 
 fn build_stream_candidates(

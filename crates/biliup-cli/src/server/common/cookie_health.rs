@@ -1,8 +1,8 @@
 //! 平台 cookie 健康监测。
 //!
 //! 直播间检查（`check_stream`）天然区分两种结果：`Ok(Offline)` = 主播确实没播（正常），
-//! `Err(_)` = 取流/检测出错或风控（cookie/sessionid 失效的信号）。本模块把这些结果汇总成
-//! 「按平台」的健康状态，供前端横幅轮询与 webhook 主动推送使用。
+//! `Err(_)` 会进一步分类为鉴权、传输、服务端或响应结构错误。只有明确鉴权失败才会
+//! 累积 cookie/sessionid 告警；其余错误只做分类计数与诊断。
 //!
 //! 检测点是监控循环（每 `event_loop_interval` 秒轮询每个直播间，含没开播的）+ 录制时的
 //! 断流复查，所以「主动自检」几乎零额外开销。用「连续失败阈值 + 去抖」避免单个坏 URL 或
@@ -16,6 +16,15 @@ use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
 use serde_json::json;
 use tracing::{info, warn};
+
+#[derive(Clone, Copy, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthErrorKind {
+    Authentication,
+    Transport,
+    Server,
+    InvalidResponse,
+}
 
 /// 连续失败达到此数才判定为异常（监控约每 30s 一次，3 次≈1.5 分钟）。
 const UNHEALTHY_THRESHOLD: u32 = 3;
@@ -40,6 +49,12 @@ pub struct PlatformHealth {
     pub last_error_ms: Option<i64>,
     /// 进入异常状态的时间戳（ms），用于前端显示「自 X 起检测失败」
     pub since_ms: Option<i64>,
+    /// 最近一次失败类别；只有 authentication 会触发 cookie 告警。
+    pub last_error_kind: Option<HealthErrorKind>,
+    pub authentication_errors: u64,
+    pub transport_errors: u64,
+    pub server_errors: u64,
+    pub invalid_response_errors: u64,
 }
 
 static HEALTH: LazyLock<RwLock<HashMap<String, PlatformHealth>>> =
@@ -70,6 +85,7 @@ pub fn record_success(platform: &str, webhook: Option<&str>) {
         h.last_ok_ms = Some(now_ms());
         h.consecutive_errors = 0;
         h.last_error = None;
+        h.last_error_kind = None;
         if h.unhealthy {
             h.unhealthy = false;
             h.since_ms = None;
@@ -91,6 +107,8 @@ pub fn record_success(platform: &str, webhook: Option<&str>) {
 
 /// 记录一次失败的直播间检查（取流/检测出错或风控）：去抖累计，达阈值→标记异常并推送。
 pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
+    let err = redact_sensitive(err);
+    let kind = classify_error(&err);
     let mut became_unhealthy = false;
     let now = now_ms();
     {
@@ -98,6 +116,27 @@ pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
         let h = map.entry(platform.to_string()).or_default();
         h.platform = platform.to_string();
         h.last_error = Some(err.chars().take(300).collect());
+        h.last_error_kind = Some(kind);
+        match kind {
+            HealthErrorKind::Authentication => {
+                h.authentication_errors = h.authentication_errors.saturating_add(1)
+            }
+            HealthErrorKind::Transport => h.transport_errors = h.transport_errors.saturating_add(1),
+            HealthErrorKind::Server => h.server_errors = h.server_errors.saturating_add(1),
+            HealthErrorKind::InvalidResponse => {
+                h.invalid_response_errors = h.invalid_response_errors.saturating_add(1)
+            }
+        }
+        if kind != HealthErrorKind::Authentication {
+            h.last_error_ms = Some(now);
+            warn!(
+                platform,
+                ?kind,
+                error = err,
+                "live check failed without cookie invalidation"
+            );
+            return;
+        }
         // 去抖：窗口内的重复失败只更新信息、不累加（吸收录制断流的快速重试）
         let debounced = h
             .last_error_ms
@@ -115,10 +154,10 @@ pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
         }
     }
     if became_unhealthy {
-        warn!(platform, err, "cookie 可能已失效：连续检查失败");
+        warn!(platform, error = err, "cookie 鉴权失败：连续检查失败");
         notify(
             webhook,
-            &format!("⚠️ {} cookie 可能已失效", display(platform)),
+            &format!("⚠️ {} cookie 鉴权连续失败", display(platform)),
             &format!(
                 "{} 直播间连续检查失败，建议尽快更换 cookie（sessionid）。最近错误：{}",
                 display(platform),
@@ -126,6 +165,60 @@ pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
             ),
         );
     }
+}
+
+pub fn classify_error(error: &str) -> HealthErrorKind {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("login expired")
+        || lower.contains("session invalid")
+        || lower.contains("风控")
+        || lower.contains("登录态")
+    {
+        HealthErrorKind::Authentication
+    } else if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("dns")
+        || lower.contains("certificate")
+        || lower.contains("connection")
+        || lower.contains("reset")
+        || lower.contains("network")
+    {
+        HealthErrorKind::Transport
+    } else if (500..=599).any(|status| lower.contains(&status.to_string())) {
+        HealthErrorKind::Server
+    } else {
+        HealthErrorKind::InvalidResponse
+    }
+}
+
+/// Redact signed URLs and credential-like key/value pairs before an error crosses a log boundary.
+pub fn redact_sensitive(value: &str) -> String {
+    static URLS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"https?://[^\s\"'<>\)]+"#).expect("valid URL redaction regex")
+    });
+    static SECRETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(cookie|token|mstoken|a_bogus|verifyfp|sign|signature|expire)=([^&\s,;]+)",
+        )
+        .expect("valid secret redaction regex")
+    });
+    let without_queries = URLS.replace_all(value, |captures: &regex::Captures<'_>| {
+        let raw = captures.get(0).expect("whole match").as_str();
+        url::Url::parse(raw)
+            .map(|mut url| {
+                url.set_query(None);
+                url.set_fragment(None);
+                url.to_string()
+            })
+            .unwrap_or_else(|_| "[REDACTED_URL]".to_string())
+    });
+    SECRETS
+        .replace_all(&without_queries, "$1=[REDACTED]")
+        .into_owned()
 }
 
 /// 供 `/v1/health/cookie` 接口返回的快照。
@@ -254,6 +347,38 @@ mod alert_tests {
         // 不应 panic；webhook 为 None 时静默返回
         notify_alert(None, "t", "c");
         notify_alert(Some(""), "t", "c");
+    }
+}
+
+#[cfg(test)]
+mod health_classification_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_is_transport_not_authentication() {
+        assert_eq!(
+            classify_error("request timed out while connecting"),
+            HealthErrorKind::Transport
+        );
+    }
+
+    #[test]
+    fn forbidden_is_authentication() {
+        assert_eq!(
+            classify_error("HTTP status 403 Forbidden"),
+            HealthErrorKind::Authentication
+        );
+    }
+
+    #[test]
+    fn signed_query_and_cookie_are_redacted() {
+        let redacted = redact_sensitive(
+            "GET https://example.test/live.flv?msToken=secret&a_bogus=also-secret Cookie=sessionid",
+        );
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("msToken="));
+        assert!(!redacted.contains("a_bogus="));
+        assert!(!redacted.contains("sessionid"));
     }
 }
 
