@@ -25,6 +25,11 @@ filtering_threshold: 20
 #segment_processor_parallel: false
 
 #------上传------#
+### 全进程预上传节流与 B 站 601 冷却；默认开启
+#upload_rate_gate_enabled: true
+#upload_min_request_interval_secs: 2
+#upload_601_initial_cooldown_secs: 60
+#upload_601_max_cooldown_secs: 1800
 ### 选择全局默认上传插件，Noop为不上传，但会执行后处理,可选bili_web，biliup-rs(默认值)
 #uploader: Noop
 ### b站提交接口，默认自动选择，可选web，client

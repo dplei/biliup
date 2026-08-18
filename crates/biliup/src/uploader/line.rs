@@ -223,32 +223,30 @@ impl Line {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let response_text = response.text().await?;
+        let status = response.status();
+        let response_bytes = response.bytes().await?;
+        // B 站在不同网关上可能用非 2xx，也可能用 HTTP 200 + JSON code 表达 601。
+        // 必须在反序列化线路 bucket 前统一识别，避免限流被降级成普通 JSON 错误。
+        if let Some(error) = parse_rate_limit(&response_bytes) {
+            return Err(error);
+        }
 
-            // 尝试解析JSON错误响应，检测限流错误（code: 601）
-            if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&response_text)
-                && let Some(code) = error_json.get("code").and_then(|c| c.as_i64())
-                && code == 601
-            {
-                let message = error_json
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("上传过快")
-                    .to_string();
-                // 直接返回限流错误，让调用方决定如何处理
-                return Err(RateLimit { code, message });
-            }
-
+        if !status.is_success() {
+            let summary: String = String::from_utf8_lossy(&response_bytes)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(2048)
+                .collect();
             return Err(Custom(format!(
-                "Failed to pre_upload from {}",
-                response_text
+                "Failed to pre_upload with HTTP {status}: {summary}"
             )));
         }
 
         match self.os {
             Uploader::Upos => Ok(Parcel {
-                line: Bucket::Upos(response.json().await?),
+                line: Bucket::Upos(serde_json::from_slice(&response_bytes)?),
                 video_file,
             }),
             // _ => {
@@ -258,12 +256,44 @@ impl Line {
     }
 }
 
+fn parse_rate_limit(bytes: &[u8]) -> Option<crate::error::Kind> {
+    let error_json = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let code = error_json.get("code").and_then(|code| code.as_i64())?;
+    if code != 601 {
+        return None;
+    }
+    let message = error_json
+        .get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or("上传过快")
+        .to_string();
+    Some(RateLimit { code, message })
+}
+
 impl Default for Line {
     fn default() -> Self {
         Line {
             cost: u128::MAX,
             ..bldsa()
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::parse_rate_limit;
+    use crate::error::Kind;
+
+    #[test]
+    fn recognizes_601_even_when_http_status_would_be_successful() {
+        let error = parse_rate_limit(r#"{"code":601,"message":"上传过快"}"#.as_bytes())
+            .expect("601 should be recognized before bucket decoding");
+        assert!(matches!(error, Kind::RateLimit { code: 601, .. }));
+    }
+
+    #[test]
+    fn ordinary_json_is_not_a_rate_limit() {
+        assert!(parse_rate_limit(br#"{"OK":1}"#).is_none());
     }
 }
 

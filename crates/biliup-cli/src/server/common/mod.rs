@@ -13,6 +13,7 @@ pub mod route_health;
 /// 上传前时间戳异常检测与修复
 pub mod timestamp_repair;
 pub mod upload;
+pub mod upload_rate_gate;
 pub mod upload_session;
 /// 通用工具函数
 pub mod util;

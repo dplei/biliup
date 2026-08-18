@@ -5,6 +5,7 @@ use pyo3::pyclass;
 use biliup_cli::server::common;
 use biliup_cli::server::common::upload::submit_to_bilibili;
 use biliup_cli::server::errors::{AppError, AppResult};
+use biliup_cli::server::infrastructure::connection_pool::ConnectionManager;
 use bon::Builder;
 use error_stack::ResultExt;
 use std::collections::HashMap;
@@ -127,12 +128,19 @@ pub async fn upload(
         extra_fields,
     } = studio_pre;
 
+    // Python/stream-gears is a production upload entry too. Reuse the process-wide config and
+    // the same durable SQLite gate state instead of bypassing the 601 cooldown used by the web
+    // server and recovery paths.
+    let runtime_config = crate::server::CONFIG.read().unwrap().clone();
+    let pool = ConnectionManager::new_pool("data/data.sqlite3").await?;
     let (bilibili, videos) = common::upload::upload(
         &cookie_file,
         proxy,
         line.map(Into::into),
         video_path.as_slice(),
         limit,
+        &runtime_config,
+        &pool,
     )
     .await?;
 

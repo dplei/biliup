@@ -10,6 +10,7 @@ use crate::server::common::missing_segment::{
 };
 use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
+use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
     insert_uploading_session, mark_submit_anomaly, mark_submitted, parse_videos, reattach_session,
@@ -57,6 +58,8 @@ struct UploadContext {
     line: Line,
     threads: usize,
     client: StatelessClient,
+    rate_gate: UploadRateGateSettings,
+    pool: ConnectionPool,
 }
 
 static GLOBAL_UPLOAD_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
@@ -82,8 +85,13 @@ where
     F: FnMut(&SegmentInfo),
 {
     info!(upload_config=?upload_config, "Starting process with upload");
-    let upload_context =
-        initialize_upload_context(&ctx.config(), &ctx.stateless_client(), upload_config).await?;
+    let upload_context = initialize_upload_context(
+        &ctx.config(),
+        &ctx.stateless_client(),
+        upload_config,
+        ctx.pool(),
+    )
+    .await?;
 
     let segment_processors: Vec<HookStep> = ctx
         .live_streamer()
@@ -183,6 +191,7 @@ async fn initialize_upload_context(
     config: &Config,
     client: &StatelessClient,
     upload_config: &UploadStreamer,
+    pool: &ConnectionPool,
 ) -> AppResult<UploadContext> {
     // 登录处理
     let cookie_file = upload_config
@@ -201,6 +210,8 @@ async fn initialize_upload_context(
         line,
         threads: config.threads as usize,
         client: client.clone(),
+        rate_gate: UploadRateGateSettings::from(config),
+        pool: pool.clone(),
     })
 }
 
@@ -541,6 +552,8 @@ async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppRes
         line,
         threads: limit,
         client,
+        rate_gate,
+        pool,
     } = context;
 
     info!(
@@ -554,10 +567,23 @@ async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppRes
     let video_file = VideoFile::new(video_path).change_context(AppError::Unknown)?;
     let total_size = video_file.total_size;
     let file_name = video_file.file_name.clone();
-    let uploader = line
-        .pre_upload(bilibili, video_file)
-        .await
-        .change_context(AppError::Unknown)?;
+    upload_rate_gate::before_pre_upload(*rate_gate, pool).await?;
+    let uploader = match line.pre_upload(bilibili, video_file).await {
+        Ok(uploader) => {
+            upload_rate_gate::record_success(*rate_gate, pool).await;
+            uploader
+        }
+        Err(Kind::RateLimit { code: 601, message }) => {
+            let until = upload_rate_gate::record_rate_limited(*rate_gate, pool).await?;
+            return Err(error_stack::Report::new(AppError::Custom(format!(
+                "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
+            ))));
+        }
+        Err(error) => {
+            upload_rate_gate::record_non_rate_limit_failure(*rate_gate).await;
+            return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+        }
+    };
 
     let instant = Instant::now();
 
@@ -614,6 +640,8 @@ async fn recover_due_missing_segments(
                 line: get_upload_line(&upload_context.client.client, line_str).await?,
                 threads: upload_context.threads,
                 client: upload_context.client.clone(),
+                rate_gate: upload_context.rate_gate,
+                pool: upload_context.pool.clone(),
             }
         } else {
             UploadContext {
@@ -623,6 +651,8 @@ async fn recover_due_missing_segments(
                     .change_context(AppError::Unknown)?,
                 threads: upload_context.threads,
                 client: upload_context.client.clone(),
+                rate_gate: upload_context.rate_gate,
+                pool: upload_context.pool.clone(),
             }
         };
 
@@ -856,6 +886,8 @@ pub async fn upload(
     line: Option<UploadLine>,
     video_paths: &[PathBuf],
     limit: usize,
+    config: &Config,
+    pool: &ConnectionPool,
 ) -> AppResult<(BiliBili, Vec<Video>)> {
     let bilibili = login_by_cookies(&cookie_file, proxy).await;
     let bilibili = match bilibili {
@@ -902,10 +934,24 @@ pub async fn upload(
         let video_file = VideoFile::new(video_path).change_context_lazy(|| AppError::Unknown)?;
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
-        let uploader = line
-            .pre_upload(&bilibili, video_file)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?;
+        let settings = UploadRateGateSettings::from(config);
+        upload_rate_gate::before_pre_upload(settings, pool).await?;
+        let uploader = match line.pre_upload(&bilibili, video_file).await {
+            Ok(uploader) => {
+                upload_rate_gate::record_success(settings, pool).await;
+                uploader
+            }
+            Err(Kind::RateLimit { code: 601, message }) => {
+                let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
+                return Err(error_stack::Report::new(AppError::Custom(format!(
+                    "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
+                ))));
+            }
+            Err(error) => {
+                upload_rate_gate::record_non_rate_limit_failure(settings).await;
+                return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+            }
+        };
 
         let instant = Instant::now();
 
@@ -981,7 +1027,8 @@ pub async fn manual_recover_missing_segment(
             .change_context(AppError::Unknown)?;
 
         let upload_context =
-            initialize_upload_context(config, &StatelessClient::default(), &upload_config).await?;
+            initialize_upload_context(config, &StatelessClient::default(), &upload_config, pool)
+                .await?;
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = config.timestamp_repair.unwrap_or(true);
         let (video, outcome) = {
@@ -1338,8 +1385,71 @@ impl UActor {
                 info!(url=ctx.live_streamer().url, result=?result, "后处理执行完毕：Finished processing segment event");
                 ctx.change_status(Stage::Upload, WorkerStatus::Idle).await;
             }
+            UploaderMessage::RecoveryBatchDeferred {
+                ctx,
+                batch_id,
+                manifest_path,
+            } => {
+                if let Err(error) =
+                    persist_recovery_batch_manifest(ctx.pool(), &ctx, &batch_id, &manifest_path)
+                        .await
+                {
+                    error!(
+                        recovery_batch_id = batch_id,
+                        manifest = %manifest_path.display(),
+                        ?error,
+                        "failed to index deferred recovery manifest; manifest remains durable"
+                    );
+                }
+            }
         }
     }
+}
+
+async fn persist_recovery_batch_manifest(
+    pool: &ConnectionPool,
+    ctx: &Context,
+    batch_id: &str,
+    manifest_path: &Path,
+) -> AppResult<()> {
+    let bytes = tokio::fs::read(manifest_path)
+        .await
+        .change_context(AppError::Unknown)?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).change_context(AppError::Unknown)?;
+    let files_json = serde_json::to_string(&manifest["files"]).change_context(AppError::Unknown)?;
+    let last_error = manifest["last_error"].as_str();
+    let next_retry_ms = manifest["next_retry_at_ms"]
+        .as_u64()
+        .and_then(|value| i64::try_from(value).ok())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let next_retry_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(next_retry_ms)
+        .unwrap_or_else(chrono::Utc::now);
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO recoverable_short_batch \
+         (recovery_batch_id, live_streamer_id, streamer_info_id, state, files_json, manifest_path, attempts, next_retry_at, last_error, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'Deferred', ?4, ?5, 0, ?6, ?7, ?8, ?8) \
+         ON CONFLICT(recovery_batch_id) DO UPDATE SET state = excluded.state, files_json = excluded.files_json, \
+         manifest_path = excluded.manifest_path, next_retry_at = excluded.next_retry_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
+    )
+    .bind(batch_id)
+    .bind(ctx.live_streamer().id)
+    .bind(ctx.id())
+    .bind(files_json)
+    .bind(manifest_path.display().to_string())
+    .bind(next_retry_at)
+    .bind(last_error)
+    .bind(now)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    info!(
+        recovery_batch_id = batch_id,
+        manifest = %manifest_path.display(),
+        "deferred recovery batch indexed in database"
+    );
+    Ok(())
 }
 
 /// 上传消息枚举
@@ -1348,4 +1458,9 @@ impl UActor {
 pub enum UploaderMessage {
     /// 分段事件消息，包含事件、接收器和工作器
     SegmentEvent(Receiver<SegmentInfo>, Context),
+    RecoveryBatchDeferred {
+        ctx: Context,
+        batch_id: String,
+        manifest_path: PathBuf,
+    },
 }

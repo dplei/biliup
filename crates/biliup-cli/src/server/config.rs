@@ -83,6 +83,26 @@ pub struct Config {
     #[serde(default)]
     pub uploader: Option<String>,
 
+    /// 进程级预上传节流与 B 站 601 冷却总开关。
+    #[builder(default = default_upload_rate_gate_enabled())]
+    #[serde(default = "default_upload_rate_gate_enabled")]
+    pub upload_rate_gate_enabled: bool,
+
+    /// 两次 pre_upload 之间的最小间隔（秒）。
+    #[builder(default = default_upload_min_request_interval_secs())]
+    #[serde(default = "default_upload_min_request_interval_secs")]
+    pub upload_min_request_interval_secs: u64,
+
+    /// 首次 601 的冷却时间（秒）。
+    #[builder(default = default_upload_601_initial_cooldown_secs())]
+    #[serde(default = "default_upload_601_initial_cooldown_secs")]
+    pub upload_601_initial_cooldown_secs: u64,
+
+    /// 连续 601 指数退避上限（秒）。
+    #[builder(default = default_upload_601_max_cooldown_secs())]
+    #[serde(default = "default_upload_601_max_cooldown_secs")]
+    pub upload_601_max_cooldown_secs: u64,
+
     /// 提交API类型：web | client
     #[serde(default)]
     pub submit_api: Option<String>,
@@ -512,6 +532,34 @@ pub fn default_segment_time() -> Option<String> {
 /// 默认过滤阈值：20MB
 fn default_filtering_threshold() -> u64 {
     20
+}
+
+fn default_recoverable_short_segment_mode() -> String {
+    "merge_or_defer".to_string()
+}
+
+fn default_recoverable_short_batch_max_files() -> usize {
+    60
+}
+
+fn default_recoverable_short_retry_interval_secs() -> u64 {
+    15 * 60
+}
+
+fn default_upload_rate_gate_enabled() -> bool {
+    true
+}
+
+fn default_upload_min_request_interval_secs() -> u64 {
+    2
+}
+
+fn default_upload_601_initial_cooldown_secs() -> u64 {
+    60
+}
+
+fn default_upload_601_max_cooldown_secs() -> u64 {
+    30 * 60
 }
 
 /// 默认上传线路：自动选择

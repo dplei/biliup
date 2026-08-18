@@ -636,6 +636,7 @@ pub async fn post_uploads(
     };
 
     info!(matched, ?streamer_name, "通过页面开始上传");
+    let runtime_config = config.read().unwrap().clone();
     tokio::spawn(async move {
         let (bilibili, videos) = upload(
             upload_config
@@ -646,6 +647,8 @@ pub async fn post_uploads(
             line,
             &files,
             limit as usize,
+            &runtime_config,
+            &pool,
         )
         .await?;
         if !videos.is_empty() {
