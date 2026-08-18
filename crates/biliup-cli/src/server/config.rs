@@ -35,6 +35,21 @@ pub struct Config {
     #[serde(default)]
     pub preserve_recoverable_short_segments: bool,
 
+    /// 可恢复短分段策略。`merge_or_defer` 是安全默认值；关闭保留开关可整体回滚。
+    #[builder(default = default_recoverable_short_segment_mode())]
+    #[serde(default = "default_recoverable_short_segment_mode")]
+    pub recoverable_short_segment_mode: String,
+
+    /// 单个恢复批次最多包含的文件数。
+    #[builder(default = default_recoverable_short_batch_max_files())]
+    #[serde(default = "default_recoverable_short_batch_max_files")]
+    pub recoverable_short_batch_max_files: usize,
+
+    /// 延迟恢复建议重试间隔（秒），写入 durable manifest 供恢复器/运维使用。
+    #[builder(default = default_recoverable_short_retry_interval_secs())]
+    #[serde(default = "default_recoverable_short_retry_interval_secs")]
+    pub recoverable_short_retry_interval_secs: u64,
+
     /// 是否启用独立的拉流线路健康计数与指数退避。true = 开启；false = 旧流程。
     #[builder(default)]
     #[serde(default)]
@@ -683,6 +698,22 @@ mod recoverable_short_segment_config_tests {
         let enabled: Config =
             serde_yaml::from_str("preserve_recoverable_short_segments: true").expect("config");
         assert!(enabled.preserve_recoverable_short_segments);
+    }
+}
+
+#[cfg(test)]
+mod upload_rate_gate_config_tests {
+    use super::Config;
+
+    #[test]
+    fn safe_upload_gate_defaults_are_enabled() {
+        let config: Config = serde_yaml::from_str("{}").expect("default config");
+        assert!(config.upload_rate_gate_enabled);
+        assert_eq!(config.upload_min_request_interval_secs, 2);
+        assert_eq!(config.upload_601_initial_cooldown_secs, 60);
+        assert_eq!(config.upload_601_max_cooldown_secs, 1800);
+        assert_eq!(config.recoverable_short_segment_mode, "merge_or_defer");
+        assert_eq!(config.recoverable_short_batch_max_files, 60);
     }
 }
 

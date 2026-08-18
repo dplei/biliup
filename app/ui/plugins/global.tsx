@@ -215,10 +215,57 @@ const Global: React.FC = () => {
           extraText={<div style={{ fontSize: '14px' }}>默认关闭；开启后保留通过媒体探测的有效短分段。</div>}
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
+        <Form.InputNumber
+          field="recoverable_short_batch_max_files"
+          label="短片恢复批次上限（recoverable_short_batch_max_files）"
+          extraText={<div style={{ fontSize: '14px' }}>合并失败会生成一个 Deferred 批次，不会逐片上传。</div>}
+          min={1}
+          max={1000}
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.InputNumber
+          field="recoverable_short_retry_interval_secs"
+          label="短片恢复重试间隔（recoverable_short_retry_interval_secs）"
+          suffix="s"
+          min={1}
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
         <Form.Switch
           field="route_health_enabled"
           label="拉流线路健康退避（route_health_enabled）"
           extraText={<div style={{ fontSize: '14px' }}>默认关闭；开启后，直播仍在线时同一路线连续失败按 2/4/8/16/30 秒退避。</div>}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.Switch
+          field="upload_rate_gate_enabled"
+          label="上传 601 全局冷却（upload_rate_gate_enabled）"
+          extraText={<div style={{ fontSize: '14px' }}>默认开启；触发 601 后暂停全进程 pre_upload，并在冷却结束时只放行一个探测任务。</div>}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.InputNumber
+          field="upload_min_request_interval_secs"
+          label="预上传最小间隔（upload_min_request_interval_secs）"
+          suffix="s"
+          min={0}
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.InputNumber
+          field="upload_601_initial_cooldown_secs"
+          label="601 首次冷却（upload_601_initial_cooldown_secs）"
+          suffix="s"
+          min={1}
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+        />
+        <Form.InputNumber
+          field="upload_601_max_cooldown_secs"
+          label="601 最大冷却（upload_601_max_cooldown_secs）"
+          suffix="s"
+          min={1}
+          style={{ width: '100%' }}
           fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
         />
 

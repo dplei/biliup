@@ -574,6 +574,43 @@ pub async fn get_cookie_health() -> Json<serde_json::Value> {
     Json(crate::server::common::cookie_health::snapshot())
 }
 
+/// 全局上传节流状态：供运维查看 601 冷却、等待任务和 pre_upload 计数。
+pub async fn get_upload_rate_health() -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(crate::server::common::upload_rate_gate::snapshot().await)
+            .unwrap_or_else(|_| serde_json::json!({ "state": "unknown" })),
+    )
+}
+
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct RecoveryBatchView {
+    pub id: i64,
+    pub recovery_batch_id: String,
+    pub live_streamer_id: i64,
+    pub streamer_info_id: i64,
+    pub state: String,
+    pub files_json: String,
+    pub manifest_path: String,
+    pub attempts: i64,
+    pub next_retry_at: chrono::DateTime<chrono::Utc>,
+    pub last_error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn get_recovery_batches(
+    State(pool): State<ConnectionPool>,
+) -> Result<Json<Vec<RecoveryBatchView>>, Response> {
+    let rows = sqlx::query_as::<_, RecoveryBatchView>(
+        "SELECT * FROM recoverable_short_batch ORDER BY created_at DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    Ok(Json(rows))
+}
+
 #[derive(Deserialize)]
 pub struct PostUploads {
     files: Vec<PathBuf>,

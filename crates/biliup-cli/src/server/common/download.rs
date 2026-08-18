@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const UPLOAD_SEGMENT_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Default)]
 struct OfflineRetryState {
@@ -69,6 +70,8 @@ pub struct SegmentEventProcessor {
     ctx: Context,
     file_validator: FileValidator,
     preserve_recoverable_short_segments: bool,
+    recovery_batch_max_files: usize,
+    recovery_retry_interval: Duration,
     pending_short_segments: Vec<SegmentInfo>,
     stats: SegmentProcessingStats,
 }
@@ -79,8 +82,10 @@ struct SegmentProcessingStats {
     recoverable_short_segments: u64,
     recoverable_short_bytes: u64,
     merged_recovery_outputs: u64,
+    deferred_recovery_batches: u64,
     invalid_segments: u64,
     segments_queued_for_upload: u64,
+    upload_queue_peak_depth: usize,
 }
 
 impl SegmentEventProcessor {
@@ -92,6 +97,10 @@ impl SegmentEventProcessor {
             uploader,
             file_validator: FileValidator::new(config.filtering_threshold * 1000 * 1000, true),
             preserve_recoverable_short_segments: config.preserve_recoverable_short_segments,
+            recovery_batch_max_files: config.recoverable_short_batch_max_files.max(1),
+            recovery_retry_interval: Duration::from_secs(
+                config.recoverable_short_retry_interval_secs,
+            ),
             pending_short_segments: Vec::new(),
             stats: SegmentProcessingStats::default(),
             ctx,
@@ -116,7 +125,11 @@ impl SegmentEventProcessor {
                 self.flush_pending_short_segments()?;
                 self.enqueue(event)
             }
-            MediaValidation::RecoverableShort { duration } => {
+            MediaValidation::RecoverableShort {
+                duration,
+                first_media_timestamp_ms,
+                last_media_timestamp_ms,
+            } => {
                 if self.preserve_recoverable_short_segments {
                     self.stats.recoverable_short_segments += 1;
                     self.stats.recoverable_short_bytes = self
@@ -126,7 +139,9 @@ impl SegmentEventProcessor {
                     warn!(
                         file = %event.prev_file_path.display(),
                         file_bytes,
-                        duration = ?duration,
+                        media_duration_ms = duration.map(|duration| duration.as_millis() as u64),
+                        first_media_timestamp_ms,
+                        last_media_timestamp_ms,
                         close_reason = ?event.close_reason,
                         attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
                         "queueing recoverable short media segment"
@@ -166,32 +181,57 @@ impl SegmentEventProcessor {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending_short_segments);
-        for group in compatible_segment_groups(pending) {
-            if group.len() > 1 {
-                match merge_compatible_segments(&group, &self.file_validator) {
-                    Ok(merged) => {
-                        self.stats.merged_recovery_outputs += 1;
-                        let original_files: Vec<_> = group
-                            .iter()
-                            .map(|event| event.prev_file_path.display().to_string())
-                            .collect();
-                        info!(
-                            output = %merged.prev_file_path.display(),
-                            originals = ?original_files,
-                            "merged compatible recoverable short segments; originals retained"
-                        );
-                        self.enqueue(merged)?;
-                        continue;
+        for compatible_group in compatible_segment_groups(pending) {
+            for chunk in compatible_group.chunks(self.recovery_batch_max_files) {
+                let group = chunk.to_vec();
+                if group.len() > 1 {
+                    match merge_compatible_segments(&group, &self.file_validator) {
+                        Ok(merged) => {
+                            self.stats.merged_recovery_outputs += 1;
+                            let original_files: Vec<_> = group
+                                .iter()
+                                .map(|event| event.prev_file_path.display().to_string())
+                                .collect();
+                            info!(
+                                output = %merged.prev_file_path.display(),
+                                originals = ?original_files,
+                                "merged compatible recoverable short segments; originals retained"
+                            );
+                            self.enqueue(merged)?;
+                            continue;
+                        }
+                        Err(error) => {
+                            let (batch_id, manifest) = defer_recovery_batch(
+                                &group,
+                                &format!("{error:?}"),
+                                self.recovery_retry_interval,
+                            )?;
+                            self.stats.deferred_recovery_batches += 1;
+                            self.queue_deferred_batch_record(&batch_id, &manifest);
+                            warn!(
+                                recovery_batch_id = batch_id,
+                                manifest = %manifest.display(),
+                                error = ?error,
+                                file_count = group.len(),
+                                "failed to merge recoverable segments; deferred batch without uploading originals"
+                            );
+                            continue;
+                        }
                     }
-                    Err(error) => warn!(
-                        error = ?error,
-                        files = ?group.iter().map(|event| &event.prev_file_path).collect::<Vec<_>>(),
-                        "failed to merge recoverable segments; preserving and uploading originals"
-                    ),
                 }
-            }
-            for event in group {
-                self.enqueue(event)?;
+                let (batch_id, manifest) = defer_recovery_batch(
+                    &group,
+                    "media parameters are not compatible with an adjacent recovery group",
+                    self.recovery_retry_interval,
+                )?;
+                self.stats.deferred_recovery_batches += 1;
+                self.queue_deferred_batch_record(&batch_id, &manifest);
+                warn!(
+                    recovery_batch_id = batch_id,
+                    manifest = %manifest.display(),
+                    file_count = group.len(),
+                    "recoverable segment deferred without immediate upload"
+                );
             }
         }
         Ok(())
@@ -212,40 +252,92 @@ impl SegmentEventProcessor {
 
         match &self.channel {
             None => {
-                // 故障窗口可能一次释放几十个不可合并的短片；不能因 32 项上限静默顶掉旧事件。
-                let (tx, rx) = async_channel::unbounded();
+                let (tx, rx) = async_channel::bounded(UPLOAD_SEGMENT_QUEUE_CAPACITY);
 
                 // 发送到上传器
-                let res = self
+                if let Err(error) = self
                     .uploader
-                    .force_send(UploaderMessage::SegmentEvent(rx.clone(), self.ctx.clone()))
-                    .change_context(AppError::Custom("Failed to send to uploader".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                    .try_send(UploaderMessage::SegmentEvent(rx.clone(), self.ctx.clone()))
+                {
+                    warn!(?error, "upload actor queue unavailable; deferring segment");
+                    return self.defer_for_backpressure(event, "upload actor queue unavailable");
                 }
 
                 // 发送到缓冲区
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                if let Err(error) = tx.try_send(event) {
+                    warn!(
+                        ?error,
+                        "new upload segment queue unexpectedly unavailable; deferring"
+                    );
+                    let event = error.into_inner();
+                    return self
+                        .defer_for_backpressure(event, "new upload segment queue unavailable");
                 }
                 self.channel = Some(tx);
             }
             Some(tx) => {
-                // 发送到缓冲区
-                let res = tx
-                    .force_send(event)
-                    .change_context(AppError::Custom("Failed to send to buffer".to_string()))?;
-                if let Some(prev) = res {
-                    warn!(SegmentEvent = ?prev, "replace an existing message in the channel");
+                if let Err(error) = tx.try_send(event) {
+                    warn!(
+                        capacity = UPLOAD_SEGMENT_QUEUE_CAPACITY,
+                        ?error,
+                        "upload segment queue reached its bound; deferring without data loss"
+                    );
+                    let event = error.into_inner();
+                    return self.defer_for_backpressure(
+                        event,
+                        "upload segment queue full during rate-limit/backlog window",
+                    );
                 }
             }
         }
 
         self.stats.segments_queued_for_upload += 1;
+        if let Some(tx) = &self.channel {
+            self.stats.upload_queue_peak_depth = self.stats.upload_queue_peak_depth.max(tx.len());
+        }
         Ok(())
+    }
+
+    fn defer_for_backpressure(&mut self, event: SegmentInfo, reason: &str) -> AppResult<()> {
+        self.stats.upload_queue_peak_depth = self
+            .stats
+            .upload_queue_peak_depth
+            .max(UPLOAD_SEGMENT_QUEUE_CAPACITY);
+        let (batch_id, manifest) = defer_recovery_batch(
+            std::slice::from_ref(&event),
+            reason,
+            self.recovery_retry_interval,
+        )?;
+        self.stats.deferred_recovery_batches += 1;
+        self.queue_deferred_batch_record(&batch_id, &manifest);
+        warn!(
+            recovery_batch_id = batch_id,
+            manifest = %manifest.display(),
+            file = %event.prev_file_path.display(),
+            reason,
+            "segment deferred because bounded upload queue was unavailable"
+        );
+        Ok(())
+    }
+
+    fn queue_deferred_batch_record(&self, batch_id: &str, manifest_path: &std::path::Path) {
+        if let Err(error) = self
+            .uploader
+            .try_send(UploaderMessage::RecoveryBatchDeferred {
+                ctx: self.ctx.clone(),
+                batch_id: batch_id.to_string(),
+                manifest_path: manifest_path.to_path_buf(),
+            })
+        {
+            // The fsynced manifest is the durability boundary. A full actor queue may delay
+            // database indexing, but must never fall back to uploading the originals.
+            warn!(
+                recovery_batch_id = batch_id,
+                manifest = %manifest_path.display(),
+                ?error,
+                "deferred recovery manifest persisted but database indexing was not queued"
+            );
+        }
     }
 
     fn remove_invalid_segment(&self, path: &std::path::Path, reason: &str) {
@@ -284,6 +376,69 @@ fn compatible_segment_groups(events: Vec<SegmentInfo>) -> Vec<Vec<SegmentInfo>> 
     groups.into_iter().map(|(_, group)| group).collect()
 }
 
+fn defer_recovery_batch(
+    events: &[SegmentInfo],
+    error: &str,
+    retry_interval: Duration,
+) -> AppResult<(String, std::path::PathBuf)> {
+    let first = events
+        .first()
+        .ok_or_else(|| AppError::Custom("cannot defer an empty recovery batch".into()))?;
+    let created_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let batch_id = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        first.segment_index,
+        created_ms
+    );
+    let parent = first
+        .prev_file_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let manifest_path = parent.join(format!(".biliup-recovery-{batch_id}.json"));
+    let temp_path = parent.join(format!(".biliup-recovery-{batch_id}.json.tmp"));
+    let files: Vec<_> = events
+        .iter()
+        .flat_map(|event| {
+            std::iter::once(&event.prev_file_path).chain(event.recovery_source_paths.iter())
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+    let manifest = serde_json::json!({
+        "version": 1,
+        "recovery_batch_id": batch_id,
+        "state": "Deferred",
+        "created_at_ms": created_ms,
+        "next_retry_at_ms": created_ms.saturating_add(retry_interval.as_millis()),
+        "files": files,
+        "last_error": bounded_diagnostic(error, 4096),
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest).change_context(AppError::Unknown)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .change_context(AppError::Unknown)?;
+    use std::io::Write;
+    file.write_all(&bytes).change_context(AppError::Unknown)?;
+    file.sync_all().change_context(AppError::Unknown)?;
+    std::fs::rename(&temp_path, &manifest_path).change_context(AppError::Unknown)?;
+    Ok((batch_id, manifest_path))
+}
+
+fn bounded_diagnostic(value: &str, max_chars: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 fn media_compatibility_key(event: &SegmentInfo) -> Option<u64> {
     if event.danmaku_file_path.is_some()
         || !event
@@ -300,6 +455,9 @@ fn media_compatibility_key(event: &SegmentInfo) -> Option<u64> {
     }
     let mut offset = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize + 4;
     let mut headers: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut has_media = false;
+    let mut has_video_sequence = false;
+    let mut has_video_keyframe = false;
     while offset < bytes.len() {
         if bytes.len().saturating_sub(offset) < 15 {
             return None;
@@ -321,11 +479,21 @@ fn media_compatibility_key(event: &SegmentInfo) -> Option<u64> {
             _ => false,
         };
         if is_sequence_header {
+            has_video_sequence |= tag_type == 9;
             headers.push((tag_type, body.to_vec()));
         }
+        has_media |= match tag_type {
+            8 if !body.is_empty() => (body[0] >> 4) != 10 || body.get(1) == Some(&1),
+            9 if !body.is_empty() => (body[0] & 0x0f) != 7 || body.get(1) == Some(&1),
+            _ => false,
+        };
+        has_video_keyframe |= tag_type == 9
+            && body.len() > 1
+            && (body[0] >> 4) == 1
+            && ((body[0] & 0x0f) != 7 || body[1] == 1);
         offset = next;
     }
-    if headers.is_empty() {
+    if headers.is_empty() || !has_media || (has_video_sequence && !has_video_keyframe) {
         return None;
     }
     use std::hash::{Hash, Hasher};
@@ -353,23 +521,20 @@ fn merge_compatible_segments(
         .unwrap_or("segment");
     let suffix = format!("{}-{}", std::process::id(), first.segment_index);
     let list_path = parent.join(format!(".{stem}.{suffix}.concat.txt"));
-    let output_path = parent.join(format!("{stem}.{suffix}.recovered.flv"));
-    let mut concat_list = String::new();
-    for event in events {
-        let absolute = event
-            .prev_file_path
-            .canonicalize()
-            .change_context(AppError::Unknown)?;
-        let escaped = absolute.to_string_lossy().replace('\'', "'\\''");
-        concat_list.push_str(&format!("file '{escaped}'\n"));
-    }
-    std::fs::write(&list_path, concat_list).change_context(AppError::Unknown)?;
-    let status = std::process::Command::new("ffmpeg")
+    let copy_output_path = parent.join(format!("{stem}.{suffix}.recovered.flv"));
+    write_concat_list(
+        &list_path,
+        events.iter().map(|event| event.prev_file_path.as_path()),
+    )?;
+    let started_at = Instant::now();
+    let copy_output = std::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
             "-loglevel",
             "warning",
             "-y",
+            "-fflags",
+            "+genpts+igndts",
             "-f",
             "concat",
             "-safe",
@@ -377,20 +542,33 @@ fn merge_compatible_segments(
             "-i",
         ])
         .arg(&list_path)
-        .args(["-c", "copy"])
-        .arg(&output_path)
-        .status()
+        .args(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .arg(&copy_output_path)
+        .output()
         .change_context(AppError::Custom(
             "failed to spawn ffmpeg for short segment merge".into(),
-        ));
-    let _ = std::fs::remove_file(&list_path);
-    let status = status?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&output_path);
-        bail!(AppError::Custom(format!(
-            "ffmpeg short segment merge failed with {status}"
-        )));
-    }
+        ))?;
+    let copy_diagnostic = bounded_diagnostic(&String::from_utf8_lossy(&copy_output.stderr), 4096);
+    let output_path = if copy_output.status.success() {
+        let _ = std::fs::remove_file(&list_path);
+        info!(
+            phase = "concat_copy",
+            elapsed_ms = started_at.elapsed().as_millis(),
+            stderr = copy_diagnostic,
+            "short segment merge phase succeeded"
+        );
+        copy_output_path
+    } else {
+        let _ = std::fs::remove_file(&copy_output_path);
+        warn!(
+            phase = "concat_copy",
+            status = %copy_output.status,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            stderr = copy_diagnostic,
+            "short segment concat copy failed; trying per-file remux"
+        );
+        remux_then_concat(events, parent, stem, &suffix, &list_path)?
+    };
     if matches!(
         validator.validate(&output_path)?,
         MediaValidation::Invalid { .. }
@@ -412,6 +590,122 @@ fn merge_compatible_segments(
             .map(|event| event.prev_file_path.clone())
             .collect(),
     })
+}
+
+fn write_concat_list<'a>(
+    list_path: &std::path::Path,
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+) -> AppResult<()> {
+    let mut concat_list = String::new();
+    for path in paths {
+        let absolute = path.canonicalize().change_context(AppError::Unknown)?;
+        let escaped = absolute.to_string_lossy().replace('\'', "'\\''");
+        concat_list.push_str(&format!("file '{escaped}'\n"));
+    }
+    std::fs::write(list_path, concat_list).change_context(AppError::Unknown)
+}
+
+fn remux_then_concat(
+    events: &[SegmentInfo],
+    parent: &std::path::Path,
+    stem: &str,
+    suffix: &str,
+    list_path: &std::path::Path,
+) -> AppResult<std::path::PathBuf> {
+    let started_at = Instant::now();
+    let mut normalized = Vec::with_capacity(events.len());
+    let mut diagnostics = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let path = parent.join(format!(".{stem}.{suffix}.{index}.normalized.mkv"));
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-fflags",
+                "+genpts+igndts",
+                "-i",
+            ])
+            .arg(&event.prev_file_path)
+            .args([
+                "-map",
+                "0:v?",
+                "-map",
+                "0:a?",
+                "-c",
+                "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+            ])
+            .arg(&path)
+            .output()
+            .change_context(AppError::Custom(
+                "failed to spawn ffmpeg for recovery remux".into(),
+            ))?;
+        diagnostics.push(bounded_diagnostic(
+            &String::from_utf8_lossy(&output.stderr),
+            1024,
+        ));
+        if !output.status.success() {
+            for temporary in normalized.iter().chain(std::iter::once(&path)) {
+                let _ = std::fs::remove_file(temporary);
+            }
+            let _ = std::fs::remove_file(list_path);
+            bail!(AppError::Custom(format!(
+                "ffmpeg short segment merge failed at remux_input_{index} with {}; elapsed_ms={}; stderr={}",
+                output.status,
+                started_at.elapsed().as_millis(),
+                diagnostics.last().cloned().unwrap_or_default(),
+            )));
+        }
+        normalized.push(path);
+    }
+
+    write_concat_list(
+        list_path,
+        normalized.iter().map(std::path::PathBuf::as_path),
+    )?;
+    let output_path = parent.join(format!("{stem}.{suffix}.recovered.mkv"));
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+        ])
+        .arg(list_path)
+        .args(["-c", "copy"])
+        .arg(&output_path)
+        .output()
+        .change_context(AppError::Custom(
+            "failed to spawn ffmpeg for normalized recovery concat".into(),
+        ))?;
+    let stderr = bounded_diagnostic(&String::from_utf8_lossy(&output.stderr), 4096);
+    for temporary in &normalized {
+        let _ = std::fs::remove_file(temporary);
+    }
+    let _ = std::fs::remove_file(list_path);
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        bail!(AppError::Custom(format!(
+            "ffmpeg short segment merge failed at remux_concat with {}; elapsed_ms={}; stderr={stderr}",
+            output.status,
+            started_at.elapsed().as_millis(),
+        )));
+    }
+    info!(
+        phase = "remux_concat",
+        elapsed_ms = started_at.elapsed().as_millis(),
+        stderr,
+        "short segment merge phase succeeded"
+    );
+    Ok(output_path)
 }
 
 /// 下载任务
@@ -641,10 +935,11 @@ impl DownloadTask {
                     offline_retry.retry_delay()
                 }
                 Err(e) => {
-                    // 检查出错 = cookie 可能失效（去抖后累计，达阈值才提示）
+                    let sanitized_error = cookie_health::redact_sensitive(&format!("{e:?}"));
+                    // 健康模块会区分鉴权、网络、服务端和响应结构错误。
                     cookie_health::record_error(
                         platform,
-                        &format!("{e:?}"),
+                        &sanitized_error,
                         cookie_webhook.as_deref(),
                     );
                     let now = Instant::now();
@@ -652,7 +947,7 @@ impl DownloadTask {
                         warn!(
                             url = url,
                             check_elapsed = ?check_elapsed,
-                            "检查直播间持续失败超过宽限期 {:?}，结束本场: {:?}", grace, e
+                            "检查直播间持续失败超过宽限期 {:?}，结束本场: {}", grace, sanitized_error
                         );
                         break;
                     }
@@ -660,8 +955,8 @@ impl DownloadTask {
                     warn!(
                         url = url,
                         check_elapsed = ?check_elapsed,
-                        "Failed to check stream status: {:?}，宽限期内继续复查 ({:?}/{:?})",
-                        e,
+                        "Failed to check stream status: {}，宽限期内继续复查 ({:?}/{:?})",
+                        sanitized_error,
                         now.saturating_duration_since(since),
                         grace
                     );
@@ -710,8 +1005,10 @@ impl DownloadTask {
             recoverable_short_segments = processor.stats.recoverable_short_segments,
             recoverable_short_bytes = processor.stats.recoverable_short_bytes,
             merged_recovery_outputs = processor.stats.merged_recovery_outputs,
+            deferred_recovery_batches = processor.stats.deferred_recovery_batches,
             invalid_segments = processor.stats.invalid_segments,
             segments_queued_for_upload = processor.stats.segments_queued_for_upload,
+            upload_queue_peak_depth = processor.stats.upload_queue_peak_depth,
             "download resilience session summary"
         );
         for route in health_metrics.routes {
@@ -960,10 +1257,11 @@ mod retry_state_tests {
 
 #[cfg(test)]
 mod short_segment_group_tests {
-    use super::compatible_segment_groups;
+    use super::{compatible_segment_groups, defer_recovery_batch};
     use crate::server::core::downloader::SegmentInfo;
     use biliup::downloader::util::SegmentCloseReason;
     use std::fs;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn append_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
@@ -1028,5 +1326,28 @@ mod short_segment_group_tests {
         let groups = compatible_segment_groups(vec![event(first, 0), event(second, 1)]);
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|group| group.len() == 1));
+    }
+
+    #[test]
+    fn deferred_batch_manifest_is_durable_and_lists_all_originals() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.flv");
+        let second = dir.path().join("second.flv");
+        fs::write(&first, flv_fixture(1)).unwrap();
+        fs::write(&second, flv_fixture(1)).unwrap();
+        let events = vec![event(first.clone(), 0), event(second.clone(), 1)];
+
+        let (batch_id, manifest) =
+            defer_recovery_batch(&events, "ffmpeg exited 254", Duration::from_secs(900)).unwrap();
+
+        assert!(manifest.exists());
+        assert!(first.exists());
+        assert!(second.exists());
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(value["recovery_batch_id"], batch_id);
+        assert_eq!(value["state"], "Deferred");
+        assert_eq!(value["files"].as_array().unwrap().len(), 2);
+        assert_eq!(value["last_error"], "ffmpeg exited 254");
     }
 }

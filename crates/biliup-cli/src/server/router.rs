@@ -6,11 +6,11 @@ use crate::server::api::cover_preview::cover_preview_router;
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_missing_upload,
     delete_streamers_endpoint, delete_template_endpoint, delete_user_endpoint, get_configuration,
-    get_cookie_health, get_missing_uploads, get_qrcode, get_status, get_streamer_info,
-    get_streamer_info_files, get_streamers_endpoint, get_upload_streamer_endpoint,
-    get_upload_streamers_endpoint, get_users_endpoint, get_videos, login_by_qrcode,
-    pause_streamers_endpoint, post_streamers_endpoint, post_uploads, put_configuration,
-    put_streamers_endpoint, recover_missing_upload, retry_missing_upload,
+    get_cookie_health, get_missing_uploads, get_qrcode, get_recovery_batches, get_status,
+    get_streamer_info, get_streamer_info_files, get_streamers_endpoint, get_upload_rate_health,
+    get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
+    login_by_qrcode, pause_streamers_endpoint, post_streamers_endpoint, post_uploads,
+    put_configuration, put_streamers_endpoint, recover_missing_upload, retry_missing_upload,
 };
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
@@ -67,6 +67,8 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/videos", get(get_videos)) // 获取视频列表
         .route("/v1/status", get(get_status))
         .route("/v1/health/cookie", get(get_cookie_health)) // cookie 健康状态（前端横幅轮询）
+        .route("/v1/health/upload-rate", get(get_upload_rate_health))
+        .route("/v1/recovery-batches", get(get_recovery_batches))
         .route("/v1/uploads/missing", get(get_missing_uploads))
         .route("/v1/uploads/missing/{id}", delete(delete_missing_upload))
         .route(
