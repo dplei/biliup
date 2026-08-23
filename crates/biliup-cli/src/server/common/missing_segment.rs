@@ -178,6 +178,77 @@ pub async fn enqueue_missing_segment(
     error: String,
     now: DateTime<Utc>,
 ) -> AppResult<()> {
+    enqueue_segment(
+        pool,
+        live_streamer_id,
+        streamer_info_id,
+        upload_session_id,
+        aid,
+        file_path,
+        danmaku_file_path,
+        segment_order,
+        "failed",
+        1,
+        1,
+        now + retry_delay_for_attempt(1),
+        error,
+        now,
+    )
+    .await
+}
+
+/// Queue a segment that never reached the upload attempt because uploader initialization failed.
+/// It is immediately due so the next healthy session can recover it without waiting for the
+/// ordinary upload-failure backoff.
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_pending_segment(
+    pool: &ConnectionPool,
+    live_streamer_id: i64,
+    streamer_info_id: i64,
+    upload_session_id: Option<i64>,
+    aid: Option<i64>,
+    file_path: &Path,
+    danmaku_file_path: Option<&Path>,
+    segment_order: i64,
+    reason: String,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    enqueue_segment(
+        pool,
+        live_streamer_id,
+        streamer_info_id,
+        upload_session_id,
+        aid,
+        file_path,
+        danmaku_file_path,
+        segment_order,
+        "pending",
+        0,
+        0,
+        now,
+        reason,
+        now,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_segment(
+    pool: &ConnectionPool,
+    live_streamer_id: i64,
+    streamer_info_id: i64,
+    upload_session_id: Option<i64>,
+    aid: Option<i64>,
+    file_path: &Path,
+    danmaku_file_path: Option<&Path>,
+    segment_order: i64,
+    status: &str,
+    attempts: i64,
+    line_index: i64,
+    next_retry_at: DateTime<Utc>,
+    error: String,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
     let item = InsertUploadMissingSegment {
         live_streamer_id,
         streamer_info_id,
@@ -186,10 +257,10 @@ pub async fn enqueue_missing_segment(
         file_path: file_path.display().to_string(),
         danmaku_file_path: danmaku_file_path.map(|p| p.display().to_string()),
         segment_order,
-        status: "failed".to_string(),
-        attempts: 1,
-        line_index: 1,
-        next_retry_at: now + retry_delay_for_attempt(1),
+        status: status.to_string(),
+        attempts,
+        line_index,
+        next_retry_at,
         last_error: Some(error),
         created_at: now,
         updated_at: now,
@@ -202,13 +273,13 @@ pub async fn enqueue_missing_segment(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(live_streamer_id, file_path) WHERE status IN ('pending', 'uploading', 'failed')
         DO UPDATE SET
-            upload_session_id = excluded.upload_session_id,
+            upload_session_id = CASE WHEN excluded.status = 'failed' THEN excluded.upload_session_id ELSE COALESCE(upload_missing_segment.upload_session_id, excluded.upload_session_id) END,
             aid = COALESCE(upload_missing_segment.aid, excluded.aid),
             segment_order = excluded.segment_order,
-            status = 'failed',
-            attempts = upload_missing_segment.attempts + 1,
-            line_index = excluded.line_index,
-            next_retry_at = excluded.next_retry_at,
+            status = CASE WHEN excluded.status = 'failed' THEN 'failed' ELSE upload_missing_segment.status END,
+            attempts = upload_missing_segment.attempts + excluded.attempts,
+            line_index = CASE WHEN excluded.status = 'failed' THEN excluded.line_index ELSE upload_missing_segment.line_index END,
+            next_retry_at = CASE WHEN excluded.status = 'failed' THEN excluded.next_retry_at ELSE upload_missing_segment.next_retry_at END,
             last_error = excluded.last_error,
             updated_at = excluded.updated_at
     "#;
@@ -233,6 +304,28 @@ pub async fn enqueue_missing_segment(
         .change_context(AppError::Unknown)?;
 
     Ok(())
+}
+
+/// Return the first unused ordering hint for another missing segment in a local upload session.
+pub async fn next_missing_segment_order(
+    pool: &ConnectionPool,
+    upload_session_id: i64,
+    successful_count: usize,
+) -> AppResult<i64> {
+    let successful_count = i64::try_from(successful_count).unwrap_or(i64::MAX);
+    let (max_queued, active_missing_count) = sqlx::query_as::<_, (Option<i64>, i64)>(
+        "SELECT MAX(segment_order), \
+                COUNT(CASE WHEN status IN ('pending', 'uploading', 'failed') THEN 1 END) \
+         FROM upload_missing_segment WHERE upload_session_id = ?",
+    )
+    .bind(upload_session_id)
+    .fetch_one(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(max_queued
+        .map(|order| order.saturating_add(1))
+        .unwrap_or(0)
+        .max(successful_count.saturating_add(active_missing_count)))
 }
 
 pub fn upload_line_for_recovery(index: i64) -> Option<UploadLine> {
@@ -266,6 +359,7 @@ mod tests {
     use super::*;
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
+    use ormlite::Model;
 
     fn video(name: &str) -> Video {
         Video {
@@ -357,6 +451,163 @@ mod tests {
             .unwrap();
 
         id
+    }
+
+    async fn insert_upload_session(pool: &ConnectionPool, id: i64) {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap();
+        sqlx::query(
+            "INSERT INTO upload_session \
+             (id, live_streamer_id, streamer_info_id, aid, bvid, videos_json, status, created_at, updated_at) \
+             VALUES (?1, 10, 20, NULL, NULL, '[]', 'uploading', ?2, ?2)",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_segment_is_immediately_due_without_counting_an_upload_attempt() {
+        let (_dir, pool) = test_pool().await;
+        insert_upload_session(&pool, 30).await;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+
+        enqueue_pending_segment(
+            &pool,
+            10,
+            20,
+            Some(30),
+            None,
+            Path::new("/tmp/init-failed.flv"),
+            Some(Path::new("/tmp/init-failed.xml")),
+            3,
+            "login unavailable".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let row = UploadMissingSegment::select()
+            .where_("file_path = ?")
+            .bind("/tmp/init-failed.flv")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.line_index, 0);
+        assert_eq!(row.next_retry_at, now);
+        assert_eq!(row.upload_session_id, Some(30));
+
+        let due = due_missing_segments_for_session(&pool, 30, now)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(next_missing_segment_order(&pool, 30, 1).await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn duplicate_pending_enqueue_keeps_retry_state_and_links_existing_row() {
+        let (_dir, pool) = test_pool().await;
+        insert_upload_session(&pool, 30).await;
+        let first = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+        let second = first + chrono::Duration::minutes(1);
+        let path = Path::new("/tmp/replayed.flv");
+
+        enqueue_pending_segment(
+            &pool,
+            10,
+            20,
+            None,
+            None,
+            path,
+            None,
+            0,
+            "first".to_string(),
+            first,
+        )
+        .await
+        .unwrap();
+        enqueue_pending_segment(
+            &pool,
+            10,
+            20,
+            Some(30),
+            None,
+            path,
+            None,
+            1,
+            "second".to_string(),
+            second,
+        )
+        .await
+        .unwrap();
+
+        let rows = UploadMissingSegment::select()
+            .where_("file_path = ?")
+            .bind(path.display().to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "pending");
+        assert_eq!(rows[0].attempts, 0);
+        assert_eq!(rows[0].next_retry_at, first);
+        assert_eq!(rows[0].upload_session_id, Some(30));
+        assert_eq!(rows[0].segment_order, 1);
+    }
+
+    #[tokio::test]
+    async fn next_order_counts_missing_segment_between_successful_segments() {
+        let (_dir, pool) = test_pool().await;
+        insert_upload_session(&pool, 30).await;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+        enqueue_missing_segment(
+            &pool,
+            10,
+            20,
+            Some(30),
+            None,
+            Path::new("/tmp/middle-missing.flv"),
+            None,
+            1,
+            "upload failed".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        // Original order: success(0), missing(1), success(2). `videos.len()` alone is only 2,
+        // but the next segment must be assigned order 3 rather than collide with success(2).
+        assert_eq!(next_missing_segment_order(&pool, 30, 2).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn rebuilt_pipeline_starts_after_init_failure_pending_segment() {
+        let (_dir, pool) = test_pool().await;
+        insert_upload_session(&pool, 30).await;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
+        enqueue_pending_segment(
+            &pool,
+            10,
+            20,
+            Some(30),
+            None,
+            Path::new("/tmp/init-failure-first.flv"),
+            None,
+            0,
+            "login unavailable".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            next_missing_segment_order(&pool, 30, 0).await.unwrap(),
+            1,
+            "the rebuilt pipeline must not reuse order 0 for its next failed upload"
+        );
     }
 
     #[test]
