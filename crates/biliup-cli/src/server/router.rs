@@ -1,3 +1,4 @@
+use crate::server::api::audio_normalization::audio_normalization_router;
 use crate::server::api::bilibili_endpoints::{
     archive_pre_endpoint, get_myinfo_endpoint, get_proxy_endpoint, get_seasons_endpoint,
 };
@@ -81,6 +82,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .merge(static_file_router(default_static_root()))
         .merge(cover_background_router(PathBuf::from(BACKGROUND_DIR)))
         .merge(cover_preview_router(PathBuf::from(BACKGROUND_DIR)))
+        .merge(audio_normalization_router(default_static_root()))
 }
 
 /// 静态文件子路由：服务工作目录下的日志与录播视频。

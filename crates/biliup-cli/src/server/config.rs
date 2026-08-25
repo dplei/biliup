@@ -77,6 +77,16 @@ pub struct Config {
     #[serde(default)]
     pub timestamp_repair: Option<bool>,
 
+    /// 上传前自动统一录音响度。默认关闭；只重编码主音轨，不重编码视频。
+    #[builder(default)]
+    #[serde(default)]
+    pub audio_normalization_enabled: bool,
+
+    /// 相对推荐目标（-16 LUFS）的音量偏移，网页推子使用，允许 -6..=4 dB。
+    #[builder(default)]
+    #[serde(default)]
+    pub audio_normalization_offset_db: i8,
+
     /// cookie 健康提示 webhook（可选）。检测到平台 cookie 可能失效（连续直播间检查失败）时，
     /// 以及恢复时各推送一次。URL 含 `{title}`/`{content}` 占位 → GET 替换（兼容 Bark/Server酱）；
     /// 否则 POST JSON `{"title":..,"content":..}`（兼容企业微信/钉钉/自建）。留空则只在网页横幅提示。
@@ -620,7 +630,18 @@ impl Default for Config {
 
 impl Config {
     pub fn validate_segment_limits(&self) -> AppResult<()> {
+        if !(-6..=4).contains(&self.audio_normalization_offset_db) {
+            bail!(AppError::Custom(format!(
+                "audio_normalization_offset_db must be between -6 and 4, got {}",
+                self.audio_normalization_offset_db
+            )));
+        }
         Ok(())
+    }
+
+    /// 实际响度目标。配置保存时会拒绝越界值；这里仍 clamp，保护旧数据库或手工构造值。
+    pub fn effective_audio_target_lufs(&self) -> f64 {
+        -16.0 + f64::from(self.audio_normalization_offset_db.clamp(-6, 4))
     }
 
     pub fn normalize_segment_limits(&mut self) {
@@ -679,6 +700,48 @@ mod timestamp_repair_config_tests {
     fn timestamp_repair_can_be_disabled() {
         let cfg: Config = serde_yaml::from_str("timestamp_repair: false").expect("parse");
         assert_eq!(cfg.timestamp_repair, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod audio_normalization_config_tests {
+    use super::{Config, ConfigPatch};
+    use struct_patch::Patch;
+
+    #[test]
+    fn defaults_are_backward_compatible() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!config.audio_normalization_enabled);
+        assert_eq!(config.audio_normalization_offset_db, 0);
+        assert_eq!(config.effective_audio_target_lufs(), -16.0);
+    }
+
+    #[test]
+    fn validates_fader_bounds() {
+        for value in [-6, 0, 4] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "audio_normalization_enabled: true\naudio_normalization_offset_db: {value}"
+            ))
+            .unwrap();
+            assert!(config.validate_segment_limits().is_ok());
+        }
+        for value in [-7, 5] {
+            let config: Config =
+                serde_yaml::from_str(&format!("audio_normalization_offset_db: {value}")).unwrap();
+            assert!(config.validate_segment_limits().is_err());
+        }
+    }
+
+    #[test]
+    fn patch_can_override_audio_settings() {
+        let mut config = Config::default();
+        let patch: ConfigPatch = serde_json::from_str(
+            r#"{"audio_normalization_enabled":true,"audio_normalization_offset_db":2}"#,
+        )
+        .unwrap();
+        config.apply(patch);
+        assert!(config.audio_normalization_enabled);
+        assert_eq!(config.audio_normalization_offset_db, 2);
     }
 }
 

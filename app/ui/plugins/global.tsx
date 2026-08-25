@@ -3,6 +3,7 @@ import React, { useEffect } from 'react'
 import styles from '../../styles/dashboard.module.scss'
 import { Form, Select, Space, useFormApi } from '@douyinfe/semi-ui'
 import { IconUpload, IconDownload } from '@douyinfe/semi-icons'
+import AudioNormalizationControl from '../AudioNormalizationControl'
 
 const Global: React.FC = () => {
   const formApi = useFormApi()
@@ -384,6 +385,7 @@ const Global: React.FC = () => {
             padding: 0,
           }}
         />
+        <AudioNormalizationControl />
         <Form.Input
           field="cookie_health_webhook"
           label="Cookie 失效推送（cookie_health_webhook）"

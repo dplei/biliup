@@ -29,6 +29,10 @@ filtering_threshold: 20
 #segment_processor_parallel: false
 
 #------上传------#
+### 自动统一录音响度；默认关闭。开启后视频不重编码，只重编码音频；失败会上传原片
+#audio_normalization_enabled: true
+### 相对推荐音量的偏移，网页音量推子会自动维护；范围 -6 到 +4
+#audio_normalization_offset_db: 0
 ### 全进程预上传节流与 B 站 601 冷却；默认开启
 #upload_rate_gate_enabled: true
 #upload_min_request_interval_secs: 2

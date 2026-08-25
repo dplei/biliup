@@ -1,4 +1,8 @@
 use crate::UploadLine;
+use crate::server::common::audio_normalization::{
+    AudioSampleStore, NormalizationOutcome, SystemAudioFfmpeg, TempArtifact,
+    maybe_capture_reference_sample, normalize_for_upload,
+};
 use crate::server::common::cookie_health::notify_alert;
 use crate::server::common::cover_generator::{
     Background, CoverOptions, render_to_tempfile, split_template_lines,
@@ -46,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::Instant;
+use struct_patch::Patch;
 use tokio::pin;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
@@ -679,11 +684,24 @@ async fn pipeline_upload_videos(
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
 
-        // 上传前时间戳检测与修复（全局开关，默认开），helper 内部选路并上传。
-        let repair_enabled = ctx.config().timestamp_repair.unwrap_or(true);
-        let _permit = acquire_global_upload_permit().await;
-        match upload_single_file_with_repair(&original_path, upload_context, repair_enabled).await {
-            Ok((video, outcome)) => {
+        // 样片截取是一次性、失败开放的旁路，不改变当前分段的上传结果。
+        let sample_store = AudioSampleStore::for_working_directory(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        maybe_capture_reference_sample(&original_path, &sample_store).await;
+
+        let effective_config = ctx.config();
+        let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        match upload_single_file_with_repair(
+            &original_path,
+            upload_context,
+            repair_enabled,
+            effective_config.audio_normalization_enabled,
+            effective_config.effective_audio_target_lufs(),
+        )
+        .await
+        {
+            Ok((video, outcome, _normalization_artifact)) => {
                 // The remote upload consumed this logical position even if local session
                 // persistence fails; never reuse the order for a later segment.
                 next_order = next_order.saturating_add(1);
@@ -770,21 +788,51 @@ async fn upload_single_file_with_repair(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
-) -> AppResult<(Video, RepairOutcome)> {
+    normalization_enabled: bool,
+    target_lufs: f64,
+) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
+    let normalization = if normalization_enabled {
+        normalize_for_upload(original_path, target_lufs, &SystemAudioFfmpeg::default()).await
+    } else {
+        NormalizationOutcome::Original {
+            reason: crate::server::common::audio_normalization::OriginalReason::NoAudio,
+        }
+    };
+    let normalization_artifact = match normalization {
+        NormalizationOutcome::Normalized { artifact, .. } => Some(artifact),
+        NormalizationOutcome::Original { reason } => {
+            if normalization_enabled {
+                info!(audio_normalization = "fallback", file = %original_path.display(), ?reason);
+            }
+            None
+        }
+    };
+    let normalized_path = normalization_artifact
+        .as_ref()
+        .map(TempArtifact::path)
+        .unwrap_or(original_path);
     let outcome = if repair_enabled {
-        normalize_timestamps(original_path, &SystemFfmpeg).await
+        normalize_timestamps(normalized_path, &SystemFfmpeg).await
     } else {
         RepairOutcome::Clean
     };
     let upload_path = match &outcome {
         RepairOutcome::Repaired(fixed) => fixed.clone(),
-        _ => original_path.to_path_buf(),
+        _ => normalized_path.to_path_buf(),
     };
-    match upload_single_file(&upload_path, context).await {
-        Ok(video) => Ok((video, outcome)),
+    let result = {
+        // CPU/磁盘处理不占网络上传 permit。
+        let _permit = acquire_global_upload_permit().await;
+        upload_single_file(&upload_path, context).await
+    };
+    match result {
+        Ok(video) => Ok((video, outcome, normalization_artifact)),
         Err(e) => {
             if let RepairOutcome::Repaired(fixed) = &outcome {
                 let _ = tokio::fs::remove_file(fixed).await;
+            }
+            if let Some(artifact) = &normalization_artifact {
+                artifact.cleanup().await;
             }
             Err(e)
         }
@@ -903,14 +951,19 @@ async fn recover_due_missing_segments(
         };
 
         let path = PathBuf::from(&file_path);
-        let repair_enabled = ctx.config().timestamp_repair.unwrap_or(true);
-        let result = {
-            let _permit = acquire_global_upload_permit().await;
-            upload_single_file_with_repair(&path, &recovery_context, repair_enabled).await
-        };
+        let effective_config = ctx.config();
+        let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        let result = upload_single_file_with_repair(
+            &path,
+            &recovery_context,
+            repair_enabled,
+            effective_config.audio_normalization_enabled,
+            effective_config.effective_audio_target_lufs(),
+        )
+        .await;
 
         match result {
-            Ok((video, outcome)) => {
+            Ok((video, outcome, _normalization_artifact)) => {
                 let updated =
                     insert_session_video_at_order(ctx.pool(), session_row_id, video, segment_order)
                         .await?;
@@ -1321,22 +1374,34 @@ pub async fn manual_recover_missing_segment(
             .await
             .change_context(AppError::Unknown)?;
 
-        let upload_context =
-            initialize_upload_context(config, &StatelessClient::default(), &upload_config, pool)
-                .await?;
+        let mut effective_config = config.clone();
+        if let Some(override_config) = live_streamer.override_cfg.clone() {
+            effective_config.apply(override_config);
+        }
+        let upload_context = initialize_upload_context(
+            &effective_config,
+            &StatelessClient::default(),
+            &upload_config,
+            pool,
+        )
+        .await?;
         let path = PathBuf::from(&row.file_path);
-        let repair_enabled = config.timestamp_repair.unwrap_or(true);
-        let (video, outcome) = {
-            let _permit = acquire_global_upload_permit().await;
-            upload_single_file_with_repair(&path, &upload_context, repair_enabled).await?
-        };
+        let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        let (video, outcome, _normalization_artifact) = upload_single_file_with_repair(
+            &path,
+            &upload_context,
+            repair_enabled,
+            effective_config.audio_normalization_enabled,
+            effective_config.effective_audio_target_lufs(),
+        )
+        .await?;
         match &outcome {
             RepairOutcome::Repaired(fixed) => {
                 let _ = tokio::fs::remove_file(fixed).await;
             }
             RepairOutcome::Unfixable => {
                 notify_alert(
-                    config.cookie_health_webhook.as_deref(),
+                    effective_config.cookie_health_webhook.as_deref(),
                     "biliup 时间戳修复失败",
                     &format!(
                         "手动补投分段 {} 时间戳异常且无法自动修复，本地文件已保留，请手动处理。",

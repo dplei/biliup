@@ -1,3 +1,5 @@
+/// 自动响度标准化样片
+pub mod audio_normalization;
 /// 认证相关API
 pub mod auth;
 /// B站API端点

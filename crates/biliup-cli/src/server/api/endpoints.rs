@@ -10,7 +10,7 @@ use crate::server::common::upload_session::{
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
 use crate::server::core::download_manager::DownloadManager;
-use crate::server::errors::{AppError, report_to_response};
+use crate::server::errors::{ApiError, AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, WorkerStatus};
 use crate::server::infrastructure::dto::LiveStreamerResponse;
@@ -210,9 +210,13 @@ pub async fn put_configuration(
 ) -> Result<Json<Config>, Response> {
     let mut json_data = json_data;
     json_data.normalize_segment_limits();
-    json_data
-        .validate_segment_limits()
-        .map_err(report_to_response)?;
+    json_data.validate_segment_limits().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(error.to_string())),
+        )
+            .into_response()
+    })?;
     // 将 JSON 序列化为 TEXT 存库
     let value_txt = serde_json::to_string(&json_data)
         .change_context(AppError::Unknown)

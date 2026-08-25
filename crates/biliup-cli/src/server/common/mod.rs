@@ -2,6 +2,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+pub mod audio_normalization;
 /// 平台 cookie 健康监测（检测失效并经横幅/webhook 提示）
 pub mod cookie_health;
 pub mod cover_generator;
