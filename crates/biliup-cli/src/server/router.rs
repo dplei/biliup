@@ -11,7 +11,8 @@ use crate::server::api::endpoints::{
     get_streamer_info, get_streamer_info_files, get_streamers_endpoint, get_upload_rate_health,
     get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
     login_by_qrcode, pause_streamers_endpoint, post_streamers_endpoint, post_uploads,
-    put_configuration, put_streamers_endpoint, recover_missing_upload, retry_missing_upload,
+    put_configuration, put_streamers_endpoint, recover_missing_upload, rescan_missing_uploads,
+    retry_missing_upload,
 };
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
@@ -71,6 +72,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/health/upload-rate", get(get_upload_rate_health))
         .route("/v1/recovery-batches", get(get_recovery_batches))
         .route("/v1/uploads/missing", get(get_missing_uploads))
+        .route("/v1/uploads/missing/rescan", post(rescan_missing_uploads))
         .route("/v1/uploads/missing/{id}", delete(delete_missing_upload))
         .route(
             "/v1/uploads/missing/{id}/recover",

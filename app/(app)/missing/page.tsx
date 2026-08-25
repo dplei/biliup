@@ -1,7 +1,7 @@
 'use client'
 import { Button, Layout, Popconfirm, Select, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconDeleteStroked, IconRefresh, IconSendStroked } from '@douyinfe/semi-icons'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import useSWR from 'swr'
 import { fetcher, requestDelete, sendRequest } from '../../lib/api-streamer'
 
@@ -27,6 +27,21 @@ interface MissingSegment {
   session_status: string | null
 }
 
+interface StreamerInfo {
+  id: number
+  name: string
+  title: string
+  date: number
+}
+
+interface RescanResult {
+  upload_session_id: number
+  scanned: number
+  queued: number
+  skipped_known: number
+  skipped_invalid: number
+}
+
 const FALLBACK_LINES = ['bda2', 'tx', 'bldsa', 'auto']
 const lineName = (i: number) => FALLBACK_LINES[((i % 4) + 4) % 4] ?? 'auto'
 
@@ -39,6 +54,9 @@ const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; 
 
 const fmtTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—')
 const baseName = (p: string) => p.split(/[/\\]/).pop() || p
+// Semi Select 的递归泛型在这页两组动态 option 并存时会触发 TS2589；运行时 props
+// 仍由 Semi 校验，这里只截断无意义的类型展开。
+const SimpleSelect = Select as any
 
 export default function MissingRecovery() {
   const { Header, Content } = Layout
@@ -49,9 +67,45 @@ export default function MissingRecovery() {
     isLoading,
     mutate,
   } = useSWR<MissingSegment[]>(`/v1/uploads/missing?status=${statusFilter}`, fetcher)
+  const { data: streamerInfos } = useSWR<StreamerInfo[]>('/v1/streamer-info', fetcher)
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
   const [retryingId, setRetryingId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [rescanStreamerInfoId, setRescanStreamerInfoId] = useState<number | null>(null)
+  const [rescanning, setRescanning] = useState(false)
+
+  const recentStreamerInfos = useMemo(
+    () => [...(streamerInfos ?? [])].sort((a, b) => b.date - a.date).slice(0, 100),
+    [streamerInfos],
+  )
+  useEffect(() => {
+    if (rescanStreamerInfoId == null && recentStreamerInfos.length > 0) {
+      setRescanStreamerInfoId(recentStreamerInfos[0].id)
+    }
+  }, [recentStreamerInfos, rescanStreamerInfoId])
+
+  const handleRescan = async () => {
+    if (rescanStreamerInfoId == null) {
+      Toast.warning('请先选择一场直播')
+      return
+    }
+    setRescanning(true)
+    try {
+      const result = (await sendRequest('/v1/uploads/missing/rescan', {
+        arg: { streamer_info_id: rescanStreamerInfoId },
+      })) as RescanResult
+      Toast.success(
+        `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
+          `${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
+      )
+      setStatusFilter('active')
+      await mutate()
+    } catch (e: any) {
+      Toast.error(`补扫失败：${e?.message ?? e}`)
+    } finally {
+      setRescanning(false)
+    }
+  }
 
   const handleRecover = async (id: number) => {
     setRecoveringId(id)
@@ -276,9 +330,23 @@ export default function MissingRecovery() {
             <h4>缺失补传</h4>
           </div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <Select
+            <SimpleSelect
+              value={rescanStreamerInfoId ?? undefined}
+              onChange={(value: unknown) => setRescanStreamerInfoId(Number(value))}
+              filter
+              placeholder="选择本场直播"
+              style={{ width: 300 }}
+              optionList={recentStreamerInfos.map((info) => ({
+                value: info.id,
+                label: `${info.name} · ${new Date(info.date * 1000).toLocaleString()}`,
+              }))}
+            />
+            <Button icon={<IconRefresh />} loading={rescanning} onClick={handleRescan}>
+              补扫本场
+            </Button>
+            <SimpleSelect
               value={statusFilter}
-              onChange={(v) => setStatusFilter(v as 'active' | 'succeeded' | 'all')}
+              onChange={(v: unknown) => setStatusFilter(v as 'active' | 'succeeded' | 'all')}
               style={{ width: 130 }}
               optionList={[
                 { value: 'active', label: '待补传' },
@@ -296,7 +364,8 @@ export default function MissingRecovery() {
         <Text type="tertiary" style={{ display: 'block', marginBottom: 16 }}>
           录制期间上传失败、尚未补传的分段。下播提交前会自动换线重试到期的分段；这里可手动立即补传，
           补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，
-          其中「#会话号」即日志里的 session，可在「实时日志」按该号检索整条上传链路。
+          其中「#会话号」即日志里的 session，可在「实时日志」按该号检索整条上传链路。若有效录像已留在
+          本地但列表中没有记录，请选择对应的本场直播并点「补扫本场」；空片段不会被加入。
         </Text>
         <Table
           rowKey="id"

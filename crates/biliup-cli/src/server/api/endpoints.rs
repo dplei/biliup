@@ -2,7 +2,8 @@ use crate::server::common::missing_segment::{
     MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
 };
 use crate::server::common::upload::{
-    build_studio, manual_recover_missing_segment, retry_missing_segment, submit_to_bilibili, upload,
+    build_studio, manual_recover_missing_segment, rescan_local_valid_segments,
+    retry_missing_segment, submit_to_bilibili, upload,
 };
 use crate::server::common::upload_session::{
     get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
@@ -794,6 +795,30 @@ pub async fn recover_missing_upload(
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct LocalSegmentRescanRequest {
+    pub streamer_info_id: i64,
+}
+
+pub async fn rescan_missing_uploads(
+    State(service_register): State<ServiceRegister>,
+    Json(request): Json<LocalSegmentRescanRequest>,
+) -> Result<Json<crate::server::common::upload::LocalSegmentRescanResult>, Response> {
+    let config = service_register.config.read().unwrap().clone();
+    let working_directory = std::env::current_dir()
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    rescan_local_valid_segments(
+        &config,
+        &service_register.pool,
+        request.streamer_info_id,
+        &working_directory,
+    )
+    .await
+    .map(Json)
+    .map_err(report_to_response)
 }
 
 pub async fn delete_missing_upload(

@@ -19,9 +19,8 @@ use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
     insert_uploading_session, mark_submit_anomaly, mark_submitted, parse_videos, reattach_session,
     select_recovery_candidate, select_stale_session_indices, submit_state_label,
-    update_session_videos,
 };
-use crate::server::common::util::Recorder;
+use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
 use crate::server::core::downloader::SegmentInfo;
 use crate::server::errors::{AppError, AppResult};
@@ -32,7 +31,9 @@ use crate::server::infrastructure::models::hook_step::{
 };
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
-use crate::server::infrastructure::models::{InsertFileItem, StreamerInfo, UploadMissingSegment};
+use crate::server::infrastructure::models::{
+    FileItem, InsertFileItem, StreamerInfo, UploadMissingSegment, UploadSession,
+};
 use async_channel::Receiver;
 use biliup::bilibili::Vid;
 use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
@@ -46,6 +47,7 @@ use error_stack::ResultExt;
 use futures::StreamExt;
 use ormlite::Insert;
 use ormlite::Model;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -91,6 +93,9 @@ pub async fn process_with_upload(
         .segment_processor
         .clone()
         .unwrap_or_default();
+    // 先落本地会话，再做 cookie 登录/线路探测。这样网络初始化即使长时间重试，
+    // 本场也已经有可绑定的 durable session；初始化最终失败时直接复用它登记 rx。
+    let deferred_archive = prepare_deferred_archive(ctx).await;
     let upload_context = match initialize_upload_context(
         &ctx.config(),
         ctx.stateless_client(),
@@ -106,7 +111,6 @@ pub async fn process_with_upload(
             // closed sender and create a fresh pipeline, which retries uploader initialization.
             rx.close();
             let reason = format!("upload context initialization failed: {init_error:?}");
-            let deferred_archive = prepare_deferred_archive(ctx).await;
             let (session_row_id, first_order) = match deferred_archive {
                 Ok(archive) => {
                     let row_id = archive.session_row_id;
@@ -487,17 +491,47 @@ async fn submit_session(
     Ok(())
 }
 
-/// 每段上传成功后：把 Video 累积进 archive 并落库（uploading 态），供下播一次性提交 & 重启恢复。
-/// 首段创建会话行，之后更新 videos_json。落库失败则返回 Err（调用方据此保留本地文件不删）。
-async fn persist_segment(ctx: &Context, archive: &mut LiveArchive, video: Video) -> AppResult<()> {
+/// 每段上传成功后：把 Video 累积进 archive，并在同一事务删除接收时的 pending 登记。
+/// 落库失败则 pending 保持可见，调用方保留本地文件不删。
+async fn persist_segment(
+    ctx: &Context,
+    archive: &mut LiveArchive,
+    video: Video,
+    enrolled_path: &Path,
+) -> AppResult<()> {
     archive.videos.push(video);
-    let had_session = archive.session_row_id.is_some();
-    let row_id = ensure_archive_session(ctx, archive).await?;
-    if had_session {
-        update_session_videos(ctx.pool(), row_id, &archive.videos).await
-    } else {
+    let result: AppResult<()> = async {
+        let row_id = ensure_archive_session(ctx, archive).await?;
+        let videos_json =
+            serde_json::to_string(&archive.videos).change_context(AppError::Unknown)?;
+        let mut tx = ctx.pool().begin().await.change_context(AppError::Unknown)?;
+        sqlx::query("UPDATE upload_session SET videos_json = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(videos_json)
+            .bind(chrono::Utc::now())
+            .bind(row_id)
+            .execute(&mut *tx)
+            .await
+            .change_context(AppError::Unknown)?;
+        // 接收时写入的 pending 行就是本地分段的 durable enrollment。只有 Video 已和
+        // session 在同一事务落库后才删除它；崩溃发生在任意更早点都会留在缺失补传。
+        sqlx::query(
+            "DELETE FROM upload_missing_segment \
+             WHERE live_streamer_id = ?1 AND file_path = ?2 \
+               AND status IN ('pending', 'uploading', 'failed')",
+        )
+        .bind(ctx.worker_id())
+        .bind(enrolled_path.display().to_string())
+        .execute(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)?;
+        tx.commit().await.change_context(AppError::Unknown)?;
         Ok(())
     }
+    .await;
+    if result.is_err() {
+        archive.videos.pop();
+    }
+    result
 }
 
 /// Ensure both successful uploads and failed first segments have a durable local session.
@@ -604,7 +638,20 @@ async fn prepare_archive(
             videos,
         })
     } else {
-        Ok(LiveArchive::default())
+        // 会话的 durable 边界必须早于首段网络上传。过去这里返回空 archive，只有首段
+        // 上传成功后才建行；一旦上传 Actor 被其他长直播占住，已验证分段会长期只存在于
+        // 内存 channel，既没有 upload_session，也不会出现在缺失补传。
+        let row = insert_uploading_session(ctx.pool(), room_id, ctx.id(), &[]).await?;
+        info!(
+            row_id = row.id,
+            room_id, "新直播：上传管道启动时已创建本地投稿会话"
+        );
+        Ok(LiveArchive {
+            session_row_id: Some(row.id),
+            aid: None,
+            bvid: None,
+            videos: Vec::new(),
+        })
     }
 }
 
@@ -684,13 +731,98 @@ async fn pipeline_upload_videos(
         if !segment_processors.is_empty()
             && let Err(e) = process_video_paths(&mut paths, segment_processors).await
         {
-            error!(file = ?event.prev_file_path, "segment_processor failed, skipping segment: {:?}", e);
+            let Some(session_row_id) = archive.session_row_id else {
+                error!(file = ?event.prev_file_path, "segment_processor 失败且上传会话不存在，本地文件保持不动: {:?}", e);
+                continue;
+            };
+            let segment_order =
+                next_missing_segment_order(ctx.pool(), session_row_id, archive.videos.len())
+                    .await
+                    .unwrap_or(next_order);
+            let reason = format!("segment_processor failed before upload: {e:?}");
+            match enqueue_pending_segment(
+                ctx.pool(),
+                ctx.worker_id(),
+                ctx.id(),
+                Some(session_row_id),
+                archive.aid.map(|aid| aid as i64),
+                &event.prev_file_path,
+                event.danmaku_file_path.as_deref(),
+                segment_order,
+                reason,
+                chrono::Utc::now(),
+            )
+            .await
+            {
+                Ok(()) => error!(
+                    file = ?event.prev_file_path,
+                    session = session_row_id,
+                    segment_order,
+                    "segment_processor 失败，原始有效分段已登记到缺失补传"
+                ),
+                Err(queue_error) => error!(
+                    file = ?event.prev_file_path,
+                    ?queue_error,
+                    "segment_processor 失败且缺失登记失败，本地文件保持不动"
+                ),
+            }
+            next_order = next_order.max(segment_order.saturating_add(1));
             continue;
         }
         let original_path = paths
             .first()
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
+
+        // 先把有效分段绑定到本场 session 并写入 durable pending，再开始任何网络上传。
+        // 这行与 upload_session 的 FK 是「已接收分段」的持久化边界：进程此后无论在
+        // 登录、限速等待、pre-upload 或传块阶段退出，缺失补传页都能看到该文件。
+        let Some(session_row_id) = archive.session_row_id else {
+            error!(file = %original_path.display(), "上传会话未创建，拒绝上传以保留本地分段");
+            continue;
+        };
+        // 补扫入口可能在直播仍进行时插入遗留分段；每次从 DB 重新分配顺序，避免管道
+        // 启动时缓存的 next_order 与人工补扫发生碰撞。
+        let segment_order = match next_missing_segment_order(
+            ctx.pool(),
+            session_row_id,
+            archive.videos.len(),
+        )
+        .await
+        {
+            Ok(order) => order,
+            Err(error) => {
+                error!(
+                    ?error,
+                    session = session_row_id,
+                    "分配分段顺序失败，使用管道本地顺序"
+                );
+                next_order
+            }
+        };
+        if let Err(error) = enqueue_pending_segment(
+            ctx.pool(),
+            ctx.worker_id(),
+            ctx.id(),
+            Some(session_row_id),
+            archive.aid.map(|aid| aid as i64),
+            &original_path,
+            event.danmaku_file_path.as_deref(),
+            segment_order,
+            "validated segment accepted; awaiting upload".to_string(),
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            error!(
+                ?error,
+                file = %original_path.display(),
+                session = session_row_id,
+                "有效分段登记失败，拒绝上传并保留本地文件"
+            );
+            continue;
+        }
+        next_order = next_order.max(segment_order.saturating_add(1));
 
         // 样片截取是一次性、失败开放的旁路，不改变当前分段的上传结果。
         let sample_store = AudioSampleStore::for_working_directory(
@@ -710,11 +842,8 @@ async fn pipeline_upload_videos(
         .await
         {
             Ok((video, outcome, _normalization_artifact)) => {
-                // The remote upload consumed this logical position even if local session
-                // persistence fails; never reuse the order for a later segment.
-                next_order = next_order.saturating_add(1);
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
-                if let Err(e) = persist_segment(ctx, &mut archive, video).await {
+                if let Err(e) = persist_segment(ctx, &mut archive, video, &original_path).await {
                     error!(file = ?original_path, "落库累积失败，保留本地文件: {:?}", e);
                     // Repaired 的临时修复件未 durable，清理掉避免残留。
                     if let RepairOutcome::Repaired(fixed) = &outcome {
@@ -754,8 +883,6 @@ async fn pipeline_upload_videos(
             }
             Err(e) => {
                 let err = format!("{e:?}");
-                let segment_order = next_order;
-                next_order = next_order.saturating_add(1);
                 if let Err(session_error) = ensure_archive_session(ctx, &mut archive).await {
                     error!(
                         ?session_error,
@@ -1284,6 +1411,204 @@ pub async fn upload(
     Ok((bilibili, videos))
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct LocalSegmentRescanResult {
+    pub live_streamer_id: i64,
+    pub streamer_info_id: i64,
+    pub upload_session_id: i64,
+    pub scanned: usize,
+    pub queued: usize,
+    pub skipped_known: usize,
+    pub skipped_invalid: usize,
+}
+
+fn is_rescan_filename_candidate(
+    file_name: &str,
+    literal_prefix: &str,
+    streamer_name: &str,
+) -> bool {
+    (!literal_prefix.is_empty() && file_name.starts_with(literal_prefix))
+        || (!streamer_name.is_empty() && file_name.contains(streamer_name))
+}
+
+fn resolve_recorded_path(root: &Path, path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+/// 按主播本场 StreamerInfo 补扫本地有效媒体，并绑定到该场未完成的 upload_session。
+/// filelist 是首选来源；同时扫描工作目录，覆盖“消息尚未被旧 UActor 消费，因此连
+/// filelist 都没有”的历史遗留。目录推断候选必须同时满足本场时间和文件名前缀。
+pub async fn rescan_local_valid_segments(
+    config: &Config,
+    pool: &ConnectionPool,
+    streamer_info_id: i64,
+    working_directory: &Path,
+) -> AppResult<LocalSegmentRescanResult> {
+    let streamer_info = StreamerInfo::select()
+        .where_("id = ?")
+        .bind(streamer_info_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    let live_streamer = LiveStreamer::select()
+        .where_("url = ?")
+        .bind(&streamer_info.url)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+
+    let session = sqlx::query_as::<_, UploadSession>(
+        "SELECT * FROM upload_session \
+         WHERE live_streamer_id = ? AND streamer_info_id = ? AND status != 'finalized' \
+         ORDER BY updated_at DESC, id DESC LIMIT 1",
+    )
+    .bind(live_streamer.id)
+    .bind(streamer_info_id)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    let session = match session {
+        Some(session) => session,
+        None => insert_uploading_session(pool, live_streamer.id, streamer_info_id, &[]).await?,
+    };
+    let videos = parse_videos(&session.videos_json);
+    let uploaded_stems: HashSet<String> = videos
+        .iter()
+        .flat_map(|video| {
+            video
+                .title
+                .iter()
+                .map(|title| crate::server::common::upload_session::filename_stem(Path::new(title)))
+                .chain(std::iter::once(
+                    crate::server::common::upload_session::filename_stem(Path::new(
+                        &video.filename,
+                    )),
+                ))
+        })
+        .filter(|stem| !stem.is_empty())
+        .collect();
+
+    let known_paths: HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT file_path FROM upload_missing_segment WHERE live_streamer_id = ?",
+    )
+    .bind(live_streamer.id)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)?
+    .into_iter()
+    .map(|path| {
+        resolve_recorded_path(working_directory, path)
+            .display()
+            .to_string()
+    })
+    .collect();
+
+    let mut candidates = BTreeSet::new();
+    for item in FileItem::select()
+        .where_("streamer_info_id = ?")
+        .bind(streamer_info_id)
+        .fetch_all(pool)
+        .await
+        .change_context(AppError::Unknown)?
+    {
+        candidates.insert(resolve_recorded_path(working_directory, item.file));
+    }
+
+    let filename_prefix = live_streamer
+        .filename_prefix
+        .clone()
+        .or_else(|| config.filename_prefix.clone());
+    let filename_template =
+        Recorder::new(filename_prefix, streamer_info.clone()).filename_template();
+    let literal_prefix = filename_template.split('%').next().unwrap_or_default();
+    let session_cutoff = streamer_info.date - chrono::Duration::minutes(5);
+    if let Ok(entries) = std::fs::read_dir(working_directory) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase);
+            if !matches!(
+                extension.as_deref(),
+                Some("flv" | "ts" | "mp4" | "mkv" | "m3u8")
+            ) {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if !is_rescan_filename_candidate(&file_name, literal_prefix, &streamer_info.name) {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            if modified.is_some_and(|modified| modified < session_cutoff) {
+                continue;
+            }
+            candidates.insert(path);
+        }
+    }
+
+    let validator = FileValidator::new(config.filtering_threshold * 1_000_000, true);
+    let mut result = LocalSegmentRescanResult {
+        live_streamer_id: live_streamer.id,
+        streamer_info_id,
+        upload_session_id: session.id,
+        scanned: 0,
+        queued: 0,
+        skipped_known: 0,
+        skipped_invalid: 0,
+    };
+    let mut segment_order = next_missing_segment_order(pool, session.id, videos.len()).await?;
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        result.scanned += 1;
+        let path_key = path.display().to_string();
+        let stem = crate::server::common::upload_session::filename_stem(&path);
+        if known_paths.contains(&path_key) || uploaded_stems.contains(&stem) {
+            result.skipped_known += 1;
+            continue;
+        }
+        if !matches!(validator.validate(&path)?, MediaValidation::Valid) {
+            result.skipped_invalid += 1;
+            continue;
+        }
+        let danmaku_path = path.with_extension("xml");
+        let danmaku_path = danmaku_path.is_file().then_some(danmaku_path);
+        enqueue_pending_segment(
+            pool,
+            live_streamer.id,
+            streamer_info_id,
+            Some(session.id),
+            session.aid,
+            &path,
+            danmaku_path.as_deref(),
+            segment_order,
+            "manual local rescan recovered an untracked valid segment".to_string(),
+            chrono::Utc::now(),
+        )
+        .await?;
+        info!(
+            file = %path.display(),
+            session = session.id,
+            segment_order,
+            "本地补扫：有效遗留分段已登记到缺失补传"
+        );
+        segment_order = segment_order.saturating_add(1);
+        result.queued += 1;
+    }
+    Ok(result)
+}
+
 async fn ensure_missing_segment_session(
     pool: &ConnectionPool,
     row: &mut UploadMissingSegment,
@@ -1587,6 +1912,38 @@ mod tests {
         assert_eq!(segment_paths(&event), vec![video, danmaku]);
     }
 
+    #[test]
+    fn rescan_filename_candidate_accepts_session_prefix_or_streamer_name() {
+        assert!(is_rescan_filename_candidate(
+            "帝骑哥 2026-08-25 22:29:32.flv",
+            "帝骑哥 ",
+            "帝骑哥"
+        ));
+        assert!(is_rescan_filename_candidate(
+            "record-帝骑哥-2026-08-25.flv",
+            "custom-prefix-",
+            "帝骑哥"
+        ));
+        assert!(!is_rescan_filename_candidate(
+            "懒懒椰椰 2026-08-25 22:29:32.flv",
+            "帝骑哥 ",
+            "帝骑哥"
+        ));
+    }
+
+    #[test]
+    fn resolve_recorded_path_keeps_absolute_and_anchors_relative_paths() {
+        let root = Path::new("/opt");
+        assert_eq!(
+            resolve_recorded_path(root, "帝骑哥 2026-08-25.flv"),
+            PathBuf::from("/opt/帝骑哥 2026-08-25.flv")
+        );
+        assert_eq!(
+            resolve_recorded_path(root, "/archive/帝骑哥.flv"),
+            PathBuf::from("/archive/帝骑哥.flv")
+        );
+    }
+
     #[tokio::test]
     async fn init_failure_drain_indexes_and_queues_every_segment() {
         let (_dir, pool) = deferred_test_pool().await;
@@ -1724,6 +2081,34 @@ mod tests {
         assert_eq!(stored_session_id, Some(session_id));
         assert_eq!(session_id, 30, "reuse the matching active local session");
         assert_eq!(row.status, "uploading");
+    }
+
+    #[tokio::test]
+    async fn local_rescan_reuses_current_session_and_rejects_thirteen_byte_flv() {
+        let (dir, pool) = deferred_test_pool().await;
+        sqlx::query(
+            "INSERT INTO livestreamers (id, url, remark) \
+             VALUES (10, 'https://example.com/live', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let empty_chunk = dir.path().join("test 2026-08-23 12:30:00.flv");
+        std::fs::write(&empty_chunk, b"thirteen-byte").unwrap();
+
+        let result = rescan_local_valid_segments(&Config::default(), &pool, 20, dir.path())
+            .await
+            .unwrap();
+
+        assert_eq!(result.upload_session_id, 30);
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.queued, 0);
+        assert_eq!(result.skipped_invalid, 1);
+        let missing_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_missing_segment")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(missing_count, 0, "空片段不得出现在缺失补传");
     }
 
     const LIVE_URL: &str = "https://live.douyin.com/123456";
@@ -1867,7 +2252,13 @@ impl UActor {
     /// 运行Actor主循环，处理接收到的消息
     pub(crate) async fn run(&mut self) {
         while let Ok(msg) = self.receiver.recv().await {
-            self.handle_message(msg).await;
+            // SegmentEvent 的 receiver 会活到整场直播结束。若在 Actor 循环里直接 await，
+            // 一个长直播会独占 Actor，使其他主播的已验证分段只停在内存队列，连本地
+            // upload_session 都无法创建。每条直播管道独立运行；真正的 B 站网络上传仍由
+            // GLOBAL_UPLOAD_SEMAPHORE 串行化，因此不会放大上传并发。
+            tokio::spawn(async move {
+                Self::handle_message(msg).await;
+            });
         }
     }
 
@@ -1875,7 +2266,7 @@ impl UActor {
     ///
     /// # 参数
     /// * `msg` - 要处理的上传消息
-    async fn handle_message(&mut self, msg: UploaderMessage) {
+    async fn handle_message(msg: UploaderMessage) {
         match msg {
             UploaderMessage::SegmentEvent(rx, ctx) => {
                 ctx.change_status(Stage::Upload, WorkerStatus::Pending)
