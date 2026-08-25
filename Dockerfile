@@ -113,12 +113,15 @@ RUN set -eux; \
 			/usr/local/doc \
 			/usr/local/man; \
 		rm -rf \
-			/usr/local/bin/ffprobe \
 			/usr/local/bin/ffplay; \
 		rm -rf \
 			ffmpeg*; \
 		chmod a+x /usr/local/* ; \
 	fi; \
+	# 自动响度标准化同时依赖 ffmpeg、ffprobe 和 loudnorm；构建期直接锁住运行时能力。 \
+	ffmpeg -version > /dev/null; \
+	ffprobe -version > /dev/null; \
+	ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' loudnorm '; \
 	\
 	# 安装 quickjs 需要 g++
 	pip3 install --no-cache-dir quickjs; \
