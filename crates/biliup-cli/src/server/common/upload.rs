@@ -142,6 +142,9 @@ pub async fn process_with_upload(
                 first_order,
                 &reason,
                 &segment_processors,
+                &AudioSampleStore::for_working_directory(
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                ),
             )
             .await;
             error!(
@@ -327,6 +330,7 @@ async fn defer_segments_after_upload_init_failure(
     first_order: i64,
     reason: &str,
     segment_processors: &[HookStep],
+    sample_store: &AudioSampleStore,
 ) -> DeferredSegmentSummary {
     // `process_with_upload` closes it before local session preparation. Close again so this helper
     // is safe in isolation and drains a finite snapshot even while producers still own senders.
@@ -356,6 +360,10 @@ async fn defer_segments_after_upload_init_failure(
             .first()
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
+
+        // 样片截取不依赖 B 站登录或上传线路。即使上传初始化失败，完整分段仍可满足
+        // 用户已提交的“截取下一段”请求；失败开放，不影响待补传登记。
+        maybe_capture_reference_sample(&queued_path, sample_store).await;
 
         match enqueue_pending_segment(
             pool,
@@ -1609,6 +1617,7 @@ mod tests {
             2,
             "login unavailable",
             &[],
+            &AudioSampleStore::for_working_directory(_dir.path()),
         )
         .await;
 
@@ -1878,6 +1887,9 @@ impl UActor {
                         // 避免误配把没上传的录像静默删掉（footgun）。文件保留本地由用户处置。
                         pin!(rx);
                         let mut segments = 0u32;
+                        let sample_store = AudioSampleStore::for_working_directory(
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                        );
                         while let Some(event) = rx.next().await {
                             segments += 1;
                             if let Err(error) =
@@ -1889,6 +1901,9 @@ impl UActor {
                                     "仅录制模式写入 filelist 失败；本地文件保持不动"
                                 );
                             }
+                            // 仅录制模式同样会产出完整分段，样片截取不应依赖投稿模板。
+                            maybe_capture_reference_sample(&event.prev_file_path, &sample_store)
+                                .await;
                         }
                         warn!(
                             url = ctx.live_streamer().url,
