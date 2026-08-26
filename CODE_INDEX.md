@@ -36,6 +36,8 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/app.rs` | 组装会话、认证、CORS、业务路由与静态回退，启动 Axum，并在退出信号后清理服务资源。 | `ApplicationController::serve`、`shutdown_signal` |
 | `crates/biliup-cli/src/server/common/upload.rs` | 编排直播分段上传、缺失补传、attempt lease/watchdog、线路选择以及远端结果落库。 | `process_with_upload`、`select_recovery_line`、`upload_enrolled_with_watchdog`、`manual_recover_missing_segment` |
+| `crates/biliup-cli/src/server/common/segment_enrollment.rs` | 在有效媒体进入内存队列前原子登记 session/分段 identity，并在数据库不可用时写 fsync outbox。 | `enroll_validated_segment`、`find_or_create_session`、`import_outbox_once` |
+| `crates/biliup-cli/src/server/common/upload_session.rs` | 维护投稿会话恢复，并以生命周期账本检查完整性、确定性重建分 P 和原子 claim/finalize。 | `SessionCompleteness`、`claim_complete_session`、`mark_submitted` |
 | `crates/biliup-cli/src/server/common/upload_line_health.rs` | 分类上传网络错误并持久维护单线路失败次数、冷却和到期单探测租约。 | `UploadFailureKind`、`acquire_line`、`record_failure`、`record_success` |
 | `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点，包括缺失分段列表/操作与上传健康状态查询。 | `get_missing_uploads`、`get_upload_line_health`、`recover_missing_upload` |
 
@@ -58,5 +60,7 @@
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-cli/src/lib.rs`（`run`）：`server` 子命令进入 Web 服务启动编排。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`select_recovery_line`）：所有服务端上传入口在 claim 前选择健康线路，并在成功、网络错误或 watchdog 超时后更新持久健康状态。
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`claim_complete_session`）：正常下播与重启补提交共用严格完整性闸门，只有 claim 所有者才能构建 studio 和调用远端投稿。
+- `crates/biliup-cli/src/server/common/segment_enrollment.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`submit_claim_token`）：提交 claim 关闭 enrollment 写入窗口，迟到分段持久转入 outbox 而不污染正在投稿的分 P 快照。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`）：恢复与自动模式把冷却线路排除在实际探测请求之外。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。

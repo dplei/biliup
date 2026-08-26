@@ -7,6 +7,7 @@ use biliup_cli::server::common::segment_enrollment::{
 use biliup_cli::server::common::upload_line_health::{
     LineAvailability, UploadFailureKind, acquire_line, record_failure,
 };
+use biliup_cli::server::common::upload_session::{SubmitClaim, claim_complete_session};
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
 use chrono::Duration;
 use std::collections::HashSet;
@@ -353,9 +354,41 @@ async fn target_02_fsynced_outbox_imports_exactly_once_after_database_recovers()
 }
 
 #[tokio::test]
-#[ignore = "contract for task 05: strict session completeness gate"]
 async fn target_03_incomplete_session_never_calls_submit() {
-    panic!("invariant 4 violated: a session with non-succeeded segments can call submit");
+    let db = IncidentDb::new().await;
+    db.insert_session(
+        "uploading",
+        r#"[{"title":"part-1","filename":"remote-1","desc":""}]"#,
+    )
+    .await;
+    db.insert_missing(Path::new("/fixture/part-2.flv"), 1, "uploading")
+        .await;
+    let submit = SubmitSpy::default();
+
+    match claim_complete_session(&db.pool, INCIDENT_SESSION_ID)
+        .await
+        .unwrap()
+    {
+        SubmitClaim::Claimed { .. } => submit.submit(),
+        SubmitClaim::Blocked { completeness, .. } => {
+            assert_eq!(completeness.uploading, 1);
+            assert!(!completeness.is_complete());
+        }
+        other => panic!("unexpected claim result: {other:?}"),
+    }
+    assert_eq!(
+        submit.calls(),
+        0,
+        "incomplete ledger must make zero submit requests"
+    );
+    let (state, attempts): (Option<String>, i64) =
+        sqlx::query_as("SELECT submit_state, submit_attempts FROM upload_session WHERE id = ?")
+            .bind(INCIDENT_SESSION_ID)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state.as_deref(), Some("blocked_missing_segments"));
+    assert_eq!(attempts, 0);
 }
 
 #[tokio::test]

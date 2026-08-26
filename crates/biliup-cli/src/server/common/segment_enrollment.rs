@@ -225,8 +225,8 @@ async fn find_or_create_session(
     tx: &mut Transaction<'_, Sqlite>,
     request: &EnrollmentRequest,
 ) -> Result<i64, sqlx::Error> {
-    if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM upload_session \
+    if let Some((id, claim_token)) = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT id, submit_claim_token FROM upload_session \
          WHERE live_streamer_id = ?1 AND streamer_info_id = ?2 AND status != 'finalized' \
          ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
@@ -235,11 +235,16 @@ async fn find_or_create_session(
     .fetch_optional(&mut **tx)
     .await?
     {
+        if claim_token.is_some() {
+            return Err(sqlx::Error::Protocol(
+                "upload session is closed for submit; enrollment deferred".to_string(),
+            ));
+        }
         return Ok(id);
     }
     let cutoff = request.now - chrono::Duration::minutes(request.recovery_window_minutes);
-    if let Some(id) = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM upload_session \
+    if let Some((id, claim_token)) = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT id, submit_claim_token FROM upload_session \
          WHERE live_streamer_id = ?1 AND status != 'finalized' AND updated_at >= ?2 \
          ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
@@ -248,6 +253,11 @@ async fn find_or_create_session(
     .fetch_optional(&mut **tx)
     .await?
     {
+        if claim_token.is_some() {
+            return Err(sqlx::Error::Protocol(
+                "upload session is closed for submit; enrollment deferred".to_string(),
+            ));
+        }
         sqlx::query(
             "UPDATE upload_session SET streamer_info_id = ?1, updated_at = ?2 WHERE id = ?3",
         )

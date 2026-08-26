@@ -30,8 +30,24 @@ interface MissingSegment {
   session_aid: number | null
   session_bvid: string | null
   session_status: string | null
+  session_submit_state: string | null
+  session_completeness: SessionCompleteness | null
   next_line: string
   line_skip_reason: string | null
+}
+
+interface SessionCompleteness {
+  total_expected: number
+  valid_videos: number
+  pending: number
+  uploading: number
+  failed: number
+  source_missing: number
+  deleting: number
+  succeeded: number
+  unknown: number
+  earliest_blocking_segment_id: number | null
+  reasons: string[]
 }
 
 interface StreamerInfo {
@@ -91,6 +107,19 @@ export default function MissingRecovery() {
     () => [...(streamerInfos ?? [])].sort((a, b) => b.date - a.date).slice(0, 100),
     [streamerInfos],
   )
+  const blockedSessions = useMemo(() => {
+    const byId = new Map<number, MissingSegment>()
+    for (const row of rows ?? []) {
+      if (
+        row.upload_session_id != null &&
+        row.session_status !== 'finalized' &&
+        row.session_submit_state === 'blocked_missing_segments'
+      ) {
+        byId.set(row.upload_session_id, row)
+      }
+    }
+    return Array.from(byId.values())
+  }, [rows])
   useEffect(() => {
     if (rescanStreamerInfoId == null && recentStreamerInfos.length > 0) {
       setRescanStreamerInfoId(recentStreamerInfos[0].id)
@@ -163,10 +192,12 @@ export default function MissingRecovery() {
     {
       title: '文件',
       dataIndex: 'file_path',
-      render: (path: string) => (
-        <Text ellipsis={{ showTooltip: { opts: { content: path } } }} style={{ maxWidth: 240 }}>
-          {baseName(path)}
-        </Text>
+      render: (path: string, record: MissingSegment) => (
+        <div id={`missing-segment-${record.id}`}>
+          <Text ellipsis={{ showTooltip: { opts: { content: path } } }} style={{ maxWidth: 240 }}>
+            {baseName(path)}
+          </Text>
+        </div>
       ),
     },
     { title: '分 P 顺序', dataIndex: 'segment_order', width: 96 },
@@ -405,6 +436,38 @@ export default function MissingRecovery() {
         </nav>
       </Header>
       <Content style={{ padding: '24px', backgroundColor: 'var(--semi-color-bg-0)' }}>
+        {blockedSessions.map((row) => {
+          const completeness = row.session_completeness
+          if (!completeness) return null
+          const incomplete = Math.max(
+            completeness.reasons.length > 0 ? 1 : 0,
+            completeness.total_expected - completeness.valid_videos,
+          )
+          return (
+            <div
+              key={row.upload_session_id!}
+              style={{
+                marginBottom: 16,
+                padding: 12,
+                borderRadius: 6,
+                background: 'var(--semi-color-warning-light-default)',
+              }}
+            >
+              <Text strong>会话 #{row.upload_session_id} 因 {incomplete} 个未完成分段暂停投稿</Text>
+              <div>
+                <Text type="tertiary" size="small">
+                  待传 {completeness.pending} · 上传中 {completeness.uploading} · 失败 {completeness.failed} ·
+                  源文件缺失 {completeness.source_missing} · 删除中 {completeness.deleting} · 异常 {completeness.unknown}
+                </Text>
+              </div>
+              {completeness.earliest_blocking_segment_id != null && (
+                <a href={`#missing-segment-${completeness.earliest_blocking_segment_id}`}>
+                  查看最早阻塞分段 #{completeness.earliest_blocking_segment_id}
+                </a>
+              )}
+            </div>
+          )
+        })}
         <Text type="tertiary" style={{ display: 'block', marginBottom: 16 }}>
           录制期间上传失败、尚未补传的分段。下播提交前会自动换线重试到期的分段；这里可手动立即补传，
           补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，

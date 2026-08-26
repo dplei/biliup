@@ -7,7 +7,8 @@ use crate::server::common::upload::{
 };
 use crate::server::common::upload_line_health;
 use crate::server::common::upload_session::{
-    get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
+    SessionCompleteness, get_streamer_info as load_streamer_info, match_streamer_by_filename,
+    missing_status_where, session_completeness,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
@@ -738,6 +739,8 @@ pub struct MissingSegmentView {
     pub session_aid: Option<i64>,
     pub session_bvid: Option<String>,
     pub session_status: Option<String>,
+    pub session_submit_state: Option<String>,
+    pub session_completeness: Option<SessionCompleteness>,
     pub next_line: String,
     pub line_skip_reason: Option<String>,
 }
@@ -767,8 +770,11 @@ pub async fn get_missing_uploads(
 
     // 取这批行涉及的会话，映射 id -> (aid, bvid, status)，再拼回每行（避免逐行查库）。
     let session_ids: Vec<i64> = rows.iter().filter_map(|r| r.upload_session_id).collect();
-    let mut session_map: std::collections::HashMap<i64, (Option<i64>, Option<String>, String)> =
-        std::collections::HashMap::new();
+    let mut session_map: std::collections::HashMap<
+        i64,
+        (Option<i64>, Option<String>, String, Option<String>),
+    > = std::collections::HashMap::new();
+    let mut completeness_map = std::collections::HashMap::new();
     if !session_ids.is_empty() {
         // session_ids 全部来自 DB 的 i64 内部主键，非外部输入，直接拼 IN 列表安全。
         let in_list = session_ids
@@ -776,15 +782,21 @@ pub async fn get_missing_uploads(
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let sql =
-            format!("SELECT id, aid, bvid, status FROM upload_session WHERE id IN ({in_list})");
-        let sessions = sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String)>(&sql)
-            .fetch_all(&service_register.pool)
-            .await
-            .change_context(AppError::Unknown)
-            .map_err(report_to_response)?;
-        for (id, aid, bvid, status) in sessions {
-            session_map.insert(id, (aid, bvid, status));
+        let sql = format!(
+            "SELECT id, aid, bvid, status, submit_state FROM upload_session WHERE id IN ({in_list})"
+        );
+        let sessions =
+            sqlx::query_as::<_, (i64, Option<i64>, Option<String>, String, Option<String>)>(&sql)
+                .fetch_all(&service_register.pool)
+                .await
+                .change_context(AppError::Unknown)
+                .map_err(report_to_response)?;
+        for (id, aid, bvid, status, submit_state) in sessions {
+            session_map.insert(id, (aid, bvid, status, submit_state));
+            let completeness = session_completeness(&service_register.pool, id)
+                .await
+                .map_err(report_to_response)?;
+            completeness_map.insert(id, completeness);
         }
     }
 
@@ -819,6 +831,10 @@ pub async fn get_missing_uploads(
                 session_aid: sess.and_then(|s| s.0),
                 session_bvid: sess.and_then(|s| s.1.clone()),
                 session_status: sess.map(|s| s.2.clone()),
+                session_submit_state: sess.and_then(|s| s.3.clone()),
+                session_completeness: r
+                    .upload_session_id
+                    .and_then(|id| completeness_map.get(&id).cloned()),
                 next_line,
                 line_skip_reason: (!skipped.is_empty()).then(|| skipped.join("; ")),
                 segment: r,

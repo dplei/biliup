@@ -18,9 +18,10 @@ use crate::server::common::upload_line_health::{
 };
 use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
-    LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
-    insert_uploading_session, mark_submit_anomaly, mark_submitted, parse_videos, reattach_session,
-    select_recovery_candidate, select_stale_session_indices, submit_state_label,
+    LiveArchive, SubmitClaim, active_sessions_for_room, claim_complete_session, get_streamer_info,
+    insert_session_video_at_order, insert_uploading_session, mark_submit_anomaly, mark_submitted,
+    parse_videos, reattach_session, release_submit_claim, select_recovery_candidate,
+    select_stale_session_indices, submit_claim_is_owned, submit_state_label,
 };
 use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
@@ -262,7 +263,6 @@ pub async fn process_with_upload(
                 .await?;
 
         if let Some(mut archive) = archive
-            && !archive.videos.is_empty()
             && let Some(row_id) = archive.session_row_id
         {
             tracing::Span::current().record("session", row_id);
@@ -281,7 +281,6 @@ pub async fn process_with_upload(
                 config.submit_api.as_deref(),
                 ctx.streamer_info(),
                 row_id,
-                &archive.videos,
             )
             .await
             {
@@ -638,18 +637,79 @@ async fn submit_session(
     submit_api: Option<&str>,
     streamer_info: &StreamerInfo,
     session_row_id: i64,
-    videos: &[Video],
 ) -> AppResult<()> {
+    let (claim_token, videos) = match claim_complete_session(pool, session_row_id).await? {
+        SubmitClaim::Claimed { token, videos } => (token, videos),
+        SubmitClaim::Blocked {
+            completeness,
+            changed,
+        } => {
+            warn!(
+                session = session_row_id,
+                incomplete = completeness.incomplete_count(),
+                pending = completeness.pending,
+                uploading = completeness.uploading,
+                failed = completeness.failed,
+                source_missing = completeness.source_missing,
+                deleting = completeness.deleting,
+                reasons = ?completeness.reasons,
+                "session submit blocked by incomplete lifecycle ledger"
+            );
+            if changed {
+                notify_alert(
+                    upload_context.health_webhook.as_deref(),
+                    "投稿已暂停：存在未完成分段",
+                    &format!(
+                        "会话 #{session_row_id} 因 {} 个未完成或异常分段暂停投稿；请在缺失补传页面处理。",
+                        completeness.incomplete_count()
+                    ),
+                );
+            }
+            return Ok(());
+        }
+        SubmitClaim::AlreadyClaimed => {
+            info!(
+                session = session_row_id,
+                "session submit already claimed; skipping duplicate finalize"
+            );
+            return Ok(());
+        }
+        SubmitClaim::Finalized => {
+            info!(
+                session = session_row_id,
+                "session already finalized; skipping submit"
+            );
+            return Ok(());
+        }
+    };
     let bilibili = &upload_context.bilibili;
     let recorder = Recorder::new(upload_config.title.clone(), streamer_info.clone());
-    let studio = build_studio(
+    let studio = match build_studio(
         upload_config,
         streamer_background,
         bilibili,
-        videos.to_vec(),
+        videos.clone(),
         &recorder,
     )
-    .await?;
+    .await
+    {
+        Ok(studio) => studio,
+        Err(error) => {
+            let _ = release_submit_claim(
+                pool,
+                session_row_id,
+                &claim_token,
+                format!("build_studio failed: {error:?}"),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if !submit_claim_is_owned(pool, session_row_id, &claim_token).await? {
+        return Err(error_stack::Report::new(AppError::Custom(
+            "submit claim was lost before remote request".to_string(),
+        )));
+    }
     info!(
         n_videos = videos.len(),
         title = %recorder.format_filename(),
@@ -661,7 +721,9 @@ async fn submit_session(
             let msg = format!("{e:?}");
             let state = submit_state_label(None, true); // "failed"
             error!(error = %msg, "submit_failed：投稿接口失败，保持 uploading 待补提交");
-            if let Err(db) = mark_submit_anomaly(pool, session_row_id, state, msg).await {
+            if let Err(db) =
+                mark_submit_anomaly(pool, session_row_id, &claim_token, state, msg, true).await
+            {
                 error!(?db, "写回 submit_state=failed 失败");
             }
             return Err(e);
@@ -683,7 +745,9 @@ async fn submit_session(
         Some(aid_val) => {
             // 提交成功即 finalize（mark_submitted 内部写 submit_state="ok_with_aid"）；
             // 写回失败仅告警（稿件已在 B 站，重复提交风险大于收益）。
-            if let Err(e) = mark_submitted(pool, session_row_id, aid_val, bvid.clone()).await {
+            if let Err(e) =
+                mark_submitted(pool, session_row_id, &claim_token, aid_val, bvid.clone()).await
+            {
                 error!(
                     ?e,
                     aid = aid_val,
@@ -700,7 +764,11 @@ async fn submit_session(
             let state = submit_state_label(aid, false); // "ok_no_aid"
             let msg = format!("submit_ok_no_aid: {resp:?}");
             error!(resp = ?resp, "submit_ok_no_aid：投稿 code==0 但响应缺少 aid，未 finalize（待下次开播补提交）");
-            if let Err(db) = mark_submit_anomaly(pool, session_row_id, state, msg).await {
+            // The remote accepted the request but returned no stable id. Preserve the claim so a
+            // restart cannot blindly create a duplicate submission.
+            if let Err(db) =
+                mark_submit_anomaly(pool, session_row_id, &claim_token, state, msg, false).await
+            {
                 error!(?db, "写回 submit_state=ok_no_aid 失败");
             }
         }
@@ -920,9 +988,6 @@ async fn prepare_archive(
                 "补提交废弃会话：先行补传缺失分段失败，继续处理已成功分段"
             );
         }
-        if archive.videos.is_empty() {
-            continue;
-        }
         let streamer_info = match get_streamer_info(ctx.pool(), stale.streamer_info_id).await {
             Ok(si) => si,
             Err(e) => {
@@ -948,7 +1013,6 @@ async fn prepare_archive(
             config.submit_api.as_deref(),
             &streamer_info,
             stale.id,
-            &archive.videos,
         )
         .await
         {

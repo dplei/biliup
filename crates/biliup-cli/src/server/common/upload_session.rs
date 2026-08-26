@@ -8,6 +8,9 @@ use biliup::bilibili::Video;
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
 use ormlite::{Insert, Model};
+use serde::Serialize;
+use sqlx::{Row, Sqlite, Transaction};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// 从候选会话中选出可续接的那条：同 room、未 finalize、updated_at 在窗口内、取最新。
@@ -59,6 +62,317 @@ pub struct LiveArchive {
     pub aid: Option<u64>,
     pub bvid: Option<String>,
     pub videos: Vec<Video>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SessionCompleteness {
+    pub total_expected: i64,
+    pub valid_videos: i64,
+    pub pending: i64,
+    pub uploading: i64,
+    pub failed: i64,
+    pub source_missing: i64,
+    pub deleting: i64,
+    pub succeeded: i64,
+    pub unknown: i64,
+    pub earliest_blocking_segment_id: Option<i64>,
+    pub reasons: Vec<String>,
+    /// Stable, sanitized member-level identity used to notify only when the blocking set changes.
+    pub blocking_fingerprints: Vec<String>,
+}
+
+impl SessionCompleteness {
+    pub fn is_complete(&self) -> bool {
+        self.total_expected > 0
+            && self.total_expected == self.succeeded
+            && self.valid_videos == self.succeeded
+            && self.reasons.is_empty()
+    }
+
+    pub fn incomplete_count(&self) -> i64 {
+        let missing = self.total_expected.saturating_sub(self.valid_videos);
+        if missing == 0 && !self.reasons.is_empty() {
+            1
+        } else {
+            missing
+        }
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "expected={}, valid={}, pending={}, uploading={}, failed={}, source_missing={}, deleting={}, unknown={}; {}",
+            self.total_expected,
+            self.valid_videos,
+            self.pending,
+            self.uploading,
+            self.failed,
+            self.source_missing,
+            self.deleting,
+            self.unknown,
+            self.reasons.join("; ")
+        )
+    }
+
+    fn signature(&self) -> AppResult<String> {
+        serde_json::to_string(self).change_context(AppError::Unknown)
+    }
+}
+
+#[derive(Debug)]
+pub enum SubmitClaim {
+    Claimed {
+        token: String,
+        videos: Vec<Video>,
+    },
+    Blocked {
+        completeness: SessionCompleteness,
+        changed: bool,
+    },
+    AlreadyClaimed,
+    Finalized,
+}
+
+#[derive(Debug)]
+struct LedgerRow {
+    id: i64,
+    file_path: String,
+    normalized_file_path: Option<String>,
+    segment_order: i64,
+    status: String,
+    video_json: Option<String>,
+}
+
+async fn inspect_completeness(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_row_id: i64,
+) -> AppResult<(SessionCompleteness, Vec<Video>)> {
+    let rows = sqlx::query(
+        "SELECT id, file_path, normalized_file_path, segment_order, status, video_json \
+         FROM upload_missing_segment WHERE upload_session_id = ?1 \
+         ORDER BY segment_order ASC, id ASC",
+    )
+    .bind(session_row_id)
+    .fetch_all(&mut **tx)
+    .await
+    .change_context(AppError::Unknown)?
+    .into_iter()
+    .map(|row| LedgerRow {
+        id: row.get("id"),
+        file_path: row.get("file_path"),
+        normalized_file_path: row.get("normalized_file_path"),
+        segment_order: row.get("segment_order"),
+        status: row.get("status"),
+        video_json: row.get("video_json"),
+    })
+    .collect::<Vec<_>>();
+
+    let mut result = SessionCompleteness {
+        total_expected: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+        ..Default::default()
+    };
+    let mut videos = Vec::with_capacity(rows.len());
+    let mut orders = HashSet::new();
+    let mut sources = HashSet::new();
+    let mut remote_filenames = HashMap::<String, (i64, Option<String>)>::new();
+
+    if rows.is_empty() {
+        result
+            .reasons
+            .push("session has no lifecycle baseline".to_string());
+    }
+    for (index, row) in rows.iter().enumerate() {
+        match row.status.as_str() {
+            "pending" => result.pending += 1,
+            "uploading" => result.uploading += 1,
+            "failed" => result.failed += 1,
+            "source_missing" => result.source_missing += 1,
+            "deleting" => result.deleting += 1,
+            "succeeded" => result.succeeded += 1,
+            other => {
+                result.unknown += 1;
+                result
+                    .reasons
+                    .push(format!("segment #{} has unknown status {other}", row.id));
+            }
+        }
+        if row.status != "succeeded" && result.earliest_blocking_segment_id.is_none() {
+            result.earliest_blocking_segment_id = Some(row.id);
+        }
+        if row.status != "succeeded" {
+            result
+                .blocking_fingerprints
+                .push(format!("{}:status:{}", row.id, row.status));
+        }
+        if !orders.insert(row.segment_order) {
+            result
+                .reasons
+                .push(format!("duplicate segment_order {}", row.segment_order));
+            result.earliest_blocking_segment_id.get_or_insert(row.id);
+            result
+                .blocking_fingerprints
+                .push(format!("{}:duplicate_order:{}", row.id, row.segment_order));
+        }
+        let expected_order = i64::try_from(index).unwrap_or(i64::MAX);
+        if row.segment_order != expected_order {
+            result.reasons.push(format!(
+                "segment_order is not contiguous: expected {expected_order}, got {}",
+                row.segment_order
+            ));
+            result.earliest_blocking_segment_id.get_or_insert(row.id);
+            result
+                .blocking_fingerprints
+                .push(format!("{}:order_gap:{}", row.id, row.segment_order));
+        }
+        let source = row
+            .normalized_file_path
+            .as_deref()
+            .unwrap_or(row.file_path.as_str());
+        if !sources.insert(source.to_string()) {
+            result
+                .reasons
+                .push(format!("duplicate source identity {source}"));
+            result.earliest_blocking_segment_id.get_or_insert(row.id);
+            result
+                .blocking_fingerprints
+                .push(format!("{}:duplicate_source", row.id));
+        }
+        if row.status == "succeeded" {
+            let Some(json) = row.video_json.as_deref() else {
+                result
+                    .reasons
+                    .push(format!("segment #{} has no video_json", row.id));
+                result.earliest_blocking_segment_id.get_or_insert(row.id);
+                result
+                    .blocking_fingerprints
+                    .push(format!("{}:missing_video_json", row.id));
+                continue;
+            };
+            match serde_json::from_str::<Video>(json) {
+                Ok(video) => {
+                    if let Some((first_id, first_title)) = remote_filenames
+                        .insert(video.filename.clone(), (row.id, video.title.clone()))
+                    {
+                        result.reasons.push(format!(
+                            "remote filename {} is shared by segments #{first_id} ({:?}) and #{} ({:?})",
+                            video.filename, first_title, row.id, video.title
+                        ));
+                        result.earliest_blocking_segment_id.get_or_insert(first_id);
+                        result.blocking_fingerprints.push(format!(
+                            "{first_id}:{}:duplicate_remote:{}",
+                            row.id, video.filename
+                        ));
+                    }
+                    result.valid_videos += 1;
+                    videos.push(video);
+                }
+                Err(error) => {
+                    result.reasons.push(format!(
+                        "segment #{} has invalid video_json: {error}",
+                        row.id
+                    ));
+                    result.earliest_blocking_segment_id.get_or_insert(row.id);
+                    result
+                        .blocking_fingerprints
+                        .push(format!("{}:invalid_video_json", row.id));
+                }
+            }
+        }
+    }
+    if result.pending + result.uploading + result.failed + result.source_missing + result.deleting
+        > 0
+    {
+        result
+            .reasons
+            .push("one or more lifecycle rows are not succeeded".to_string());
+    }
+    Ok((result, videos))
+}
+
+pub async fn session_completeness(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+) -> AppResult<SessionCompleteness> {
+    let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
+    let (result, _) = inspect_completeness(&mut tx, session_row_id).await?;
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(result)
+}
+
+/// Atomically validate the permanent lifecycle ledger, rebuild videos_json and acquire submit
+/// ownership. No network-facing studio construction may happen before this succeeds.
+pub async fn claim_complete_session(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+) -> AppResult<SubmitClaim> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .change_context(AppError::Unknown)?;
+    let session =
+        sqlx::query("SELECT status, submit_claim_token FROM upload_session WHERE id = ?1")
+            .bind(session_row_id)
+            .fetch_one(&mut *tx)
+            .await
+            .change_context(AppError::Unknown)?;
+    if session.get::<String, _>("status") == "finalized" {
+        return Ok(SubmitClaim::Finalized);
+    }
+    if session
+        .get::<Option<String>, _>("submit_claim_token")
+        .is_some()
+    {
+        return Ok(SubmitClaim::AlreadyClaimed);
+    }
+    let (completeness, videos) = inspect_completeness(&mut tx, session_row_id).await?;
+    let now = Utc::now();
+    if !completeness.is_complete() {
+        let signature = completeness.signature()?;
+        let previous = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT blocked_signature FROM upload_session WHERE id = ?1",
+        )
+        .bind(session_row_id)
+        .fetch_one(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)?;
+        let changed = previous.as_deref() != Some(signature.as_str());
+        sqlx::query(
+            "UPDATE upload_session SET submit_state = 'blocked_missing_segments', \
+             last_submit_error = ?1, blocked_signature = ?2, \
+             blocked_count = blocked_count + 1 WHERE id = ?3",
+        )
+        .bind(completeness.summary())
+        .bind(signature)
+        .bind(session_row_id)
+        .execute(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)?;
+        tx.commit().await.change_context(AppError::Unknown)?;
+        return Ok(SubmitClaim::Blocked {
+            completeness,
+            changed,
+        });
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let videos_json = serde_json::to_string(&videos).change_context(AppError::Unknown)?;
+    let updated = sqlx::query(
+        "UPDATE upload_session SET videos_json = ?1, submit_claim_token = ?2, \
+         submit_claimed_at = ?3, submit_state = 'submitting', last_submit_error = NULL, \
+         blocked_signature = NULL, updated_at = ?3 WHERE id = ?4 AND status != 'finalized' \
+         AND submit_claim_token IS NULL",
+    )
+    .bind(videos_json)
+    .bind(&token)
+    .bind(now)
+    .bind(session_row_id)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    if updated.rows_affected() != 1 {
+        return Ok(SubmitClaim::AlreadyClaimed);
+    }
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(SubmitClaim::Claimed { token, videos })
 }
 
 /// 查询某 room 下所有未 finalize 的会话（供纯函数选择候选）。
@@ -185,17 +499,22 @@ async fn mutate_session(
     session_row_id: i64,
     f: impl FnOnce(&mut UploadSession) -> AppResult<()>,
 ) -> AppResult<()> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .change_context(AppError::Unknown)?;
     let mut row = UploadSession::select()
-        .where_("id = ?")
+        .where_("id = ? AND status != 'finalized' AND submit_claim_token IS NULL")
         .bind(session_row_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
     f(&mut row)?;
     row.updated_at = chrono::Utc::now();
-    row.update_all_fields(pool)
+    row.update_all_fields(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
+    tx.commit().await.change_context(AppError::Unknown)?;
     Ok(())
 }
 
@@ -217,20 +536,31 @@ pub async fn update_session_videos(
 pub async fn mark_submitted(
     pool: &ConnectionPool,
     session_row_id: i64,
+    claim_token: &str,
     aid: u64,
     bvid: Option<String>,
 ) -> AppResult<()> {
-    mutate_session(pool, session_row_id, |row| {
-        row.aid = Some(aid as i64);
-        row.bvid = bvid;
-        row.status = "finalized".to_string();
-        row.submit_state = Some("ok_with_aid".to_string());
-        row.last_submit_at = Some(chrono::Utc::now());
-        row.last_submit_error = None;
-        row.submit_attempts += 1;
-        Ok(())
-    })
+    let updated = sqlx::query(
+        "UPDATE upload_session SET aid = ?1, bvid = ?2, status = 'finalized', \
+         submit_state = 'ok_with_aid', last_submit_at = ?3, last_submit_error = NULL, \
+         submit_attempts = submit_attempts + 1, submit_claim_token = NULL, \
+         submit_claimed_at = NULL, updated_at = ?3 \
+         WHERE id = ?4 AND status != 'finalized' AND submit_claim_token = ?5",
+    )
+    .bind(i64::try_from(aid).unwrap_or(i64::MAX))
+    .bind(bvid)
+    .bind(Utc::now())
+    .bind(session_row_id)
+    .bind(claim_token)
+    .execute(pool)
     .await
+    .change_context(AppError::Unknown)?;
+    if updated.rows_affected() != 1 {
+        return Err(error_stack::Report::new(AppError::Custom(
+            "submit claim no longer owns session during finalize".to_string(),
+        )));
+    }
+    Ok(())
 }
 
 /// 记录一次投稿异常（ok_no_aid / failed）。不改 status/aid，仅落投稿状态，
@@ -238,18 +568,70 @@ pub async fn mark_submitted(
 pub async fn mark_submit_anomaly(
     pool: &ConnectionPool,
     session_row_id: i64,
+    claim_token: &str,
     state: &str,
     error: String,
+    release_claim: bool,
 ) -> AppResult<()> {
-    let state = state.to_string();
-    mutate_session(pool, session_row_id, |row| {
-        row.submit_state = Some(state);
-        row.last_submit_error = Some(error);
-        row.last_submit_at = Some(chrono::Utc::now());
-        row.submit_attempts += 1;
-        Ok(())
-    })
+    let updated = sqlx::query(
+        "UPDATE upload_session SET submit_state = ?1, last_submit_error = ?2, \
+         last_submit_at = ?3, submit_attempts = submit_attempts + 1, \
+         submit_claim_token = CASE WHEN ?4 THEN NULL ELSE submit_claim_token END, \
+         submit_claimed_at = CASE WHEN ?4 THEN NULL ELSE submit_claimed_at END, updated_at = ?3 \
+         WHERE id = ?5 AND submit_claim_token = ?6",
+    )
+    .bind(state)
+    .bind(error)
+    .bind(Utc::now())
+    .bind(release_claim)
+    .bind(session_row_id)
+    .bind(claim_token)
+    .execute(pool)
     .await
+    .change_context(AppError::Unknown)?;
+    if updated.rows_affected() != 1 {
+        return Err(error_stack::Report::new(AppError::Custom(
+            "submit claim no longer owns session while recording result".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+pub async fn submit_claim_is_owned(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    claim_token: &str,
+) -> AppResult<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM upload_session WHERE id = ?1 \
+         AND status != 'finalized' AND submit_claim_token = ?2)",
+    )
+    .bind(session_row_id)
+    .bind(claim_token)
+    .fetch_one(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
+pub async fn release_submit_claim(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    claim_token: &str,
+    error: String,
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE upload_session SET submit_state = 'failed', last_submit_error = ?1, \
+         submit_claim_token = NULL, submit_claimed_at = NULL, updated_at = ?2 \
+         WHERE id = ?3 AND submit_claim_token = ?4",
+    )
+    .bind(error)
+    .bind(Utc::now())
+    .bind(session_row_id)
+    .bind(claim_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(())
 }
 
 /// 从 videos_json 反序列化已投稿视频列表。
@@ -286,7 +668,62 @@ pub async fn insert_session_video_at_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
+
+    async fn completeness_pool() -> (tempfile::TempDir, ConnectionPool) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("completeness.db");
+        let pool = ConnectionManager::new_pool(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (9, 'gate-test', 'https://example.invalid/live', 'gate test', ?1, '')",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_session \
+             (id, live_streamer_id, streamer_info_id, videos_json, status, created_at, updated_at) \
+             VALUES (70, 7, 9, '[]', 'uploading', ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (directory, pool)
+    }
+
+    async fn insert_ledger(
+        pool: &ConnectionPool,
+        id: i64,
+        order: i64,
+        status: &str,
+        path: &str,
+        video: Option<&Video>,
+    ) {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+              segment_order, status, next_retry_at, created_at, updated_at, \
+              normalized_file_path, lifecycle_version, video_json) \
+             VALUES (?1, 7, 9, 70, ?2, ?3, ?4, ?5, ?5, ?5, ?2, 2, ?6)",
+        )
+        .bind(id)
+        .bind(path)
+        .bind(order)
+        .bind(status)
+        .bind(now)
+        .bind(video.map(|video| serde_json::to_string(video).unwrap()))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 
     fn session(id: i64, room_id: i64, status: &str, updated_at: DateTime<Utc>) -> UploadSession {
         UploadSession {
@@ -312,6 +749,159 @@ mod tests {
 
     fn now_fixed() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_active_or_terminal_failure_status_blocks_submit_claim() {
+        for status in [
+            "pending",
+            "uploading",
+            "failed",
+            "source_missing",
+            "deleting",
+            "mystery",
+        ] {
+            let (_directory, pool) = completeness_pool().await;
+            insert_ledger(&pool, 1, 0, status, &format!("/{status}.flv"), None).await;
+            let claim = claim_complete_session(&pool, 70).await.unwrap();
+            let SubmitClaim::Blocked { completeness, .. } = claim else {
+                panic!("{status} unexpectedly acquired submit claim")
+            };
+            assert!(!completeness.is_complete());
+            let (state, attempts): (Option<String>, i64) = sqlx::query_as(
+                "SELECT submit_state, submit_attempts FROM upload_session WHERE id = 70",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(state.as_deref(), Some("blocked_missing_segments"));
+            assert_eq!(attempts, 0, "blocked checks are not remote submit attempts");
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_claim_rebuilds_stable_order_and_preserves_equal_titles() {
+        let (_directory, pool) = completeness_pool().await;
+        let mut first = Video::new("remote-first");
+        first.title = Some("04:54:30".to_string());
+        let mut second = Video::new("remote-second");
+        second.title = Some("04:54:30".to_string());
+        insert_ledger(&pool, 2, 1, "succeeded", "/second.flv", Some(&second)).await;
+        insert_ledger(&pool, 1, 0, "succeeded", "/first.flv", Some(&first)).await;
+
+        let SubmitClaim::Claimed { videos, .. } = claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("complete ledger should be claimable")
+        };
+        assert_eq!(
+            videos
+                .iter()
+                .map(|v| v.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["remote-first", "remote-second"]
+        );
+        let stored: String =
+            sqlx::query_scalar("SELECT videos_json FROM upload_session WHERE id = 70")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<Video>>(&stored).unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_remote_identity_and_corrupt_json_block_claim() {
+        let (_directory, pool) = completeness_pool().await;
+        let video = Video::new("same-remote-file");
+        insert_ledger(&pool, 1, 0, "succeeded", "/one.flv", Some(&video)).await;
+        insert_ledger(&pool, 2, 1, "succeeded", "/two.flv", Some(&video)).await;
+        let SubmitClaim::Blocked { completeness, .. } =
+            claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("duplicate remote identity must block")
+        };
+        assert!(
+            completeness
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("remote filename"))
+        );
+
+        sqlx::query("UPDATE upload_missing_segment SET video_json = '{broken' WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let SubmitClaim::Blocked { completeness, .. } =
+            claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("corrupt video_json must block")
+        };
+        assert!(
+            completeness
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("invalid video_json"))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_finalize_has_exactly_one_owner() {
+        let (_directory, pool) = completeness_pool().await;
+        insert_ledger(
+            &pool,
+            1,
+            0,
+            "succeeded",
+            "/one.flv",
+            Some(&Video::new("one")),
+        )
+        .await;
+        let (left, right) = tokio::join!(
+            claim_complete_session(&pool, 70),
+            claim_complete_session(&pool, 70)
+        );
+        let claims = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| matches!(claim, SubmitClaim::Claimed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| matches!(claim, SubmitClaim::AlreadyClaimed))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn final_missing_success_reopens_gate_for_exactly_one_submit() {
+        let (_directory, pool) = completeness_pool().await;
+        insert_ledger(&pool, 1, 0, "pending", "/last.flv", None).await;
+        assert!(matches!(
+            claim_complete_session(&pool, 70).await.unwrap(),
+            SubmitClaim::Blocked { .. }
+        ));
+        sqlx::query(
+            "UPDATE upload_missing_segment SET status = 'succeeded', video_json = ?1 WHERE id = 1",
+        )
+        .bind(serde_json::to_string(&Video::new("last")).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            claim_complete_session(&pool, 70).await.unwrap(),
+            SubmitClaim::Claimed { .. }
+        ));
+        assert!(matches!(
+            claim_complete_session(&pool, 70).await.unwrap(),
+            SubmitClaim::AlreadyClaimed
+        ));
     }
 
     #[test]
