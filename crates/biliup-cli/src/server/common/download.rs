@@ -1,5 +1,9 @@
 use crate::server::common::cookie_health;
 use crate::server::common::route_health::{HealthUpdate, RouteHealthState, RouteSelection};
+use crate::server::common::segment_enrollment::{
+    EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
+    normalize_segment_path,
+};
 use crate::server::common::upload::UploaderMessage;
 use crate::server::common::util::{FileValidator, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
@@ -108,7 +112,7 @@ impl SegmentEventProcessor {
     }
 
     /// 处理分段事件
-    pub fn process(&mut self, event: SegmentInfo) -> AppResult<()> {
+    pub async fn process(&mut self, mut event: SegmentInfo) -> AppResult<()> {
         let file_bytes = std::fs::metadata(&event.prev_file_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -116,14 +120,8 @@ impl SegmentEventProcessor {
         match self.file_validator.validate(&event.prev_file_path)? {
             MediaValidation::Valid => {
                 self.stats.valid_segments += 1;
-                info!(
-                    file = %event.prev_file_path.display(),
-                    close_reason = ?event.close_reason,
-                    attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
-                    "validated media segment"
-                );
-                self.flush_pending_short_segments()?;
-                self.enqueue(event)
+                self.flush_pending_short_segments().await?;
+                self.enqueue_validated(&mut event, file_bytes).await
             }
             MediaValidation::RecoverableShort {
                 duration,
@@ -172,11 +170,11 @@ impl SegmentEventProcessor {
         }
     }
 
-    pub fn finish(&mut self) -> AppResult<()> {
-        self.flush_pending_short_segments()
+    pub async fn finish(&mut self) -> AppResult<()> {
+        self.flush_pending_short_segments().await
     }
 
-    fn flush_pending_short_segments(&mut self) -> AppResult<()> {
+    async fn flush_pending_short_segments(&mut self) -> AppResult<()> {
         if self.pending_short_segments.is_empty() {
             return Ok(());
         }
@@ -197,7 +195,11 @@ impl SegmentEventProcessor {
                                 originals = ?original_files,
                                 "merged compatible recoverable short segments; originals retained"
                             );
-                            self.enqueue(merged)?;
+                            let mut merged = merged;
+                            let bytes = std::fs::metadata(&merged.prev_file_path)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            self.enqueue_validated(&mut merged, bytes).await?;
                             continue;
                         }
                         Err(error) => {
@@ -235,6 +237,70 @@ impl SegmentEventProcessor {
             }
         }
         Ok(())
+    }
+
+    async fn enqueue_validated(
+        &mut self,
+        event: &mut SegmentInfo,
+        total_bytes: u64,
+    ) -> AppResult<()> {
+        if self.ctx.upload_config().is_some() {
+            let normalized_file_path = normalize_segment_path(&event.prev_file_path)?;
+            let request = EnrollmentRequest {
+                live_streamer_id: self.ctx.worker_id(),
+                streamer_info_id: self.ctx.id(),
+                file_path: event.prev_file_path.clone(),
+                normalized_file_path,
+                danmaku_file_path: event.danmaku_file_path.clone(),
+                total_bytes,
+                now: chrono::Utc::now(),
+                recovery_window_minutes: self.ctx.config().recovery_window_minutes.unwrap_or(30)
+                    as i64,
+            };
+            let store = EnrollmentStore::production(self.ctx.pool().clone());
+            match enroll_validated_segment(&store, &request).await? {
+                EnrollmentOutcome::Enrolled(enrollment) => {
+                    info!(
+                        file = %event.prev_file_path.display(),
+                        missing_id = enrollment.missing_id,
+                        session = enrollment.upload_session_id,
+                        segment_order = enrollment.segment_order,
+                        duplicate = enrollment.duplicate,
+                        close_reason = ?event.close_reason,
+                        attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
+                        "validated and enrolled media segment"
+                    );
+                    if enrollment.duplicate {
+                        return Ok(());
+                    }
+                    event.enrollment = Some(enrollment);
+                }
+                EnrollmentOutcome::Outboxed(manifest) => {
+                    warn!(
+                        file = %event.prev_file_path.display(),
+                        manifest = %manifest.display(),
+                        "validated media segment durably outboxed; upload deferred until database import"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO filelist (file, streamer_info_id) \
+                 SELECT ?1, ?2 WHERE NOT EXISTS \
+                 (SELECT 1 FROM filelist WHERE file = ?1 AND streamer_info_id = ?2)",
+            )
+            .bind(event.prev_file_path.display().to_string())
+            .bind(self.ctx.id())
+            .execute(self.ctx.pool())
+            .await
+            .change_context(AppError::Unknown)?;
+            info!(
+                file = %event.prev_file_path.display(),
+                "validated and indexed record-only media segment"
+            );
+        }
+        self.enqueue(event.clone())
     }
 
     fn enqueue(&mut self, event: SegmentInfo) -> AppResult<()> {
@@ -303,6 +369,16 @@ impl SegmentEventProcessor {
             .stats
             .upload_queue_peak_depth
             .max(UPLOAD_SEGMENT_QUEUE_CAPACITY);
+        if let Some(enrollment) = &event.enrollment {
+            warn!(
+                missing_id = enrollment.missing_id,
+                session = enrollment.upload_session_id,
+                file = %event.prev_file_path.display(),
+                reason,
+                "upload queue unavailable; durable lifecycle row remains pending"
+            );
+            return Ok(());
+        }
         let (batch_id, manifest) = defer_recovery_batch(
             std::slice::from_ref(&event),
             reason,
@@ -589,6 +665,7 @@ fn merge_compatible_segments(
             .iter()
             .map(|event| event.prev_file_path.clone())
             .collect(),
+        enrollment: None,
     })
 }
 
@@ -981,7 +1058,7 @@ impl DownloadTask {
                 }
             }
         }
-        if let Err(error) = processor.finish() {
+        if let Err(error) = processor.finish().await {
             error!(
                 error = ?error,
                 "failed to flush queued recoverable segments; original files preserved"
@@ -1065,6 +1142,7 @@ impl DownloadTask {
         // let hook = processor.create_hook(danmaku_client.clone());
         let completed_configured_segment = Arc::new(AtomicBool::new(false));
         let completed_configured_segment_for_hook = completed_configured_segment.clone();
+        let (segment_tx, segment_rx) = async_channel::unbounded::<SegmentInfo>();
         let hook = move |event| {
             match event {
                 SegmentEvent::Start { .. } => {
@@ -1088,21 +1166,47 @@ impl DownloadTask {
                             Err(e) => error!("Danmaku rolling error: {}", e),
                         }
                     }
-                    // 异步处理事件
-                    // let processor = processor.clone();
-                    if let Err(e) = processor.process(event) {
-                        error!("Failed to process segment event: {}", e);
+                    if let Err(error) = segment_tx.try_send(event) {
+                        error!(
+                            ?error,
+                            "failed to transfer completed segment to durable enrollment loop"
+                        );
                     }
                 }
             }
         };
 
         let started_at = Instant::now();
-        let result = self
+        let download = self
             .downloader
-            .download(Box::new(hook), ctx.download_config(stream))
-            .await
-            .change_context(AppError::Custom("Failed to download segment".into()));
+            .download(Box::new(hook), ctx.download_config(stream));
+        tokio::pin!(download);
+        let mut receive_segments = true;
+        let result = loop {
+            tokio::select! {
+                result = &mut download => {
+                    break result.change_context(AppError::Custom("Failed to download segment".into()));
+                }
+                event = segment_rx.recv(), if receive_segments => {
+                    match event {
+                        Ok(event) => {
+                            if let Err(error) = processor.process(event).await {
+                                error!(?error, "failed to durably process completed segment");
+                            }
+                        }
+                        Err(_) => receive_segments = false,
+                    }
+                }
+            }
+        };
+        while let Ok(event) = segment_rx.try_recv() {
+            if let Err(error) = processor.process(event).await {
+                error!(
+                    ?error,
+                    "failed to durably process trailing completed segment"
+                );
+            }
+        }
         let connected_for = started_at.elapsed();
         let completed_configured_segment = completed_configured_segment.load(Ordering::Relaxed)
             || matches!(result.as_ref().ok(), Some(DownloadStatus::SegmentCompleted));
@@ -1299,6 +1403,7 @@ mod short_segment_group_tests {
             close_reason: SegmentCloseReason::TransportError,
             attempt_id: Some(format!("attempt-{index}")),
             recovery_source_paths: Vec::new(),
+            enrollment: None,
         }
     }
 

@@ -134,6 +134,7 @@ impl StreamGears {
                     close_reason,
                     attempt_id: Some(attempt_id.clone()),
                     recovery_source_paths: Vec::new(),
+                    enrollment: None,
                 };
                 callback(SegmentEvent::Segment(event));
 

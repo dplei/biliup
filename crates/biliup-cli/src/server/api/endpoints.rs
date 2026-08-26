@@ -587,6 +587,12 @@ pub async fn get_upload_rate_health() -> Json<serde_json::Value> {
     )
 }
 
+pub async fn get_upload_enrollment_health() -> Json<serde_json::Value> {
+    Json(crate::server::common::segment_enrollment::outbox_health(
+        std::path::Path::new(crate::server::common::segment_enrollment::DEFAULT_OUTBOX_DIRECTORY),
+    ))
+}
+
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct RecoveryBatchView {
     pub id: i64,

@@ -140,6 +140,15 @@ pub struct UploadMissingSegment {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub normalized_file_path: Option<String>,
+    pub lifecycle_version: i64,
+    pub video_json: Option<String>,
+    pub total_bytes: Option<i64>,
+    pub uploaded_bytes: i64,
+    pub current_line: Option<String>,
+    pub upload_started_at: Option<DateTime<Utc>>,
+    pub last_progress_at: Option<DateTime<Utc>>,
+    pub attempt_token: Option<String>,
 }
 
 /// 配置模型

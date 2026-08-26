@@ -8,9 +8,9 @@ use crate::server::common::cover_generator::{
     Background, CoverOptions, render_to_tempfile, split_template_lines,
 };
 use crate::server::common::missing_segment::{
-    due_missing_segments_for_session, enqueue_missing_segment, enqueue_pending_segment,
-    mark_retry_failure, mark_retry_success, next_missing_segment_order, patch_studio_videos,
-    reset_for_manual_retry, upload_line_for_recovery,
+    due_missing_segments_for_session, enqueue_pending_segment, mark_retry_failure,
+    mark_retry_success, next_missing_segment_order, patch_studio_videos, reset_for_manual_retry,
+    upload_line_for_recovery,
 };
 use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
@@ -22,7 +22,7 @@ use crate::server::common::upload_session::{
 };
 use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
-use crate::server::core::downloader::SegmentInfo;
+use crate::server::core::downloader::{SegmentEnrollment, SegmentInfo};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
@@ -32,7 +32,7 @@ use crate::server::infrastructure::models::hook_step::{
 use crate::server::infrastructure::models::live_streamer::LiveStreamer;
 use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use crate::server::infrastructure::models::{
-    FileItem, InsertFileItem, StreamerInfo, UploadMissingSegment, UploadSession,
+    FileItem, StreamerInfo, UploadMissingSegment, UploadSession,
 };
 use async_channel::Receiver;
 use biliup::bilibili::Vid;
@@ -45,7 +45,6 @@ use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
 use error_stack::ResultExt;
 use futures::StreamExt;
-use ormlite::Insert;
 use ormlite::Model;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -307,11 +306,15 @@ async fn index_recorded_segment(
     streamer_info_id: i64,
     event: &SegmentInfo,
 ) -> AppResult<()> {
-    InsertFileItem {
-        file: event.prev_file_path.display().to_string(),
-        streamer_info_id,
-    }
-    .insert(pool)
+    let file = event.prev_file_path.display().to_string();
+    sqlx::query(
+        "INSERT INTO filelist (file, streamer_info_id) \
+         SELECT ?1, ?2 WHERE NOT EXISTS \
+         (SELECT 1 FROM filelist WHERE file = ?1 AND streamer_info_id = ?2)",
+    )
+    .bind(file)
+    .bind(streamer_info_id)
+    .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
     Ok(())
@@ -369,20 +372,34 @@ async fn defer_segments_after_upload_init_failure(
         // 用户已提交的“截取下一段”请求；失败开放，不影响待补传登记。
         maybe_capture_reference_sample(&queued_path, sample_store).await;
 
-        match enqueue_pending_segment(
-            pool,
-            live_streamer_id,
-            streamer_info_id,
-            upload_session_id,
-            None,
-            &queued_path,
-            event.danmaku_file_path.as_deref(),
-            segment_order,
-            queue_reason,
-            chrono::Utc::now(),
-        )
-        .await
-        {
+        let queued = if let Some(enrollment) = &event.enrollment {
+            sqlx::query(
+                "UPDATE upload_missing_segment SET last_error = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND lifecycle_version = 2 AND status = 'pending'",
+            )
+            .bind(&queue_reason)
+            .bind(chrono::Utc::now())
+            .bind(enrollment.missing_id)
+            .execute(pool)
+            .await
+            .map(|_| ())
+            .change_context(AppError::Unknown)
+        } else {
+            enqueue_pending_segment(
+                pool,
+                live_streamer_id,
+                streamer_info_id,
+                upload_session_id,
+                None,
+                &queued_path,
+                event.danmaku_file_path.as_deref(),
+                segment_order,
+                queue_reason,
+                chrono::Utc::now(),
+            )
+            .await
+        };
+        match queued {
             Ok(()) => summary.queued += 1,
             Err(error) => {
                 summary.queue_failures += 1;
@@ -491,58 +508,134 @@ async fn submit_session(
     Ok(())
 }
 
-/// 每段上传成功后：把 Video 累积进 archive，并在同一事务删除接收时的 pending 登记。
-/// 落库失败则 pending 保持可见，调用方保留本地文件不删。
+async fn claim_enrolled_attempt(
+    pool: &ConnectionPool,
+    enrollment: &SegmentEnrollment,
+    line: &str,
+) -> AppResult<Option<String>> {
+    let token = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now();
+    let result = sqlx::query(
+        "UPDATE upload_missing_segment \
+         SET status = 'uploading', attempt_token = ?1, current_line = ?2, \
+             upload_started_at = ?3, last_progress_at = ?3, uploaded_bytes = 0, updated_at = ?3 \
+         WHERE id = ?4 AND lifecycle_version = 2 AND status IN ('pending', 'failed') \
+           AND attempt_token IS NULL",
+    )
+    .bind(&token)
+    .bind(line)
+    .bind(now)
+    .bind(enrollment.missing_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok((result.rows_affected() == 1).then_some(token))
+}
+
+async fn fail_enrolled_attempt(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+    error: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE upload_missing_segment \
+         SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
+             next_retry_at = ?1, last_error = ?2, attempt_token = NULL, current_line = NULL, \
+             updated_at = ?3 \
+         WHERE id = ?4 AND lifecycle_version = 2 AND attempt_token = ?5",
+    )
+    .bind(now + chrono::Duration::minutes(10))
+    .bind(error)
+    .bind(now)
+    .bind(missing_id)
+    .bind(attempt_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(())
+}
+
+/// Commit the remote Video, lifecycle success and session ordering atomically. The lifecycle row
+/// is permanent: it is the idempotency identity for later event replays and rescans.
 async fn persist_segment(
-    ctx: &Context,
+    pool: &ConnectionPool,
     archive: &mut LiveArchive,
     video: Video,
-    enrolled_path: &Path,
+    enrollment: &SegmentEnrollment,
+    attempt_token: &str,
 ) -> AppResult<()> {
-    archive.videos.push(video);
-    let result: AppResult<()> = async {
-        let row_id = ensure_archive_session(ctx, archive).await?;
-        let videos_json =
-            serde_json::to_string(&archive.videos).change_context(AppError::Unknown)?;
-        let mut tx = ctx.pool().begin().await.change_context(AppError::Unknown)?;
-        sqlx::query("UPDATE upload_session SET videos_json = ?1, updated_at = ?2 WHERE id = ?3")
-            .bind(videos_json)
-            .bind(chrono::Utc::now())
-            .bind(row_id)
-            .execute(&mut *tx)
-            .await
-            .change_context(AppError::Unknown)?;
-        // 接收时写入的 pending 行就是本地分段的 durable enrollment。只有 Video 已和
-        // session 在同一事务落库后才删除它；崩溃发生在任意更早点都会留在缺失补传。
-        sqlx::query(
-            "DELETE FROM upload_missing_segment \
-             WHERE live_streamer_id = ?1 AND file_path = ?2 \
-               AND status IN ('pending', 'uploading', 'failed')",
-        )
-        .bind(ctx.worker_id())
-        .bind(enrolled_path.display().to_string())
+    let video_json = serde_json::to_string(&video).change_context(AppError::Unknown)?;
+    let now = chrono::Utc::now();
+    let total_bytes = i64::try_from(enrollment.total_bytes).unwrap_or(i64::MAX);
+    let mut tx = pool.begin().await.change_context(AppError::Unknown)?;
+    let updated = sqlx::query(
+        "UPDATE upload_missing_segment \
+         SET video_json = ?1, status = 'succeeded', uploaded_bytes = ?2, \
+             last_progress_at = ?3, last_error = NULL, attempt_token = NULL, updated_at = ?3 \
+         WHERE id = ?4 AND upload_session_id = ?5 AND lifecycle_version = 2 \
+           AND attempt_token = ?6 AND status = 'uploading'",
+    )
+    .bind(video_json)
+    .bind(total_bytes)
+    .bind(now)
+    .bind(enrollment.missing_id)
+    .bind(enrollment.upload_session_id)
+    .bind(attempt_token)
+    .execute(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    if updated.rows_affected() != 1 {
+        return Err(error_stack::Report::new(AppError::Custom(
+            "upload attempt lease no longer owns lifecycle row".to_string(),
+        )));
+    }
+    let session_json = sqlx::query_scalar::<_, String>(
+        "SELECT videos_json FROM upload_session WHERE id = ? AND status != 'finalized'",
+    )
+    .bind(enrollment.upload_session_id)
+    .fetch_one(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    let mut videos = parse_videos(&session_json);
+    let baseline_count = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MIN(segment_order) FROM upload_missing_segment \
+         WHERE upload_session_id = ? AND lifecycle_version = 2",
+    )
+    .bind(enrollment.upload_session_id)
+    .fetch_one(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?
+    .and_then(|value| usize::try_from(value).ok())
+    .unwrap_or(videos.len())
+    .min(videos.len());
+    videos.truncate(baseline_count);
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT segment_order, video_json FROM upload_missing_segment \
+         WHERE upload_session_id = ? AND lifecycle_version = 2 AND status = 'succeeded' \
+           AND video_json IS NOT NULL ORDER BY segment_order ASC, id ASC",
+    )
+    .bind(enrollment.upload_session_id)
+    .fetch_all(&mut *tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    for (_order, json) in rows {
+        let video: Video = serde_json::from_str(&json).change_context(AppError::Unknown)?;
+        videos.push(video);
+    }
+    let videos_json = serde_json::to_string(&videos).change_context(AppError::Unknown)?;
+    sqlx::query("UPDATE upload_session SET videos_json = ?1, updated_at = ?2 WHERE id = ?3")
+        .bind(videos_json)
+        .bind(now)
+        .bind(enrollment.upload_session_id)
         .execute(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
-        tx.commit().await.change_context(AppError::Unknown)?;
-        Ok(())
-    }
-    .await;
-    if result.is_err() {
-        archive.videos.pop();
-    }
-    result
-}
-
-/// Ensure both successful uploads and failed first segments have a durable local session.
-async fn ensure_archive_session(ctx: &Context, archive: &mut LiveArchive) -> AppResult<i64> {
-    if let Some(row_id) = archive.session_row_id {
-        return Ok(row_id);
-    }
-    let row =
-        insert_uploading_session(ctx.pool(), ctx.worker_id(), ctx.id(), &archive.videos).await?;
-    archive.session_row_id = Some(row.id);
-    Ok(row.id)
+    tx.commit().await.change_context(AppError::Unknown)?;
+    archive.session_row_id = Some(enrollment.upload_session_id);
+    archive.videos = videos;
+    Ok(())
 }
 
 /// 开播时准备本场会话状态：
@@ -638,20 +731,9 @@ async fn prepare_archive(
             videos,
         })
     } else {
-        // 会话的 durable 边界必须早于首段网络上传。过去这里返回空 archive，只有首段
-        // 上传成功后才建行；一旦上传 Actor 被其他长直播占住，已验证分段会长期只存在于
-        // 内存 channel，既没有 upload_session，也不会出现在缺失补传。
-        let row = insert_uploading_session(ctx.pool(), room_id, ctx.id(), &[]).await?;
-        info!(
-            row_id = row.id,
-            room_id, "新直播：上传管道启动时已创建本地投稿会话"
-        );
-        Ok(LiveArchive {
-            session_row_id: Some(row.id),
-            aid: None,
-            bvid: None,
-            videos: Vec::new(),
-        })
+        Err(error_stack::Report::new(AppError::Custom(
+            "upload pipeline started without an enrollment-created session".to_string(),
+        )))
     }
 }
 
@@ -684,17 +766,9 @@ async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
             videos,
         })
     } else {
-        let row = insert_uploading_session(ctx.pool(), room_id, ctx.id(), &[]).await?;
-        info!(
-            row_id = row.id,
-            room_id, "上传初始化失败：已创建本地投稿会话用于登记待补传"
-        );
-        Ok(LiveArchive {
-            session_row_id: Some(row.id),
-            aid: None,
-            bvid: None,
-            videos: Vec::new(),
-        })
+        Err(error_stack::Report::new(AppError::Custom(
+            "upload initialization failed without an enrollment-created session".to_string(),
+        )))
     }
 }
 
@@ -706,67 +780,46 @@ async fn pipeline_upload_videos(
     ctx: &Context,
 ) -> AppResult<Option<LiveArchive>> {
     let mut archive = prepare_archive(upload_context, upload_config, ctx).await?;
-    let mut next_order = if let Some(row_id) = archive.session_row_id {
-        match next_missing_segment_order(ctx.pool(), row_id, archive.videos.len()).await {
-            Ok(order) => order,
-            Err(error) => {
-                error!(?error, row_id, "读取上传管道分段顺序失败，从已上传段数继续");
-                i64::try_from(archive.videos.len()).unwrap_or(i64::MAX)
-            }
-        }
-    } else {
-        i64::try_from(archive.videos.len()).unwrap_or(i64::MAX)
-    };
     pin!(rx);
     while let Some(event) = rx.next().await {
-        if let Err(error) = index_recorded_segment(ctx.pool(), ctx.id(), &event).await {
+        let Some(enrollment) = event.enrollment.clone() else {
             error!(
-                ?error,
                 file = %event.prev_file_path.display(),
-                "写入 filelist 失败；继续上传，缺失补传仍以持久队列为准"
+                "upload pipeline rejected segment without durable enrollment"
             );
+            continue;
+        };
+        if archive.session_row_id != Some(enrollment.upload_session_id) {
+            let session = UploadSession::select()
+                .where_("id = ?")
+                .bind(enrollment.upload_session_id)
+                .fetch_one(ctx.pool())
+                .await
+                .change_context(AppError::Unknown)?;
+            archive = LiveArchive {
+                session_row_id: Some(session.id),
+                aid: session.aid.map(|aid| aid as u64),
+                bvid: session.bvid,
+                videos: parse_videos(&session.videos_json),
+            };
         }
         let recovery_source_paths = event.recovery_source_paths.clone();
         let mut paths = segment_paths(&event);
         if !segment_processors.is_empty()
             && let Err(e) = process_video_paths(&mut paths, segment_processors).await
         {
-            let Some(session_row_id) = archive.session_row_id else {
-                error!(file = ?event.prev_file_path, "segment_processor 失败且上传会话不存在，本地文件保持不动: {:?}", e);
-                continue;
-            };
-            let segment_order =
-                next_missing_segment_order(ctx.pool(), session_row_id, archive.videos.len())
-                    .await
-                    .unwrap_or(next_order);
             let reason = format!("segment_processor failed before upload: {e:?}");
-            match enqueue_pending_segment(
-                ctx.pool(),
-                ctx.worker_id(),
-                ctx.id(),
-                Some(session_row_id),
-                archive.aid.map(|aid| aid as i64),
-                &event.prev_file_path,
-                event.danmaku_file_path.as_deref(),
-                segment_order,
-                reason,
-                chrono::Utc::now(),
+            sqlx::query(
+                "UPDATE upload_missing_segment SET last_error = ?1, updated_at = ?2 \
+                 WHERE id = ?3 AND lifecycle_version = 2 AND status = 'pending'",
             )
+            .bind(reason)
+            .bind(chrono::Utc::now())
+            .bind(enrollment.missing_id)
+            .execute(ctx.pool())
             .await
-            {
-                Ok(()) => error!(
-                    file = ?event.prev_file_path,
-                    session = session_row_id,
-                    segment_order,
-                    "segment_processor 失败，原始有效分段已登记到缺失补传"
-                ),
-                Err(queue_error) => error!(
-                    file = ?event.prev_file_path,
-                    ?queue_error,
-                    "segment_processor 失败且缺失登记失败，本地文件保持不动"
-                ),
-            }
-            next_order = next_order.max(segment_order.saturating_add(1));
+            .change_context(AppError::Unknown)?;
+            error!(file = ?event.prev_file_path, missing_id = enrollment.missing_id, "segment_processor failed; durable pending lifecycle row retained: {:?}", e);
             continue;
         }
         let original_path = paths
@@ -774,61 +827,20 @@ async fn pipeline_upload_videos(
             .cloned()
             .unwrap_or_else(|| event.prev_file_path.clone());
 
-        // 先把有效分段绑定到本场 session 并写入 durable pending，再开始任何网络上传。
-        // 这行与 upload_session 的 FK 是「已接收分段」的持久化边界：进程此后无论在
-        // 登录、限速等待、pre-upload 或传块阶段退出，缺失补传页都能看到该文件。
-        let Some(session_row_id) = archive.session_row_id else {
-            error!(file = %original_path.display(), "上传会话未创建，拒绝上传以保留本地分段");
-            continue;
-        };
-        // 补扫入口可能在直播仍进行时插入遗留分段；每次从 DB 重新分配顺序，避免管道
-        // 启动时缓存的 next_order 与人工补扫发生碰撞。
-        let segment_order = match next_missing_segment_order(
-            ctx.pool(),
-            session_row_id,
-            archive.videos.len(),
-        )
-        .await
-        {
-            Ok(order) => order,
-            Err(error) => {
-                error!(
-                    ?error,
-                    session = session_row_id,
-                    "分配分段顺序失败，使用管道本地顺序"
-                );
-                next_order
-            }
-        };
-        if let Err(error) = enqueue_pending_segment(
-            ctx.pool(),
-            ctx.worker_id(),
-            ctx.id(),
-            Some(session_row_id),
-            archive.aid.map(|aid| aid as i64),
-            &original_path,
-            event.danmaku_file_path.as_deref(),
-            segment_order,
-            "validated segment accepted; awaiting upload".to_string(),
-            chrono::Utc::now(),
-        )
-        .await
-        {
-            error!(
-                ?error,
-                file = %original_path.display(),
-                session = session_row_id,
-                "有效分段登记失败，拒绝上传并保留本地文件"
-            );
-            continue;
-        }
-        next_order = next_order.max(segment_order.saturating_add(1));
-
         // 样片截取是一次性、失败开放的旁路，不改变当前分段的上传结果。
         let sample_store = AudioSampleStore::for_working_directory(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         );
         maybe_capture_reference_sample(&original_path, &sample_store).await;
+
+        let Some(attempt_token) = claim_enrolled_attempt(ctx.pool(), &enrollment, "live").await?
+        else {
+            info!(
+                missing_id = enrollment.missing_id,
+                "segment lifecycle row was already claimed or completed; skipping replay"
+            );
+            continue;
+        };
 
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
@@ -843,7 +855,10 @@ async fn pipeline_upload_videos(
         {
             Ok((video, outcome, _normalization_artifact)) => {
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
-                if let Err(e) = persist_segment(ctx, &mut archive, video, &original_path).await {
+                if let Err(e) =
+                    persist_segment(ctx.pool(), &mut archive, video, &enrollment, &attempt_token)
+                        .await
+                {
                     error!(file = ?original_path, "落库累积失败，保留本地文件: {:?}", e);
                     // Repaired 的临时修复件未 durable，清理掉避免残留。
                     if let RepairOutcome::Repaired(fixed) = &outcome {
@@ -883,30 +898,15 @@ async fn pipeline_upload_videos(
             }
             Err(e) => {
                 let err = format!("{e:?}");
-                if let Err(session_error) = ensure_archive_session(ctx, &mut archive).await {
-                    error!(
-                        ?session_error,
-                        file = ?original_path,
-                        "上传失败后创建本地投稿会话失败，将以未绑定状态登记分段"
-                    );
-                }
-                error!(file = ?original_path, segment_order, "upload_single_file failed, queueing missing segment: {:?}", e);
-                if let Err(queue_err) = enqueue_missing_segment(
+                fail_enrolled_attempt(
                     ctx.pool(),
-                    ctx.worker_id(),
-                    ctx.id(),
-                    archive.session_row_id,
-                    archive.aid.map(|aid| aid as i64),
-                    &original_path,
-                    event.danmaku_file_path.as_deref(),
-                    segment_order,
+                    enrollment.missing_id,
+                    &attempt_token,
                     err,
                     chrono::Utc::now(),
                 )
-                .await
-                {
-                    error!(file = ?original_path, "failed to enqueue missing segment: {:?}", queue_err);
-                }
+                .await?;
+                error!(file = ?original_path, segment_order = enrollment.segment_order, "upload_single_file failed; lifecycle row retained: {:?}", e);
             }
         }
     }
@@ -1044,16 +1044,40 @@ async fn recover_due_missing_segments(
     let now = chrono::Utc::now();
     let rows = due_missing_segments_for_session(ctx.pool(), session_row_id, now).await?;
     for mut row in rows {
-        row.status = "uploading".to_string();
-        row.updated_at = chrono::Utc::now();
         let line_index = row.line_index;
         let file_path = row.file_path.clone();
         let segment_order = row.segment_order;
         let row_id = row.id;
-        row = row
-            .update_all_fields(ctx.pool())
-            .await
-            .change_context(AppError::Unknown)?;
+        let v2_enrollment = (row.lifecycle_version == 2).then(|| SegmentEnrollment {
+            missing_id: row.id,
+            upload_session_id: session_row_id,
+            segment_order: row.segment_order,
+            normalized_file_path: PathBuf::from(
+                row.normalized_file_path
+                    .clone()
+                    .unwrap_or_else(|| row.file_path.clone()),
+            ),
+            total_bytes: row
+                .total_bytes
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0),
+            duplicate: false,
+        });
+        let attempt_token = if let Some(enrollment) = &v2_enrollment {
+            let line = format!("recovery-{line_index}");
+            let Some(token) = claim_enrolled_attempt(ctx.pool(), enrollment, &line).await? else {
+                continue;
+            };
+            Some(token)
+        } else {
+            row.status = "uploading".to_string();
+            row.updated_at = chrono::Utc::now();
+            row = row
+                .update_all_fields(ctx.pool())
+                .await
+                .change_context(AppError::Unknown)?;
+            None
+        };
 
         let selected_line = upload_line_for_recovery(line_index);
         let recovery_context = if let Some(line) = selected_line {
@@ -1099,14 +1123,22 @@ async fn recover_due_missing_segments(
 
         match result {
             Ok((video, outcome, _normalization_artifact)) => {
-                let updated =
-                    insert_session_video_at_order(ctx.pool(), session_row_id, video, segment_order)
-                        .await?;
-                archive.videos = updated;
-                mark_retry_success(&mut row, chrono::Utc::now());
-                row.update_all_fields(ctx.pool())
-                    .await
-                    .change_context(AppError::Unknown)?;
+                if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
+                    persist_segment(ctx.pool(), archive, video, enrollment, token).await?;
+                } else {
+                    let updated = insert_session_video_at_order(
+                        ctx.pool(),
+                        session_row_id,
+                        video,
+                        segment_order,
+                    )
+                    .await?;
+                    archive.videos = updated;
+                    mark_retry_success(&mut row, chrono::Utc::now());
+                    row.update_all_fields(ctx.pool())
+                        .await
+                        .change_context(AppError::Unknown)?;
+                }
                 match outcome {
                     RepairOutcome::Unfixable => {
                         error!(row_id, file = ?path, "补传分段时间戳无法修复，保留本地文件待手动处理");
@@ -1139,10 +1171,21 @@ async fn recover_due_missing_segments(
                 }
             }
             Err(e) => {
-                mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
-                row.update_all_fields(ctx.pool())
-                    .await
-                    .change_context(AppError::Unknown)?;
+                if let Some(token) = &attempt_token {
+                    fail_enrolled_attempt(
+                        ctx.pool(),
+                        row.id,
+                        token,
+                        format!("{e:?}"),
+                        chrono::Utc::now(),
+                    )
+                    .await?;
+                } else {
+                    mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
+                    row.update_all_fields(ctx.pool())
+                        .await
+                        .change_context(AppError::Unknown)?;
+                }
             }
         }
     }
@@ -1665,23 +1708,51 @@ pub async fn manual_recover_missing_segment(
         .await
         .change_context(AppError::Unknown)?;
 
-    // Atomic claim: flip to 'uploading' only if the row is still actionable.
-    // Rows already 'succeeded', 'uploading' (another recovery in flight), or otherwise
-    // finalized are intentionally skipped — idempotent no-op.
     let claim_now = chrono::Utc::now();
-    let claimed = sqlx::query(
-        "UPDATE upload_missing_segment SET status = 'uploading', updated_at = ?1 \
-         WHERE id = ?2 AND status IN ('pending', 'failed')",
-    )
-    .bind(claim_now)
-    .bind(missing_id)
-    .execute(pool)
-    .await
-    .change_context(AppError::Unknown)?;
-    if claimed.rows_affected() == 0 {
-        // Already succeeded, or another recovery is in flight — nothing to do.
-        return Ok(());
-    }
+    let v2_enrollment = if row.lifecycle_version == 2 {
+        let Some(session_id) = row.upload_session_id else {
+            return Err(error_stack::Report::new(AppError::Custom(
+                "v2 lifecycle row is missing its upload session".to_string(),
+            )));
+        };
+        Some(SegmentEnrollment {
+            missing_id: row.id,
+            upload_session_id: session_id,
+            segment_order: row.segment_order,
+            normalized_file_path: PathBuf::from(
+                row.normalized_file_path
+                    .clone()
+                    .unwrap_or_else(|| row.file_path.clone()),
+            ),
+            total_bytes: row
+                .total_bytes
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0),
+            duplicate: false,
+        })
+    } else {
+        None
+    };
+    let attempt_token = if let Some(enrollment) = &v2_enrollment {
+        let Some(token) = claim_enrolled_attempt(pool, enrollment, "manual").await? else {
+            return Ok(());
+        };
+        Some(token)
+    } else {
+        let claimed = sqlx::query(
+            "UPDATE upload_missing_segment SET status = 'uploading', updated_at = ?1 \
+             WHERE id = ?2 AND status IN ('pending', 'failed')",
+        )
+        .bind(claim_now)
+        .bind(missing_id)
+        .execute(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+        if claimed.rows_affected() == 0 {
+            return Ok(());
+        }
+        None
+    };
 
     // Perform the upload + edit/insert inside a fallible scope so that any failure
     // resets the row to 'failed' and persists the error before returning.
@@ -1758,7 +1829,7 @@ pub async fn manual_recover_missing_segment(
                     .studio_data(&Vid::Aid(aid as u64), None)
                     .await
                     .change_context(AppError::Unknown)?;
-                patch_studio_videos(&mut studio, video, row.segment_order);
+                patch_studio_videos(&mut studio, video.clone(), row.segment_order);
                 bilibili
                     .edit_by_app(&studio, None)
                     .await
@@ -1769,7 +1840,15 @@ pub async fn manual_recover_missing_segment(
                     "manual_recover_edit_archive：手动补传已追加到稿件"
                 );
             } else {
-                insert_session_video_at_order(pool, session_id, video, row.segment_order).await?;
+                if v2_enrollment.is_none() {
+                    insert_session_video_at_order(
+                        pool,
+                        session_id,
+                        video.clone(),
+                        row.segment_order,
+                    )
+                    .await?;
+                }
                 info!(
                     session = session_id,
                     segment_order = row.segment_order,
@@ -1782,7 +1861,7 @@ pub async fn manual_recover_missing_segment(
                 .studio_data(&Vid::Aid(aid as u64), None)
                 .await
                 .change_context(AppError::Unknown)?;
-            patch_studio_videos(&mut studio, video, row.segment_order);
+            patch_studio_videos(&mut studio, video.clone(), row.segment_order);
             bilibili
                 .edit_by_app(&studio, None)
                 .await
@@ -1796,6 +1875,22 @@ pub async fn manual_recover_missing_segment(
             return Err(error_stack::Report::new(AppError::Custom(
                 "missing segment has neither upload_session_id nor aid".to_string(),
             )));
+        }
+
+        if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
+            let session = UploadSession::select()
+                .where_("id = ?")
+                .bind(enrollment.upload_session_id)
+                .fetch_one(pool)
+                .await
+                .change_context(AppError::Unknown)?;
+            let mut archive = LiveArchive {
+                session_row_id: Some(session.id),
+                aid: session.aid.map(|aid| aid as u64),
+                bvid: session.bvid,
+                videos: parse_videos(&session.videos_json),
+            };
+            persist_segment(pool, &mut archive, video, enrollment, token).await?;
         }
 
         // 补传成功并入稿/入会话后，按主播 postprocessor 清理本地文件，对齐自动补传路径
@@ -1817,19 +1912,26 @@ pub async fn manual_recover_missing_segment(
 
     match upload_result {
         Ok(()) => {
-            mark_retry_success(&mut row, chrono::Utc::now());
-            row = row
-                .update_all_fields(pool)
-                .await
-                .change_context(AppError::Unknown)?;
-            let _ = row;
+            if v2_enrollment.is_none() {
+                mark_retry_success(&mut row, chrono::Utc::now());
+                row = row
+                    .update_all_fields(pool)
+                    .await
+                    .change_context(AppError::Unknown)?;
+                let _ = row;
+            }
             Ok(())
         }
         Err(e) => {
-            mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
-            row.update_all_fields(pool)
-                .await
-                .change_context(AppError::Unknown)?;
+            if let Some(token) = &attempt_token {
+                fail_enrolled_attempt(pool, row.id, token, format!("{e:?}"), chrono::Utc::now())
+                    .await?;
+            } else {
+                mark_retry_failure(&mut row, format!("{e:?}"), chrono::Utc::now());
+                row.update_all_fields(pool)
+                    .await
+                    .change_context(AppError::Unknown)?;
+            }
             Err(e)
         }
     }
@@ -1865,6 +1967,10 @@ pub async fn retry_missing_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::common::segment_enrollment::{
+        EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
+        normalize_segment_path,
+    };
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
 
@@ -1910,6 +2016,173 @@ mod tests {
         let event = SegmentInfo::new(video.clone(), Some(danmaku.clone()), None, 0);
 
         assert_eq!(segment_paths(&event), vec![video, danmaku]);
+    }
+
+    async fn v2_enrollment(
+        pool: &ConnectionPool,
+        directory: &Path,
+        name: &str,
+    ) -> SegmentEnrollment {
+        let path = directory.join(name);
+        std::fs::write(&path, b"synthetic upload bytes").unwrap();
+        let request = EnrollmentRequest {
+            live_streamer_id: 10,
+            streamer_info_id: 20,
+            file_path: path.clone(),
+            normalized_file_path: normalize_segment_path(&path).unwrap(),
+            danmaku_file_path: None,
+            total_bytes: std::fs::metadata(&path).unwrap().len(),
+            now: chrono::Utc.with_ymd_and_hms(2026, 8, 23, 12, 5, 0).unwrap(),
+            recovery_window_minutes: 30,
+        };
+        let store = EnrollmentStore::new(pool.clone(), directory.join("outbox"));
+        let EnrollmentOutcome::Enrolled(enrollment) =
+            enroll_validated_segment(&store, &request).await.unwrap()
+        else {
+            panic!("healthy test database must enroll directly");
+        };
+        enrollment
+    }
+
+    fn uploaded_video(name: &str) -> Video {
+        Video {
+            title: Some(name.to_string()),
+            filename: name.to_string(),
+            desc: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_upload_success_commits_video_lifecycle_and_session_atomically() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "atomic-success.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = LiveArchive {
+            session_row_id: Some(enrollment.upload_session_id),
+            aid: None,
+            bvid: None,
+            videos: vec![],
+        };
+        let uploaded = uploaded_video("remote-atomic");
+
+        persist_segment(&pool, &mut archive, uploaded.clone(), &enrollment, &token)
+            .await
+            .unwrap();
+
+        let lifecycle = sqlx::query_as::<_, (String, Option<String>, i64, Option<String>)>(
+            "SELECT status, video_json, uploaded_bytes, attempt_token \
+             FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle.0, "succeeded");
+        assert_eq!(
+            serde_json::from_str::<Video>(&lifecycle.1.unwrap())
+                .unwrap()
+                .filename,
+            uploaded.filename
+        );
+        assert_eq!(lifecycle.2, enrollment.total_bytes as i64);
+        assert_eq!(lifecycle.3, None);
+        let session_json: String =
+            sqlx::query_scalar("SELECT videos_json FROM upload_session WHERE id = ?")
+                .bind(enrollment.upload_session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let session_videos = serde_json::from_str::<Vec<Video>>(&session_json).unwrap();
+        assert_eq!(session_videos.len(), 1);
+        assert_eq!(session_videos[0].filename, uploaded.filename);
+    }
+
+    #[tokio::test]
+    async fn v2_session_write_failure_rolls_back_lifecycle_success() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "atomic-rollback.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE upload_session SET status = 'finalized' WHERE id = ?")
+            .bind(enrollment.upload_session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut archive = LiveArchive::default();
+
+        assert!(
+            persist_segment(
+                &pool,
+                &mut archive,
+                uploaded_video("must-rollback"),
+                &enrollment,
+                &token,
+            )
+            .await
+            .is_err()
+        );
+
+        let lifecycle = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT status, video_json, attempt_token FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle.0, "uploading");
+        assert_eq!(lifecycle.1, None);
+        assert_eq!(lifecycle.2.as_deref(), Some(token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn v2_out_of_order_success_rebuilds_session_in_enrollment_order() {
+        let (directory, pool) = deferred_test_pool().await;
+        let first = v2_enrollment(&pool, directory.path(), "order-0.flv").await;
+        let second = v2_enrollment(&pool, directory.path(), "order-1.flv").await;
+        let first_token = claim_enrolled_attempt(&pool, &first, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let second_token = claim_enrolled_attempt(&pool, &second, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = LiveArchive::default();
+
+        persist_segment(
+            &pool,
+            &mut archive,
+            uploaded_video("remote-order-1"),
+            &second,
+            &second_token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archive.videos.len(), 1);
+        assert_eq!(archive.videos[0].filename, "remote-order-1");
+
+        persist_segment(
+            &pool,
+            &mut archive,
+            uploaded_video("remote-order-0"),
+            &first,
+            &first_token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            archive
+                .videos
+                .iter()
+                .map(|video| video.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["remote-order-0", "remote-order-1"]
+        );
     }
 
     #[test]

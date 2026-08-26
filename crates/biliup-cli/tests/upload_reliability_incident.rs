@@ -1,5 +1,9 @@
 mod support;
 
+use biliup_cli::server::common::segment_enrollment::{
+    EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
+    import_outbox_once, normalize_segment_path,
+};
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
 use chrono::Duration;
 use std::collections::HashSet;
@@ -230,9 +234,119 @@ async fn scenario_06_source_missing_and_finalized_recovery_are_reproducible() {
 }
 
 #[tokio::test]
-#[ignore = "contract for task 02: enrollment must move before the actor channel"]
 async fn target_02_validated_segments_are_durable_before_actor_consumption() {
-    panic!("invariant 1 violated: validated segments are not durably enrolled before queueing");
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let segments = incident_segments(media.path());
+    for segment in &segments {
+        write_synthetic_valid_flv(&segment.prev_file_path);
+        let request = enrollment_request(&segment.prev_file_path);
+        assert!(matches!(
+            enroll_validated_segment(&store, &request).await.unwrap(),
+            EnrollmentOutcome::Enrolled(_)
+        ));
+    }
+
+    assert_eq!(
+        db.counts().await,
+        (1, 3),
+        "invariant 1: all validated segments must be durable while the actor is still busy"
+    );
+    let rows = sqlx::query_as::<_, (String, i64, String, i64)>(
+        "SELECT normalized_file_path, segment_order, status, lifecycle_version \
+         FROM upload_missing_segment ORDER BY segment_order",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.iter().map(|row| row.1).collect::<Vec<_>>(), [0, 1, 2]);
+    assert!(rows.iter().all(|row| row.2 == "pending" && row.3 == 2));
+
+    // A later downloader TransportError has no write path that can erase prior enrollment.
+    assert_eq!(db.counts().await, (1, 3));
+}
+
+#[tokio::test]
+async fn target_02_duplicate_and_concurrent_enrollment_is_idempotent_and_ordered() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let duplicate_path = media.path().join("duplicate.flv");
+    write_synthetic_valid_flv(&duplicate_path);
+    let request = enrollment_request(&duplicate_path);
+    for replay in 0..100 {
+        let outcome = enroll_validated_segment(&store, &request).await.unwrap();
+        let EnrollmentOutcome::Enrolled(enrollment) = outcome else {
+            panic!("database is healthy; replay {replay} must not use outbox");
+        };
+        assert_eq!(enrollment.duplicate, replay > 0);
+    }
+
+    let mut tasks = Vec::new();
+    for index in 0..20 {
+        let path = media.path().join(format!("concurrent-{index:02}.flv"));
+        write_synthetic_valid_flv(&path);
+        let request = enrollment_request(&path);
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            enroll_validated_segment(&store, &request).await.unwrap()
+        }));
+    }
+    for task in tasks {
+        assert!(matches!(
+            task.await.unwrap(),
+            EnrollmentOutcome::Enrolled(_)
+        ));
+    }
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT segment_order, normalized_file_path FROM upload_missing_segment \
+         WHERE lifecycle_version = 2 ORDER BY segment_order",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 21, "invariant 2: one row per normalized path");
+    assert_eq!(
+        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        (0..21).collect::<Vec<_>>(),
+        "session orders must be unique and contiguous under concurrent enrollment"
+    );
+}
+
+#[tokio::test]
+async fn target_02_fsynced_outbox_imports_exactly_once_after_database_recovers() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let unavailable_db = IncidentDb::new().await;
+    unavailable_db.pool.close().await;
+    let unavailable_store =
+        EnrollmentStore::new(unavailable_db.pool.clone(), outbox.path().to_path_buf());
+    let path = media.path().join("outboxed.flv");
+    write_synthetic_valid_flv(&path);
+    let request = enrollment_request(&path);
+    let outcome = enroll_validated_segment(&unavailable_store, &request)
+        .await
+        .unwrap();
+    let EnrollmentOutcome::Outboxed(manifest) = outcome else {
+        panic!("closed database must fall back to a durable outbox manifest");
+    };
+    assert!(manifest.exists());
+    let manifest_text = std::fs::read_to_string(&manifest).unwrap();
+    for forbidden in ["Cookie", "Authorization", "SESSDATA", "raw_stream_url"] {
+        assert!(!manifest_text.contains(forbidden));
+    }
+
+    let recovered_db = IncidentDb::new().await;
+    let recovered_store =
+        EnrollmentStore::new(recovered_db.pool.clone(), outbox.path().to_path_buf());
+    assert_eq!(import_outbox_once(&recovered_store).await.unwrap(), 1);
+    assert_eq!(import_outbox_once(&recovered_store).await.unwrap(), 0);
+    assert_eq!(recovered_db.counts().await, (1, 1));
+    assert!(!manifest.exists());
 }
 
 #[tokio::test]
@@ -269,4 +383,17 @@ fn fixture_data_is_synthetic_and_contains_no_credentials() {
         );
     }
     assert!(fixture_text.contains("example.invalid"));
+}
+
+fn enrollment_request(path: &Path) -> EnrollmentRequest {
+    EnrollmentRequest {
+        live_streamer_id: INCIDENT_ROOM_ID,
+        streamer_info_id: INCIDENT_STREAMER_INFO_ID,
+        file_path: path.to_path_buf(),
+        normalized_file_path: normalize_segment_path(path).unwrap(),
+        danmaku_file_path: None,
+        total_bytes: std::fs::metadata(path).unwrap().len(),
+        now: FakeClock::incident_start().now(),
+        recovery_window_minutes: 30,
+    }
 }

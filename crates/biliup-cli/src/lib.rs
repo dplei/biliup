@@ -44,6 +44,7 @@ pub async fn run(
     let conn_pool = ConnectionManager::new_pool("data/data.sqlite3")
         .await
         .expect("could not initialize the database connection pool");
+    server::common::segment_enrollment::spawn_outbox_importer(conn_pool.clone());
 
     let loaded_config = if let Some(path) = config_path.as_deref() {
         let config = Config::load(path)?;

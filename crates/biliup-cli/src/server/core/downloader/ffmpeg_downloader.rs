@@ -221,6 +221,7 @@ impl FfmpegDownloader {
             close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
             attempt_id: download_config.attempt_id.clone(),
             recovery_source_paths: Vec::new(),
+            enrollment: None,
         }));
         // 根据退出码判断状态
         match status.code() {
@@ -289,6 +290,7 @@ impl FfmpegDownloader {
                 close_reason: biliup::downloader::util::SegmentCloseReason::TimedSplit,
                 attempt_id: download_config.attempt_id.clone(),
                 recovery_source_paths: Vec::new(),
+                enrollment: None,
                 // start_time: std::time::SystemTime::now(),
                 // end_time: std::time::SystemTime::now(),
             }));
@@ -312,6 +314,7 @@ impl FfmpegDownloader {
                 close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
                 attempt_id: download_config.attempt_id.clone(),
                 recovery_source_paths: Vec::new(),
+                enrollment: None,
                 // start_time: std::time::SystemTime::now(),
                 // end_time: std::time::SystemTime::now(),
             }));

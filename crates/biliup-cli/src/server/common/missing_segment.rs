@@ -264,6 +264,15 @@ async fn enqueue_segment(
         last_error: Some(error),
         created_at: now,
         updated_at: now,
+        normalized_file_path: None,
+        lifecycle_version: 1,
+        video_json: None,
+        total_bytes: None,
+        uploaded_bytes: 0,
+        current_line: None,
+        upload_started_at: None,
+        last_progress_at: None,
+        attempt_token: None,
     };
 
     let sql = r#"
@@ -387,6 +396,15 @@ mod tests {
             last_error: None,
             created_at: now,
             updated_at: now,
+            normalized_file_path: None,
+            lifecycle_version: 1,
+            video_json: None,
+            total_bytes: None,
+            uploaded_bytes: 0,
+            current_line: None,
+            upload_started_at: None,
+            last_progress_at: None,
+            attempt_token: None,
         }
     }
 

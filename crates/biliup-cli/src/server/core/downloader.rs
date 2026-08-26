@@ -143,10 +143,23 @@ pub struct SegmentInfo {
     pub attempt_id: Option<String>,
     /// 合并成功后保留的原始短片；上传 durable 后才允许交给后处理清理。
     pub recovery_source_paths: Vec<PathBuf>,
+    /// Durable v2 lifecycle identity. Upload code must consume this identity instead of
+    /// allocating another session/order after the event has crossed an in-memory channel.
+    pub enrollment: Option<SegmentEnrollment>,
     // /// 分段开始时间戳
     // start_time: std::time::SystemTime,
     // /// 分段结束时间戳
     // end_time: std::time::SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentEnrollment {
+    pub missing_id: i64,
+    pub upload_session_id: i64,
+    pub segment_order: i64,
+    pub normalized_file_path: PathBuf,
+    pub total_bytes: u64,
+    pub duplicate: bool,
 }
 
 impl SegmentInfo {
@@ -164,6 +177,7 @@ impl SegmentInfo {
             close_reason: SegmentCloseReason::Unknown,
             attempt_id: None,
             recovery_source_paths: Vec::new(),
+            enrollment: None,
         }
     }
 }
