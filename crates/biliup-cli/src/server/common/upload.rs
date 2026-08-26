@@ -784,8 +784,9 @@ async fn submit_session(
     Ok(())
 }
 
+/// The outcome of competing for the single valid attempt on a lifecycle row (invariant 5).
 #[derive(Debug, PartialEq, Eq)]
-enum AttemptClaim {
+pub enum AttemptClaim {
     Claimed(String),
     AlreadyRunning,
     AlreadyCompleted,
@@ -803,7 +804,7 @@ impl AttemptClaim {
     }
 }
 
-async fn claim_enrolled_attempt(
+pub async fn claim_enrolled_attempt(
     pool: &ConnectionPool,
     enrollment: &SegmentEnrollment,
     line: &str,
@@ -850,7 +851,7 @@ async fn claim_enrolled_attempt(
     })
 }
 
-async fn fail_enrolled_attempt(
+pub async fn fail_enrolled_attempt(
     pool: &ConnectionPool,
     missing_id: i64,
     attempt_token: &str,
@@ -878,7 +879,7 @@ async fn fail_enrolled_attempt(
 
 /// Commit the remote Video, lifecycle success and session ordering atomically. The lifecycle row
 /// is permanent: it is the idempotency identity for later event replays and rescans.
-async fn persist_segment(
+pub async fn persist_segment(
     pool: &ConnectionPool,
     archive: &mut LiveArchive,
     video: Video,

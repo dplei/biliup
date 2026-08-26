@@ -57,7 +57,7 @@ Status: ready-for-agent
 
 任务 07 需要注意：11–15 号 migration 均已随 02、04、05、06 落地，本任务不再新增 schema，只实现 Rust backfill（复用已建的 `upload_lifecycle_backfill` 断点日志表）与会话 #227 的只读审计。
 
-遗留项：`target_04_replays_and_late_attempts_produce_one_ordered_part` 仍是 `#[ignore]` 的占位断言，需在 07 之前或期间补齐 02/03/05/06 的联合契约（不变量 2 与 5）。
+01 的六条 `target_*` 契约测试均已由生产实现兑现，不再有 `#[ignore]` 占位。
 
 ## 实施边界
 

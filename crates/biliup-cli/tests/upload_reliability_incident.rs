@@ -1,22 +1,30 @@
 mod support;
 
+use biliup::bilibili::Video;
 use biliup_cli::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     import_outbox_once, normalize_segment_path,
 };
+use biliup_cli::server::common::upload::{
+    AttemptClaim, claim_enrolled_attempt, fail_enrolled_attempt, persist_segment,
+};
 use biliup_cli::server::common::upload_line_health::{
     LineAvailability, UploadFailureKind, acquire_line, record_failure,
 };
-use biliup_cli::server::common::upload_session::{SubmitClaim, claim_complete_session};
+use biliup_cli::server::common::upload_session::{
+    LiveArchive, SubmitClaim, claim_complete_session, parse_videos,
+};
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
+use biliup_cli::server::core::downloader::SegmentEnrollment;
+use biliup_cli::server::infrastructure::connection_pool::ConnectionPool;
 use chrono::Duration;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use support::upload_reliability::*;
 
-/// The non-ignored tests characterize the 2026-08-25 failure without touching Bilibili.
-/// Ignored tests are executable contracts owned by tasks 02-06; each is intentionally red until
-/// its production adapter replaces the legacy action in that scenario.
+/// The `scenario_*` tests characterize the 2026-08-25 failure without touching Bilibili; the
+/// `target_*` tests are the executable contracts owned by tasks 02-06. Every contract is now
+/// backed by a production adapter, so none of them is ignored.
 
 #[tokio::test]
 async fn scenario_01_test_model_is_deterministic_and_network_free() {
@@ -392,9 +400,110 @@ async fn target_03_incomplete_session_never_calls_submit() {
 }
 
 #[tokio::test]
-#[ignore = "contract for tasks 02, 03, 05 and 06: lifecycle identity and attempt lease"]
 async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
-    panic!("invariants 2 and 5 violated: duplicate identity or stale attempt can add a part");
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let first_path = media.path().join("ordered-0.flv");
+    let second_path = media.path().join("ordered-1.flv");
+    write_synthetic_valid_flv(&first_path);
+    write_synthetic_valid_flv(&second_path);
+
+    // Invariant 2: a replayed SegmentEvent reuses the lifecycle row it already created.
+    let first = enroll_once(&store, &first_path).await;
+    let second = enroll_once(&store, &second_path).await;
+    for _ in 0..3 {
+        assert_eq!(
+            enroll_once(&store, &first_path).await.missing_id,
+            first.missing_id,
+            "invariant 2: one lifecycle row per local segment"
+        );
+    }
+    assert_eq!(db.counts().await, (1, 2));
+
+    // Invariant 5: the cancelled attempt lost its lease, and the delayed success it was still
+    // carrying must not overwrite the attempt which replaced it.
+    let stale = claim_lease(&db.pool, &second, "bda2").await;
+    assert!(
+        fail_enrolled_attempt(
+            &db.pool,
+            second.missing_id,
+            &stale,
+            "watchdog cancelled".to_string(),
+            FakeClock::incident_start().now(),
+        )
+        .await
+        .unwrap()
+    );
+    let current = claim_lease(&db.pool, &second, "tx").await;
+    let mut archive = LiveArchive::default();
+    assert!(
+        persist_segment(
+            &db.pool,
+            &mut archive,
+            uploaded_video("remote-stale-part-1"),
+            &second,
+            &stale,
+        )
+        .await
+        .is_err(),
+        "invariant 5: a revoked lease cannot publish a delayed success"
+    );
+    persist_segment(
+        &db.pool,
+        &mut archive,
+        uploaded_video("remote-part-1"),
+        &second,
+        &current,
+    )
+    .await
+    .unwrap();
+
+    // The later segment finished first, so the session must be rebuilt in enrollment order.
+    let first_token = claim_lease(&db.pool, &first, "bda2").await;
+    persist_segment(
+        &db.pool,
+        &mut archive,
+        uploaded_video("remote-part-0"),
+        &first,
+        &first_token,
+    )
+    .await
+    .unwrap();
+
+    let videos_json =
+        sqlx::query_scalar::<_, String>("SELECT videos_json FROM upload_session WHERE id = ?")
+            .bind(first.upload_session_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    for parts in [&archive.videos, &parse_videos(&videos_json)] {
+        assert_eq!(
+            parts
+                .iter()
+                .map(|video| video.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["remote-part-0", "remote-part-1"],
+            "replays and a revoked attempt still yield exactly one ordered part each"
+        );
+    }
+
+    // A replay arriving after success is idempotent: no new part, no reset of the succeeded row.
+    assert_eq!(
+        enroll_once(&store, &first_path).await.missing_id,
+        first.missing_id
+    );
+    let statuses = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM upload_missing_segment WHERE upload_session_id = ? \
+         ORDER BY segment_order",
+    )
+    .bind(first.upload_session_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(statuses, ["succeeded", "succeeded"]);
+    assert_eq!(db.counts().await, (1, 2));
 }
 
 #[tokio::test]
@@ -526,6 +635,35 @@ fn fixture_data_is_synthetic_and_contains_no_credentials() {
         );
     }
     assert!(fixture_text.contains("example.invalid"));
+}
+
+async fn enroll_once(store: &EnrollmentStore, path: &Path) -> SegmentEnrollment {
+    let EnrollmentOutcome::Enrolled(enrollment) =
+        enroll_validated_segment(store, &enrollment_request(path))
+            .await
+            .unwrap()
+    else {
+        panic!("a healthy incident database must enroll directly");
+    };
+    enrollment
+}
+
+async fn claim_lease(pool: &ConnectionPool, enrollment: &SegmentEnrollment, line: &str) -> String {
+    let AttemptClaim::Claimed(token) = claim_enrolled_attempt(pool, enrollment, line, None)
+        .await
+        .unwrap()
+    else {
+        panic!("a due lifecycle row must yield exactly one lease");
+    };
+    token
+}
+
+fn uploaded_video(name: &str) -> Video {
+    Video {
+        title: Some(name.to_string()),
+        filename: name.to_string(),
+        desc: String::new(),
+    }
 }
 
 fn enrollment_request(path: &Path) -> EnrollmentRequest {
