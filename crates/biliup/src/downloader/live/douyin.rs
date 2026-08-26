@@ -157,6 +157,9 @@ impl DouyinLive {
                 stream_candidates,
                 recording_quality: Some(recording_quality),
                 attempt_id: Some(attempt_id),
+                // `room.id_str` 是抖音这一场直播的房间标识，随本次检测的响应一起返回，
+                // 已经用于弹幕源。它跨进程重启稳定，正是会话续接需要的场次键。
+                live_session_key: self.room_id.clone(),
             }),
         })
     }
@@ -377,10 +380,7 @@ impl DouyinLive {
         if room_info.get("status").and_then(Value::as_i64) != Some(2) {
             return Ok(None);
         }
-        self.room_id = room_info
-            .get("id_str")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+        self.room_id = live_session_key_from_room(&room_info);
         Ok(Some(room_info))
     }
 
@@ -763,6 +763,19 @@ fn sdk_resolution(value: &Value) -> Option<String> {
         let height = sdk_u64(value, &["height", "vheight", "Height"])?;
         Some(format!("{width}x{height}"))
     })
+}
+
+/// The platform's id for *this* broadcast, taken from the room payload.
+///
+/// Stable across process restarts within one live stream, which is what session continuation
+/// needs; `date` cannot serve that role because every platform fills it with `Utc::now()` at
+/// detection time, not with the broadcast's start.
+fn live_session_key_from_room(room_info: &Value) -> Option<String> {
+    room_info
+        .get("id_str")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
 }
 
 fn generate_attempt_id() -> String {
@@ -1572,5 +1585,40 @@ impl ABogus {
             .collect();
         let abogus = self.crypto_utility.abogus_encode(&final_values, 0);
         format!("{params}&a_bogus={abogus}")
+    }
+}
+
+#[cfg(test)]
+mod live_session_key_tests {
+    use super::live_session_key_from_room;
+    use serde_json::json;
+
+    #[test]
+    fn takes_the_room_id_from_the_room_payload() {
+        let room = json!({"id_str": "7412345678901234567", "status": 2});
+
+        assert_eq!(
+            live_session_key_from_room(&room).as_deref(),
+            Some("7412345678901234567")
+        );
+    }
+
+    /// A key that is absent or blank must stay `None`: continuation falls back to the clock
+    /// window, and an empty-string key would match every other keyless session.
+    #[test]
+    fn a_missing_or_blank_room_id_yields_no_key() {
+        assert_eq!(live_session_key_from_room(&json!({"status": 2})), None);
+        assert_eq!(live_session_key_from_room(&json!({"id_str": ""})), None);
+    }
+
+    #[test]
+    fn the_key_carries_no_url_cookie_or_signature() {
+        let room = json!({
+            "id_str": "7412345678901234567",
+            "stream_url": {"flv_pull_url": {"FULL_HD1": "https://pull.example/live.flv?sign=deadbeef"}},
+        });
+
+        let key = live_session_key_from_room(&room).unwrap();
+        assert!(!key.contains("://") && !key.contains("sign") && !key.contains('='));
     }
 }

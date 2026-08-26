@@ -1,6 +1,8 @@
 mod support;
 
 use biliup::bilibili::Video;
+use biliup_cli::server::common::attempt_lease::{AttemptPhase, record_heartbeat, record_phase};
+use biliup_cli::server::common::missing_segment::recover_stale_upload_attempts;
 use biliup_cli::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     import_outbox_once, normalize_segment_path,
@@ -11,6 +13,7 @@ use biliup_cli::server::common::upload::{
 use biliup_cli::server::common::upload_line_health::{
     LineAvailability, UploadFailureKind, acquire_line, record_failure,
 };
+use biliup_cli::server::common::upload_line_selection::LineSource;
 use biliup_cli::server::common::upload_session::{
     LiveArchive, SubmitClaim, claim_complete_session, parse_videos,
 };
@@ -347,7 +350,7 @@ async fn target_02_pending_segment_survives_process_restart() {
 
     // Recovery is not just a status string: the row must still be claimable after restart.
     assert!(matches!(
-        claim_enrolled_attempt(&restarted, &enrollment, "bda2", None)
+        claim_enrolled_attempt(&restarted, &enrollment, "bda2", LineSource::Configured)
             .await
             .unwrap(),
         AttemptClaim::Claimed(_)
@@ -382,10 +385,11 @@ async fn target_02_duplicate_and_concurrent_enrollment_is_idempotent_and_ordered
         }));
     }
     for task in tasks {
-        assert!(matches!(
-            task.await.unwrap(),
-            EnrollmentOutcome::Enrolled(_)
-        ));
+        let outcome = task.await.unwrap();
+        assert!(
+            matches!(outcome, EnrollmentOutcome::Enrolled(_)),
+            "{outcome:?}"
+        );
     }
     let rows = sqlx::query_as::<_, (i64, String)>(
         "SELECT segment_order, normalized_file_path FROM upload_missing_segment \
@@ -698,6 +702,222 @@ async fn target_06_outbox_import_respects_a_finalized_session_boundary() {
     assert_eq!(audit_count, 1, "the discarded manifest stays auditable");
 }
 
+/// The 2026-08-26 self-sustaining loop, in one test.
+///
+/// A 3.32 GB segment normalizes for far longer than five minutes. The database-side reaper judged
+/// every `uploading` row by "no network progress in five minutes", so it reaped a lease whose
+/// ffmpeg was working perfectly — and the upload that kept running became a ghost that threw away
+/// its own result at `persist_segment`.
+#[tokio::test]
+async fn target_07_long_preprocessing_is_not_reaped_while_its_owner_is_alive() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let path = media.path().join("long-normalization.flv");
+    write_synthetic_valid_flv(&path);
+    let enrollment = enroll_once(&store, &path).await;
+    let token = claim_lease(&db.pool, &enrollment, "alia").await;
+    let started = FakeClock::incident_start().now();
+    // 3.32 GB of source: the preprocessing budget is 10 + 4 * 10 = 50 minutes. The claim stamps
+    // the phase with the wall clock, so re-stamp it onto the fixture clock.
+    sqlx::query("UPDATE upload_missing_segment SET total_bytes = ? WHERE id = ?")
+        .bind(3_565_158_400_i64)
+        .bind(enrollment.missing_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        record_phase(
+            &db.pool,
+            enrollment.missing_id,
+            &token,
+            AttemptPhase::Preprocessing,
+            started,
+        )
+        .await
+        .unwrap()
+    );
+
+    for minute in [5, 20, 45] {
+        let now = started + Duration::minutes(minute);
+        // The owner is alive and says so; nothing else about the row changes.
+        assert!(
+            record_heartbeat(&db.pool, enrollment.missing_id, &token, now)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            recover_stale_upload_attempts(&db.pool, now).await.unwrap(),
+            0,
+            "a heartbeating preprocessing attempt must survive minute {minute}"
+        );
+    }
+
+    let (status, held) = lease_state(&db.pool, enrollment.missing_id).await;
+    assert_eq!(status, "uploading");
+    assert_eq!(held.as_deref(), Some(token.as_str()));
+
+    // Past the size-derived cap it is reaped, and the reason says preprocessing rather than
+    // pretending the upload line went silent.
+    let expired = started + Duration::minutes(51);
+    assert!(
+        record_heartbeat(&db.pool, enrollment.missing_id, &token, expired)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        recover_stale_upload_attempts(&db.pool, expired)
+            .await
+            .unwrap(),
+        1
+    );
+    let last_error: String =
+        sqlx::query_scalar("SELECT last_error FROM upload_missing_segment WHERE id = ?")
+            .bind(enrollment.missing_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(
+        last_error.starts_with("preprocess_timeout"),
+        "the reason must name the phase, got {last_error:?}"
+    );
+}
+
+/// A lease whose owner stopped heartbeating is converged in every phase, including the two that
+/// legitimately move no network bytes.
+#[tokio::test]
+async fn target_07_a_lease_whose_owner_died_is_converged_in_any_phase() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let path = media.path().join("crashed-owner.flv");
+    write_synthetic_valid_flv(&path);
+    let enrollment = enroll_once(&store, &path).await;
+    let token = claim_lease(&db.pool, &enrollment, "alia").await;
+    let started = FakeClock::incident_start().now();
+    assert!(
+        record_phase(
+            &db.pool,
+            enrollment.missing_id,
+            &token,
+            AttemptPhase::Queued,
+            started,
+        )
+        .await
+        .unwrap()
+    );
+
+    // Nothing in this process owns the lease, so there is nothing to cancel: it is simply stale.
+    let now = started + Duration::minutes(4);
+    assert_eq!(
+        recover_stale_upload_attempts(&db.pool, now).await.unwrap(),
+        1
+    );
+    let (status, held) = lease_state(&db.pool, enrollment.missing_id).await;
+    assert_eq!(status, "failed");
+    assert_eq!(held, None);
+    let outcome: String = sqlx::query_scalar(
+        "SELECT outcome FROM upload_attempt WHERE missing_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(enrollment.missing_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome, "stale",
+        "attempt history must record how the attempt ended"
+    );
+}
+
+/// Restarting mid-broadcast used to produce a second `streamerinfo` row, and with it a second
+/// upload session — the exact split that had to be repaired by hand. The platform's session key
+/// keeps both restarts on one session, and `segment_order` stays contiguous.
+#[tokio::test]
+async fn target_08_a_restart_mid_broadcast_keeps_one_session() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.set_live_session_key(INCIDENT_STREAMER_INFO_ID, "room-42")
+        .await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+
+    let before = media.path().join("before-restart.flv");
+    write_synthetic_valid_flv(&before);
+    let first = enroll_once(&store, &before).await;
+
+    // The restart: a new streamerinfo row for the same broadcast, and enough elapsed time that
+    // the old clock window would have expired.
+    let restarted_info = db.insert_streamer_info(Some("room-42")).await;
+    let after = media.path().join("after-restart.flv");
+    write_synthetic_valid_flv(&after);
+    let mut request = enrollment_request(&after);
+    request.streamer_info_id = restarted_info;
+    request.now = FakeClock::incident_start().now() + Duration::minutes(95);
+    let EnrollmentOutcome::Enrolled(second) =
+        enroll_validated_segment(&store, &request).await.unwrap()
+    else {
+        panic!("the restarted process must enroll its segment");
+    };
+
+    assert_eq!(
+        second.upload_session_id, first.upload_session_id,
+        "one broadcast must produce one session, however many times the process restarted"
+    );
+    assert_eq!(second.segment_order, first.segment_order + 1);
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_session")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions, 1);
+}
+
+/// The opposite hazard: two broadcasts must never be merged into one archive, even when the
+/// second starts minutes after the first and the first never finalized.
+#[tokio::test]
+async fn target_08_two_broadcasts_are_never_merged() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.set_live_session_key(INCIDENT_STREAMER_INFO_ID, "room-41")
+        .await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+
+    let first_path = media.path().join("broadcast-one.flv");
+    write_synthetic_valid_flv(&first_path);
+    let first = enroll_once(&store, &first_path).await;
+
+    let second_info = db.insert_streamer_info(Some("room-42")).await;
+    let second_path = media.path().join("broadcast-two.flv");
+    write_synthetic_valid_flv(&second_path);
+    let mut request = enrollment_request(&second_path);
+    request.streamer_info_id = second_info;
+    request.now = FakeClock::incident_start().now() + Duration::minutes(4);
+    let EnrollmentOutcome::Enrolled(second) =
+        enroll_validated_segment(&store, &request).await.unwrap()
+    else {
+        panic!("the second broadcast must enroll its segment");
+    };
+
+    assert_ne!(
+        second.upload_session_id, first.upload_session_id,
+        "a different live session key means a different archive, however close in time"
+    );
+}
+
+async fn lease_state(pool: &ConnectionPool, missing_id: i64) -> (String, Option<String>) {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, attempt_token FROM upload_missing_segment WHERE id = ?",
+    )
+    .bind(missing_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[test]
 fn fixture_data_is_synthetic_and_contains_no_credentials() {
     let fixture_text = include_str!("support/upload_reliability.rs");
@@ -722,9 +942,10 @@ async fn enroll_once(store: &EnrollmentStore, path: &Path) -> SegmentEnrollment 
 }
 
 async fn claim_lease(pool: &ConnectionPool, enrollment: &SegmentEnrollment, line: &str) -> String {
-    let AttemptClaim::Claimed(token) = claim_enrolled_attempt(pool, enrollment, line, None)
-        .await
-        .unwrap()
+    let AttemptClaim::Claimed(token) =
+        claim_enrolled_attempt(pool, enrollment, line, LineSource::Configured)
+            .await
+            .unwrap()
     else {
         panic!("a due lifecycle row must yield exactly one lease");
     };

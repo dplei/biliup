@@ -326,3 +326,28 @@ pub enum UploadLine {
     Txa,
     Alia,
 }
+
+impl UploadLine {
+    /// The `upcdn` key this line is known by everywhere else — line health, the recovery page,
+    /// `config.lines`. Keeping the mapping here means the CLI enum and the unified line decision
+    /// cannot drift apart.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Bldsa => "bldsa",
+            Self::Cnbldsa => "cnbldsa",
+            Self::Andsa => "andsa",
+            Self::Atdsa => "atdsa",
+            Self::Bda2 => "bda2",
+            Self::Cnbd => "cnbd",
+            Self::Anbd => "anbd",
+            Self::Atbd => "atbd",
+            Self::Tx => "tx",
+            Self::Cntx => "cntx",
+            Self::Antx => "antx",
+            Self::Attx => "attx",
+            Self::Bda => "bda",
+            Self::Txa => "txa",
+            Self::Alia => "alia",
+        }
+    }
+}

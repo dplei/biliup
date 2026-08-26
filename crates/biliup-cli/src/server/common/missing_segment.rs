@@ -1,4 +1,7 @@
-use crate::UploadLine;
+use crate::server::common::attempt_lease::{AttemptPhase, LeaseSnapshot, classify_stale_lease};
+use crate::server::common::upload::{
+    CancelAttemptResult, cancel_registered_attempt, fail_enrolled_attempt_with_outcome,
+};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::{InsertUploadMissingSegment, UploadMissingSegment};
@@ -8,24 +11,17 @@ use error_stack::ResultExt;
 use std::path::Path;
 use tracing::{error, info};
 
-const STALE_ATTEMPT_AFTER: chrono::Duration = chrono::Duration::minutes(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryUploadLine {
-    Bda2,
-    Tx,
-    Auto,
-}
-
-pub const FALLBACK_LINES: [RecoveryUploadLine; 3] = [
-    RecoveryUploadLine::Bda2,
-    RecoveryUploadLine::Tx,
-    RecoveryUploadLine::Auto,
-];
+/// `line_index` is a wrapping failure counter on legacy (lifecycle_version 1) rows. It no longer
+/// selects anything: line choice belongs to `upload_line_selection`, which reads `config.lines`
+/// and the persistent cooldown state instead of rotating through a fixed list.
+const LINE_INDEX_MODULUS: i64 = 3;
 
 pub fn next_line_index(current: i64) -> i64 {
-    let len = FALLBACK_LINES.len() as i64;
-    if current < 0 { 0 } else { (current + 1) % len }
+    if current < 0 {
+        0
+    } else {
+        (current + 1) % LINE_INDEX_MODULUS
+    }
 }
 
 pub fn retry_delay_for_attempt(attempts: i64) -> chrono::Duration {
@@ -95,27 +91,109 @@ pub fn reset_for_manual_retry(row: &mut UploadMissingSegment, now: DateTime<Utc>
     row.updated_at = now;
 }
 
-/// Converge leases left by a crashed process (and any attempt whose in-process watchdog failed
-/// to run) using the same token-CAS transition as normal attempt failure.
+/// One `uploading` row, in the shape the stale verdict needs.
+#[derive(sqlx::FromRow)]
+struct LeaseRow {
+    id: i64,
+    attempt_token: Option<String>,
+    attempt_phase: Option<String>,
+    phase_started_at: Option<DateTime<Utc>>,
+    last_heartbeat_at: Option<DateTime<Utc>>,
+    last_progress_at: Option<DateTime<Utc>>,
+    upload_started_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    total_bytes: Option<i64>,
+}
+
+impl LeaseRow {
+    fn snapshot(&self) -> LeaseSnapshot {
+        LeaseSnapshot {
+            phase: self.attempt_phase.as_deref().and_then(AttemptPhase::parse),
+            phase_started_at: self.phase_started_at,
+            last_heartbeat_at: self.last_heartbeat_at,
+            last_progress_at: self.last_progress_at,
+            upload_started_at: self.upload_started_at,
+            updated_at: self.updated_at,
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
+async fn uploading_leases(pool: &ConnectionPool) -> AppResult<Vec<LeaseRow>> {
+    sqlx::query_as::<_, LeaseRow>(
+        "SELECT id, attempt_token, attempt_phase, phase_started_at, last_heartbeat_at, \
+                last_progress_at, upload_started_at, updated_at, total_bytes \
+         FROM upload_missing_segment \
+         WHERE lifecycle_version = 2 AND status = 'uploading'",
+    )
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
+/// Converge leases whose owner is gone or whose phase ran past its deadline.
+///
+/// Two things this does that the old five-minute blanket rule did not:
+///
+/// 1. It asks [`AttemptPhase`] which deadline applies, so a 3.32 GB audio normalization is not
+///    mistaken for a stalled network transfer;
+/// 2. it cancels a still-running in-process attempt and waits for it to exit *before* rewriting
+///    the row. The old reaper was completely decoupled from the attempt registry, so it produced
+///    ghost uploads that raced the replacement attempt for the same lifecycle row.
 pub async fn recover_stale_upload_attempts(
     pool: &ConnectionPool,
     now: DateTime<Utc>,
 ) -> AppResult<u64> {
-    let cutoff = now - STALE_ATTEMPT_AFTER;
-    let result = sqlx::query(
-        "UPDATE upload_missing_segment \
-         SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
-             next_retry_at = ?1, last_error = 'stale_uploading_lease', attempt_token = NULL, \
-             current_line = NULL, updated_at = ?1 \
-         WHERE lifecycle_version = 2 AND status = 'uploading' \
-           AND COALESCE(last_progress_at, upload_started_at, updated_at) <= ?2",
-    )
-    .bind(now)
-    .bind(cutoff)
-    .execute(pool)
-    .await
-    .change_context(AppError::Unknown)?;
-    Ok(result.rows_affected())
+    let mut recovered = 0u64;
+    for row in uploading_leases(pool).await? {
+        let Some(reason) = classify_stale_lease(&row.snapshot(), now) else {
+            continue;
+        };
+        let Some(token) = row.attempt_token.clone() else {
+            // No token means no lease to CAS against; leave it for manual inspection rather than
+            // stomping a row whose ownership cannot be proven.
+            error!(
+                missing_id = row.id,
+                ?reason,
+                "uploading row has no attempt token; leaving it for manual inspection"
+            );
+            continue;
+        };
+        let outcome = match cancel_registered_attempt(row.id, &token).await {
+            CancelAttemptResult::Exited => {
+                info!(
+                    missing_id = row.id,
+                    ?reason,
+                    "cancelled a locally running attempt before converging its lease"
+                );
+                "cancelled"
+            }
+            CancelAttemptResult::TimedOut => {
+                // It is still running and holding the file. Reissuing the lease now would give us
+                // two uploads of the same segment, which is worse than waiting one more cycle.
+                error!(
+                    missing_id = row.id,
+                    ?reason,
+                    "stale attempt did not exit within the cancellation wait; retrying next cycle"
+                );
+                continue;
+            }
+            CancelAttemptResult::NotRegistered => "stale",
+        };
+        if fail_enrolled_attempt_with_outcome(
+            pool,
+            row.id,
+            &token,
+            reason.as_error().to_string(),
+            outcome,
+            now,
+        )
+        .await?
+        {
+            recovered += 1;
+        }
+    }
+    Ok(recovered)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -140,24 +218,26 @@ pub async fn missing_segment_health(
     .fetch_all(pool)
     .await
     .change_context(AppError::Unknown)?;
-    let cutoff = now - STALE_ATTEMPT_AFTER;
-    let stale: Vec<(DateTime<Utc>,)> = sqlx::query_as(
-        "SELECT COALESCE(last_progress_at, upload_started_at, updated_at) \
-         FROM upload_missing_segment \
-         WHERE lifecycle_version = 2 AND status = 'uploading' \
-           AND COALESCE(last_progress_at, upload_started_at, updated_at) <= ?1",
-    )
-    .bind(cutoff)
-    .fetch_all(pool)
-    .await
-    .change_context(AppError::Unknown)?;
+    // Same verdict as the reaper, so the health endpoint can never disagree with what the
+    // background loop is about to do.
+    let stale = uploading_leases(pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            let snapshot = row.snapshot();
+            classify_stale_lease(&snapshot, now).map(|_| {
+                snapshot
+                    .last_progress_at
+                    .or(snapshot.phase_started_at)
+                    .or(snapshot.upload_started_at)
+                    .unwrap_or(snapshot.updated_at)
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(MissingSegmentHealth {
         status_counts: counts.into_iter().collect(),
         stale_uploading_count: stale.len() as i64,
-        oldest_stale_uploading_secs: stale
-            .iter()
-            .map(|(since,)| (now - *since).num_seconds())
-            .max(),
+        oldest_stale_uploading_secs: stale.iter().map(|since| (now - *since).num_seconds()).max(),
     })
 }
 
@@ -354,6 +434,13 @@ async fn enqueue_segment(
         upload_started_at: None,
         last_progress_at: None,
         attempt_token: None,
+        attempt_phase: None,
+        phase_started_at: None,
+        last_heartbeat_at: None,
+        line_source: None,
+        last_chunk_index: None,
+        last_chunk_started_at: None,
+        last_chunk_error: None,
     };
 
     let sql = r#"
@@ -418,14 +505,6 @@ pub async fn next_missing_segment_order(
         .max(successful_count.saturating_add(active_missing_count)))
 }
 
-pub fn upload_line_for_recovery(index: i64) -> Option<UploadLine> {
-    match FALLBACK_LINES[index.rem_euclid(FALLBACK_LINES.len() as i64) as usize] {
-        RecoveryUploadLine::Bda2 => Some(UploadLine::Bda2),
-        RecoveryUploadLine::Tx => Some(UploadLine::Tx),
-        RecoveryUploadLine::Auto => None,
-    }
-}
-
 pub async fn due_missing_segments_for_session(
     pool: &ConnectionPool,
     upload_session_id: i64,
@@ -485,6 +564,13 @@ mod tests {
             upload_started_at: None,
             last_progress_at: None,
             attempt_token: None,
+            attempt_phase: None,
+            phase_started_at: None,
+            last_heartbeat_at: None,
+            line_source: None,
+            last_chunk_index: None,
+            last_chunk_started_at: None,
+            last_chunk_error: None,
         }
     }
 
@@ -615,7 +701,11 @@ mod tests {
         assert_eq!(state.0, "failed");
         assert_eq!((state.1, state.2), (3, 2));
         assert_eq!(state.3, None);
-        assert_eq!(state.4, "stale_uploading_lease");
+        assert!(
+            state.4.starts_with("stale_uploading_lease"),
+            "the reason must name the lease, got {:?}",
+            state.4
+        );
     }
 
     #[tokio::test]

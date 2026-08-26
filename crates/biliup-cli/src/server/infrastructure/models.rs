@@ -25,6 +25,9 @@ pub struct StreamerInfo {
     pub date: DateTime<Utc>,
     /// 直播封面路径（可选）
     pub live_cover_path: String,
+    /// 平台给出的场次标识（抖音为 room id）。用于「重启后这还是同一场直播吗」的判定；
+    /// 平台拿不到时为 None，续接逻辑退回时钟窗口。不含 URL / Cookie / 签名参数。
+    pub live_session_key: Option<String>,
 }
 
 impl StreamerInfo {
@@ -42,7 +45,15 @@ impl StreamerInfo {
             title: title.to_string(),
             date,
             live_cover_path: live_cover_path.to_string(),
+            live_session_key: None,
         }
+    }
+
+    /// 挂上平台场次标识。单独一个方法而不是给 `new` 再加一个参数——`new` 已经有三个
+    /// 相邻的 `&str`，再加一个照样编译但会静默错位。
+    pub fn with_live_session_key(mut self, key: Option<String>) -> Self {
+        self.live_session_key = key;
+        self
     }
 
     /// 反查不到主播时的占位信息：名字取自上传模板名，其余字段一律留空。
@@ -116,6 +127,8 @@ pub struct UploadSession {
     pub last_submit_error: Option<String>,
     /// 投稿结果：ok_with_aid / ok_no_aid / failed；None=未投。
     pub submit_state: Option<String>,
+    /// 本会话归属的场次标识，跨重启续接的第一判据。
+    pub live_session_key: Option<String>,
 }
 
 /// Missing segment recovery queue.
@@ -149,6 +162,36 @@ pub struct UploadMissingSegment {
     pub upload_started_at: Option<DateTime<Utc>>,
     pub last_progress_at: Option<DateTime<Utc>>,
     pub attempt_token: Option<String>,
+    /// 当前 attempt 所处阶段：preprocessing / queued / transferring；无 attempt 时为 None。
+    pub attempt_phase: Option<String>,
+    /// 进入当前阶段的时刻，收割器按阶段各自的硬上限判定。
+    pub phase_started_at: Option<DateTime<Utc>>,
+    /// 持有者进程的存活心跳。跨进程遗留租约靠它与「本进程仍在干活」区分开。
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// 本次 attempt 为何落在 `current_line` 上：configured / manual / fallback / auto_probe。
+    pub line_source: Option<String>,
+    pub last_chunk_index: Option<i64>,
+    pub last_chunk_started_at: Option<DateTime<Utc>>,
+    pub last_chunk_error: Option<String>,
+}
+
+/// 一次 attempt 一行的追加式历史，供补传页展示「先后用过哪些线路、各自为何结束」。
+#[derive(Model, Debug, Clone, Serialize, Deserialize)]
+#[ormlite(table = "upload_attempt", insert = "InsertUploadAttempt")]
+pub struct UploadAttempt {
+    pub id: i64,
+    pub missing_id: i64,
+    pub attempt_token: String,
+    pub line_key: Option<String>,
+    pub line_source: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub phase_reached: Option<String>,
+    /// succeeded / failed / cancelled / stale
+    pub outcome: Option<String>,
+    pub uploaded_bytes: i64,
+    pub last_chunk_index: Option<i64>,
+    pub error: Option<String>,
 }
 
 /// 配置模型

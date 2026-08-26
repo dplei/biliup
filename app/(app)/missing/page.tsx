@@ -26,6 +26,14 @@ interface MissingSegment {
   current_line: string | null
   upload_started_at: string | null
   last_progress_at: string | null
+  // attempt 阶段：preprocessing（本地转码）/ queued（等全局上传许可）/ transferring（真在传）
+  attempt_phase: string | null
+  phase_started_at: string | null
+  last_heartbeat_at: string | null
+  line_source: string | null
+  last_chunk_index: number | null
+  last_chunk_started_at: string | null
+  last_chunk_error: string | null
   // 所属会话的投稿结果（后端 JOIN upload_session 得到，真正的番号在这里）
   session_aid: number | null
   session_bvid: string | null
@@ -34,6 +42,50 @@ interface MissingSegment {
   session_completeness: SessionCompleteness | null
   next_line: string
   line_skip_reason: string | null
+  line_candidates: string[]
+}
+
+interface UploadLineHealth {
+  line_key: string
+  consecutive_failures: number
+  cooldown_until: string | null
+  last_failure_kind: string | null
+  last_error: string | null
+  updated_at: string
+}
+
+interface RecoveryAccepted {
+  ok: boolean
+  missing_id: number
+  eligibility: string
+  attempt_token: string | null
+  line: string | null
+  line_skip_reason: string | null
+  status: string
+}
+
+const ELIGIBILITY_TEXT: Record<string, string> = {
+  already_succeeded: '该分段已经补传成功',
+  already_running: '已有一次补传在跑，本页会持续刷新它的进度',
+  source_missing: '本地源文件不存在',
+  finalized_rejected: '所属会话已投稿完成，不再接受新分段',
+  legacy_finalized_edit: '已补进现有稿件；该编辑可能触发重新审核',
+  invalid_media: '源文件不是有效录像',
+  conflict: '状态已变化，请刷新后重试',
+}
+
+interface AttemptHistory {
+  id: number
+  missing_id: number
+  line_key: string | null
+  line_source: string | null
+  started_at: string
+  ended_at: string | null
+  phase_reached: string | null
+  outcome: string | null
+  uploaded_bytes: number
+  last_chunk_index: number | null
+  error: string | null
 }
 
 interface SessionCompleteness {
@@ -64,6 +116,8 @@ interface RescanResult {
   skipped_known: number
   skipped_invalid: number
   skipped_finalized: boolean
+  /** 补扫自己新建了会话——正常情况下它应该挂进本场已有的会话。 */
+  created_session: boolean
 }
 
 const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; text: string }> = {
@@ -74,8 +128,49 @@ const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; 
   source_missing: { color: 'grey', text: '源文件缺失' },
 }
 
+// 一次 attempt 依次经过这三个阶段，各自有各自的超时。区分它们是这轮修复的核心：
+// 「本地转码 20 分钟」和「网络 20 分钟没动静」完全不是一回事。
+const PHASE_META: Record<string, { text: string; hint: string }> = {
+  preprocessing: { text: '本地转码中', hint: '音量标准化与时间戳修复，尚未开始上传' },
+  queued: { text: '排队等待上传', hint: '全局同时只允许一个上传，正在等前一段传完' },
+  transferring: { text: '传输中', hint: '正在向上传线路推送分块' },
+}
+
+const LINE_SOURCE_TEXT: Record<string, string> = {
+  configured: '跟随配置',
+  manual: '手动指定',
+  fallback: '回退（配置线路冷却中）',
+  auto_probe: 'auto 探测',
+}
+
+const OUTCOME_META: Record<string, { color: 'green' | 'red' | 'orange' | 'grey'; text: string }> = {
+  succeeded: { color: 'green', text: '成功' },
+  failed: { color: 'red', text: '失败' },
+  cancelled: { color: 'orange', text: '已取消' },
+  stale: { color: 'grey', text: '租约超时' },
+}
+
+// 可手动指定的线路。空串表示「跟随配置」，也就是不传 line 参数。
+const LINE_OPTIONS = [
+  { value: '', label: '跟随配置' },
+  { value: 'auto', label: 'auto（自动探测）' },
+  { value: 'bda2', label: 'bda2' },
+  { value: 'bda', label: 'bda' },
+  { value: 'tx', label: 'tx' },
+  { value: 'txa', label: 'txa' },
+  { value: 'alia', label: 'alia' },
+  { value: 'bldsa', label: 'bldsa' },
+]
+
 const fmtTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—')
 const fmtBytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+const fmtDuration = (seconds: number) => {
+  const total = Math.max(0, Math.floor(seconds))
+  if (total < 60) return `${total}秒`
+  const minutes = Math.floor(total / 60)
+  if (minutes < 60) return `${minutes}分${total % 60}秒`
+  return `${Math.floor(minutes / 60)}小时${minutes % 60}分`
+}
 const baseName = (p: string) => p.split(/[/\\]/).pop() || p
 // Semi Select 的递归泛型在这页两组动态 option 并存时会触发 TS2589；运行时 props
 // 仍由 Semi 校验，这里只截断无意义的类型展开。
@@ -93,9 +188,15 @@ export default function MissingRecovery() {
     refreshInterval: 5000,
   })
   const { data: streamerInfos } = useSWR<StreamerInfo[]>('/v1/streamer-info', fetcher)
+  const { data: lineHealth } = useSWR<UploadLineHealth[]>('/v1/health/upload-lines', fetcher, {
+    refreshInterval: 15000,
+  })
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
   const [retryingId, setRetryingId] = useState<number | null>(null)
+  const [stoppingId, setStoppingId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  // 每行各自的线路选择；空串（或缺省）表示「跟随配置」。
+  const [lineChoice, setLineChoice] = useState<Record<number, string>>({})
   const [rescanStreamerInfoId, setRescanStreamerInfoId] = useState<number | null>(null)
   const [rescanning, setRescanning] = useState(false)
   const [now, setNow] = useState(Date.now())
@@ -108,6 +209,12 @@ export default function MissingRecovery() {
   const recentStreamerInfos = useMemo(
     () => [...(streamerInfos ?? [])].sort((a, b) => b.date - a.date).slice(0, 100),
     [streamerInfos],
+  )
+  // 冷却中的线路。bldsa 的证书熔断以前只在 /v1/health/upload-lines 看得到，
+  // 补传页完全不可见——于是「为什么它不走我配的线」在这一页永远问不出答案。
+  const coolingLines = useMemo(
+    () => (lineHealth ?? []).filter((line) => line.cooldown_until != null && new Date(line.cooldown_until).getTime() > now),
+    [lineHealth, now],
   )
   const blockedSessions = useMemo(() => {
     const byId = new Map<number, MissingSegment>()
@@ -144,6 +251,10 @@ export default function MissingRecovery() {
           : `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
             `${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
       )
+      if (result.created_session) {
+        // 本场没有可挂接的会话时补扫才会新建。发生在录制中就意味着一场直播被拆成了两个稿件。
+        Toast.warning(`会话 #${result.upload_session_id} 是本次补扫新建的，请确认它不该并入本场已有会话`)
+      }
       setStatusFilter('active')
       await mutate()
     } catch (e: any) {
@@ -153,19 +264,32 @@ export default function MissingRecovery() {
     }
   }
 
+  /** 该行当前选中的线路参数；跟随配置时不传，让后端按 config.lines 决策。 */
+  const lineArg = (id: number) => {
+    const chosen = lineChoice[id]
+    return chosen ? { line: chosen } : {}
+  }
+
+  /** 补传/重投接口现在是「同步 claim、异步执行」，返回的是已受理，不是已完成。 */
+  const describeAccepted = (result: RecoveryAccepted) => {
+    if (!result.ok) return null
+    const line = result.line ? `，线路 ${result.line}` : ''
+    return `已在后台开始补传${line}；进度会在本页自动刷新`
+  }
+
   const handleRecover = async (id: number) => {
     setRecoveringId(id)
     try {
-      const result = (await sendRequest(`/v1/uploads/missing/${id}/recover`, { arg: {} })) as {
-        ok: boolean
-        eligibility: string
-      }
+      const result = (await sendRequest(`/v1/uploads/missing/${id}/recover`, {
+        arg: lineArg(id),
+      })) as RecoveryAccepted
       if (!result.ok) {
-        Toast.warning(`未执行补传：${result.eligibility}`)
-      } else if (result.eligibility === 'legacy_finalized_edit') {
-        Toast.success('已补进现有稿件；该编辑可能触发重新审核')
+        Toast.warning(`未执行补传：${ELIGIBILITY_TEXT[result.eligibility] ?? result.eligibility}`)
       } else {
-        Toast.success('补传成功，已补进对应稿件或待提交会话')
+        Toast.success(describeAccepted(result)!)
+        if (result.line_skip_reason) {
+          Toast.warning(`已回退线路：${result.line_skip_reason}`)
+        }
       }
       await mutate()
     } catch (e: any) {
@@ -178,17 +302,42 @@ export default function MissingRecovery() {
   const handleRetry = async (id: number) => {
     setRetryingId(id)
     try {
-      const result = (await sendRequest(`/v1/uploads/missing/${id}/retry`, { arg: {} })) as {
-        ok: boolean
-        eligibility: string
+      const result = (await sendRequest(`/v1/uploads/missing/${id}/retry`, {
+        arg: lineArg(id),
+      })) as RecoveryAccepted
+      if (result.ok) {
+        Toast.success(describeAccepted(result)!)
+        if (result.line_skip_reason) {
+          Toast.warning(`已回退线路：${result.line_skip_reason}`)
+        }
+      } else {
+        Toast.warning(`未重新发起：${ELIGIBILITY_TEXT[result.eligibility] ?? result.eligibility}`)
       }
-      if (result.ok) Toast.success('已重新发起补投')
-      else Toast.warning(`未重新发起：${result.eligibility}`)
       await mutate()
     } catch (e: any) {
       Toast.error(`重新补投失败：${e?.message ?? e}`)
     } finally {
       setRetryingId(null)
+    }
+  }
+
+  const handleStop = async (id: number) => {
+    setStoppingId(id)
+    try {
+      const result = (await sendRequest(`/v1/uploads/missing/${id}/stop`, { arg: {} })) as {
+        outcome: string
+        status?: string
+      }
+      if (result.outcome === 'stopped') {
+        Toast.success('已停止当前 attempt；不会自动重传，请自行决定下一步')
+      } else {
+        Toast.warning(`当前没有在跑的 attempt（状态：${result.status ?? '未知'}）`)
+      }
+      await mutate()
+    } catch (e: any) {
+      Toast.error(`停止失败：${e?.message ?? e}`)
+    } finally {
+      setStoppingId(null)
     }
   }
 
@@ -204,6 +353,24 @@ export default function MissingRecovery() {
       setDeletingId(null)
     }
   }
+
+  /** 线路下拉：默认「跟随配置」，选定后 recover/retry 会严格按它走（除非该线路正在冷却）。 */
+  const renderLinePicker = (record: MissingSegment) => (
+    <SimpleSelect
+      size="small"
+      style={{ width: 148 }}
+      value={lineChoice[record.id] ?? ''}
+      onChange={(value: unknown) =>
+        setLineChoice((prev) => ({ ...prev, [record.id]: String(value ?? '') }))
+      }
+      optionList={LINE_OPTIONS.map((option) => ({
+        value: option.value,
+        label: coolingLines.some((line) => line.line_key === option.value)
+          ? `${option.label}（冷却中）`
+          : option.label,
+      }))}
+    />
+  )
 
   const columns = [
     {
@@ -231,9 +398,23 @@ export default function MissingRecovery() {
     {
       title: '上传进度',
       dataIndex: 'uploaded_bytes',
-      width: 230,
+      width: 260,
       render: (_: number, record: MissingSegment) => {
         if (record.status !== 'uploading') return '—'
+        const phase = record.attempt_phase ? PHASE_META[record.attempt_phase] : undefined
+        const phaseSeconds = record.phase_started_at
+          ? (now - new Date(record.phase_started_at).getTime()) / 1000
+          : 0
+        // 转码与排队阶段没有网络字节可言，显示「已无进度」只会让人误以为卡住了。
+        if (record.attempt_phase && record.attempt_phase !== 'transferring') {
+          return (
+            <div>
+              <div>{phase?.text ?? record.attempt_phase} · 已 {fmtDuration(phaseSeconds)}</div>
+              <Text type="tertiary" size="small">{phase?.hint ?? ''}</Text>
+              <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
+            </div>
+          )
+        }
         const total = record.total_bytes ?? 0
         const percent = total > 0 ? Math.min(100, (record.uploaded_bytes / total) * 100) : 0
         const stalledSeconds = record.last_progress_at
@@ -243,20 +424,36 @@ export default function MissingRecovery() {
           <div>
             <div>{percent.toFixed(1)}% · {fmtBytes(record.uploaded_bytes)} / {fmtBytes(total)}</div>
             <Text type="tertiary" size="small">
-              {record.current_line ?? '未知线路'} · 已无进度 {Math.floor(stalledSeconds / 60)}分{stalledSeconds % 60}秒
+              {record.current_line ?? '未知线路'}
+              {record.line_source ? `（${LINE_SOURCE_TEXT[record.line_source] ?? record.line_source}）` : ''}
+              {' · '}已无进度 {fmtDuration(stalledSeconds)}
             </Text>
+            {record.last_chunk_index != null && (
+              <div>
+                <Text type="tertiary" size="small">
+                  当前分块 #{record.last_chunk_index}
+                  {record.last_chunk_started_at
+                    ? ` · 已 ${fmtDuration((now - new Date(record.last_chunk_started_at).getTime()) / 1000)}`
+                    : ''}
+                </Text>
+              </div>
+            )}
             <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
           </div>
         )
       },
     },
     {
-      title: '下次线路',
+      title: '线路',
       dataIndex: 'line_index',
-      width: 180,
+      width: 210,
       render: (_: number, record: MissingSegment) => (
-        <div>
-          <div>{record.next_line}</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div>
+            下次：{lineChoice[record.id] || record.next_line}
+            {lineChoice[record.id] ? '（手动指定）' : ''}
+          </div>
+          {record.status !== 'succeeded' && renderLinePicker(record)}
           {record.line_skip_reason && (
             <Text type="tertiary" size="small">
               已跳过 {record.line_skip_reason}
@@ -274,14 +471,30 @@ export default function MissingRecovery() {
     {
       title: '最后错误',
       dataIndex: 'last_error',
-      render: (err: string | null) =>
-        err ? (
-          <Text type="danger" ellipsis={{ showTooltip: { opts: { content: err } } }} style={{ maxWidth: 280 }}>
-            {err}
-          </Text>
-        ) : (
-          '—'
-        ),
+      render: (err: string | null, record: MissingSegment) => {
+        if (!err && !record.last_chunk_error) return '—'
+        return (
+          <div>
+            {err && (
+              <Text type="danger" ellipsis={{ showTooltip: { opts: { content: err } } }} style={{ maxWidth: 280 }}>
+                {err}
+              </Text>
+            )}
+            {record.last_chunk_error && (
+              <div>
+                <Text
+                  type="tertiary"
+                  size="small"
+                  ellipsis={{ showTooltip: { opts: { content: record.last_chunk_error } } }}
+                  style={{ maxWidth: 280 }}
+                >
+                  {record.last_chunk_error}
+                </Text>
+              </div>
+            )}
+          </div>
+        )
+      },
     },
     {
       title: '去向',
@@ -335,7 +548,7 @@ export default function MissingRecovery() {
     {
       title: '操作',
       dataIndex: 'operate',
-      width: 110,
+      width: 180,
       fixed: 'right' as const,
       render: (_: unknown, record: MissingSegment) => {
         if (record.status === 'succeeded') return '—'
@@ -366,20 +579,33 @@ export default function MissingRecovery() {
 
         if (record.status === 'uploading') {
           return (
-            <Popconfirm
-              title="重新补投这一段？"
-              content="将取消旧 attempt，等待其退出，并从下一条健康线路重新上传该分段。"
-              okText="重新补投"
-              onConfirm={() => handleRetry(record.id)}
-            >
-              <Button
-                theme="borderless"
-                icon={<IconSendStroked />}
-                loading={retryingId === record.id}
+            <div style={{ display: 'flex', gap: 4 }}>
+              <Popconfirm
+                title="停止这次补传？"
+                content="取消当前 attempt 并释放它，状态转为「失败」。不会自动重传——停止之后由你决定下一步。"
+                okText="停止"
+                okButtonProps={{ type: 'danger' }}
+                onConfirm={() => handleStop(record.id)}
               >
-                重新补投
-              </Button>
-            </Popconfirm>
+                <Button theme="borderless" type="danger" loading={stoppingId === record.id}>
+                  停止
+                </Button>
+              </Popconfirm>
+              <Popconfirm
+                title="换线重投这一段？"
+                content="将取消旧 attempt，等待其退出，并按上方选择的线路重新上传该分段。"
+                okText="换线重投"
+                onConfirm={() => handleRetry(record.id)}
+              >
+                <Button
+                  theme="borderless"
+                  icon={<IconSendStroked />}
+                  loading={retryingId === record.id}
+                >
+                  换线重投
+                </Button>
+              </Popconfirm>
+            </div>
           )
         }
 
@@ -387,7 +613,7 @@ export default function MissingRecovery() {
           <div style={{ display: 'flex', gap: 4 }}>
             <Popconfirm
               title="补传这一段？"
-              content="将重新上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待提交会话。"
+              content="将在后台重新上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待提交会话。"
               okText="补传"
               onConfirm={() => handleRecover(record.id)}
             >
@@ -477,6 +703,26 @@ export default function MissingRecovery() {
         </nav>
       </Header>
       <Content style={{ padding: '24px', backgroundColor: 'var(--semi-color-bg-0)' }}>
+        {coolingLines.length > 0 && (
+          <div
+            style={{
+              marginBottom: 16,
+              padding: 12,
+              borderRadius: 6,
+              background: 'var(--semi-color-danger-light-default)',
+            }}
+          >
+            <Text strong>以下上传线路正在冷却，补传会自动绕开它们</Text>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 4 }}>
+              {coolingLines.map((line) => (
+                <Text key={line.line_key} type="tertiary" size="small">
+                  {line.line_key}：{line.last_failure_kind ?? '失败'} · 连续失败 {line.consecutive_failures} 次 ·
+                  剩余 {fmtDuration((new Date(line.cooldown_until!).getTime() - now) / 1000)}
+                </Text>
+              ))}
+            </div>
+          </div>
+        )}
         {blockedSessions.map((row) => {
           const completeness = row.session_completeness
           if (!completeness) return null
@@ -514,6 +760,8 @@ export default function MissingRecovery() {
           补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，
           其中「#会话号」即日志里的 session，可在「实时日志」按该号检索整条上传链路。若有效录像已留在
           本地但列表中没有记录，请选择对应的本场直播并点「补扫本场」；空片段不会被加入。
+          「补传」「换线重投」都是后台执行，接口立刻返回，进度看本页；「停止」只释放卡住的任务，不会自动重传。
+          展开任意一行可以看到它先后用过哪些线路、每次为何结束。
         </Text>
         <Table
           rowKey="id"
@@ -522,6 +770,9 @@ export default function MissingRecovery() {
           loading={isLoading}
           pagination={false}
           scroll={{ x: 'max-content' }}
+          expandedRowRender={(record?: MissingSegment) =>
+            record ? <AttemptHistoryPanel missingId={record.id} /> : null
+          }
           empty={
             <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--semi-color-text-2)' }}>
               <IconSendStroked
@@ -534,5 +785,62 @@ export default function MissingRecovery() {
         />
       </Content>
     </>
+  )
+}
+
+/**
+ * 一行任务的 attempt 历史。
+ *
+ * `current_line` 只有「现在这次用的哪条线」，`line_index` 又只是个失败计数，所以
+ * 「这个任务先后换过哪些线、各自为何结束」在页面上一直无从回答。后端为此新建了
+ * `upload_attempt` 表，一次 attempt 一行、必有终态。
+ */
+function AttemptHistoryPanel({ missingId }: { missingId: number }) {
+  const { Text } = Typography
+  const { data, isLoading } = useSWR<AttemptHistory[]>(
+    `/v1/uploads/missing/${missingId}/attempts`,
+    fetcher,
+  )
+
+  if (isLoading) return <Text type="tertiary">加载线路切换历史…</Text>
+  if (!data || data.length === 0) return <Text type="tertiary">这一段还没有任何 attempt 记录</Text>
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '4px 0' }}>
+      {data.map((attempt) => {
+        const meta = attempt.outcome ? OUTCOME_META[attempt.outcome] : undefined
+        const elapsed = attempt.ended_at
+          ? (new Date(attempt.ended_at).getTime() - new Date(attempt.started_at).getTime()) / 1000
+          : null
+        return (
+          <div key={attempt.id} style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+            <Tag color={meta?.color ?? 'grey'}>{meta?.text ?? attempt.outcome ?? '进行中'}</Tag>
+            <Text>{attempt.line_key ?? '未知线路'}</Text>
+            <Text type="tertiary" size="small">
+              {LINE_SOURCE_TEXT[attempt.line_source ?? ''] ?? attempt.line_source ?? ''}
+            </Text>
+            <Text type="tertiary" size="small">
+              {fmtTime(attempt.started_at)}
+              {elapsed != null ? ` · 历时 ${fmtDuration(elapsed)}` : ' · 进行中'}
+            </Text>
+            <Text type="tertiary" size="small">
+              止步于 {PHASE_META[attempt.phase_reached ?? '']?.text ?? attempt.phase_reached ?? '—'}
+              {attempt.uploaded_bytes > 0 ? ` · 已确认 ${fmtBytes(attempt.uploaded_bytes)}` : ''}
+              {attempt.last_chunk_index != null ? ` · 分块 #${attempt.last_chunk_index}` : ''}
+            </Text>
+            {attempt.error && (
+              <Text
+                type="danger"
+                size="small"
+                ellipsis={{ showTooltip: { opts: { content: attempt.error } } }}
+                style={{ maxWidth: 420 }}
+              >
+                {attempt.error}
+              </Text>
+            )}
+          </div>
+        )
+      })}
+    </div>
   )
 }

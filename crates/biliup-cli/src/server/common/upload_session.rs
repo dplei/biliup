@@ -13,7 +13,35 @@ use sqlx::{Row, Sqlite, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// 从候选会话中选出可续接的那条：同 room、未 finalize、updated_at 在窗口内、取最新。
+/// Does `session` belong to a *different* broadcast than `live_session_key`?
+///
+/// Only a key-vs-key mismatch counts. A missing key on either side is "unknown", not "different",
+/// because platforms that give us no key must keep working exactly as they did.
+fn different_live_session(session: &UploadSession, live_session_key: Option<&str>) -> bool {
+    matches!(
+        (live_session_key, session.live_session_key.as_deref()),
+        (Some(incoming), Some(existing)) if incoming != existing
+    )
+}
+
+fn same_live_session(session: &UploadSession, live_session_key: Option<&str>) -> bool {
+    matches!(
+        (live_session_key, session.live_session_key.as_deref()),
+        (Some(incoming), Some(existing)) if incoming == existing
+    )
+}
+
+/// 从候选会话中选出可续接的那条。
+///
+/// 判据有两条，优先级从高到低：
+///
+/// 1. **场次键相同**：平台给出的本场标识一致，就是同一场直播，不看时间窗口。这条是为
+///    「录制中重启」准备的——重启前后是同一场，但两次检测的时间戳必然不同。
+/// 2. **时钟窗口**：拿不到场次键的平台沿用今天的判据（同 room、未 finalize、
+///    `updated_at` 在窗口内、取最新）。
+///
+/// 窗口分支会拒绝场次键明确不同的会话：把两场直播并进一个稿件，比把一场拆成两个更难挽回。
+///
 /// 返回选中项在 `sessions` 中的下标，便于调用方按需取用（避免借用纠纷）。
 /// 方案B 下「未 finalize」即 status="uploading"（累积中、尚未下播提交）。
 pub fn select_recovery_candidate(
@@ -21,13 +49,30 @@ pub fn select_recovery_candidate(
     room_id: i64,
     now: DateTime<Utc>,
     window_minutes: i64,
+    live_session_key: Option<&str>,
 ) -> Option<usize> {
+    if let Some(index) = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.live_streamer_id == room_id
+                && s.status != "finalized"
+                && same_live_session(s, live_session_key)
+        })
+        .max_by_key(|(_, s)| s.updated_at)
+        .map(|(i, _)| i)
+    {
+        return Some(index);
+    }
     let cutoff = now - chrono::Duration::minutes(window_minutes);
     sessions
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            s.live_streamer_id == room_id && s.status != "finalized" && s.updated_at >= cutoff
+            s.live_streamer_id == room_id
+                && s.status != "finalized"
+                && s.updated_at >= cutoff
+                && !different_live_session(s, live_session_key)
         })
         .max_by_key(|(_, s)| s.updated_at)
         .map(|(i, _)| i)
@@ -37,18 +82,24 @@ pub fn select_recovery_candidate(
 /// 这些是上一场直播累积了分段却没等到下播提交（典型：进程在下播前重启、
 /// 且停机期间直播已结束）。开播时应把它们一次性补提交并 finalize，避免上传
 /// 到 B 站存储的分段永远滞留未投稿。
+///
+/// 场次键与本场相同的会话永远不算废弃——那是本场自己，正等着被续接。
 pub fn select_stale_session_indices(
     sessions: &[UploadSession],
     room_id: i64,
     now: DateTime<Utc>,
     window_minutes: i64,
+    live_session_key: Option<&str>,
 ) -> Vec<usize> {
     let cutoff = now - chrono::Duration::minutes(window_minutes);
     sessions
         .iter()
         .enumerate()
         .filter(|(_, s)| {
-            s.live_streamer_id == room_id && s.status != "finalized" && s.updated_at < cutoff
+            s.live_streamer_id == room_id
+                && s.status != "finalized"
+                && s.updated_at < cutoff
+                && !same_live_session(s, live_session_key)
         })
         .map(|(i, _)| i)
         .collect()
@@ -406,6 +457,65 @@ pub async fn reattach_session(
         .change_context(AppError::Unknown)
 }
 
+/// The `streamerinfo` row already recording this exact live session, if there is one.
+///
+/// `monitor` used to insert a new row on *every* live check that found the room live, so a
+/// restart mid-broadcast produced a second identity for one live stream — and with it a second
+/// upload session and a second archive. Reusing the row keeps `ctx.id()` stable across restarts.
+///
+/// Deliberately conservative: it only reuses a row that still has an unfinalized session hanging
+/// off it. Once the previous broadcast has been submitted there is nothing to continue, so the
+/// next broadcast gets its own row even if the platform reuses the key.
+pub async fn reusable_streamer_info(
+    pool: &ConnectionPool,
+    live_streamer_id: i64,
+    url: &str,
+    live_session_key: Option<&str>,
+) -> AppResult<Option<StreamerInfo>> {
+    let Some(live_session_key) = live_session_key else {
+        return Ok(None);
+    };
+    sqlx::query_as::<_, StreamerInfo>(
+        "SELECT si.* FROM streamerinfo si \
+         JOIN upload_session s ON s.streamer_info_id = si.id \
+         WHERE si.url = ?1 AND si.live_session_key = ?2 \
+           AND s.live_streamer_id = ?3 AND s.status != 'finalized' \
+         ORDER BY si.id DESC LIMIT 1",
+    )
+    .bind(url)
+    .bind(live_session_key)
+    .bind(live_streamer_id)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
+/// Mark a session as still alive.
+///
+/// The 30-minute continuation window is meant to say "this room has been silent for half an
+/// hour". It used to say "nothing submit-related has been written for half an hour", because
+/// `updated_at` only moved on submit paths — so a single 3.32 GB segment uploading for over an
+/// hour aged its own session out of the window, and the restart in the middle of that upload
+/// created a second, empty session for the same live stream.
+///
+/// Failure-open by design: a heartbeat write failing must never abort an upload that is working.
+pub async fn touch_session_activity(pool: &ConnectionPool, session_id: i64, now: DateTime<Utc>) {
+    if let Err(error) = sqlx::query(
+        "UPDATE upload_session SET updated_at = ?1 WHERE id = ?2 AND status != 'finalized'",
+    )
+    .bind(now)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            ?error,
+            session = session_id,
+            "刷新会话活跃时间失败，不影响上传"
+        );
+    }
+}
+
 /// 首段上传成功后插入会话行（uploading 态：累积中、尚未提交，aid 暂空）。
 pub async fn insert_uploading_session(
     pool: &ConnectionPool,
@@ -427,6 +537,7 @@ pub async fn insert_uploading_session(
         last_submit_at: None,
         last_submit_error: None,
         submit_state: None,
+        live_session_key: None,
     }
     .insert(pool)
     .await
@@ -731,6 +842,7 @@ mod tests {
 
     fn session(id: i64, room_id: i64, status: &str, updated_at: DateTime<Utc>) -> UploadSession {
         UploadSession {
+            live_session_key: None,
             id,
             live_streamer_id: room_id,
             streamer_info_id: id,
@@ -916,34 +1028,93 @@ mod tests {
             session(2, 7, "submitted", t(5, now)), // 最新且在窗口内
             session(3, 7, "uploading", t(25, now)),
         ];
-        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30), Some(1));
+        assert_eq!(
+            select_recovery_candidate(&sessions, 7, now, 30, None),
+            Some(1)
+        );
     }
 
     #[test]
     fn skips_finalized() {
         let now = now_fixed();
         let sessions = vec![session(1, 7, "finalized", t(1, now))];
-        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30), None);
+        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30, None), None);
     }
 
     #[test]
     fn skips_outside_window() {
         let now = now_fixed();
         let sessions = vec![session(1, 7, "submitted", t(31, now))];
-        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30), None);
+        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30, None), None);
     }
 
     #[test]
     fn skips_other_room() {
         let now = now_fixed();
         let sessions = vec![session(1, 8, "submitted", t(1, now))];
-        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30), None);
+        assert_eq!(select_recovery_candidate(&sessions, 7, now, 30, None), None);
     }
 
     #[test]
     fn none_when_empty() {
         let now = now_fixed();
-        assert_eq!(select_recovery_candidate(&[], 7, now, 30), None);
+        assert_eq!(select_recovery_candidate(&[], 7, now, 30, None), None);
+    }
+
+    fn keyed(mut session: UploadSession, key: &str) -> UploadSession {
+        session.live_session_key = Some(key.to_string());
+        session
+    }
+
+    /// The incident in one test: a 3.32 GB segment uploaded for over an hour without touching
+    /// `updated_at`, so the restart in the middle of it found nothing inside the window and
+    /// started a second session for the same live stream.
+    #[test]
+    fn the_same_broadcast_is_continued_even_far_outside_the_clock_window() {
+        let now = now_fixed();
+        let sessions = vec![keyed(session(1, 7, "uploading", t(95, now)), "room-42")];
+
+        assert_eq!(
+            select_recovery_candidate(&sessions, 7, now, 30, Some("room-42")),
+            Some(0)
+        );
+        assert!(
+            select_stale_session_indices(&sessions, 7, now, 30, Some("room-42")).is_empty(),
+            "the session we are about to continue must not also be submitted as abandoned"
+        );
+    }
+
+    /// The opposite failure, and the worse one: two broadcasts merged into one archive.
+    #[test]
+    fn a_different_broadcast_is_never_continued_even_inside_the_window() {
+        let now = now_fixed();
+        let sessions = vec![keyed(session(1, 7, "uploading", t(3, now)), "room-41")];
+
+        assert_eq!(
+            select_recovery_candidate(&sessions, 7, now, 30, Some("room-42")),
+            None
+        );
+        assert_eq!(
+            select_stale_session_indices(&sessions, 7, now, 30, Some("room-42")),
+            Vec::<usize>::new(),
+            "a fresh session from another broadcast is not abandoned either; it is just not ours"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_falls_back_to_todays_clock_window() {
+        let now = now_fixed();
+        let sessions = vec![session(1, 7, "uploading", t(3, now))];
+
+        assert_eq!(
+            select_recovery_candidate(&sessions, 7, now, 30, None),
+            Some(0)
+        );
+        assert_eq!(
+            select_recovery_candidate(&sessions, 7, now, 30, Some("room-42")),
+            Some(0),
+            "an unkeyed session predates the key; it must stay continuable"
+        );
     }
 
     #[test]
@@ -957,7 +1128,7 @@ mod tests {
             session(5, 7, "uploading", t(90, now)), // 超窗口 -> 废弃
         ];
         assert_eq!(
-            select_stale_session_indices(&sessions, 7, now, 30),
+            select_stale_session_indices(&sessions, 7, now, 30, None),
             vec![1, 4]
         );
     }
@@ -966,7 +1137,7 @@ mod tests {
     fn stale_empty_when_all_in_window() {
         let now = now_fixed();
         let sessions = vec![session(1, 7, "uploading", t(10, now))];
-        assert!(select_stale_session_indices(&sessions, 7, now, 30).is_empty());
+        assert!(select_stale_session_indices(&sessions, 7, now, 30, None).is_empty());
     }
 
     fn video(name: &str) -> Video {

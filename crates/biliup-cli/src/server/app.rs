@@ -5,6 +5,7 @@ use crate::server::api::auth;
 use crate::server::api::spa::static_handler;
 use crate::server::api::ws::ws_logs;
 use crate::server::common::missing_segment::start_stale_attempt_recovery;
+use crate::server::common::recovery_scheduler::start_due_recovery_scan;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::infrastructure::users::Backend;
@@ -42,6 +43,14 @@ impl ApplicationController {
         // Run once immediately, then once per minute. Fresh leases are retained until their
         // five-minute no-progress deadline instead of being killed just because the process booted.
         start_stale_attempt_recovery(service_register.pool.clone());
+
+        // Due `pending`/`failed` segments used to be picked up only from inside the live upload
+        // pipeline, so after a restart they waited for the streamer to go live again. This loop
+        // claims them on its own, in `segment_order`, reusing each session's existing archive.
+        start_due_recovery_scan(
+            service_register.config.clone(),
+            service_register.pool.clone(),
+        );
 
         // 启动定期清理过期会话的任务
         let deletion_task = tokio::task::spawn(

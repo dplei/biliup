@@ -7,13 +7,14 @@ use crate::server::api::cover_preview::cover_preview_router;
 use crate::server::api::endpoints::{
     add_upload_streamer_endpoint, add_user_endpoint, delete_missing_upload,
     delete_streamers_endpoint, delete_template_endpoint, delete_user_endpoint, get_configuration,
-    get_cookie_health, get_missing_uploads, get_qrcode, get_recovery_batches, get_status,
-    get_streamer_info, get_streamer_info_files, get_streamers_endpoint,
-    get_upload_enrollment_health, get_upload_line_health, get_upload_missing_segment_health,
-    get_upload_rate_health, get_upload_streamer_endpoint, get_upload_streamers_endpoint,
-    get_users_endpoint, get_videos, login_by_qrcode, pause_streamers_endpoint,
-    post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
-    recover_missing_upload, rescan_missing_uploads, retry_missing_upload,
+    get_cookie_health, get_missing_upload_attempts, get_missing_uploads, get_qrcode,
+    get_recovery_batches, get_status, get_streamer_info, get_streamer_info_files,
+    get_streamers_endpoint, get_upload_enrollment_health, get_upload_line_health,
+    get_upload_missing_segment_health, get_upload_rate_health, get_upload_streamer_endpoint,
+    get_upload_streamers_endpoint, get_users_endpoint, get_videos, login_by_qrcode,
+    pause_streamers_endpoint, post_streamers_endpoint, post_uploads, put_configuration,
+    put_streamers_endpoint, recover_missing_upload, recover_session_uploads,
+    rescan_missing_uploads, retry_missing_upload, stop_missing_upload,
 };
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
@@ -89,6 +90,17 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             post(recover_missing_upload),
         )
         .route("/v1/uploads/missing/{id}/retry", post(retry_missing_upload))
+        // 「停止」不等于「重试」：释放卡住的租约后由人决定下一步，接口不会自动起下一次上传。
+        .route("/v1/uploads/missing/{id}/stop", post(stop_missing_upload))
+        .route(
+            "/v1/uploads/missing/{id}/attempts",
+            get(get_missing_upload_attempts),
+        )
+        // 按会话恢复：只领取该会话已有的待补传行，复用它的 aid/bvid，不新建投稿会话。
+        .route(
+            "/v1/uploads/sessions/{id}/recover",
+            post(recover_session_uploads),
+        )
         .route("/v1/uploads", post(post_uploads))
         .with_state(service_register) // 注入服务注册器状态
         .merge(static_file_router(default_static_root()))

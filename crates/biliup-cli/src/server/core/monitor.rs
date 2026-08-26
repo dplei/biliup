@@ -1,6 +1,7 @@
 use crate::server::common::cookie_health;
 use crate::server::common::download::start_download_workflow;
 use crate::server::common::upload::UploaderMessage;
+use crate::server::common::upload_session::reusable_streamer_info;
 use crate::server::core::live::{live_request, streamer_info};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
@@ -118,21 +119,52 @@ impl Monitor {
                     // 检查成功（cookie 工作正常）
                     cookie_health::record_success(platform_name, webhook.as_deref());
                     let sql_no_id = streamer_info(&stream);
-                    let insert = match StreamerInfo::builder()
-                        .url(sql_no_id.url.clone())
-                        .name(room.live_streamer.remark.clone())
-                        .title(sql_no_id.title.clone())
-                        .date(sql_no_id.date)
-                        .live_cover_path(sql_no_id.live_cover_path.clone())
-                        .insert(&self.pool)
-                        .await
+                    // 同一场直播不该有两个身份。此前每检测到一次开播就无条件插入一行
+                    // streamer_info，于是「录制中重启」必然换掉 ctx.id()，会话续接的两条路
+                    // 同时失效，一场直播被拆成两个会话、两个稿件。
+                    let reused = match reusable_streamer_info(
+                        &self.pool,
+                        room.live_streamer.id,
+                        &sql_no_id.url,
+                        sql_no_id.live_session_key.as_deref(),
+                    )
+                    .await
                     {
-                        Ok(insert) => insert,
+                        Ok(reused) => reused,
                         Err(e) => {
-                            error!(e=?e, "插入数据库失败");
-                            self.wake_waker(room.id()).await;
-                            continue;
+                            // 查不到就当没有：宁可多建一行（退回今天的行为），也不能因为一次
+                            // 读库失败就拒绝录制。
+                            error!(e=?e, "查询同场 streamer_info 失败，按新开一场处理");
+                            None
                         }
+                    };
+                    let insert = match reused {
+                        Some(existing) => {
+                            info!(
+                                url = url,
+                                streamer_info = existing.id,
+                                live_session_key = ?sql_no_id.live_session_key,
+                                "room: is live -> 续接同一场直播（复用 streamer_info）"
+                            );
+                            existing
+                        }
+                        None => match StreamerInfo::builder()
+                            .url(sql_no_id.url.clone())
+                            .name(room.live_streamer.remark.clone())
+                            .title(sql_no_id.title.clone())
+                            .date(sql_no_id.date)
+                            .live_cover_path(sql_no_id.live_cover_path.clone())
+                            .live_session_key(sql_no_id.live_session_key.clone())
+                            .insert(&self.pool)
+                            .await
+                        {
+                            Ok(insert) => insert,
+                            Err(e) => {
+                                error!(e=?e, "插入数据库失败");
+                                self.wake_waker(room.id()).await;
+                                continue;
+                            }
+                        },
                     };
                     info!(url = url, "room: is live -> 开播了");
 

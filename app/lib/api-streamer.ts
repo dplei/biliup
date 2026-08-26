@@ -52,11 +52,67 @@ async function handleResponse(res: Response) {
 	}
 
 	if (!res.ok) {
-		// 尽量返回服务端错误信息
-		const text = await res.text().catch(() => '');
-		throw new Error(text || `HTTP ${res.status}`);
+		throw new Error(await describeError(res));
 	}
 	return res;
+}
+
+/** 状态码到中文提示的兜底映射。服务端自己给了 JSON 错误时不会走到这里。 */
+const STATUS_MESSAGES: Record<number, string> = {
+	400: '请求参数有误，请检查后重试',
+	403: '没有权限执行该操作',
+	404: '请求的资源不存在',
+	409: '当前状态下无法执行该操作，请刷新后查看最新状态',
+	429: '请求过于频繁，请稍后再试',
+	500: '服务端内部错误，请查看实时日志',
+	502: '网关错误，服务端可能正在重启，请稍后重试',
+	503: '服务暂时不可用，请稍后重试',
+	504: '服务端处理超时，任务可能仍在后台执行，请刷新查看状态',
+};
+
+/** Toast 里塞不下一整页 HTML，超长正文一律截断。 */
+const MAX_DETAIL_LENGTH = 300;
+
+/**
+ * 把一个失败响应变成一句能读的话。
+ *
+ * 这里原本直接把响应体原文 throw 出去，于是反向代理返回的 504 页面会把整段 OpenResty HTML
+ * 弹进 Toast——既看不出发生了什么，也盖住了半个屏幕。现在只透传服务端自己给的结构化错误，
+ * 其余按状态码翻译。
+ */
+async function describeError(res: Response): Promise<string> {
+	const contentType = res.headers.get('content-type') ?? '';
+	const fallback = STATUS_MESSAGES[res.status] ?? `请求失败（HTTP ${res.status}）`;
+
+	if (contentType.includes('application/json')) {
+		const detail = await res
+			.json()
+			.then((body: unknown) => {
+				if (typeof body === 'string') return body;
+				if (body && typeof body === 'object') {
+					const record = body as Record<string, unknown>;
+					for (const key of ['message', 'error', 'detail']) {
+						if (typeof record[key] === 'string') return record[key] as string;
+					}
+					return JSON.stringify(body);
+				}
+				return '';
+			})
+			.catch(() => '');
+		return detail ? truncate(detail) : fallback;
+	}
+
+	// 纯文本的短错误（后端很多 handler 就是 `(StatusCode, &str)`）仍然值得展示；
+	// HTML 一律丢掉，它从来不是给人看的。
+	if (contentType.includes('text/html')) return fallback;
+	const text = await res.text().catch(() => '');
+	const trimmed = text.trim();
+	if (!trimmed || trimmed.startsWith('<')) return fallback;
+	return truncate(trimmed);
+}
+
+function truncate(detail: string) {
+	return detail.length > MAX_DETAIL_LENGTH ? `${detail.slice(0, MAX_DETAIL_LENGTH)}…` : detail;
 }
 
 type Credit = {

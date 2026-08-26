@@ -96,6 +96,7 @@ impl AfreecaTVLive {
                 stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
+                live_session_key: None,
             }),
         })
     }

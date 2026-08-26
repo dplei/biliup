@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 use crate::client::StatelessClient;
 use crate::retry;
@@ -20,6 +21,8 @@ pub struct Upos {
     bucket: Bucket,
     url: String,
     upload_id: String,
+    /// `upcdn` key, carried only so chunk failures can say which line they were on.
+    line_key: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -44,8 +47,12 @@ pub struct Protocol<'a> {
     end: u64,
 }
 
+/// Per-request cap on one chunk PUT. With `retry`'s three attempts this bounds a single stuck
+/// chunk at roughly thirteen minutes; the attempt-level watchdog fires long before that.
+pub const CHUNK_REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
+
 impl Upos {
-    pub async fn from(client: StatelessClient, bucket: Bucket) -> Result<Self> {
+    pub async fn from(client: StatelessClient, bucket: Bucket, line_key: String) -> Result<Self> {
         let url = format!(
             "https:{}/{}",
             bucket.endpoint,
@@ -77,6 +84,7 @@ impl Upos {
             bucket,
             url,
             upload_id,
+            line_key,
         })
     }
 
@@ -120,21 +128,48 @@ impl Upos {
                     start: i as u64 * chunk_size as u64,
                     end: i as u64 * chunk_size as u64 + len as u64,
                 };
-                retry(|| async {
-                    let response = client
-                        .put(url)
-                        .header(
-                            "X-Upos-Auth",
-                            header::HeaderValue::from_str(&self.bucket.auth)?,
-                        )
-                        .query(&params)
-                        .timeout(Duration::from_secs(240))
-                        .header(CONTENT_LENGTH, len)
-                        .body(chunk.clone())
-                        .send()
-                        .await?;
-                    response.error_for_status()?;
-                    Ok::<_, Kind>(())
+                // Chunk-level failures used to surface only as an untagged line inside `retry`,
+                // so a post-mortem could not say which chunk on which line had stalled or for how
+                // long. Each attempt now logs its own structured line.
+                let mut attempt = 0usize;
+                let params = &params;
+                retry(|| {
+                    attempt += 1;
+                    let current_attempt = attempt;
+                    let chunk = chunk.clone();
+                    async move {
+                        let started = Instant::now();
+                        let result = async {
+                            let response = client
+                                .put(url)
+                                .header(
+                                    "X-Upos-Auth",
+                                    header::HeaderValue::from_str(&self.bucket.auth)?,
+                                )
+                                .query(params)
+                                .timeout(CHUNK_REQUEST_TIMEOUT)
+                                .header(CONTENT_LENGTH, len)
+                                .body(chunk)
+                                .send()
+                                .await?;
+                            response.error_for_status()?;
+                            Ok::<_, Kind>(())
+                        }
+                        .await;
+                        if let Err(error) = &result {
+                            warn!(
+                                line = %self.line_key,
+                                chunk_index = i,
+                                attempt = current_attempt,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                chunk_bytes = len,
+                                timeout_secs = CHUNK_REQUEST_TIMEOUT.as_secs(),
+                                error = %error,
+                                "upload chunk request failed"
+                            );
+                        }
+                        result
+                    }
                 })
                 .await?;
 

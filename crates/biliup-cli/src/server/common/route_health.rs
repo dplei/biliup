@@ -492,6 +492,7 @@ mod tests {
             runtime_options: None,
             recording_quality: first.quality.clone(),
             attempt_id: Some("attempt-fixture".to_string()),
+            live_session_key: Some("fixture-room".to_string()),
             stream_candidates: candidates,
         }
     }

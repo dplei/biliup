@@ -111,6 +111,7 @@ impl BilibiliLive {
             return Ok(LiveStatus::Offline);
         };
         self.room_id = Some(profile.room_id);
+        let profile_room_id = profile.room_id;
         let candidates = self.get_stream_candidates(&profile, headers).await?;
         let raw_stream_url = self.select_stream_url(&candidates).await?;
         let danmaku = self.danmaku_source();
@@ -138,6 +139,9 @@ impl BilibiliLive {
                 stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
+                // B 站 room_id 在同一房间跨场不变，但续接只认未 finalize 的会话，上一场正常
+                // 下播即 finalize，因此这个粒度足够（详见 issue 07 的残余风险说明）。
+                live_session_key: Some(profile_room_id.to_string()),
             }),
         })
     }

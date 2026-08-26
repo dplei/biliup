@@ -21,6 +21,10 @@ pub struct Parcel {
     // line: &'a Line,
     line: Bucket,
     video_file: VideoFile,
+    /// `upcdn` key of the line this parcel was pre-uploaded on. Carried so chunk-level failures
+    /// can name the line they happened on — the incident post-mortem could not tell which line a
+    /// stalled chunk belonged to.
+    line_key: String,
 }
 
 /// Progress reported only after the upload server has accepted a chunk.
@@ -65,7 +69,7 @@ impl Parcel {
             Bucket::Upos(bucket) => {
                 // let bucket: crate::uploader::upos::Bucket = self.pre_upload(client).await?;
                 let chunk_size = bucket.chunk_size;
-                let upos = Upos::from(client, bucket).await?;
+                let upos = Upos::from(client, bucket, self.line_key.clone()).await?;
                 let mut parts = Vec::new();
                 let stream = upos
                     .upload_stream(
@@ -339,6 +343,7 @@ impl Line {
             Uploader::Upos => Ok(Parcel {
                 line: Bucket::Upos(serde_json::from_slice(&response_bytes)?),
                 video_file,
+                line_key: self.key().to_string(),
             }),
             // _ => {
             //     panic!("unsupported")

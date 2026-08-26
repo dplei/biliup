@@ -1,4 +1,5 @@
 use crate::UploadLine;
+use crate::server::common::attempt_lease::{self, AttemptPhase, StaleReason, preprocess_deadline};
 use crate::server::common::audio_normalization::{
     AudioSampleStore, NormalizationOutcome, SystemAudioFfmpeg, TempArtifact,
     maybe_capture_reference_sample, normalize_for_upload,
@@ -24,12 +25,17 @@ use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, norma
 use crate::server::common::upload_line_health::{
     self, LineAvailability, UploadFailureKind, classify_kind, sanitize_error,
 };
+use crate::server::common::upload_line_selection::{
+    LineSource, SelectedLine, cooling_lines, log_line_decision, plan_upload_line,
+    resolve_planned_line,
+};
 use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
     LiveArchive, SubmitClaim, active_sessions_for_room, claim_complete_session, get_streamer_info,
     insert_session_video_at_order, insert_uploading_session, mark_submit_anomaly, mark_submitted,
     parse_videos, reattach_session, release_submit_claim, select_recovery_candidate,
     select_stale_session_indices, submit_claim_is_owned, submit_state_label,
+    touch_session_activity,
 };
 use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
@@ -51,10 +57,10 @@ use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
+use biliup::uploader::VideoFile;
+use biliup::uploader::line::Line;
 use biliup::uploader::line::UploadProgress;
-use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
-use biliup::uploader::{VideoFile, line};
 use error_stack::ResultExt;
 use futures::StreamExt;
 use ormlite::Model;
@@ -82,7 +88,28 @@ struct UploadContext {
     rate_gate: UploadRateGateSettings,
     pool: ConnectionPool,
     line_key: String,
+    /// Why this attempt is on `line_key`; persisted so the page can distinguish "as configured"
+    /// from "fell back because the configured line is cooling".
+    line_source: LineSource,
     health_webhook: Option<String>,
+}
+
+impl UploadContext {
+    /// Same uploader, different line. Used by every recovery path, which decides its line per
+    /// attempt rather than once per session.
+    fn with_line(&self, selected: SelectedLine) -> Self {
+        Self {
+            bilibili: self.bilibili.clone(),
+            line: selected.line,
+            threads: self.threads,
+            client: self.client.clone(),
+            rate_gate: self.rate_gate,
+            pool: self.pool.clone(),
+            line_key: selected.key,
+            line_source: selected.source,
+            health_webhook: self.health_webhook.clone(),
+        }
+    }
 }
 
 static GLOBAL_UPLOAD_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
@@ -363,12 +390,14 @@ async fn initialize_upload_context(
     // 会直接返回 Err。此处带退避重试，避免一次网络抽风就把整场上传  rx 提前 drop、报销整场录像。
     let bilibili = login_with_retry(&cookie_file).await?;
 
-    // 获取上传线路。显式配置也必须服从持久熔断；冷却时按恢复序列回退。
-    let selected = select_configured_line(
+    // 获取上传线路。显式配置也必须服从持久熔断；冷却时按候选序列回退，回退必须留痕。
+    let selected = decide_upload_line(
         pool,
         &client.client,
         &config.lines,
+        None,
         config.cookie_health_webhook.as_deref(),
+        "session_init",
     )
     .await?;
 
@@ -380,124 +409,32 @@ async fn initialize_upload_context(
         rate_gate: UploadRateGateSettings::from(config),
         pool: pool.clone(),
         line_key: selected.key,
+        line_source: selected.source,
         health_webhook: config.cookie_health_webhook.clone(),
     })
 }
 
-fn explicit_upload_line(line: &str) -> Option<Line> {
-    match line {
-        "bda2" => Some(line::bda2()),
-        "bda" => Some(line::bda()),
-        "tx" => Some(line::tx()),
-        "txa" => Some(line::txa()),
-        "bldsa" => Some(line::bldsa()),
-        "alia" => Some(line::alia()),
-        _ => None,
-    }
-}
-
-#[derive(Clone)]
-struct SelectedLine {
-    line: Line,
-    key: String,
-    recovery_index: Option<i64>,
-}
-
-async fn probe_healthy_line(
-    pool: &ConnectionPool,
-    client: &reqwest::Client,
-    webhook: Option<&str>,
-) -> AppResult<SelectedLine> {
-    let excluded = upload_line_health::active_cooldowns(pool, chrono::Utc::now())
-        .await?
-        .into_iter()
-        .map(|row| row.line_key)
-        .collect::<Vec<_>>();
-    let (line, failures) = Probe::probe_excluding_with_failures(client, &excluded)
-        .await
-        .change_context(AppError::Unknown)?;
-    for failure in failures {
-        record_line_kind_failure(pool, &failure.line_key, webhook, &failure.error).await;
-    }
-    let key = line.key().to_string();
-    Ok(SelectedLine {
-        line,
-        key,
-        recovery_index: None,
-    })
-}
-
-async fn select_configured_line(
+/// The one upload-line decision, shared by recording-time upload, page upload, silent recovery
+/// and manual recovery. `forced` is the per-task override from the recovery page.
+///
+/// Resolution and logging live here rather than in `upload_line_selection` so that a probe that
+/// fails mid-decision still feeds the persistent line-health breaker.
+pub(crate) async fn decide_upload_line(
     pool: &ConnectionPool,
     client: &reqwest::Client,
     configured: &str,
+    forced: Option<&str>,
     webhook: Option<&str>,
+    context: &str,
 ) -> AppResult<SelectedLine> {
-    if let Some(line) = explicit_upload_line(configured) {
-        match upload_line_health::acquire_line(pool, configured, chrono::Utc::now()).await? {
-            LineAvailability::Available => {
-                return Ok(SelectedLine {
-                    line,
-                    key: configured.to_string(),
-                    recovery_index: None,
-                });
-            }
-            LineAvailability::Cooling { until, reason } => warn!(
-                line = configured,
-                %until,
-                ?reason,
-                "configured upload line is cooling; overriding to the next healthy line"
-            ),
-        }
-    } else if configured.eq_ignore_ascii_case("auto") || configured.is_empty() {
-        return probe_healthy_line(pool, client, webhook).await;
+    let now = chrono::Utc::now();
+    let plan = plan_upload_line(configured, forced, &cooling_lines(pool, now).await?, now);
+    let (selected, probe_failures) = resolve_planned_line(pool, client, plan).await?;
+    for failure in probe_failures {
+        record_line_probe_failure(pool, &failure.line_key, webhook, &failure.error).await;
     }
-    select_recovery_line(pool, client, 0, webhook).await
-}
-
-/// Recovery order is deliberately bda2 -> tx -> auto. bldsa is never an implicit candidate.
-async fn select_recovery_line(
-    pool: &ConnectionPool,
-    client: &reqwest::Client,
-    start_index: i64,
-    webhook: Option<&str>,
-) -> AppResult<SelectedLine> {
-    const CANDIDATES: [&str; 3] = ["bda2", "tx", "auto"];
-    let start = start_index.rem_euclid(CANDIDATES.len() as i64) as usize;
-    for offset in 0..CANDIDATES.len() {
-        let index = (start + offset) % CANDIDATES.len();
-        let key = CANDIDATES[index];
-        if key == "auto" {
-            match probe_healthy_line(pool, client, webhook).await {
-                Ok(mut selected) => {
-                    selected.recovery_index = Some(index as i64);
-                    return Ok(selected);
-                }
-                Err(error) => {
-                    warn!(?error, "healthy upload line auto probe failed");
-                    continue;
-                }
-            }
-        }
-        match upload_line_health::acquire_line(pool, key, chrono::Utc::now()).await? {
-            LineAvailability::Available => {
-                return Ok(SelectedLine {
-                    line: explicit_upload_line(key).expect("fixed recovery line"),
-                    key: key.to_string(),
-                    recovery_index: Some(index as i64),
-                });
-            }
-            LineAvailability::Cooling { until, reason } => info!(
-                line = key,
-                %until,
-                ?reason,
-                "skipping cooling upload line"
-            ),
-        }
-    }
-    Err(error_stack::Report::new(AppError::Custom(
-        "no healthy upload line is currently available; attempt remains due".to_string(),
-    )))
+    log_line_decision(context, &selected, configured);
+    Ok(selected)
 }
 
 pub(crate) fn segment_paths(event: &SegmentInfo) -> Vec<PathBuf> {
@@ -810,32 +747,51 @@ pub async fn claim_enrolled_attempt(
     pool: &ConnectionPool,
     enrollment: &SegmentEnrollment,
     line: &str,
-    recovery_index: Option<i64>,
+    line_source: LineSource,
 ) -> AppResult<AttemptClaim> {
     let token = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
+    // `last_progress_at` stays NULL on purpose. It means "the remote acknowledged bytes at", and
+    // stamping it at claim time is exactly what made the reaper treat a running normalization as
+    // a stalled transfer. Liveness during preprocessing is carried by `last_heartbeat_at`.
     let result = sqlx::query(
         "UPDATE upload_missing_segment \
-         SET status = 'uploading', attempt_token = ?1, current_line = ?2, \
-             line_index = COALESCE(?3, line_index), upload_started_at = ?4, \
-             last_progress_at = ?4, uploaded_bytes = 0, updated_at = ?4 \
+         SET status = 'uploading', attempt_token = ?1, current_line = ?2, line_source = ?3, \
+             upload_started_at = ?4, last_progress_at = NULL, uploaded_bytes = 0, \
+             attempt_phase = 'preprocessing', phase_started_at = ?4, last_heartbeat_at = ?4, \
+             last_chunk_index = NULL, last_chunk_started_at = NULL, last_chunk_error = NULL, \
+             updated_at = ?4 \
          WHERE id = ?5 AND lifecycle_version = 2 AND status IN ('pending', 'failed') \
            AND next_retry_at <= ?4 AND attempt_token IS NULL",
     )
     .bind(&token)
     .bind(line)
-    .bind(recovery_index)
+    .bind(line_source.as_str())
     .bind(now)
     .bind(enrollment.missing_id)
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
     if result.rows_affected() == 1 {
+        attempt_lease::open_attempt_history(
+            pool,
+            enrollment.missing_id,
+            &token,
+            line,
+            line_source.as_str(),
+            now,
+        )
+        .await?;
+        // Claiming an attempt is proof the session is alive. Without this heartbeat the
+        // continuation window measured "time since the last submit-related write", so an
+        // hour-long upload aged its own session out of the window while it was busy working.
+        touch_session_activity(pool, enrollment.upload_session_id, now).await;
         info!(
             missing_id = enrollment.missing_id,
             attempt = short_attempt_id(&token),
             line,
-            recovery_index,
+            line_source = line_source.as_str(),
+            phase = AttemptPhase::Preprocessing.as_str(),
             "upload attempt started"
         );
         return Ok(AttemptClaim::Claimed(token));
@@ -867,6 +823,22 @@ pub async fn fail_enrolled_attempt(
     error: String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<bool> {
+    fail_enrolled_attempt_with_outcome(pool, missing_id, attempt_token, error, "failed", now).await
+}
+
+/// Release a lease and record its terminal state.
+///
+/// `outcome` only distinguishes the attempt-history row (`failed` / `cancelled` / `stale`); the
+/// lifecycle row itself always lands on `failed`, because from the queue's point of view a
+/// cancelled or reaped attempt is simply one that has to be retried.
+pub async fn fail_enrolled_attempt_with_outcome(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+    error: String,
+    outcome: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> AppResult<bool> {
     // `last_error` is stored durably and rendered verbatim on the missing-uploads page, so it
     // gets the same Cookie/token/query-string scrub as the line-health error summary, not just
     // the tracing log line below (attempt_token itself is a random UUID lease id, not a secret).
@@ -875,6 +847,7 @@ pub async fn fail_enrolled_attempt(
         "UPDATE upload_missing_segment \
          SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
              next_retry_at = ?1, last_error = ?2, attempt_token = NULL, current_line = NULL, \
+             attempt_phase = NULL, phase_started_at = NULL, last_heartbeat_at = NULL, \
              updated_at = ?3 \
          WHERE id = ?4 AND lifecycle_version = 2 AND status = 'uploading' \
            AND attempt_token = ?5 \
@@ -889,10 +862,30 @@ pub async fn fail_enrolled_attempt(
     .await
     .change_context(AppError::Unknown)?;
     if let Some(attempts) = updated_attempts {
+        let diagnostics = sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT uploaded_bytes, last_chunk_index FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(missing_id)
+        .fetch_optional(pool)
+        .await
+        .change_context(AppError::Unknown)?
+        .unwrap_or((0, None));
+        attempt_lease::close_attempt_history(
+            pool,
+            missing_id,
+            attempt_token,
+            outcome,
+            diagnostics.0,
+            diagnostics.1,
+            Some(&error),
+            now,
+        )
+        .await?;
         info!(
             missing_id,
             attempt = short_attempt_id(attempt_token),
             attempts,
+            outcome,
             reason = %error,
             "upload attempt ended"
         );
@@ -922,7 +915,9 @@ pub async fn persist_segment(
     let updated = sqlx::query(
         "UPDATE upload_missing_segment \
          SET video_json = ?1, status = 'succeeded', uploaded_bytes = ?2, \
-             last_progress_at = ?3, last_error = NULL, attempt_token = NULL, updated_at = ?3 \
+             last_progress_at = ?3, last_error = NULL, attempt_token = NULL, \
+             attempt_phase = NULL, phase_started_at = NULL, last_heartbeat_at = NULL, \
+             updated_at = ?3 \
          WHERE id = ?4 AND upload_session_id = ?5 AND lifecycle_version = 2 \
            AND attempt_token = ?6 AND status = 'uploading'",
     )
@@ -982,6 +977,17 @@ pub async fn persist_segment(
         .await
         .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
+    attempt_lease::close_attempt_history(
+        pool,
+        enrollment.missing_id,
+        attempt_token,
+        "succeeded",
+        total_bytes,
+        None,
+        None,
+        now,
+    )
+    .await?;
     info!(
         missing_id = enrollment.missing_id,
         attempt = short_attempt_id(attempt_token),
@@ -1013,7 +1019,10 @@ async fn prepare_archive(
     let now = chrono::Utc::now();
 
     // (1) 补提交废弃会话（用各自当时的 streamer_info 构建标题/时间）。
-    for idx in select_stale_session_indices(&sessions, room_id, now, window) {
+    let live_session_key = ctx.streamer_info().live_session_key.clone();
+    for idx in
+        select_stale_session_indices(&sessions, room_id, now, window, live_session_key.as_deref())
+    {
         let stale = &sessions[idx];
         let mut archive = LiveArchive {
             session_row_id: Some(stale.id),
@@ -1066,7 +1075,9 @@ async fn prepare_archive(
     }
 
     // (2) 续接窗口内的会话。
-    if let Some(idx) = select_recovery_candidate(&sessions, room_id, now, window) {
+    if let Some(idx) =
+        select_recovery_candidate(&sessions, room_id, now, window, live_session_key.as_deref())
+    {
         let candidate = sessions[idx].clone();
         let videos = parse_videos(&candidate.videos_json);
         info!(
@@ -1100,8 +1111,11 @@ async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
         .unwrap_or(DEFAULT_RECOVERY_WINDOW_MINUTES) as i64;
     let sessions = active_sessions_for_room(ctx.pool(), room_id).await?;
     let now = chrono::Utc::now();
+    let live_session_key = ctx.streamer_info().live_session_key.clone();
 
-    if let Some(idx) = select_recovery_candidate(&sessions, room_id, now, window) {
+    if let Some(idx) =
+        select_recovery_candidate(&sessions, room_id, now, window, live_session_key.as_deref())
+    {
         let candidate = sessions[idx].clone();
         let videos = parse_videos(&candidate.videos_json);
         let row = reattach_session(ctx.pool(), candidate, ctx.id()).await?;
@@ -1185,8 +1199,13 @@ async fn pipeline_upload_videos(
         );
         maybe_capture_reference_sample(&original_path, &sample_store).await;
 
-        let AttemptClaim::Claimed(attempt_token) =
-            claim_enrolled_attempt(ctx.pool(), &enrollment, &upload_context.line_key, None).await?
+        let AttemptClaim::Claimed(attempt_token) = claim_enrolled_attempt(
+            ctx.pool(),
+            &enrollment,
+            &upload_context.line_key,
+            upload_context.line_source,
+        )
+        .await?
         else {
             info!(
                 missing_id = enrollment.missing_id,
@@ -1313,7 +1332,11 @@ async fn upload_single_file_with_repair(
         _ => normalized_path.to_path_buf(),
     };
     let result = {
-        // CPU/磁盘处理不占网络上传 permit。
+        // CPU/磁盘处理不占网络上传 permit。排队本身可能很久（全局 permit 容量为 1，前一段
+        // 3 GB 级分段传一小时是正常的），所以要让 watchdog 知道现在是在排队而不是在传输。
+        if let Some(tx) = &activity_tx {
+            let _ = tx.send(UploadActivity::QueueWaitStarted);
+        }
         let _permit = acquire_global_upload_permit().await;
         upload_single_file(&upload_path, context, activity_tx).await
     };
@@ -1346,6 +1369,7 @@ async fn upload_single_file(
         pool,
         line_key,
         health_webhook,
+        line_source: _,
     } = context;
 
     info!(
@@ -1433,6 +1457,48 @@ async fn upload_single_file(
     Ok(video)
 }
 
+/// Same persistent breaker update as [`record_line_kind_failure`], but for a probe failure whose
+/// error has already been rendered to a string by the prober.
+async fn record_line_probe_failure(
+    pool: &ConnectionPool,
+    line_key: &str,
+    webhook: Option<&str>,
+    error: &str,
+) {
+    let summary = sanitize_error(error);
+    let now = chrono::Utc::now();
+    match upload_line_health::record_failure(
+        pool,
+        line_key,
+        UploadFailureKind::Transport,
+        &summary,
+        now,
+    )
+    .await
+    {
+        Ok(tripped) => {
+            warn!(
+                line = line_key,
+                error = %summary,
+                breaker_tripped = tripped,
+                "upload line probe failure recorded"
+            );
+            if tripped {
+                notify_alert(
+                    webhook,
+                    "biliup 上传线路探测失败",
+                    &format!("{line_key} 线路探测连续失败，已进入冷却，上传会自动换线。"),
+                );
+            }
+        }
+        Err(db_error) => warn!(
+            ?db_error,
+            line = line_key,
+            "failed to persist upload line probe failure"
+        ),
+    }
+}
+
 async fn record_line_kind_failure(
     pool: &ConnectionPool,
     line_key: &str,
@@ -1514,19 +1580,25 @@ async fn persist_attempt_progress(
     missing_id: i64,
     attempt_token: &str,
     progress: UploadProgress,
+    chunk_started_at: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<bool> {
     let uploaded_bytes = i64::try_from(progress.uploaded_bytes).unwrap_or(i64::MAX);
     let total_bytes = i64::try_from(progress.total_bytes).unwrap_or(i64::MAX);
+    let chunk_index = i64::try_from(progress.chunk_index).unwrap_or(i64::MAX);
     let now = chrono::Utc::now();
     let updated = sqlx::query(
         "UPDATE upload_missing_segment \
-         SET uploaded_bytes = ?1, total_bytes = ?2, last_progress_at = ?3, updated_at = ?3 \
-         WHERE id = ?4 AND lifecycle_version = 2 AND status = 'uploading' \
-           AND attempt_token = ?5",
+         SET uploaded_bytes = ?1, total_bytes = ?2, last_progress_at = ?3, \
+             last_heartbeat_at = ?3, last_chunk_index = ?4, last_chunk_started_at = ?5, \
+             updated_at = ?3 \
+         WHERE id = ?6 AND lifecycle_version = 2 AND status = 'uploading' \
+           AND attempt_token = ?7",
     )
     .bind(uploaded_bytes)
     .bind(total_bytes)
     .bind(now)
+    .bind(chunk_index)
+    .bind(chunk_started_at)
     .bind(missing_id)
     .bind(attempt_token)
     .execute(pool)
@@ -1538,14 +1610,20 @@ async fn persist_attempt_progress(
 enum AttemptEvent<T> {
     Completed(T),
     Cancelled,
-    NoProgressTimeout,
+    /// The current phase ran past its own deadline. Which deadline (and whether the upload line
+    /// is to blame) depends on the phase the attempt was in.
+    PhaseDeadline,
     TotalUploadTimeout,
+    Heartbeat,
     Activity(UploadActivity),
     ActivityClosed,
 }
 
 #[derive(Debug)]
 enum UploadActivity {
+    /// Entered the queue for the process-wide upload permit. No network byte can move here, so
+    /// this phase is bounded by its own long timeout rather than by transfer progress.
+    QueueWaitStarted,
     TransferStarted {
         file_path: PathBuf,
         total_bytes: u64,
@@ -1553,14 +1631,16 @@ enum UploadActivity {
     Progress(UploadProgress),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn next_attempt_event<F>(
     mut upload: Pin<&mut F>,
     cancellation: &CancellationToken,
-    mut no_progress: Pin<&mut tokio::time::Sleep>,
+    mut phase_deadline: Pin<&mut tokio::time::Sleep>,
     mut total: Pin<&mut tokio::time::Sleep>,
+    heartbeat: &mut tokio::time::Interval,
     activity_rx: &mut mpsc::UnboundedReceiver<UploadActivity>,
     activity_open: bool,
-    watchdog_enabled: bool,
+    total_enabled: bool,
 ) -> AttemptEvent<F::Output>
 where
     F: Future,
@@ -1568,13 +1648,56 @@ where
     tokio::select! {
         result = &mut upload => AttemptEvent::Completed(result),
         _ = cancellation.cancelled() => AttemptEvent::Cancelled,
-        _ = &mut no_progress, if watchdog_enabled => AttemptEvent::NoProgressTimeout,
-        _ = &mut total, if watchdog_enabled => AttemptEvent::TotalUploadTimeout,
+        _ = &mut phase_deadline => AttemptEvent::PhaseDeadline,
+        _ = &mut total, if total_enabled => AttemptEvent::TotalUploadTimeout,
+        _ = heartbeat.tick() => AttemptEvent::Heartbeat,
         activity = activity_rx.recv(), if activity_open => match activity {
             Some(activity) => AttemptEvent::Activity(activity),
             None => AttemptEvent::ActivityClosed,
         },
     }
+}
+
+/// Everything the watchdog knows about the attempt it is supervising. Kept in one place because
+/// both the timeout paths and the failure message need the same values.
+struct AttemptWatch {
+    phase: AttemptPhase,
+    phase_deadline: Duration,
+    persisted_bytes: u64,
+    last_chunk_index: Option<usize>,
+    chunk_started_at: chrono::DateTime<chrono::Utc>,
+    last_activity: Instant,
+}
+
+impl AttemptWatch {
+    /// The diagnostic tail appended to every watchdog `last_error`: which chunk was in flight, on
+    /// which line, for how long, and how many bytes the remote had actually acknowledged.
+    fn diagnostics(&self, line_key: &str) -> String {
+        let chunk = self
+            .last_chunk_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "phase={} line={} chunk={} chunk_elapsed_secs={} acknowledged_bytes={}",
+            self.phase.as_str(),
+            line_key,
+            chunk,
+            (chrono::Utc::now() - self.chunk_started_at)
+                .num_seconds()
+                .max(0),
+            self.persisted_bytes,
+        )
+    }
+}
+
+/// Deadline for a phase, given the source file size (preprocessing scales with it).
+fn phase_deadline_for(phase: AttemptPhase, source_bytes: Option<i64>) -> Duration {
+    let duration = match phase {
+        AttemptPhase::Preprocessing => preprocess_deadline(source_bytes),
+        AttemptPhase::Queued => attempt_lease::QUEUE_TIMEOUT,
+        AttemptPhase::Transferring => attempt_lease::NO_PROGRESS_TIMEOUT,
+    };
+    duration.to_std().unwrap_or(NO_PROGRESS_TIMEOUT)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1595,6 +1718,10 @@ async fn upload_enrolled_with_watchdog(
 )> {
     let (guard, cancellation) = register_attempt(missing_id, attempt_token);
     let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
+    let source_bytes = tokio::fs::metadata(original_path)
+        .await
+        .ok()
+        .and_then(|metadata| i64::try_from(metadata.len()).ok());
     let upload = upload_single_file_with_repair(
         original_path,
         context,
@@ -1605,34 +1732,58 @@ async fn upload_enrolled_with_watchdog(
     );
     pin!(upload);
 
-    let no_progress = tokio::time::sleep(NO_PROGRESS_TIMEOUT);
+    let mut watch = AttemptWatch {
+        phase: AttemptPhase::Preprocessing,
+        phase_deadline: phase_deadline_for(AttemptPhase::Preprocessing, source_bytes),
+        persisted_bytes: 0,
+        last_chunk_index: None,
+        chunk_started_at: chrono::Utc::now(),
+        last_activity: Instant::now(),
+    };
+    let phase_deadline = tokio::time::sleep(watch.phase_deadline);
     let total = tokio::time::sleep(TOTAL_UPLOAD_TIMEOUT);
-    pin!(no_progress);
+    pin!(phase_deadline);
     pin!(total);
+    let mut heartbeat = tokio::time::interval(attempt_lease::HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_persist = Instant::now();
-    let mut persisted_bytes = 0u64;
     let mut activity_open = true;
-    let mut watchdog_enabled = false;
+    // The total-upload timeout only starts once bytes are actually moving; local preprocessing
+    // and permit queueing are bounded by their own phase deadlines instead.
+    let mut total_enabled = false;
     info!(
         missing_id,
-        watchdog = "paused",
-        phase = "preprocessing",
-        "upload watchdog is not enabled until upload transfer starts"
+        phase = AttemptPhase::Preprocessing.as_str(),
+        deadline_secs = watch.phase_deadline.as_secs(),
+        source_bytes,
+        "upload attempt entered local preprocessing; the transfer watchdog stays paused"
     );
 
     loop {
         match next_attempt_event(
             upload.as_mut(),
             &cancellation,
-            no_progress.as_mut(),
+            phase_deadline.as_mut(),
             total.as_mut(),
+            &mut heartbeat,
             &mut activity_rx,
             activity_open,
-            watchdog_enabled,
+            total_enabled,
         )
         .await
         {
             AttemptEvent::Completed(result) => {
+                if let Err(error) = &result {
+                    // The upload's own error says *what* failed; this says *where*, which is the
+                    // half the incident post-mortem could not answer.
+                    record_chunk_diagnostics(
+                        pool,
+                        missing_id,
+                        attempt_token,
+                        &format!("{}: {error:?}", watch.diagnostics(&context.line_key)),
+                    )
+                    .await;
+                }
                 return result
                     .map(|(video, outcome, artifact)| (video, outcome, artifact, Some(guard)));
             }
@@ -1641,30 +1792,71 @@ async fn upload_enrolled_with_watchdog(
                     "upload attempt cancelled by manual retry".to_string(),
                 )));
             }
-            AttemptEvent::NoProgressTimeout => {
+            AttemptEvent::Heartbeat => {
+                // The reaper cannot tell "still working" from "process died" by looking at
+                // network progress, because two of three phases have none. This is that signal.
+                match attempt_lease::record_heartbeat(
+                    pool,
+                    missing_id,
+                    attempt_token,
+                    chrono::Utc::now(),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        missing_id,
+                        attempt = short_attempt_id(attempt_token),
+                        "attempt lease was revoked while still running; it will be discarded at persist"
+                    ),
+                    Err(error) => warn!(?error, missing_id, "写入 attempt 心跳失败"),
+                }
+            }
+            AttemptEvent::PhaseDeadline => {
+                let (reason, kind) = match watch.phase {
+                    AttemptPhase::Preprocessing => {
+                        (StaleReason::PreprocessTimeout, "preprocess_timeout")
+                    }
+                    AttemptPhase::Queued => (StaleReason::QueueTimeout, "queue_timeout"),
+                    AttemptPhase::Transferring => {
+                        (StaleReason::NoNetworkProgress, "no_progress_timeout")
+                    }
+                };
+                let diagnostics = watch.diagnostics(&context.line_key);
                 warn!(
                     missing_id,
-                    watchdog = "no_progress",
-                    uploaded_bytes = persisted_bytes,
-                    idle_secs = last_persist.elapsed().as_secs(),
+                    watchdog = kind,
+                    phase = watch.phase.as_str(),
+                    uploaded_bytes = watch.persisted_bytes,
+                    idle_secs = watch.last_activity.elapsed().as_secs(),
+                    deadline_secs = watch.phase_deadline.as_secs(),
+                    diagnostics = %diagnostics,
                     "upload watchdog fired"
                 );
-                record_watchdog_failure(
-                    context,
-                    UploadFailureKind::RequestTimeout,
-                    "no_progress_timeout",
+                // Only a stalled network transfer says anything about the upload line. Blaming
+                // the line for slow local ffmpeg is what cooled bda2 into the one-hour tier.
+                if reason.blames_upload_line() {
+                    record_watchdog_failure(context, UploadFailureKind::RequestTimeout, kind).await;
+                }
+                record_chunk_diagnostics(
+                    pool,
+                    missing_id,
+                    attempt_token,
+                    &format!("{kind}: {diagnostics}"),
                 )
                 .await;
-                return Err(error_stack::Report::new(AppError::Custom(
-                    "no_progress_timeout".to_string(),
-                )));
+                return Err(error_stack::Report::new(AppError::Custom(format!(
+                    "{kind}: {diagnostics}"
+                ))));
             }
             AttemptEvent::TotalUploadTimeout => {
+                let diagnostics = watch.diagnostics(&context.line_key);
                 warn!(
                     missing_id,
                     watchdog = "total_upload",
-                    uploaded_bytes = persisted_bytes,
-                    idle_secs = last_persist.elapsed().as_secs(),
+                    uploaded_bytes = watch.persisted_bytes,
+                    idle_secs = watch.last_activity.elapsed().as_secs(),
+                    diagnostics = %diagnostics,
                     "upload watchdog fired"
                 );
                 record_watchdog_failure(
@@ -1673,55 +1865,106 @@ async fn upload_enrolled_with_watchdog(
                     "total_upload_timeout",
                 )
                 .await;
-                return Err(error_stack::Report::new(AppError::Custom(
-                    "total_upload_timeout".to_string(),
-                )));
+                record_chunk_diagnostics(
+                    pool,
+                    missing_id,
+                    attempt_token,
+                    &format!("total_upload_timeout: {diagnostics}"),
+                )
+                .await;
+                return Err(error_stack::Report::new(AppError::Custom(format!(
+                    "total_upload_timeout: {diagnostics}"
+                ))));
             }
             AttemptEvent::ActivityClosed => activity_open = false,
+            AttemptEvent::Activity(UploadActivity::QueueWaitStarted) => {
+                enter_phase(
+                    pool,
+                    missing_id,
+                    attempt_token,
+                    AttemptPhase::Queued,
+                    source_bytes,
+                    &mut watch,
+                    phase_deadline.as_mut(),
+                )
+                .await;
+                info!(
+                    missing_id,
+                    phase = AttemptPhase::Queued.as_str(),
+                    deadline_secs = watch.phase_deadline.as_secs(),
+                    "preprocessing finished; waiting for the global upload permit"
+                );
+            }
             AttemptEvent::Activity(UploadActivity::TransferStarted {
                 file_path,
                 total_bytes,
             }) => {
-                let now = tokio::time::Instant::now();
-                no_progress.as_mut().reset(now + NO_PROGRESS_TIMEOUT);
-                total.as_mut().reset(now + TOTAL_UPLOAD_TIMEOUT);
+                enter_phase(
+                    pool,
+                    missing_id,
+                    attempt_token,
+                    AttemptPhase::Transferring,
+                    source_bytes,
+                    &mut watch,
+                    phase_deadline.as_mut(),
+                )
+                .await;
+                total
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + TOTAL_UPLOAD_TIMEOUT);
                 last_persist = Instant::now();
-                watchdog_enabled = true;
+                total_enabled = true;
                 info!(
                     missing_id,
-                    watchdog = "enabled",
+                    phase = AttemptPhase::Transferring.as_str(),
                     file = %file_path.display(),
                     total_bytes,
-                    no_progress_timeout_secs = NO_PROGRESS_TIMEOUT.as_secs(),
+                    no_progress_timeout_secs = watch.phase_deadline.as_secs(),
                     "upload watchdog now monitors transferred network bytes"
                 );
             }
             AttemptEvent::Activity(UploadActivity::Progress(progress)) => {
-                // Both activity variants share a channel, so this is normally already true.  The
+                // Both activity variants share a channel, so this is normally already true. The
                 // defensive branch keeps the 5-minute network watchdog correct if an uploader
                 // implementation ever emits a progress callback before its start signal.
-                if !watchdog_enabled {
-                    let now = tokio::time::Instant::now();
-                    no_progress.as_mut().reset(now + NO_PROGRESS_TIMEOUT);
-                    total.as_mut().reset(now + TOTAL_UPLOAD_TIMEOUT);
-                    watchdog_enabled = true;
-                    info!(
+                if watch.phase != AttemptPhase::Transferring {
+                    enter_phase(
+                        pool,
                         missing_id,
-                        watchdog = "enabled",
-                        "upload progress enabled watchdog monitoring"
-                    );
+                        attempt_token,
+                        AttemptPhase::Transferring,
+                        source_bytes,
+                        &mut watch,
+                        phase_deadline.as_mut(),
+                    )
+                    .await;
+                    total
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + TOTAL_UPLOAD_TIMEOUT);
+                    total_enabled = true;
                 }
-                no_progress
+                phase_deadline
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + NO_PROGRESS_TIMEOUT);
-                let should_persist = persisted_bytes == 0
-                    || progress.uploaded_bytes.saturating_sub(persisted_bytes)
+                    .reset(tokio::time::Instant::now() + watch.phase_deadline);
+                watch.last_activity = Instant::now();
+                let acknowledged_at = chrono::Utc::now();
+                let should_persist = watch.persisted_bytes == 0
+                    || progress
+                        .uploaded_bytes
+                        .saturating_sub(watch.persisted_bytes)
                         >= PROGRESS_PERSIST_BYTES
                     || last_persist.elapsed() >= PROGRESS_PERSIST_INTERVAL;
                 if should_persist
-                    && persist_attempt_progress(pool, missing_id, attempt_token, progress).await?
+                    && persist_attempt_progress(
+                        pool,
+                        missing_id,
+                        attempt_token,
+                        progress,
+                        acknowledged_at,
+                    )
+                    .await?
                 {
-                    persisted_bytes = progress.uploaded_bytes;
+                    watch.persisted_bytes = progress.uploaded_bytes;
                     last_persist = Instant::now();
                     info!(
                         missing_id,
@@ -1731,18 +1974,96 @@ async fn upload_enrolled_with_watchdog(
                         "upload chunk acknowledged"
                     );
                 }
+                // The next chunk starts where this one was acknowledged; that pair is what makes
+                // "chunk 41 on bda2 has been in flight for 700s" answerable after the fact.
+                watch.last_chunk_index = Some(progress.chunk_index);
+                watch.chunk_started_at = acknowledged_at;
             }
         }
     }
 }
 
-enum CancelAttemptResult {
+/// Persist the chunk-scoped failure detail (which chunk, which line, how long, how many bytes
+/// acknowledged) next to the free-form `last_error`.
+///
+/// Failure-open: this is diagnostics, and losing it must not change an attempt's outcome.
+async fn record_chunk_diagnostics(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+    detail: &str,
+) {
+    let detail = sanitize_error(detail);
+    if let Err(error) = sqlx::query(
+        "UPDATE upload_missing_segment SET last_chunk_error = ?1 \
+         WHERE id = ?2 AND lifecycle_version = 2 AND attempt_token = ?3",
+    )
+    .bind(detail)
+    .bind(missing_id)
+    .bind(attempt_token)
+    .execute(pool)
+    .await
+    {
+        warn!(?error, missing_id, "写入分块诊断信息失败");
+    }
+}
+
+/// Move both the in-process watchdog and the durable lease into `phase`.
+///
+/// Failure-open on the database write: losing a phase write must not kill an upload that is
+/// working — the reaper still has the heartbeat, and the in-process deadline is already correct.
+async fn enter_phase(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+    phase: AttemptPhase,
+    source_bytes: Option<i64>,
+    watch: &mut AttemptWatch,
+    phase_deadline: Pin<&mut tokio::time::Sleep>,
+) {
+    watch.phase = phase;
+    watch.phase_deadline = phase_deadline_for(phase, source_bytes);
+    watch.last_activity = Instant::now();
+    watch.chunk_started_at = chrono::Utc::now();
+    phase_deadline.reset(tokio::time::Instant::now() + watch.phase_deadline);
+    let now = chrono::Utc::now();
+    match attempt_lease::record_phase(pool, missing_id, attempt_token, phase, now).await {
+        Ok(true) => {
+            if let Err(error) =
+                attempt_lease::note_attempt_phase(pool, missing_id, attempt_token, phase).await
+            {
+                warn!(?error, missing_id, "记录 attempt 阶段历史失败");
+            }
+        }
+        Ok(false) => warn!(
+            missing_id,
+            attempt = short_attempt_id(attempt_token),
+            phase = phase.as_str(),
+            "attempt lease was revoked before this phase transition"
+        ),
+        Err(error) => warn!(?error, missing_id, "写入 attempt 阶段失败"),
+    }
+}
+
+/// What happened when we asked a running attempt to stop.
+pub enum CancelAttemptResult {
+    /// The attempt was running in this process and has now exited.
     Exited,
+    /// It was running here but did not exit within the wait limit; its lease must not be reissued.
     TimedOut,
+    /// Nothing in this process owns that lease — it is a leftover from a crashed process.
     NotRegistered,
 }
 
-async fn cancel_registered_attempt(missing_id: i64, attempt_token: &str) -> CancelAttemptResult {
+/// Ask the in-process owner of `attempt_token` to cancel, and wait for it to actually exit.
+///
+/// The stale-lease reaper calls this *before* it rewrites the row. Without it the reaper would
+/// flip a still-running attempt to `failed` while the upload kept going — a ghost that discards
+/// its own work at `persist_segment` and leaves the row free for a second, concurrent attempt.
+pub async fn cancel_registered_attempt(
+    missing_id: i64,
+    attempt_token: &str,
+) -> CancelAttemptResult {
     let registration = attempt_registry()
         .lock()
         .expect("attempt registry poisoned")
@@ -1794,11 +2115,15 @@ async fn recover_due_missing_segments(
                 continue;
             }
         }
-        let selected = match select_recovery_line(
+        // Silent recovery honours `config.lines` exactly like the recording-time uploader; it
+        // used to run off a hardcoded `bda2 -> tx -> auto` constant that ignored configuration.
+        let selected = match decide_upload_line(
             ctx.pool(),
             &upload_context.client.client,
-            row.line_index,
+            &ctx.config().lines,
+            None,
             upload_context.health_webhook.as_deref(),
+            "silent_recovery",
         )
         .await
         {
@@ -1831,13 +2156,9 @@ async fn recover_due_missing_segments(
             duplicate: false,
         });
         let attempt_token = if let Some(enrollment) = &v2_enrollment {
-            let AttemptClaim::Claimed(token) = claim_enrolled_attempt(
-                ctx.pool(),
-                enrollment,
-                &selected.key,
-                selected.recovery_index,
-            )
-            .await?
+            let AttemptClaim::Claimed(token) =
+                claim_enrolled_attempt(ctx.pool(), enrollment, &selected.key, selected.source)
+                    .await?
             else {
                 continue;
             };
@@ -1852,16 +2173,7 @@ async fn recover_due_missing_segments(
             None
         };
 
-        let recovery_context = UploadContext {
-            bilibili: upload_context.bilibili.clone(),
-            line: selected.line,
-            threads: upload_context.threads,
-            client: upload_context.client.clone(),
-            rate_gate: upload_context.rate_gate,
-            pool: upload_context.pool.clone(),
-            line_key: selected.key,
-            health_webhook: upload_context.health_webhook.clone(),
-        };
+        let recovery_context = upload_context.with_line(selected);
 
         let path = PathBuf::from(&file_path);
         let effective_config = ctx.config();
@@ -2149,52 +2461,16 @@ pub async fn upload(
 
     let client = StatelessClient::default();
     let mut videos = Vec::new();
-    let requested_line = match line {
-        Some(UploadLine::Bldsa) => line::bldsa(),
-        Some(UploadLine::Cnbldsa) => line::cnbldsa(),
-        Some(UploadLine::Andsa) => line::andsa(),
-        Some(UploadLine::Atdsa) => line::atdsa(),
-        Some(UploadLine::Bda2) => line::bda2(),
-        Some(UploadLine::Cnbd) => line::cnbd(),
-        Some(UploadLine::Anbd) => line::anbd(),
-        Some(UploadLine::Atbd) => line::atbd(),
-        Some(UploadLine::Tx) => line::tx(),
-        Some(UploadLine::Cntx) => line::cntx(),
-        Some(UploadLine::Antx) => line::antx(),
-        Some(UploadLine::Attx) => line::attx(),
-        // Some(UploadLine::Bda) => line::bda(),
-        Some(UploadLine::Txa) => line::txa(),
-        Some(UploadLine::Alia) => line::alia(),
-        _ => {
-            probe_healthy_line(
-                pool,
-                &client.client,
-                config.cookie_health_webhook.as_deref(),
-            )
-            .await?
-            .line
-        }
-    };
-    let requested_key = requested_line.key().to_string();
-    let selected = match upload_line_health::acquire_line(pool, &requested_key, chrono::Utc::now())
-        .await?
-    {
-        LineAvailability::Available => SelectedLine {
-            line: requested_line,
-            key: requested_key,
-            recovery_index: None,
-        },
-        LineAvailability::Cooling { until, reason } => {
-            warn!(line = requested_key, %until, ?reason, "explicit upload line is cooling; overriding");
-            select_recovery_line(
-                pool,
-                &client.client,
-                0,
-                config.cookie_health_webhook.as_deref(),
-            )
-            .await?
-        }
-    };
+    // 页面整场上传与录制期上传、补传共用同一个线路决策：显式指定优先，冷却时按候选序列回退。
+    let selected = decide_upload_line(
+        pool,
+        &client.client,
+        &config.lines,
+        line.clone().map(UploadLine::key),
+        config.cookie_health_webhook.as_deref(),
+        "page_upload",
+    )
+    .await?;
     let line = selected.line;
     let line_key = selected.key;
     for video_path in video_paths {
@@ -2278,6 +2554,10 @@ pub struct LocalSegmentRescanResult {
     pub live_streamer_id: i64,
     pub streamer_info_id: i64,
     pub upload_session_id: i64,
+    /// True when this rescan had to create the session itself. Surfaced so a rescan that quietly
+    /// forks a live stream into a second archive is visible instead of silent.
+    #[serde(default)]
+    pub created_session: bool,
     pub scanned: usize,
     pub queued: usize,
     pub skipped_known: usize,
@@ -2336,6 +2616,10 @@ pub async fn rescan_local_valid_segments(
         .await
         .change_context(AppError::Unknown)?;
 
+    // Rescan must not invent a second identity for a live stream that already has one. It used
+    // to fall straight through to `insert_uploading_session` whenever the exact `streamer_info_id`
+    // had no session, which meant a manual rescan after a restart *added* to the split instead of
+    // repairing it. Same-broadcast lookup by session key comes first.
     let session = sqlx::query_as::<_, UploadSession>(
         "SELECT * FROM upload_session \
          WHERE live_streamer_id = ? AND streamer_info_id = ? AND status != 'finalized' \
@@ -2346,6 +2630,23 @@ pub async fn rescan_local_valid_segments(
     .fetch_optional(pool)
     .await
     .change_context(AppError::Unknown)?;
+    let session = match session {
+        Some(session) => Some(session),
+        None => match streamer_info.live_session_key.as_deref() {
+            Some(key) => sqlx::query_as::<_, UploadSession>(
+                "SELECT * FROM upload_session \
+                 WHERE live_streamer_id = ? AND live_session_key = ? AND status != 'finalized' \
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+            )
+            .bind(live_streamer.id)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .change_context(AppError::Unknown)?,
+            None => None,
+        },
+    };
+    let mut created_session = false;
     let session = match session {
         Some(session) => session,
         None => {
@@ -2366,6 +2667,7 @@ pub async fn rescan_local_valid_segments(
                     live_streamer_id: live_streamer.id,
                     streamer_info_id,
                     upload_session_id: session_id,
+                    created_session: false,
                     scanned: 0,
                     queued: 0,
                     skipped_known: 0,
@@ -2373,6 +2675,7 @@ pub async fn rescan_local_valid_segments(
                     skipped_finalized: true,
                 });
             }
+            created_session = true;
             insert_uploading_session(pool, live_streamer.id, streamer_info_id, &[]).await?
         }
     };
@@ -2461,6 +2764,7 @@ pub async fn rescan_local_valid_segments(
         live_streamer_id: live_streamer.id,
         streamer_info_id,
         upload_session_id: session.id,
+        created_session,
         scanned: 0,
         queued: 0,
         skipped_known: 0,
@@ -2560,11 +2864,56 @@ async fn ensure_missing_segment_session(
     Ok(())
 }
 
-pub async fn manual_recover_missing_segment(
+/// A claimed manual recovery, ready to be executed off the HTTP request's lifetime.
+///
+/// Claiming and executing are separate because the two used to be one `await` inside the axum
+/// handler: a reverse-proxy 504 dropped the handler future, which dropped the upload future *and*
+/// the watchdog living in the same `select!`, so `fail_enrolled_attempt` never ran and the row
+/// sat at `uploading` forever.
+pub struct ClaimedRecovery {
+    row: UploadMissingSegment,
+    eligibility: RecoveryEligibility,
+    enrollment: Option<SegmentEnrollment>,
+    selected_line: Option<SelectedLine>,
+    attempt_token: Option<String>,
+}
+
+impl ClaimedRecovery {
+    pub fn missing_id(&self) -> i64 {
+        self.row.id
+    }
+
+    pub fn attempt_token(&self) -> Option<&str> {
+        self.attempt_token.as_deref()
+    }
+
+    pub fn line_key(&self) -> Option<&str> {
+        self.selected_line.as_ref().map(|line| line.key.as_str())
+    }
+
+    pub fn line_skip_reason(&self) -> Option<String> {
+        self.selected_line
+            .as_ref()
+            .and_then(SelectedLine::skip_reason)
+    }
+}
+
+/// Either a lease on the row, or the reason no work was started.
+pub enum RecoveryClaim {
+    Claimed(Box<ClaimedRecovery>),
+    Rejected(RecoveryEligibility),
+}
+
+/// Take the lease for a manual recovery. Does no network I/O beyond the line probe, so it is safe
+/// to await inside an HTTP handler; the actual upload belongs in [`run_claimed_recovery`].
+///
+/// `forced_line` is the per-task override from the recovery page (`None` = follow configuration).
+pub async fn claim_manual_recovery(
     config: &Config,
     pool: &ConnectionPool,
     missing_id: i64,
-) -> AppResult<RecoveryEligibility> {
+    forced_line: Option<&str>,
+) -> AppResult<RecoveryClaim> {
     let mut row = UploadMissingSegment::select()
         .where_("id = ?")
         .bind(missing_id)
@@ -2612,13 +2961,13 @@ pub async fn manual_recover_missing_segment(
                 claim_now,
             )
             .await?;
-            return Ok(RecoveryEligibility::SourceMissing);
+            return Ok(RecoveryClaim::Rejected(RecoveryEligibility::SourceMissing));
         }
-        decision => return Ok(decision),
+        decision => return Ok(RecoveryClaim::Rejected(decision)),
     }
-    let v2_enrollment = if row.lifecycle_version == 2 {
+    let enrollment = if row.lifecycle_version == 2 {
         let Some(session_id) = row.upload_session_id else {
-            return Ok(RecoveryEligibility::Conflict);
+            return Ok(RecoveryClaim::Rejected(RecoveryEligibility::Conflict));
         };
         Some(SegmentEnrollment {
             missing_id: row.id,
@@ -2638,42 +2987,42 @@ pub async fn manual_recover_missing_segment(
     } else {
         None
     };
-    let selected_recovery = if v2_enrollment.is_some() {
+    let selected_line = if enrollment.is_some() {
         Some(
-            select_recovery_line(
+            decide_upload_line(
                 pool,
                 &StatelessClient::default().client,
-                row.line_index,
+                &config.lines,
+                forced_line,
                 config.cookie_health_webhook.as_deref(),
+                "manual_recovery",
             )
             .await?,
         )
     } else {
         None
     };
-    let attempt_token = if let (Some(enrollment), Some(selected)) =
-        (&v2_enrollment, &selected_recovery)
-    {
+    let attempt_token = if let (Some(enrollment), Some(selected)) = (&enrollment, &selected_line) {
         let token =
-            match claim_enrolled_attempt(pool, enrollment, &selected.key, selected.recovery_index)
-                .await?
-            {
+            match claim_enrolled_attempt(pool, enrollment, &selected.key, selected.source).await? {
                 AttemptClaim::Claimed(token) => token,
                 AttemptClaim::AlreadyRunning => {
-                    return Ok(RecoveryEligibility::AlreadyRunning);
+                    return Ok(RecoveryClaim::Rejected(RecoveryEligibility::AlreadyRunning));
                 }
                 AttemptClaim::AlreadyCompleted => {
-                    return Ok(RecoveryEligibility::AlreadySucceeded);
+                    return Ok(RecoveryClaim::Rejected(
+                        RecoveryEligibility::AlreadySucceeded,
+                    ));
                 }
                 AttemptClaim::NotDue => {
-                    return Ok(RecoveryEligibility::Conflict);
+                    return Ok(RecoveryClaim::Rejected(RecoveryEligibility::Conflict));
                 }
                 AttemptClaim::NotClaimable(status) => {
                     warn!(
                         missing_id,
                         status, "manual recovery claim rejected after eligibility check"
                     );
-                    return Ok(RecoveryEligibility::Conflict);
+                    return Ok(RecoveryClaim::Rejected(RecoveryEligibility::Conflict));
                 }
             };
         Some(token)
@@ -2688,10 +3037,50 @@ pub async fn manual_recover_missing_segment(
         .await
         .change_context(AppError::Unknown)?;
         if claimed.rows_affected() == 0 {
-            return Ok(RecoveryEligibility::AlreadyRunning);
+            return Ok(RecoveryClaim::Rejected(RecoveryEligibility::AlreadyRunning));
         }
         None
     };
+
+    Ok(RecoveryClaim::Claimed(Box::new(ClaimedRecovery {
+        row,
+        eligibility,
+        enrollment,
+        selected_line,
+        attempt_token,
+    })))
+}
+
+/// Claim and run in one call. Used by tests and by callers that genuinely want to block on the
+/// upload; HTTP handlers use [`claim_manual_recovery`] plus a spawned [`run_claimed_recovery`].
+pub async fn manual_recover_missing_segment(
+    config: &Config,
+    pool: &ConnectionPool,
+    missing_id: i64,
+) -> AppResult<RecoveryEligibility> {
+    match claim_manual_recovery(config, pool, missing_id, None).await? {
+        RecoveryClaim::Claimed(claim) => run_claimed_recovery(config, pool, *claim).await,
+        RecoveryClaim::Rejected(decision) => Ok(decision),
+    }
+}
+
+/// Execute a claimed recovery to a terminal state.
+///
+/// This must never be left half-done: every exit path either commits the segment through
+/// `persist_segment` or releases the lease through `fail_enrolled_attempt`, because the caller may
+/// be a detached task with nobody left to observe its return value.
+pub async fn run_claimed_recovery(
+    config: &Config,
+    pool: &ConnectionPool,
+    claim: ClaimedRecovery,
+) -> AppResult<RecoveryEligibility> {
+    let ClaimedRecovery {
+        mut row,
+        eligibility,
+        enrollment: v2_enrollment,
+        selected_line: selected_recovery,
+        attempt_token,
+    } = claim;
 
     // Perform the upload + edit/insert inside a fallible scope so that any failure
     // resets the row to 'failed' and persists the error before returning.
@@ -2731,6 +3120,7 @@ pub async fn manual_recover_missing_segment(
         if let Some(selected) = &selected_recovery {
             upload_context.line = selected.line.clone();
             upload_context.line_key = selected.key.clone();
+            upload_context.line_source = selected.source;
         }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
@@ -2911,11 +3301,78 @@ pub async fn manual_recover_missing_segment(
     }
 }
 
-pub async fn retry_missing_segment(
+/// Release the lease on a running attempt without starting a new one.
+///
+/// "Stop" and "retry" are deliberately different actions: a wedged attempt has to be releasable
+/// so the operator can decide what to do next (change line, delete, wait) instead of being forced
+/// into an immediate re-upload as the only way out of `uploading`.
+pub async fn stop_missing_segment_attempt(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    reason: &str,
+) -> AppResult<StopAttemptOutcome> {
+    let row = UploadMissingSegment::select()
+        .where_("id = ?")
+        .bind(missing_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+    if row.status != "uploading" {
+        return Ok(StopAttemptOutcome::NotRunning { status: row.status });
+    }
+    let Some(token) = row.attempt_token.clone() else {
+        return Ok(StopAttemptOutcome::NotRunning { status: row.status });
+    };
+    let cancellation = cancel_registered_attempt(missing_id, &token).await;
+    if matches!(cancellation, CancelAttemptResult::TimedOut) {
+        return Ok(StopAttemptOutcome::CancelTimedOut);
+    }
+    let detail = match cancellation {
+        CancelAttemptResult::Exited => format!("{reason}: cancelled the running attempt"),
+        _ => format!("{reason}: revoked a lease left by a previous process"),
+    };
+    // The row lands on `failed` with the ordinary backoff, so nothing restarts it immediately —
+    // stopping must not smuggle in a retry.
+    let released = fail_enrolled_attempt_with_outcome(
+        pool,
+        missing_id,
+        &token,
+        detail,
+        "cancelled",
+        now_utc(),
+    )
+    .await?;
+    Ok(if released {
+        StopAttemptOutcome::Stopped
+    } else {
+        StopAttemptOutcome::NotRunning {
+            status: row.status.clone(),
+        }
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StopAttemptOutcome {
+    Stopped,
+    NotRunning { status: String },
+    CancelTimedOut,
+}
+
+fn now_utc() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+/// Cancel whatever is running on this row, then take a fresh lease on it.
+///
+/// Like [`claim_manual_recovery`], this stops at the lease: the upload itself belongs to
+/// [`run_claimed_recovery`], off the request's lifetime.
+pub async fn claim_retry_recovery(
     config: &Config,
     pool: &ConnectionPool,
     missing_id: i64,
-) -> AppResult<RecoveryEligibility> {
+    forced_line: Option<&str>,
+) -> AppResult<RecoveryClaim> {
     let row = UploadMissingSegment::select()
         .where_("id = ?")
         .bind(missing_id)
@@ -2924,7 +3381,9 @@ pub async fn retry_missing_segment(
         .change_context(AppError::Unknown)?;
 
     if row.status == "succeeded" {
-        return Ok(RecoveryEligibility::AlreadySucceeded);
+        return Ok(RecoveryClaim::Rejected(
+            RecoveryEligibility::AlreadySucceeded,
+        ));
     }
 
     if row.status == "uploading" {
@@ -2940,7 +3399,7 @@ pub async fn retry_missing_segment(
                 "previous upload attempt did not exit within cancellation wait limit".to_string(),
             )));
         }
-        let _ = fail_enrolled_attempt(
+        let _ = fail_enrolled_attempt_with_outcome(
             pool,
             missing_id,
             token,
@@ -2949,6 +3408,7 @@ pub async fn retry_missing_segment(
             } else {
                 "manual retry revoked stale attempt from a previous process".to_string()
             },
+            "cancelled",
             now,
         )
         .await?;
@@ -2963,7 +3423,18 @@ pub async fn retry_missing_segment(
         .change_context(AppError::Unknown)?;
     }
 
-    manual_recover_missing_segment(config, pool, missing_id).await
+    claim_manual_recovery(config, pool, missing_id, forced_line).await
+}
+
+pub async fn retry_missing_segment(
+    config: &Config,
+    pool: &ConnectionPool,
+    missing_id: i64,
+) -> AppResult<RecoveryEligibility> {
+    match claim_retry_recovery(config, pool, missing_id, None).await? {
+        RecoveryClaim::Claimed(claim) => run_claimed_recovery(config, pool, *claim).await,
+        RecoveryClaim::Rejected(decision) => Ok(decision),
+    }
 }
 
 #[cfg(test)]
@@ -3054,16 +3525,30 @@ mod tests {
         }
     }
 
+    /// A heartbeat interval that will not fire during a short test.
+    fn idle_heartbeat() -> tokio::time::Interval {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    }
+
     #[tokio::test]
-    async fn watchdog_waits_until_the_full_no_progress_deadline() {
-        assert_eq!(NO_PROGRESS_TIMEOUT, Duration::from_secs(5 * 60));
+    async fn watchdog_waits_until_the_full_phase_deadline() {
+        assert_eq!(
+            attempt_lease::NO_PROGRESS_TIMEOUT.to_std().unwrap(),
+            Duration::from_secs(5 * 60)
+        );
         let upload = std::future::pending::<()>();
         pin!(upload);
         let cancellation = CancellationToken::new();
-        let no_progress = tokio::time::sleep(Duration::from_millis(80));
+        let phase_deadline = tokio::time::sleep(Duration::from_millis(80));
         let total = tokio::time::sleep(Duration::from_secs(1));
-        pin!(no_progress);
+        pin!(phase_deadline);
         pin!(total);
+        let mut heartbeat = idle_heartbeat();
         let (_activity_tx, mut activity_rx) = mpsc::unbounded_channel();
 
         assert!(
@@ -3072,8 +3557,9 @@ mod tests {
                 next_attempt_event(
                     upload.as_mut(),
                     &cancellation,
-                    no_progress.as_mut(),
+                    phase_deadline.as_mut(),
                     total.as_mut(),
+                    &mut heartbeat,
                     &mut activity_rx,
                     true,
                     true,
@@ -3087,26 +3573,47 @@ mod tests {
             next_attempt_event(
                 upload.as_mut(),
                 &cancellation,
-                no_progress.as_mut(),
+                phase_deadline.as_mut(),
                 total.as_mut(),
+                &mut heartbeat,
                 &mut activity_rx,
                 true,
                 true,
             )
             .await,
-            AttemptEvent::NoProgressTimeout
+            AttemptEvent::PhaseDeadline
         ));
     }
 
+    /// Local preprocessing gets a size-derived budget of its own, and it is far longer than the
+    /// transfer deadline. Getting this backwards is exactly what reaped a healthy 3.32 GB
+    /// normalization mid-flight.
+    #[test]
+    fn preprocessing_deadline_scales_with_the_source_file() {
+        let transfer = phase_deadline_for(AttemptPhase::Transferring, Some(3_565_158_400));
+        let preprocessing = phase_deadline_for(AttemptPhase::Preprocessing, Some(3_565_158_400));
+        let queued = phase_deadline_for(AttemptPhase::Queued, Some(3_565_158_400));
+
+        assert_eq!(transfer, Duration::from_secs(5 * 60));
+        assert_eq!(preprocessing, Duration::from_secs(50 * 60));
+        assert_eq!(queued, Duration::from_secs(2 * 60 * 60));
+        assert!(
+            phase_deadline_for(AttemptPhase::Preprocessing, Some(512 * 1024 * 1024))
+                < preprocessing,
+            "a smaller source must get a smaller preprocessing budget"
+        );
+    }
+
     #[tokio::test]
-    async fn watchdog_is_disabled_until_upload_transfer_starts() {
+    async fn the_total_upload_timeout_is_disabled_until_transfer_starts() {
         let upload = std::future::pending::<()>();
         pin!(upload);
         let cancellation = CancellationToken::new();
-        let no_progress = tokio::time::sleep(Duration::from_millis(20));
+        let phase_deadline = tokio::time::sleep(Duration::from_secs(3600));
         let total = tokio::time::sleep(Duration::from_millis(20));
-        pin!(no_progress);
+        pin!(phase_deadline);
         pin!(total);
+        let mut heartbeat = idle_heartbeat();
         let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
 
         assert!(
@@ -3115,8 +3622,9 @@ mod tests {
                 next_attempt_event(
                     upload.as_mut(),
                     &cancellation,
-                    no_progress.as_mut(),
+                    phase_deadline.as_mut(),
                     total.as_mut(),
+                    &mut heartbeat,
                     &mut activity_rx,
                     true,
                     false,
@@ -3124,8 +3632,24 @@ mod tests {
             )
             .await
             .is_err(),
-            "preprocessing must not consume either upload watchdog deadline"
+            "preprocessing must not consume the total upload deadline"
         );
+
+        activity_tx.send(UploadActivity::QueueWaitStarted).unwrap();
+        assert!(matches!(
+            next_attempt_event(
+                upload.as_mut(),
+                &cancellation,
+                phase_deadline.as_mut(),
+                total.as_mut(),
+                &mut heartbeat,
+                &mut activity_rx,
+                true,
+                false,
+            )
+            .await,
+            AttemptEvent::Activity(UploadActivity::QueueWaitStarted)
+        ));
 
         activity_tx
             .send(UploadActivity::TransferStarted {
@@ -3137,8 +3661,9 @@ mod tests {
             next_attempt_event(
                 upload.as_mut(),
                 &cancellation,
-                no_progress.as_mut(),
+                phase_deadline.as_mut(),
                 total.as_mut(),
+                &mut heartbeat,
                 &mut activity_rx,
                 true,
                 false,
@@ -3155,10 +3680,11 @@ mod tests {
         pin!(upload);
         let cancellation = CancellationToken::new();
         let no_progress_duration = Duration::from_millis(100);
-        let no_progress = tokio::time::sleep(no_progress_duration);
+        let phase_deadline = tokio::time::sleep(no_progress_duration);
         let total = tokio::time::sleep(Duration::from_millis(260));
-        pin!(no_progress);
+        pin!(phase_deadline);
         pin!(total);
+        let mut heartbeat = idle_heartbeat();
         let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
         let sender = tokio::spawn(async move {
             for chunk_index in 0..20 {
@@ -3181,19 +3707,20 @@ mod tests {
             match next_attempt_event(
                 upload.as_mut(),
                 &cancellation,
-                no_progress.as_mut(),
+                phase_deadline.as_mut(),
                 total.as_mut(),
+                &mut heartbeat,
                 &mut activity_rx,
                 true,
                 true,
             )
             .await
             {
-                AttemptEvent::Activity(UploadActivity::Progress(_)) => no_progress
+                AttemptEvent::Activity(UploadActivity::Progress(_)) => phase_deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + no_progress_duration),
                 AttemptEvent::TotalUploadTimeout => break,
-                AttemptEvent::NoProgressTimeout => panic!("regular progress must extend idle time"),
+                AttemptEvent::PhaseDeadline => panic!("regular progress must extend idle time"),
                 _ => panic!("unexpected watchdog event"),
             }
         }
@@ -3220,12 +3747,14 @@ mod tests {
             let total = tokio::time::sleep(Duration::from_secs(1));
             pin!(no_progress);
             pin!(total);
+            let mut heartbeat = idle_heartbeat();
             let (_activity_tx, mut activity_rx) = mpsc::unbounded_channel();
             next_attempt_event(
                 upload.as_mut(),
                 &task_cancellation,
                 no_progress.as_mut(),
                 total.as_mut(),
+                &mut heartbeat,
                 &mut activity_rx,
                 true,
                 true,
@@ -3239,11 +3768,171 @@ mod tests {
         assert!(semaphore.try_acquire_owned().is_ok());
     }
 
+    /// The reaper and the in-process attempt registry used to be completely decoupled: the reaper
+    /// flipped the row to `failed` while the upload kept running, so the still-running attempt
+    /// became a ghost that discarded its own work and raced its replacement.
+    #[tokio::test]
+    async fn reaping_a_locally_running_attempt_cancels_it_first() {
+        use crate::server::common::missing_segment::recover_stale_upload_attempts;
+
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "running-attempt.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "alia", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+        let (guard, cancellation) = register_attempt(enrollment.missing_id, &token);
+        assert!(!cancellation.is_cancelled());
+        // Stand in for the real attempt: exit when told to, dropping the guard on the way out.
+        let attempt = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                cancellation.cancelled().await;
+                drop(guard);
+            }
+        });
+
+        // Age the lease past every deadline it has.
+        let stale = chrono::Utc::now() - chrono::Duration::hours(3);
+        sqlx::query(
+            "UPDATE upload_missing_segment \
+             SET attempt_phase = 'transferring', phase_started_at = ?1, last_heartbeat_at = ?1, \
+                 last_progress_at = ?1 \
+             WHERE id = ?2",
+        )
+        .bind(stale)
+        .bind(enrollment.missing_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recover_stale_upload_attempts(&pool, chrono::Utc::now())
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            cancellation.is_cancelled(),
+            "the running attempt must be told to stop before its row is reissued"
+        );
+        attempt.await.unwrap();
+        let outcome = sqlx::query_scalar::<_, String>(
+            "SELECT outcome FROM upload_attempt WHERE missing_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outcome, "cancelled");
+    }
+
+    /// The lease has to outlive the request that took it: an HTTP handler that is dropped by a
+    /// reverse-proxy timeout must leave a row that is claimed and durably owned, not a row that
+    /// silently reverts (or worse, one that can be claimed twice).
+    #[tokio::test]
+    async fn a_manual_claim_is_durable_and_exclusive_of_its_caller() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "detached-claim.flv").await;
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (10, ?1, 'test')")
+            .bind("https://example.invalid/live/room")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // An explicit, healthy line keeps the decision offline: no probe, no network.
+        let config = Config {
+            lines: "alia".to_string(),
+            ..Config::default()
+        };
+
+        let RecoveryClaim::Claimed(claim) =
+            claim_manual_recovery(&config, &pool, enrollment.missing_id, None)
+                .await
+                .unwrap()
+        else {
+            panic!("a due lifecycle row must be claimable");
+        };
+        assert_eq!(claim.line_key(), Some("alia"));
+        let token = claim.attempt_token().map(str::to_string);
+        // Drop the claim exactly like axum drops a handler future on a proxy timeout.
+        drop(claim);
+
+        let (status, held, phase) = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            "SELECT status, attempt_token, attempt_phase FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "uploading");
+        assert_eq!(held, token);
+        assert_eq!(phase.as_deref(), Some("preprocessing"));
+
+        assert!(
+            matches!(
+                claim_manual_recovery(&config, &pool, enrollment.missing_id, None)
+                    .await
+                    .unwrap(),
+                RecoveryClaim::Rejected(RecoveryEligibility::AlreadyRunning)
+            ),
+            "a second click must join the running attempt, not start a second upload"
+        );
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_attempt WHERE missing_id = ?")
+                .bind(enrollment.missing_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    /// Stopping is not retrying. The page needs a way to release a wedged task and then decide,
+    /// instead of being forced into an immediate re-upload as the only exit from `uploading`.
+    #[tokio::test]
+    async fn stopping_an_attempt_releases_it_without_starting_another() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "stop-me.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "alia", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let outcome = stop_missing_segment_attempt(&pool, enrollment.missing_id, "test stop")
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, StopAttemptOutcome::Stopped));
+        let (status, held, next_retry) = sqlx::query_as::<
+            _,
+            (String, Option<String>, chrono::DateTime<chrono::Utc>),
+        >(
+            "SELECT status, attempt_token, next_retry_at FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(held, None);
+        assert!(
+            next_retry > chrono::Utc::now(),
+            "a stopped task must not be immediately due again; stopping is not retrying"
+        );
+        let _ = token;
+
+        assert!(matches!(
+            stop_missing_segment_attempt(&pool, enrollment.missing_id, "test stop")
+                .await
+                .unwrap(),
+            StopAttemptOutcome::NotRunning { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn v2_upload_success_commits_video_lifecycle_and_session_atomically() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "atomic-success.flv").await;
-        let token = claim_enrolled_attempt(&pool, &enrollment, "test", None)
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();
@@ -3292,8 +3981,8 @@ mod tests {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "concurrent-claim.flv").await;
         let (left, right) = tokio::join!(
-            claim_enrolled_attempt(&pool, &enrollment, "bda2", None),
-            claim_enrolled_attempt(&pool, &enrollment, "tx", None),
+            claim_enrolled_attempt(&pool, &enrollment, "bda2", LineSource::Configured),
+            claim_enrolled_attempt(&pool, &enrollment, "tx", LineSource::Configured),
         );
         let claims = [left.unwrap(), right.unwrap()];
         let tokens = claims
@@ -3315,7 +4004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_bldsa_cooldown_is_overridden_by_bda2() {
+    async fn a_cooling_configured_line_falls_back_and_says_why() {
         let (_directory, pool) = deferred_test_pool().await;
         upload_line_health::record_failure(
             &pool,
@@ -3327,39 +4016,62 @@ mod tests {
         .await
         .unwrap();
 
-        let selected = select_configured_line(&pool, &reqwest::Client::new(), "bldsa", None)
-            .await
-            .unwrap();
+        let selected =
+            decide_upload_line(&pool, &reqwest::Client::new(), "bldsa", None, None, "test")
+                .await
+                .unwrap();
+
         assert_eq!(selected.key, "bda2");
         assert_eq!(selected.line.key(), "bda2");
+        assert_eq!(selected.source, LineSource::Fallback);
+        assert!(
+            selected
+                .skip_reason()
+                .is_some_and(|reason| reason.contains("bldsa")),
+            "a silent fallback is what made the incident unreadable; the reason must be recorded"
+        );
+    }
+
+    /// The recovery path used to run off a hardcoded `bda2 -> tx -> auto` constant, so a box
+    /// configured for `alia` recovered over `bda2` no matter what.
+    #[tokio::test]
+    async fn recovery_uses_the_configured_line_rather_than_bda2() {
+        let (_directory, pool) = deferred_test_pool().await;
+
+        let selected =
+            decide_upload_line(&pool, &reqwest::Client::new(), "alia", None, None, "test")
+                .await
+                .unwrap();
+
+        assert_eq!(selected.key, "alia");
+        assert_eq!(selected.source, LineSource::Configured);
+        assert_eq!(selected.skip_reason(), None);
     }
 
     #[tokio::test]
-    async fn recovery_skips_cooling_bda2_and_selects_tx_without_bldsa() {
+    async fn a_manual_line_wins_over_configuration() {
         let (_directory, pool) = deferred_test_pool().await;
-        upload_line_health::record_failure(
+
+        let selected = decide_upload_line(
             &pool,
-            "bda2",
-            UploadFailureKind::Transport,
-            "connection reset",
-            chrono::Utc::now(),
+            &reqwest::Client::new(),
+            "alia",
+            Some("tx"),
+            None,
+            "test",
         )
         .await
         .unwrap();
 
-        let selected = select_recovery_line(&pool, &reqwest::Client::new(), 0, None)
-            .await
-            .unwrap();
         assert_eq!(selected.key, "tx");
-        assert_eq!(selected.recovery_index, Some(1));
-        assert_ne!(selected.line.key(), "bldsa");
+        assert_eq!(selected.source, LineSource::Manual);
     }
 
     #[tokio::test]
     async fn revoked_attempt_cannot_publish_delayed_success_over_new_lease() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "delayed-success.flv").await;
-        let old_token = claim_enrolled_attempt(&pool, &enrollment, "bda2", None)
+        let old_token = claim_enrolled_attempt(&pool, &enrollment, "bda2", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();
@@ -3380,7 +4092,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let new_token = claim_enrolled_attempt(&pool, &enrollment, "tx", None)
+        let new_token = claim_enrolled_attempt(&pool, &enrollment, "tx", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();
@@ -3414,7 +4126,7 @@ mod tests {
     async fn v2_session_write_failure_rolls_back_lifecycle_success() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "atomic-rollback.flv").await;
-        let token = claim_enrolled_attempt(&pool, &enrollment, "test", None)
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();
@@ -3454,11 +4166,11 @@ mod tests {
         let (directory, pool) = deferred_test_pool().await;
         let first = v2_enrollment(&pool, directory.path(), "order-0.flv").await;
         let second = v2_enrollment(&pool, directory.path(), "order-1.flv").await;
-        let first_token = claim_enrolled_attempt(&pool, &first, "test", None)
+        let first_token = claim_enrolled_attempt(&pool, &first, "test", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();
-        let second_token = claim_enrolled_attempt(&pool, &second, "test", None)
+        let second_token = claim_enrolled_attempt(&pool, &second, "test", LineSource::Configured)
             .await
             .unwrap()
             .unwrap();

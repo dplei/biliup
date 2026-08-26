@@ -204,6 +204,35 @@ impl IncidentDb {
         }
     }
 
+    /// Stamp a `streamerinfo` row with the platform's key for the broadcast it belongs to.
+    pub async fn set_live_session_key(&self, streamer_info_id: i64, key: &str) {
+        sqlx::query("UPDATE streamerinfo SET live_session_key = ?1 WHERE id = ?2")
+            .bind(key)
+            .bind(streamer_info_id)
+            .execute(&self.pool)
+            .await
+            .expect("set live session key");
+    }
+
+    /// A second `streamerinfo` row for the same room — what a process restart mid-broadcast
+    /// produces. Returns its id.
+    pub async fn insert_streamer_info(&self, live_session_key: Option<&str>) -> i64 {
+        let now = FakeClock::incident_start().now();
+        sqlx::query(
+            "INSERT INTO streamerinfo (name, url, title, date, live_cover_path, live_session_key) \
+             VALUES (?1, ?2, ?3, ?4, '', ?5)",
+        )
+        .bind("synthetic-streamer")
+        .bind("https://example.invalid/live/synthetic-room")
+        .bind("synthetic incident fixture")
+        .bind(now)
+        .bind(live_session_key)
+        .execute(&self.pool)
+        .await
+        .expect("seed restarted streamer info")
+        .last_insert_rowid()
+    }
+
     pub async fn insert_session(&self, status: &str, videos_json: &str) {
         let now = FakeClock::incident_start().now();
         sqlx::query(

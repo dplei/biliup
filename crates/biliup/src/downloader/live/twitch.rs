@@ -200,6 +200,7 @@ impl TwitchLive {
                 stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
+                live_session_key: None,
             }),
         })
     }
@@ -324,6 +325,7 @@ impl TwitchVideosLive {
                 stream_candidates: Vec::new(),
                 recording_quality: None,
                 attempt_id: None,
+                live_session_key: None,
             }),
         })
     }

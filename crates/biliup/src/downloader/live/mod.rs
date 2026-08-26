@@ -331,6 +331,16 @@ pub struct LiveStream {
     /// 一次选流/下载尝试的脱敏关联 ID；不包含 URL、Cookie 或签名参数。
     #[serde(default)]
     pub attempt_id: Option<String>,
+    /// 本场直播的平台标识（抖音为房间 id）。与 `attempt_id` 不同，它在同一场直播的多次检测
+    /// 之间保持不变，因此可以回答「进程重启后这还是同一场吗」。
+    ///
+    /// 注意 `date` 回答不了这个问题：全部平台实现填的都是 `Utc::now()`（检测时刻）而不是开播
+    /// 时间，重启后再检测就是一个新时间。
+    ///
+    /// 脱敏：只允许平台的房间/场次编号，不得含 URL、Cookie 或签名参数。拿不到时为 `None`，
+    /// 上层会退回时钟窗口判据。
+    #[serde(default)]
+    pub live_session_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +509,7 @@ mod stream_candidate_compatibility_tests {
             stream_candidates: Vec::new(),
             recording_quality: None,
             attempt_id: None,
+            live_session_key: None,
         }
     }
 

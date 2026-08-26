@@ -2,6 +2,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
 use std::str::FromStr;
 
+pub mod attempt_lease;
 pub mod audio_normalization;
 /// 平台 cookie 健康监测（检测失效并经横幅/webhook 提示）
 pub mod cookie_health;
@@ -12,12 +13,16 @@ pub mod missing_segment;
 /// 用户提供路径的安全解析（静态文件接口与后续的图片上传共用）
 pub mod path_safety;
 pub mod recovery_eligibility;
+/// 到期补传的主动扫描与后台执行（接口只 claim，上传在这里跑）
+pub mod recovery_scheduler;
 pub mod route_health;
 pub mod segment_enrollment;
 /// 上传前时间戳异常检测与修复
 pub mod timestamp_repair;
 pub mod upload;
 pub mod upload_line_health;
+/// 全仓唯一的上传线路决策（配置优先、冷却回退、auto 探测）
+pub mod upload_line_selection;
 pub mod upload_rate_gate;
 pub mod upload_session;
 /// 通用工具函数

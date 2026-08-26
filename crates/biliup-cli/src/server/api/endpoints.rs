@@ -1,11 +1,14 @@
 use crate::server::common::missing_segment::{
     MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
 };
+use crate::server::common::recovery_eligibility::RecoveryEligibility;
+use crate::server::common::recovery_scheduler::{recover_due_segments, spawn_claimed_recovery};
 use crate::server::common::upload::{
-    build_studio, manual_recover_missing_segment, rescan_local_valid_segments,
-    retry_missing_segment, submit_to_bilibili, upload,
+    RecoveryClaim, StopAttemptOutcome, build_studio, claim_manual_recovery, claim_retry_recovery,
+    rescan_local_valid_segments, stop_missing_segment_attempt, submit_to_bilibili, upload,
 };
 use crate::server::common::upload_line_health;
+use crate::server::common::upload_line_selection::{cooling_lines, plan_upload_line};
 use crate::server::common::upload_session::{
     SessionCompleteness, get_streamer_info as load_streamer_info, match_streamer_by_filename,
     missing_status_where, session_completeness,
@@ -757,6 +760,9 @@ pub struct MissingSegmentView {
     pub session_completeness: Option<SessionCompleteness>,
     pub next_line: String,
     pub line_skip_reason: Option<String>,
+    /// The full candidate sequence behind `next_line`, so the page can show what a fallback
+    /// would try next without guessing.
+    pub line_candidates: Vec<String>,
 }
 
 pub async fn get_upload_line_health(
@@ -814,33 +820,22 @@ pub async fn get_missing_uploads(
         }
     }
 
-    let cooling_lines = upload_line_health::active_cooldowns(&service_register.pool, Utc::now())
+    // The page's "next line" is the *same* decision the uploader will make, evaluated against the
+    // same cooldown snapshot. It used to be a second copy of the hardcoded `bda2 -> tx -> auto`
+    // constant, so page and reality were consistently wrong together.
+    let now = Utc::now();
+    let cooling = cooling_lines(&service_register.pool, now)
         .await
-        .map_err(report_to_response)?
-        .into_iter()
-        .map(|line| (line.line_key, line.last_failure_kind))
-        .collect::<std::collections::HashMap<_, _>>();
+        .map_err(report_to_response)?;
+    let configured_line = service_register.config.read().unwrap().lines.clone();
 
     let views = rows
         .into_iter()
         .map(|r| {
             let sess = r.upload_session_id.and_then(|id| session_map.get(&id));
-            const LINES: [&str; 3] = ["bda2", "tx", "auto"];
-            let start = r.line_index.rem_euclid(LINES.len() as i64) as usize;
-            let mut next_line = LINES[start].to_string();
-            let mut skipped = Vec::new();
-            for offset in 0..LINES.len() {
-                let candidate = LINES[(start + offset) % LINES.len()];
-                if candidate == "auto" || !cooling_lines.contains_key(candidate) {
-                    next_line = candidate.to_string();
-                    break;
-                }
-                let reason = cooling_lines
-                    .get(candidate)
-                    .and_then(|reason| reason.as_deref())
-                    .unwrap_or("cooldown");
-                skipped.push(format!("{candidate}: {reason}"));
-            }
+            let plan = plan_upload_line(&configured_line, None, &cooling, now);
+            let next_line = plan.chosen.clone();
+            let line_skip_reason = plan.skip_reason();
             MissingSegmentView {
                 session_aid: sess.and_then(|s| s.0),
                 session_bvid: sess.and_then(|s| s.1.clone()),
@@ -850,7 +845,8 @@ pub async fn get_missing_uploads(
                     .upload_session_id
                     .and_then(|id| completeness_map.get(&id).cloned()),
                 next_line,
-                line_skip_reason: (!skipped.is_empty()).then(|| skipped.join("; ")),
+                line_skip_reason,
+                line_candidates: plan.candidates,
                 segment: r,
             }
         })
@@ -858,19 +854,75 @@ pub async fn get_missing_uploads(
     Ok(Json(views))
 }
 
+/// Optional per-task line override from the recovery page. `None` (or `"auto"`) means "follow
+/// configuration"; anything else is honoured unless that line is cooling.
+#[derive(serde::Deserialize, Default)]
+pub struct RecoveryRequest {
+    #[serde(default)]
+    pub line: Option<String>,
+}
+
+/// What the page gets back the moment a recovery is accepted.
+#[derive(serde::Serialize)]
+pub struct RecoveryAccepted {
+    pub ok: bool,
+    pub missing_id: i64,
+    pub eligibility: RecoveryEligibility,
+    pub attempt_token: Option<String>,
+    pub line: Option<String>,
+    pub line_skip_reason: Option<String>,
+    pub status: &'static str,
+}
+
+/// Turn a claim into a response and hand the upload to a background task.
+///
+/// The handler used to `await` the whole upload. For a 3.32 GB segment that is guaranteed to
+/// exceed any reverse proxy's read timeout, and the resulting dropped future took the watchdog
+/// down with it, leaving the row stuck at `uploading` forever.
+fn accept_recovery(
+    service_register: &ServiceRegister,
+    config: Config,
+    missing_id: i64,
+    claim: RecoveryClaim,
+) -> Json<RecoveryAccepted> {
+    match claim {
+        RecoveryClaim::Claimed(claim) => {
+            let accepted = RecoveryAccepted {
+                ok: true,
+                missing_id: claim.missing_id(),
+                eligibility: RecoveryEligibility::Eligible,
+                attempt_token: claim.attempt_token().map(str::to_string),
+                line: claim.line_key().map(str::to_string),
+                line_skip_reason: claim.line_skip_reason(),
+                status: "uploading",
+            };
+            spawn_claimed_recovery(config, service_register.pool.clone(), claim);
+            Json(accepted)
+        }
+        RecoveryClaim::Rejected(eligibility) => Json(RecoveryAccepted {
+            ok: matches!(eligibility, RecoveryEligibility::LegacyFinalizedEdit),
+            missing_id,
+            eligibility,
+            attempt_token: None,
+            line: None,
+            line_skip_reason: None,
+            status: "rejected",
+        }),
+    }
+}
+
 pub async fn recover_missing_upload(
     State(service_register): State<ServiceRegister>,
     axum::extract::Path(id): axum::extract::Path<i64>,
-) -> Result<Json<serde_json::Value>, Response> {
+    body: Option<Json<RecoveryRequest>>,
+) -> Result<Json<RecoveryAccepted>, Response> {
     let config = service_register.config.read().unwrap().clone();
-    let eligibility = manual_recover_missing_segment(&config, &service_register.pool, id)
+    let line = body.and_then(|Json(request)| request.line);
+    let claim = claim_manual_recovery(&config, &service_register.pool, id, line.as_deref())
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    Ok(Json(serde_json::json!({
-        "ok": matches!(&eligibility, crate::server::common::recovery_eligibility::RecoveryEligibility::Eligible | crate::server::common::recovery_eligibility::RecoveryEligibility::LegacyFinalizedEdit),
-        "eligibility": eligibility,
-    })))
+    Ok(accept_recovery(&service_register, config, id, claim))
 }
 
 #[derive(serde::Deserialize)]
@@ -965,14 +1017,105 @@ pub async fn delete_missing_upload(
 pub async fn retry_missing_upload(
     State(service_register): State<ServiceRegister>,
     axum::extract::Path(id): axum::extract::Path<i64>,
-) -> Result<Json<serde_json::Value>, Response> {
+    body: Option<Json<RecoveryRequest>>,
+) -> Result<Json<RecoveryAccepted>, Response> {
     let config = service_register.config.read().unwrap().clone();
-    let eligibility = retry_missing_segment(&config, &service_register.pool, id)
+    let line = body.and_then(|Json(request)| request.line);
+    let claim = claim_retry_recovery(&config, &service_register.pool, id, line.as_deref())
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
+    Ok(accept_recovery(&service_register, config, id, claim))
+}
+
+/// Release a wedged attempt without starting another one.
+pub async fn stop_missing_upload(
+    State(service_register): State<ServiceRegister>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<StopAttemptOutcome>, Response> {
+    let outcome = stop_missing_segment_attempt(
+        &service_register.pool,
+        id,
+        "stopped from the missing-uploads page",
+    )
+    .await
+    .map_err(report_to_response)?;
+    if matches!(outcome, StopAttemptOutcome::CancelTimedOut) {
+        return Err((
+            StatusCode::CONFLICT,
+            "上一次上传尚未退出，请稍后重试；强行释放会导致同一分段被上传两次",
+        )
+            .into_response());
+    }
+    Ok(Json(outcome))
+}
+
+/// Recover everything still outstanding in one session, reusing its existing `aid`/`bvid`.
+///
+/// Deliberately distinct from `rescan`: rescan is for "the file is on disk but has no row", this
+/// is for "the row exists but nobody is running it". It never creates a submission session.
+pub async fn recover_session_uploads(
+    State(service_register): State<ServiceRegister>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let status = sqlx::query_scalar::<_, String>("SELECT status FROM upload_session WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&service_register.pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    match status.as_deref() {
+        None => return Err((StatusCode::NOT_FOUND, "upload session not found").into_response()),
+        Some("finalized") => {
+            return Err((
+                StatusCode::CONFLICT,
+                "该会话已投稿完成，不会为它创建新的补传任务",
+            )
+                .into_response());
+        }
+        Some(_) => {}
+    }
+    let config = service_register.config.read().unwrap().clone();
+    let result = recover_due_segments(&config, &service_register.pool, Some(id), Utc::now())
+        .await
+        .map_err(report_to_response)?;
     Ok(Json(serde_json::json!({
-        "ok": matches!(&eligibility, crate::server::common::recovery_eligibility::RecoveryEligibility::Eligible | crate::server::common::recovery_eligibility::RecoveryEligibility::LegacyFinalizedEdit),
-        "eligibility": eligibility,
+        "upload_session_id": id,
+        "started": result.started,
+        "skipped": result.skipped,
+        "busy": !result.busy_sessions.is_empty(),
     })))
+}
+
+/// One historical attempt on a lifecycle row, newest first.
+#[derive(serde::Serialize, sqlx::FromRow)]
+pub struct AttemptHistoryView {
+    pub id: i64,
+    pub missing_id: i64,
+    pub line_key: Option<String>,
+    pub line_source: Option<String>,
+    pub started_at: chrono::DateTime<Utc>,
+    pub ended_at: Option<chrono::DateTime<Utc>>,
+    pub phase_reached: Option<String>,
+    pub outcome: Option<String>,
+    pub uploaded_bytes: i64,
+    pub last_chunk_index: Option<i64>,
+    pub error: Option<String>,
+}
+
+pub async fn get_missing_upload_attempts(
+    State(service_register): State<ServiceRegister>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<Vec<AttemptHistoryView>>, Response> {
+    let rows = sqlx::query_as::<_, AttemptHistoryView>(
+        "SELECT id, missing_id, line_key, line_source, started_at, ended_at, phase_reached, \
+                outcome, uploaded_bytes, last_chunk_index, error \
+         FROM upload_attempt WHERE missing_id = ? ORDER BY id DESC",
+    )
+    .bind(id)
+    .fetch_all(&service_register.pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    Ok(Json(rows))
 }

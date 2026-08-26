@@ -159,6 +159,7 @@ pub fn streamer_info(stream: &LiveStream) -> StreamerInfo {
         stream.date,
         &stream.live_cover_url,
     )
+    .with_live_session_key(stream.live_session_key.clone())
 }
 
 pub fn downloader_runtime(

@@ -338,43 +338,88 @@ async fn existing_enrollment(
     }))
 }
 
+/// The live-session key of the `streamerinfo` row this enrollment belongs to.
+///
+/// Read inside the enrollment transaction rather than passed in, so every caller (recording,
+/// rescan, outbox import) gets the same identity without having to plumb it.
+async fn live_session_key_of(
+    tx: &mut Transaction<'_, Sqlite>,
+    streamer_info_id: i64,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT live_session_key FROM streamerinfo WHERE id = ?",
+    )
+    .bind(streamer_info_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map(Option::flatten)
+}
+
+/// A session that is closed for submit cannot accept more segments; the caller defers instead.
+fn reject_if_claimed(claim_token: Option<String>) -> Result<(), sqlx::Error> {
+    if claim_token.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "upload session is closed for submit; enrollment deferred".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Find the session this segment belongs to, or create it.
+///
+/// Three matches, in decreasing confidence:
+///
+/// 1. the exact `streamerinfo` row this segment was recorded under;
+/// 2. the same **live session key** — the platform's own id for this broadcast. This is what
+///    survives a restart: `monitor` reuses the `streamerinfo` row for a known key, but if it had
+///    to create a new one, the key still ties the two together;
+/// 3. a clock window, kept only as the fallback for platforms that give us no key.
+///
+/// The window used to be the only continuation path, and it was measured from `updated_at`, which
+/// nothing touched during recording or uploading. A single hour-long segment therefore aged its
+/// own live session out of the window — which is how one live stream ended up split across two
+/// sessions and two archives.
 async fn find_or_create_session(
     tx: &mut Transaction<'_, Sqlite>,
     request: &EnrollmentRequest,
 ) -> Result<i64, sqlx::Error> {
-    if let Some((id, claim_token)) = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT id, submit_claim_token FROM upload_session \
-         WHERE live_streamer_id = ?1 AND streamer_info_id = ?2 AND status != 'finalized' \
-         ORDER BY updated_at DESC, id DESC LIMIT 1",
-    )
-    .bind(request.live_streamer_id)
-    .bind(request.streamer_info_id)
-    .fetch_optional(&mut **tx)
-    .await?
+    if let Some((id, claim_token, updated_at)) =
+        sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>)>(
+            "SELECT id, submit_claim_token, updated_at FROM upload_session \
+             WHERE live_streamer_id = ?1 AND streamer_info_id = ?2 AND status != 'finalized' \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(request.live_streamer_id)
+        .bind(request.streamer_info_id)
+        .fetch_optional(&mut **tx)
+        .await?
     {
-        if claim_token.is_some() {
-            return Err(sqlx::Error::Protocol(
-                "upload session is closed for submit; enrollment deferred".to_string(),
-            ));
+        reject_if_claimed(claim_token)?;
+        // Enrolling a segment proves the session is alive, even when nothing else writes to it.
+        // Only issued when the timestamp is actually stale: in SQLite even a zero-row UPDATE
+        // takes a write lock, and this is the recorder's hottest transaction.
+        if request.now - updated_at >= chrono::Duration::seconds(60) {
+            sqlx::query("UPDATE upload_session SET updated_at = ?1 WHERE id = ?2")
+                .bind(request.now)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
         }
         return Ok(id);
     }
-    let cutoff = request.now - chrono::Duration::minutes(request.recovery_window_minutes);
-    if let Some((id, claim_token)) = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT id, submit_claim_token FROM upload_session \
-         WHERE live_streamer_id = ?1 AND status != 'finalized' AND updated_at >= ?2 \
-         ORDER BY updated_at DESC, id DESC LIMIT 1",
-    )
-    .bind(request.live_streamer_id)
-    .bind(cutoff)
-    .fetch_optional(&mut **tx)
-    .await?
+    let session_key = live_session_key_of(tx, request.streamer_info_id).await?;
+    if let Some(session_key) = session_key.as_deref()
+        && let Some((id, claim_token)) = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, submit_claim_token FROM upload_session \
+             WHERE live_streamer_id = ?1 AND live_session_key = ?2 AND status != 'finalized' \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(request.live_streamer_id)
+        .bind(session_key)
+        .fetch_optional(&mut **tx)
+        .await?
     {
-        if claim_token.is_some() {
-            return Err(sqlx::Error::Protocol(
-                "upload session is closed for submit; enrollment deferred".to_string(),
-            ));
-        }
+        reject_if_claimed(claim_token)?;
         sqlx::query(
             "UPDATE upload_session SET streamer_info_id = ?1, updated_at = ?2 WHERE id = ?3",
         )
@@ -384,6 +429,42 @@ async fn find_or_create_session(
         .execute(&mut **tx)
         .await?;
         return Ok(id);
+    }
+    let cutoff = request.now - chrono::Duration::minutes(request.recovery_window_minutes);
+    if let Some((id, claim_token, existing_key)) =
+        sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
+            "SELECT id, submit_claim_token, live_session_key FROM upload_session \
+             WHERE live_streamer_id = ?1 AND status != 'finalized' AND updated_at >= ?2 \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(request.live_streamer_id)
+        .bind(cutoff)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        // Two different keys mean two different broadcasts. Merging them because they happen to
+        // be close in time is the one failure worse than splitting one broadcast in two, so the
+        // window is only allowed to match when at least one side has no key to contradict it.
+        let keys_conflict = matches!(
+            (session_key.as_deref(), existing_key.as_deref()),
+            (Some(incoming), Some(existing)) if incoming != existing
+        );
+        if !keys_conflict {
+            reject_if_claimed(claim_token)?;
+            sqlx::query(
+                "UPDATE upload_session \
+                 SET streamer_info_id = ?1, updated_at = ?2, \
+                     live_session_key = COALESCE(live_session_key, ?3) \
+                 WHERE id = ?4",
+            )
+            .bind(request.streamer_info_id)
+            .bind(request.now)
+            .bind(session_key.as_deref())
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+            return Ok(id);
+        }
     }
     // Keep the finalized boundary inside the enrollment transaction as well. The public
     // preflight above gives callers a useful outcome; this closes its check/insert race.
@@ -404,12 +485,13 @@ async fn find_or_create_session(
     let result = sqlx::query(
         "INSERT INTO upload_session \
          (live_streamer_id, streamer_info_id, aid, bvid, videos_json, status, created_at, updated_at, \
-          submit_attempts, last_submit_at, last_submit_error, submit_state) \
-         VALUES (?1, ?2, NULL, NULL, '[]', 'uploading', ?3, ?3, 0, NULL, NULL, NULL)",
+          submit_attempts, last_submit_at, last_submit_error, submit_state, live_session_key) \
+         VALUES (?1, ?2, NULL, NULL, '[]', 'uploading', ?3, ?3, 0, NULL, NULL, NULL, ?4)",
     )
     .bind(request.live_streamer_id)
     .bind(request.streamer_info_id)
     .bind(request.now)
+    .bind(session_key)
     .execute(&mut **tx)
     .await?;
     Ok(result.last_insert_rowid())
