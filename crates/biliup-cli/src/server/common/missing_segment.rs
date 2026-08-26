@@ -6,7 +6,9 @@ use biliup::bilibili::{Studio, Video};
 use chrono::{DateTime, Utc};
 use error_stack::ResultExt;
 use std::path::Path;
-use tracing::info;
+use tracing::{error, info};
+
+const STALE_ATTEMPT_AFTER: chrono::Duration = chrono::Duration::minutes(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryUploadLine {
@@ -93,6 +95,44 @@ pub fn reset_for_manual_retry(row: &mut UploadMissingSegment, now: DateTime<Utc>
     row.last_error = Some("manual retry requested from uploading state".to_string());
     row.next_retry_at = now;
     row.updated_at = now;
+}
+
+/// Converge leases left by a crashed process (and any attempt whose in-process watchdog failed
+/// to run) using the same token-CAS transition as normal attempt failure.
+pub async fn recover_stale_upload_attempts(
+    pool: &ConnectionPool,
+    now: DateTime<Utc>,
+) -> AppResult<u64> {
+    let cutoff = now - STALE_ATTEMPT_AFTER;
+    let result = sqlx::query(
+        "UPDATE upload_missing_segment \
+         SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
+             next_retry_at = ?1, last_error = 'stale_uploading_lease', attempt_token = NULL, \
+             current_line = NULL, updated_at = ?1 \
+         WHERE lifecycle_version = 2 AND status = 'uploading' \
+           AND COALESCE(last_progress_at, upload_started_at, updated_at) <= ?2",
+    )
+    .bind(now)
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(result.rows_affected())
+}
+
+pub fn start_stale_attempt_recovery(pool: ConnectionPool) {
+    tokio::spawn(async move {
+        loop {
+            match recover_stale_upload_attempts(&pool, Utc::now()).await {
+                Ok(recovered) if recovered > 0 => {
+                    info!(recovered, "recovered stale upload attempt leases");
+                }
+                Ok(_) => {}
+                Err(error) => error!(?error, "failed to recover stale upload attempt leases"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 #[derive(Debug)]
@@ -483,6 +523,59 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_uploading_lease_waits_five_minutes_and_converges_once() {
+        let (_dir, pool) = test_pool().await;
+        let started = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap();
+        let id = insert_missing_row_with_status(&pool, "uploading", "/tmp/stale.flv").await;
+        sqlx::query(
+            "UPDATE upload_missing_segment \
+             SET lifecycle_version = 2, attempts = 2, line_index = 1, attempt_token = 'lease-a', \
+                 upload_started_at = ?1, last_progress_at = ?1, updated_at = ?1 WHERE id = ?2",
+        )
+        .bind(started)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            recover_stale_upload_attempts(
+                &pool,
+                started + chrono::Duration::minutes(4) + chrono::Duration::seconds(59)
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            recover_stale_upload_attempts(&pool, started + chrono::Duration::minutes(5))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            recover_stale_upload_attempts(&pool, started + chrono::Duration::minutes(6))
+                .await
+                .unwrap(),
+            0,
+            "the already-converged lease must not increment twice"
+        );
+
+        let state = sqlx::query_as::<_, (String, i64, i64, Option<String>, String)>(
+            "SELECT status, attempts, line_index, attempt_token, last_error \
+             FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "failed");
+        assert_eq!((state.1, state.2), (3, 2));
+        assert_eq!(state.3, None);
+        assert_eq!(state.4, "stale_uploading_lease");
     }
 
     #[tokio::test]

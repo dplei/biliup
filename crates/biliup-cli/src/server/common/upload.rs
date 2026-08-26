@@ -9,8 +9,7 @@ use crate::server::common::cover_generator::{
 };
 use crate::server::common::missing_segment::{
     due_missing_segments_for_session, enqueue_pending_segment, mark_retry_failure,
-    mark_retry_success, next_missing_segment_order, patch_studio_videos, reset_for_manual_retry,
-    upload_line_for_recovery,
+    mark_retry_success, next_missing_segment_order, patch_studio_videos, upload_line_for_recovery,
 };
 use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
@@ -40,20 +39,25 @@ use biliup::bilibili::{BiliBili, ResponseData, Studio, Video};
 use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
+use biliup::uploader::line::UploadProgress;
 use biliup::uploader::line::{Line, Probe};
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, line};
 use error_stack::ResultExt;
 use futures::StreamExt;
 use ormlite::Model;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use struct_patch::Patch;
 use tokio::pin;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::{error, info, warn};
 
@@ -68,6 +72,88 @@ struct UploadContext {
 }
 
 static GLOBAL_UPLOAD_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
+
+const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const TOTAL_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+const PROGRESS_PERSIST_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+struct AttemptRegistration {
+    attempt_token: String,
+    cancellation: CancellationToken,
+    completion: Arc<AttemptCompletion>,
+}
+
+#[derive(Default)]
+struct AttemptCompletion {
+    done: AtomicBool,
+    notify: Notify,
+}
+
+impl AttemptCompletion {
+    async fn wait(&self) {
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+static ATTEMPT_REGISTRY: OnceLock<Mutex<HashMap<i64, AttemptRegistration>>> = OnceLock::new();
+
+fn attempt_registry() -> &'static Mutex<HashMap<i64, AttemptRegistration>> {
+    ATTEMPT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct AttemptGuard {
+    missing_id: i64,
+    attempt_token: String,
+    completion: Arc<AttemptCompletion>,
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        let mut registry = attempt_registry()
+            .lock()
+            .expect("attempt registry poisoned");
+        if registry
+            .get(&self.missing_id)
+            .is_some_and(|entry| entry.attempt_token == self.attempt_token)
+        {
+            registry.remove(&self.missing_id);
+        }
+        self.completion.done.store(true, Ordering::Release);
+        self.completion.notify.notify_waiters();
+    }
+}
+
+fn register_attempt(missing_id: i64, attempt_token: &str) -> (AttemptGuard, CancellationToken) {
+    let cancellation = CancellationToken::new();
+    let completion = Arc::new(AttemptCompletion::default());
+    let registration = AttemptRegistration {
+        attempt_token: attempt_token.to_string(),
+        cancellation: cancellation.clone(),
+        completion: completion.clone(),
+    };
+    attempt_registry()
+        .lock()
+        .expect("attempt registry poisoned")
+        .insert(missing_id, registration);
+    (
+        AttemptGuard {
+            missing_id,
+            attempt_token: attempt_token.to_string(),
+            completion,
+        },
+        cancellation,
+    )
+}
 
 async fn acquire_global_upload_permit() -> OwnedSemaphorePermit {
     GLOBAL_UPLOAD_SEMAPHORE
@@ -508,19 +594,38 @@ async fn submit_session(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptClaim {
+    Claimed(String),
+    AlreadyRunning,
+    AlreadyCompleted,
+    NotDue,
+    NotClaimable(String),
+}
+
+#[cfg(test)]
+impl AttemptClaim {
+    fn unwrap(self) -> String {
+        match self {
+            Self::Claimed(token) => token,
+            other => panic!("expected claimed attempt, got {other:?}"),
+        }
+    }
+}
+
 async fn claim_enrolled_attempt(
     pool: &ConnectionPool,
     enrollment: &SegmentEnrollment,
     line: &str,
-) -> AppResult<Option<String>> {
-    let token = format!("{:032x}", rand::random::<u128>());
+) -> AppResult<AttemptClaim> {
+    let token = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let result = sqlx::query(
         "UPDATE upload_missing_segment \
          SET status = 'uploading', attempt_token = ?1, current_line = ?2, \
              upload_started_at = ?3, last_progress_at = ?3, uploaded_bytes = 0, updated_at = ?3 \
          WHERE id = ?4 AND lifecycle_version = 2 AND status IN ('pending', 'failed') \
-           AND attempt_token IS NULL",
+           AND next_retry_at <= ?3 AND attempt_token IS NULL",
     )
     .bind(&token)
     .bind(line)
@@ -529,7 +634,27 @@ async fn claim_enrolled_attempt(
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
-    Ok((result.rows_affected() == 1).then_some(token))
+    if result.rows_affected() == 1 {
+        return Ok(AttemptClaim::Claimed(token));
+    }
+    let state = sqlx::query_as::<_, (String, Option<String>, chrono::DateTime<chrono::Utc>)>(
+        "SELECT status, attempt_token, next_retry_at FROM upload_missing_segment WHERE id = ?",
+    )
+    .bind(enrollment.missing_id)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(match state {
+        Some((status, token, _)) if status == "uploading" || token.is_some() => {
+            AttemptClaim::AlreadyRunning
+        }
+        Some((status, _, _)) if status == "succeeded" => AttemptClaim::AlreadyCompleted,
+        Some((status, _, due)) if matches!(status.as_str(), "pending" | "failed") && due > now => {
+            AttemptClaim::NotDue
+        }
+        Some((status, _, _)) => AttemptClaim::NotClaimable(status),
+        None => AttemptClaim::NotClaimable("not_found".to_string()),
+    })
 }
 
 async fn fail_enrolled_attempt(
@@ -538,13 +663,14 @@ async fn fail_enrolled_attempt(
     attempt_token: &str,
     error: String,
     now: chrono::DateTime<chrono::Utc>,
-) -> AppResult<()> {
-    sqlx::query(
+) -> AppResult<bool> {
+    let updated = sqlx::query(
         "UPDATE upload_missing_segment \
          SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
              next_retry_at = ?1, last_error = ?2, attempt_token = NULL, current_line = NULL, \
              updated_at = ?3 \
-         WHERE id = ?4 AND lifecycle_version = 2 AND attempt_token = ?5",
+         WHERE id = ?4 AND lifecycle_version = 2 AND status = 'uploading' \
+           AND attempt_token = ?5",
     )
     .bind(now + chrono::Duration::minutes(10))
     .bind(error)
@@ -554,7 +680,7 @@ async fn fail_enrolled_attempt(
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
-    Ok(())
+    Ok(updated.rows_affected() == 1)
 }
 
 /// Commit the remote Video, lifecycle success and session ordering atomically. The lifecycle row
@@ -833,7 +959,12 @@ async fn pipeline_upload_videos(
         );
         maybe_capture_reference_sample(&original_path, &sample_store).await;
 
-        let Some(attempt_token) = claim_enrolled_attempt(ctx.pool(), &enrollment, "live").await?
+        let AttemptClaim::Claimed(attempt_token) = claim_enrolled_attempt(
+            ctx.pool(),
+            &enrollment,
+            &format!("{:?}", upload_context.line),
+        )
+        .await?
         else {
             info!(
                 missing_id = enrollment.missing_id,
@@ -844,16 +975,19 @@ async fn pipeline_upload_videos(
 
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        match upload_single_file_with_repair(
+        match upload_enrolled_with_watchdog(
             &original_path,
             upload_context,
             repair_enabled,
             effective_config.audio_normalization_enabled,
             effective_config.effective_audio_target_lufs(),
+            ctx.pool(),
+            enrollment.missing_id,
+            &attempt_token,
         )
         .await
         {
-            Ok((video, outcome, _normalization_artifact)) => {
+            Ok((video, outcome, _normalization_artifact, _attempt_guard)) => {
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
                 if let Err(e) =
                     persist_segment(ctx.pool(), &mut archive, video, &enrollment, &attempt_token)
@@ -925,6 +1059,7 @@ async fn upload_single_file_with_repair(
     repair_enabled: bool,
     normalization_enabled: bool,
     target_lufs: f64,
+    progress_tx: Option<mpsc::UnboundedSender<UploadProgress>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
     let normalization = if normalization_enabled {
         normalize_for_upload(original_path, target_lufs, &SystemAudioFfmpeg::default()).await
@@ -958,7 +1093,7 @@ async fn upload_single_file_with_repair(
     let result = {
         // CPU/磁盘处理不占网络上传 permit。
         let _permit = acquire_global_upload_permit().await;
-        upload_single_file(&upload_path, context).await
+        upload_single_file(&upload_path, context, progress_tx).await
     };
     match result {
         Ok(video) => Ok((video, outcome, normalization_artifact)),
@@ -974,7 +1109,11 @@ async fn upload_single_file_with_repair(
     }
 }
 
-async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppResult<Video> {
+async fn upload_single_file(
+    file_path: &Path,
+    context: &UploadContext,
+    progress_tx: Option<mpsc::UnboundedSender<UploadProgress>>,
+) -> AppResult<Video> {
     let video_path = file_path;
     let UploadContext {
         bilibili,
@@ -1017,13 +1156,22 @@ async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppRes
     let instant = Instant::now();
 
     let video = uploader
-        .upload(client.clone(), *limit, |vs| {
-            vs.map(|vs| {
-                let chunk = vs?;
-                let len = chunk.len();
-                Ok((chunk, len))
-            })
-        })
+        .upload_with_observer(
+            client.clone(),
+            *limit,
+            |vs| {
+                vs.map(|vs| {
+                    let chunk = vs?;
+                    let len = chunk.len();
+                    Ok((chunk, len))
+                })
+            },
+            move |progress| {
+                if let Some(tx) = &progress_tx {
+                    let _ = tx.send(progress);
+                }
+            },
+        )
         .await
         .change_context(AppError::Unknown)?;
     let t = instant.elapsed().as_millis();
@@ -1033,6 +1181,184 @@ async fn upload_single_file(file_path: &Path, context: &UploadContext) -> AppRes
         total_size as f64 / 1000. / t as f64
     );
     Ok(video)
+}
+
+async fn persist_attempt_progress(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+    progress: UploadProgress,
+) -> AppResult<bool> {
+    let uploaded_bytes = i64::try_from(progress.uploaded_bytes).unwrap_or(i64::MAX);
+    let total_bytes = i64::try_from(progress.total_bytes).unwrap_or(i64::MAX);
+    let now = chrono::Utc::now();
+    let updated = sqlx::query(
+        "UPDATE upload_missing_segment \
+         SET uploaded_bytes = ?1, total_bytes = ?2, last_progress_at = ?3, updated_at = ?3 \
+         WHERE id = ?4 AND lifecycle_version = 2 AND status = 'uploading' \
+           AND attempt_token = ?5",
+    )
+    .bind(uploaded_bytes)
+    .bind(total_bytes)
+    .bind(now)
+    .bind(missing_id)
+    .bind(attempt_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(updated.rows_affected() == 1)
+}
+
+enum AttemptEvent<T> {
+    Completed(T),
+    Cancelled,
+    NoProgressTimeout,
+    TotalUploadTimeout,
+    Progress(UploadProgress),
+    ProgressClosed,
+}
+
+async fn next_attempt_event<F>(
+    mut upload: Pin<&mut F>,
+    cancellation: &CancellationToken,
+    mut no_progress: Pin<&mut tokio::time::Sleep>,
+    mut total: Pin<&mut tokio::time::Sleep>,
+    progress_rx: &mut mpsc::UnboundedReceiver<UploadProgress>,
+    progress_open: bool,
+) -> AttemptEvent<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        result = &mut upload => AttemptEvent::Completed(result),
+        _ = cancellation.cancelled() => AttemptEvent::Cancelled,
+        _ = &mut no_progress => AttemptEvent::NoProgressTimeout,
+        _ = &mut total => AttemptEvent::TotalUploadTimeout,
+        progress = progress_rx.recv(), if progress_open => match progress {
+            Some(progress) => AttemptEvent::Progress(progress),
+            None => AttemptEvent::ProgressClosed,
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_enrolled_with_watchdog(
+    original_path: &Path,
+    context: &UploadContext,
+    repair_enabled: bool,
+    normalization_enabled: bool,
+    target_lufs: f64,
+    pool: &ConnectionPool,
+    missing_id: i64,
+    attempt_token: &str,
+) -> AppResult<(
+    Video,
+    RepairOutcome,
+    Option<TempArtifact>,
+    Option<AttemptGuard>,
+)> {
+    let (guard, cancellation) = register_attempt(missing_id, attempt_token);
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let upload = upload_single_file_with_repair(
+        original_path,
+        context,
+        repair_enabled,
+        normalization_enabled,
+        target_lufs,
+        Some(progress_tx),
+    );
+    pin!(upload);
+
+    let no_progress = tokio::time::sleep(NO_PROGRESS_TIMEOUT);
+    let total = tokio::time::sleep(TOTAL_UPLOAD_TIMEOUT);
+    pin!(no_progress);
+    pin!(total);
+    let mut last_persist = Instant::now();
+    let mut persisted_bytes = 0u64;
+    let mut progress_open = true;
+
+    loop {
+        match next_attempt_event(
+            upload.as_mut(),
+            &cancellation,
+            no_progress.as_mut(),
+            total.as_mut(),
+            &mut progress_rx,
+            progress_open,
+        )
+        .await
+        {
+            AttemptEvent::Completed(result) => {
+                return result
+                    .map(|(video, outcome, artifact)| (video, outcome, artifact, Some(guard)));
+            }
+            AttemptEvent::Cancelled => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "upload attempt cancelled by manual retry".to_string(),
+                )));
+            }
+            AttemptEvent::NoProgressTimeout => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "no_progress_timeout".to_string(),
+                )));
+            }
+            AttemptEvent::TotalUploadTimeout => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "total_upload_timeout".to_string(),
+                )));
+            }
+            AttemptEvent::ProgressClosed => progress_open = false,
+            AttemptEvent::Progress(progress) => {
+                no_progress
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + NO_PROGRESS_TIMEOUT);
+                let should_persist = persisted_bytes == 0
+                    || progress.uploaded_bytes.saturating_sub(persisted_bytes)
+                        >= PROGRESS_PERSIST_BYTES
+                    || last_persist.elapsed() >= PROGRESS_PERSIST_INTERVAL;
+                if should_persist
+                    && persist_attempt_progress(pool, missing_id, attempt_token, progress).await?
+                {
+                    persisted_bytes = progress.uploaded_bytes;
+                    last_persist = Instant::now();
+                    info!(
+                        missing_id,
+                        chunk = progress.chunk_index,
+                        uploaded_bytes = progress.uploaded_bytes,
+                        total_bytes = progress.total_bytes,
+                        "upload chunk acknowledged"
+                    );
+                }
+            }
+        }
+    }
+}
+
+enum CancelAttemptResult {
+    Exited,
+    TimedOut,
+    NotRegistered,
+}
+
+async fn cancel_registered_attempt(missing_id: i64, attempt_token: &str) -> CancelAttemptResult {
+    let registration = attempt_registry()
+        .lock()
+        .expect("attempt registry poisoned")
+        .get(&missing_id)
+        .filter(|entry| entry.attempt_token == attempt_token)
+        .cloned();
+    let Some(registration) = registration else {
+        return CancelAttemptResult::NotRegistered;
+    };
+    registration.cancellation.cancel();
+    if tokio::time::timeout(CANCEL_WAIT_TIMEOUT, registration.completion.wait())
+        .await
+        .is_ok()
+    {
+        CancelAttemptResult::Exited
+    } else {
+        CancelAttemptResult::TimedOut
+    }
 }
 
 async fn recover_due_missing_segments(
@@ -1065,7 +1391,9 @@ async fn recover_due_missing_segments(
         });
         let attempt_token = if let Some(enrollment) = &v2_enrollment {
             let line = format!("recovery-{line_index}");
-            let Some(token) = claim_enrolled_attempt(ctx.pool(), enrollment, &line).await? else {
+            let AttemptClaim::Claimed(token) =
+                claim_enrolled_attempt(ctx.pool(), enrollment, &line).await?
+            else {
                 continue;
             };
             Some(token)
@@ -1112,17 +1440,33 @@ async fn recover_due_missing_segments(
         let path = PathBuf::from(&file_path);
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let result = upload_single_file_with_repair(
-            &path,
-            &recovery_context,
-            repair_enabled,
-            effective_config.audio_normalization_enabled,
-            effective_config.effective_audio_target_lufs(),
-        )
-        .await;
+        let result = if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
+            upload_enrolled_with_watchdog(
+                &path,
+                &recovery_context,
+                repair_enabled,
+                effective_config.audio_normalization_enabled,
+                effective_config.effective_audio_target_lufs(),
+                ctx.pool(),
+                enrollment.missing_id,
+                token,
+            )
+            .await
+        } else {
+            upload_single_file_with_repair(
+                &path,
+                &recovery_context,
+                repair_enabled,
+                effective_config.audio_normalization_enabled,
+                effective_config.effective_audio_target_lufs(),
+                None,
+            )
+            .await
+            .map(|(video, outcome, artifact)| (video, outcome, artifact, None))
+        };
 
         match result {
-            Ok((video, outcome, _normalization_artifact)) => {
+            Ok((video, outcome, _normalization_artifact, _attempt_guard)) => {
                 if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
                     persist_segment(ctx.pool(), archive, video, enrollment, token).await?;
                 } else {
@@ -1709,6 +2053,18 @@ pub async fn manual_recover_missing_segment(
         .change_context(AppError::Unknown)?;
 
     let claim_now = chrono::Utc::now();
+    if row.lifecycle_version == 2 && matches!(row.status.as_str(), "pending" | "failed") {
+        sqlx::query(
+            "UPDATE upload_missing_segment SET next_retry_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status IN ('pending', 'failed') AND attempt_token IS NULL",
+        )
+        .bind(claim_now)
+        .bind(missing_id)
+        .execute(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+        row.next_retry_at = claim_now;
+    }
     let v2_enrollment = if row.lifecycle_version == 2 {
         let Some(session_id) = row.upload_session_id else {
             return Err(error_stack::Report::new(AppError::Custom(
@@ -1734,8 +2090,34 @@ pub async fn manual_recover_missing_segment(
         None
     };
     let attempt_token = if let Some(enrollment) = &v2_enrollment {
-        let Some(token) = claim_enrolled_attempt(pool, enrollment, "manual").await? else {
-            return Ok(());
+        let line_label = match upload_line_for_recovery(row.line_index) {
+            Some(UploadLine::Bda2) => "bda2",
+            Some(UploadLine::Tx) => "tx",
+            Some(UploadLine::Bldsa) => "bldsa",
+            _ => "auto",
+        };
+        let token = match claim_enrolled_attempt(pool, enrollment, line_label).await? {
+            AttemptClaim::Claimed(token) => token,
+            AttemptClaim::AlreadyRunning => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "missing segment already has a running upload attempt".to_string(),
+                )));
+            }
+            AttemptClaim::AlreadyCompleted => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "missing segment upload is already completed".to_string(),
+                )));
+            }
+            AttemptClaim::NotDue => {
+                return Err(error_stack::Report::new(AppError::Custom(
+                    "missing segment retry is not due yet".to_string(),
+                )));
+            }
+            AttemptClaim::NotClaimable(status) => {
+                return Err(error_stack::Report::new(AppError::Custom(format!(
+                    "missing segment status '{status}' cannot be claimed"
+                ))));
+            }
         };
         Some(token)
     } else {
@@ -1782,23 +2164,56 @@ pub async fn manual_recover_missing_segment(
         if let Some(override_config) = live_streamer.override_cfg.clone() {
             effective_config.apply(override_config);
         }
-        let upload_context = initialize_upload_context(
+        let mut upload_context = initialize_upload_context(
             &effective_config,
             &StatelessClient::default(),
             &upload_config,
             pool,
         )
         .await?;
+        if v2_enrollment.is_some() {
+            upload_context.line = match upload_line_for_recovery(row.line_index) {
+                Some(line) => {
+                    let line_name = match line {
+                        UploadLine::Bda2 => "bda2",
+                        UploadLine::Tx => "tx",
+                        UploadLine::Bldsa => "bldsa",
+                        _ => "auto",
+                    };
+                    get_upload_line(&upload_context.client.client, line_name).await?
+                }
+                None => Probe::probe(&upload_context.client.client)
+                    .await
+                    .change_context(AppError::Unknown)?,
+            };
+        }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let (video, outcome, _normalization_artifact) = upload_single_file_with_repair(
-            &path,
-            &upload_context,
-            repair_enabled,
-            effective_config.audio_normalization_enabled,
-            effective_config.effective_audio_target_lufs(),
-        )
-        .await?;
+        let (video, outcome, _normalization_artifact, _attempt_guard) =
+            if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
+                upload_enrolled_with_watchdog(
+                    &path,
+                    &upload_context,
+                    repair_enabled,
+                    effective_config.audio_normalization_enabled,
+                    effective_config.effective_audio_target_lufs(),
+                    pool,
+                    enrollment.missing_id,
+                    token,
+                )
+                .await?
+            } else {
+                upload_single_file_with_repair(
+                    &path,
+                    &upload_context,
+                    repair_enabled,
+                    effective_config.audio_normalization_enabled,
+                    effective_config.effective_audio_target_lufs(),
+                    None,
+                )
+                .await
+                .map(|(video, outcome, artifact)| (video, outcome, artifact, None))?
+            };
         match &outcome {
             RepairOutcome::Repaired(fixed) => {
                 let _ = tokio::fs::remove_file(fixed).await;
@@ -1942,7 +2357,7 @@ pub async fn retry_missing_segment(
     pool: &ConnectionPool,
     missing_id: i64,
 ) -> AppResult<()> {
-    let mut row = UploadMissingSegment::select()
+    let row = UploadMissingSegment::select()
         .where_("id = ?")
         .bind(missing_id)
         .fetch_one(pool)
@@ -1950,15 +2365,45 @@ pub async fn retry_missing_segment(
         .change_context(AppError::Unknown)?;
 
     if row.status == "succeeded" {
-        return Ok(());
+        return Err(error_stack::Report::new(AppError::Custom(
+            "missing segment upload is already completed".to_string(),
+        )));
     }
 
     if row.status == "uploading" {
         let now = chrono::Utc::now();
-        reset_for_manual_retry(&mut row, now);
-        row.update_all_fields(pool)
-            .await
-            .change_context(AppError::Unknown)?;
+        let token = row.attempt_token.as_deref().ok_or_else(|| {
+            error_stack::Report::new(AppError::Custom(
+                "uploading missing segment has no attempt token".to_string(),
+            ))
+        })?;
+        let cancellation = cancel_registered_attempt(missing_id, token).await;
+        if matches!(cancellation, CancelAttemptResult::TimedOut) {
+            return Err(error_stack::Report::new(AppError::Custom(
+                "previous upload attempt did not exit within cancellation wait limit".to_string(),
+            )));
+        }
+        let _ = fail_enrolled_attempt(
+            pool,
+            missing_id,
+            token,
+            if matches!(cancellation, CancelAttemptResult::Exited) {
+                "manual retry cancelled previous attempt".to_string()
+            } else {
+                "manual retry revoked stale attempt from a previous process".to_string()
+            },
+            now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE upload_missing_segment SET next_retry_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status = 'failed' AND attempt_token IS NULL",
+        )
+        .bind(now)
+        .bind(missing_id)
+        .execute(pool)
+        .await
+        .change_context(AppError::Unknown)?;
     }
 
     manual_recover_missing_segment(config, pool, missing_id).await
@@ -2053,6 +2498,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_waits_until_the_full_no_progress_deadline() {
+        assert_eq!(NO_PROGRESS_TIMEOUT, Duration::from_secs(5 * 60));
+        let upload = std::future::pending::<()>();
+        pin!(upload);
+        let cancellation = CancellationToken::new();
+        let no_progress = tokio::time::sleep(Duration::from_millis(80));
+        let total = tokio::time::sleep(Duration::from_secs(1));
+        pin!(no_progress);
+        pin!(total);
+        let (_progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(60),
+                next_attempt_event(
+                    upload.as_mut(),
+                    &cancellation,
+                    no_progress.as_mut(),
+                    total.as_mut(),
+                    &mut progress_rx,
+                    true,
+                ),
+            )
+            .await
+            .is_err(),
+            "an attempt must still be alive immediately before its deadline"
+        );
+        assert!(matches!(
+            next_attempt_event(
+                upload.as_mut(),
+                &cancellation,
+                no_progress.as_mut(),
+                total.as_mut(),
+                &mut progress_rx,
+                true,
+            )
+            .await,
+            AttemptEvent::NoProgressTimeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn progress_extends_idle_deadline_but_not_total_deadline() {
+        assert_eq!(TOTAL_UPLOAD_TIMEOUT, Duration::from_secs(2 * 60 * 60));
+        let upload = std::future::pending::<()>();
+        pin!(upload);
+        let cancellation = CancellationToken::new();
+        let no_progress_duration = Duration::from_millis(100);
+        let no_progress = tokio::time::sleep(no_progress_duration);
+        let total = tokio::time::sleep(Duration::from_millis(260));
+        pin!(no_progress);
+        pin!(total);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let sender = tokio::spawn(async move {
+            for chunk_index in 0..20 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if progress_tx
+                    .send(UploadProgress {
+                        chunk_bytes: 1024,
+                        uploaded_bytes: (chunk_index + 1) * 1024,
+                        total_bytes: 100 * 1024,
+                        chunk_index: chunk_index as usize,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        loop {
+            match next_attempt_event(
+                upload.as_mut(),
+                &cancellation,
+                no_progress.as_mut(),
+                total.as_mut(),
+                &mut progress_rx,
+                true,
+            )
+            .await
+            {
+                AttemptEvent::Progress(_) => no_progress
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + no_progress_duration),
+                AttemptEvent::TotalUploadTimeout => break,
+                AttemptEvent::NoProgressTimeout => panic!("regular progress must extend idle time"),
+                _ => panic!("unexpected watchdog event"),
+            }
+        }
+        sender.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_upload_future_and_releases_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let acquired = Arc::new(Notify::new());
+        let acquired_wait = acquired.notified();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task_semaphore = semaphore.clone();
+        let task_acquired = acquired.clone();
+        let task = tokio::spawn(async move {
+            let upload = async move {
+                let _permit = task_semaphore.acquire_owned().await.unwrap();
+                task_acquired.notify_one();
+                std::future::pending::<()>().await;
+            };
+            pin!(upload);
+            let no_progress = tokio::time::sleep(Duration::from_secs(1));
+            let total = tokio::time::sleep(Duration::from_secs(1));
+            pin!(no_progress);
+            pin!(total);
+            let (_progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            next_attempt_event(
+                upload.as_mut(),
+                &task_cancellation,
+                no_progress.as_mut(),
+                total.as_mut(),
+                &mut progress_rx,
+                true,
+            )
+            .await
+        });
+
+        acquired_wait.await;
+        cancellation.cancel();
+        assert!(matches!(task.await.unwrap(), AttemptEvent::Cancelled));
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
     async fn v2_upload_success_commits_video_lifecycle_and_session_atomically() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "atomic-success.flv").await;
@@ -2098,6 +2674,88 @@ mod tests {
         let session_videos = serde_json::from_str::<Vec<Video>>(&session_json).unwrap();
         assert_eq!(session_videos.len(), 1);
         assert_eq!(session_videos[0].filename, uploaded.filename);
+    }
+
+    #[tokio::test]
+    async fn concurrent_v2_claims_issue_exactly_one_uuid_lease() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "concurrent-claim.flv").await;
+        let (left, right) = tokio::join!(
+            claim_enrolled_attempt(&pool, &enrollment, "bda2"),
+            claim_enrolled_attempt(&pool, &enrollment, "tx"),
+        );
+        let claims = [left.unwrap(), right.unwrap()];
+        let tokens = claims
+            .iter()
+            .filter_map(|claim| match claim {
+                AttemptClaim::Claimed(token) => Some(token),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tokens.len(), 1);
+        assert!(uuid::Uuid::parse_str(tokens[0]).is_ok());
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| matches!(claim, AttemptClaim::AlreadyRunning))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_attempt_cannot_publish_delayed_success_over_new_lease() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "delayed-success.flv").await;
+        let old_token = claim_enrolled_attempt(&pool, &enrollment, "bda2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fail_enrolled_attempt(
+                &pool,
+                enrollment.missing_id,
+                &old_token,
+                "cancelled".to_string(),
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap()
+        );
+        sqlx::query("UPDATE upload_missing_segment SET next_retry_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now())
+            .bind(enrollment.missing_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let new_token = claim_enrolled_attempt(&pool, &enrollment, "tx")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = LiveArchive::default();
+
+        assert!(
+            persist_segment(
+                &pool,
+                &mut archive,
+                uploaded_video("late-old"),
+                &enrollment,
+                &old_token,
+            )
+            .await
+            .is_err()
+        );
+        persist_segment(
+            &pool,
+            &mut archive,
+            uploaded_video("current-new"),
+            &enrollment,
+            &new_token,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archive.videos.len(), 1);
+        assert_eq!(archive.videos[0].filename, "current-new");
     }
 
     #[tokio::test]

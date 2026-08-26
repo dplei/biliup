@@ -21,6 +21,11 @@ interface MissingSegment {
   last_error: string | null
   created_at: string
   updated_at: string
+  total_bytes: number | null
+  uploaded_bytes: number
+  current_line: string | null
+  upload_started_at: string | null
+  last_progress_at: string | null
   // 所属会话的投稿结果（后端 JOIN upload_session 得到，真正的番号在这里）
   session_aid: number | null
   session_bvid: string | null
@@ -53,6 +58,7 @@ const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; 
 }
 
 const fmtTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—')
+const fmtBytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`
 const baseName = (p: string) => p.split(/[/\\]/).pop() || p
 // Semi Select 的递归泛型在这页两组动态 option 并存时会触发 TS2589；运行时 props
 // 仍由 Semi 校验，这里只截断无意义的类型展开。
@@ -66,13 +72,21 @@ export default function MissingRecovery() {
     data: rows,
     isLoading,
     mutate,
-  } = useSWR<MissingSegment[]>(`/v1/uploads/missing?status=${statusFilter}`, fetcher)
+  } = useSWR<MissingSegment[]>(`/v1/uploads/missing?status=${statusFilter}`, fetcher, {
+    refreshInterval: 5000,
+  })
   const { data: streamerInfos } = useSWR<StreamerInfo[]>('/v1/streamer-info', fetcher)
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
   const [retryingId, setRetryingId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [rescanStreamerInfoId, setRescanStreamerInfoId] = useState<number | null>(null)
   const [rescanning, setRescanning] = useState(false)
+  const [now, setNow] = useState(Date.now())
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   const recentStreamerInfos = useMemo(
     () => [...(streamerInfos ?? [])].sort((a, b) => b.date - a.date).slice(0, 100),
@@ -168,6 +182,28 @@ export default function MissingRecovery() {
     },
     { title: '尝试次数', dataIndex: 'attempts', width: 96 },
     {
+      title: '上传进度',
+      dataIndex: 'uploaded_bytes',
+      width: 230,
+      render: (_: number, record: MissingSegment) => {
+        if (record.status !== 'uploading') return '—'
+        const total = record.total_bytes ?? 0
+        const percent = total > 0 ? Math.min(100, (record.uploaded_bytes / total) * 100) : 0
+        const stalledSeconds = record.last_progress_at
+          ? Math.max(0, Math.floor((now - new Date(record.last_progress_at).getTime()) / 1000))
+          : 0
+        return (
+          <div>
+            <div>{percent.toFixed(1)}% · {fmtBytes(record.uploaded_bytes)} / {fmtBytes(total)}</div>
+            <Text type="tertiary" size="small">
+              {record.current_line ?? '未知线路'} · 已无进度 {Math.floor(stalledSeconds / 60)}分{stalledSeconds % 60}秒
+            </Text>
+            <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
+          </div>
+        )
+      },
+    },
+    {
       title: '下次线路',
       dataIndex: 'line_index',
       width: 100,
@@ -252,7 +288,7 @@ export default function MissingRecovery() {
           return (
             <Popconfirm
               title="重新补投这一段？"
-              content="将重新上传该分段。旧的卡住请求不一定会被取消，目标是尽快把分 P 补进 B 站。"
+              content="将取消旧 attempt，等待其退出，并从下一条健康线路重新上传该分段。"
               okText="重新补投"
               onConfirm={() => handleRetry(record.id)}
             >

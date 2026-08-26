@@ -4,6 +4,7 @@ use crate::server;
 use crate::server::api::auth;
 use crate::server::api::spa::static_handler;
 use crate::server::api::ws::ws_logs;
+use crate::server::common::missing_segment::start_stale_attempt_recovery;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::infrastructure::users::Backend;
@@ -37,6 +38,10 @@ impl ApplicationController {
             .migrate()
             .await
             .change_context(AppError::Unknown)?;
+
+        // Run once immediately, then once per minute. Fresh leases are retained until their
+        // five-minute no-progress deadline instead of being killed just because the process booted.
+        start_stale_attempt_recovery(service_register.pool.clone());
 
         // 启动定期清理过期会话的任务
         let deletion_task = tokio::task::spawn(

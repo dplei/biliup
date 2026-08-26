@@ -23,6 +23,15 @@ pub struct Parcel {
     video_file: VideoFile,
 }
 
+/// Progress reported only after the upload server has accepted a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadProgress {
+    pub chunk_bytes: usize,
+    pub uploaded_bytes: u64,
+    pub total_bytes: u64,
+    pub chunk_index: usize,
+}
+
 impl Parcel {
     pub async fn upload<F, S, B>(
         self,
@@ -34,6 +43,23 @@ impl Parcel {
         F: FnOnce(VideoStream) -> S,
         S: Stream<Item = Result<(B, usize)>>,
         B: Into<Body> + Clone,
+    {
+        self.upload_with_observer(client, limit, progress, |_| {})
+            .await
+    }
+
+    pub async fn upload_with_observer<F, S, B, O>(
+        self,
+        client: StatelessClient,
+        limit: usize,
+        progress: F,
+        mut observer: O,
+    ) -> Result<Video>
+    where
+        F: FnOnce(VideoStream) -> S,
+        S: Stream<Item = Result<(B, usize)>>,
+        B: Into<Body> + Clone,
+        O: FnMut(UploadProgress),
     {
         let mut video = match self.line {
             Bucket::Upos(bucket) => {
@@ -49,7 +75,20 @@ impl Parcel {
                     )
                     .await?;
                 tokio::pin!(stream);
-                while let Some((part, _size)) = stream.try_next().await? {
+                let mut uploaded_bytes = 0u64;
+                while let Some((part, size)) = stream.try_next().await? {
+                    uploaded_bytes = uploaded_bytes.saturating_add(size as u64);
+                    let chunk_index = part
+                        .get("partNumber")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|part| usize::try_from(part.saturating_sub(1)).ok())
+                        .unwrap_or(parts.len());
+                    observer(UploadProgress {
+                        chunk_bytes: size,
+                        uploaded_bytes,
+                        total_bytes: self.video_file.total_size,
+                        chunk_index,
+                    });
                     parts.push(part);
                 }
                 upos.get_ret_video_info(&parts, &self.video_file.filepath)
