@@ -1,8 +1,10 @@
 use biliup::uploader::util::SubmitOption;
 use biliup_cli::cli::{Cli, Commands};
 use biliup_cli::downloader::generate_json;
+use biliup_cli::server::common::lifecycle_backfill::run_lifecycle_backfill;
 use biliup_cli::server::config::Config;
 use biliup_cli::server::errors::AppResult;
+use biliup_cli::server::infrastructure::connection_pool::ConnectionManager;
 use biliup_cli::uploader::{
     append, comments, list, login, renew, reply, show, upload_by_command, upload_by_config,
 };
@@ -329,6 +331,18 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
                 max_pages,
             )
             .await?
+        }
+        Commands::BackfillLifecycle { database, dry_run } => {
+            let pool = ConnectionManager::new_pool(&database).await?;
+            let summary = run_lifecycle_backfill(&pool, dry_run).await?;
+            info!(
+                processed_sessions = summary.processed_sessions,
+                migrated_rows = summary.migrated_rows,
+                synthetic_rows = summary.synthetic_rows,
+                conflict_rows = summary.conflict_rows,
+                dry_run,
+                "lifecycle backfill finished"
+            );
         }
     };
 

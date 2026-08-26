@@ -16,7 +16,7 @@ use biliup_cli::server::common::upload_session::{
 };
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
 use biliup_cli::server::core::downloader::SegmentEnrollment;
-use biliup_cli::server::infrastructure::connection_pool::ConnectionPool;
+use biliup_cli::server::infrastructure::connection_pool::{ConnectionManager, ConnectionPool};
 use chrono::Duration;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -279,6 +279,79 @@ async fn target_02_validated_segments_are_durable_before_actor_consumption() {
 
     // A later downloader TransportError has no write path that can erase prior enrollment.
     assert_eq!(db.counts().await, (1, 3));
+}
+
+/// Scenario 1 from task 08's fault matrix: the process is killed the instant a segment becomes
+/// validated, before any actor or watchdog touches it. Restart must find the row exactly where
+/// enrollment left it — `pending`, unclaimed — not lost, not stuck `uploading` forever.
+#[tokio::test]
+async fn target_02_pending_segment_survives_process_restart() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let db_path = directory.path().join("restart.sqlite3");
+    let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let now = FakeClock::incident_start().now();
+    sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (?1, ?2, ?3)")
+        .bind(INCIDENT_ROOM_ID)
+        .bind("https://example.invalid/live/synthetic-room")
+        .bind("synthetic-streamer")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '')",
+    )
+    .bind(INCIDENT_STREAMER_INFO_ID)
+    .bind("synthetic-streamer")
+    .bind("https://example.invalid/live/synthetic-room")
+    .bind("synthetic incident fixture")
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = EnrollmentStore::new(pool.clone(), outbox.path().to_path_buf());
+    let path = media.path().join("restart-segment.flv");
+    write_synthetic_valid_flv(&path);
+    let enrollment = match enroll_validated_segment(&store, &enrollment_request(&path))
+        .await
+        .unwrap()
+    {
+        EnrollmentOutcome::Enrolled(enrollment) => enrollment,
+        other => panic!("expected a durable enrollment before the simulated crash, got {other:?}"),
+    };
+
+    // Simulate "kill -9 right after validated": drop the pool without any actor or watchdog
+    // ever consuming the row, then reopen the same file to model the restarted process.
+    pool.close().await;
+    let restarted = ConnectionManager::new_pool(db_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    let (status, attempt_token): (String, Option<String>) =
+        sqlx::query_as("SELECT status, attempt_token FROM upload_missing_segment WHERE id = ?")
+            .bind(enrollment.missing_id)
+            .fetch_one(&restarted)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "pending",
+        "restart invariant: a crash right after validation must leave the row pending, \
+         not lost and not stuck uploading"
+    );
+    assert!(attempt_token.is_none());
+
+    // Recovery is not just a status string: the row must still be claimable after restart.
+    assert!(matches!(
+        claim_enrolled_attempt(&restarted, &enrollment, "bda2", None)
+            .await
+            .unwrap(),
+        AttemptClaim::Claimed(_)
+    ));
 }
 
 #[tokio::test]

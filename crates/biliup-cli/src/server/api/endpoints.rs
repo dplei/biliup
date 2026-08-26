@@ -595,6 +595,20 @@ pub async fn get_upload_enrollment_health() -> Json<serde_json::Value> {
     ))
 }
 
+/// 缺失分段生命周期状态计数 + 已过 5 分钟仍 uploading 未被后台收敛的行，
+/// 供运维在自愈周期（60s）跑完前就能看到卡住的补传（对应 08 号任务第 3/4 节）。
+pub async fn get_upload_missing_segment_health(
+    State(service_register): State<ServiceRegister>,
+) -> Result<Json<crate::server::common::missing_segment::MissingSegmentHealth>, Response> {
+    crate::server::common::missing_segment::missing_segment_health(
+        &service_register.pool,
+        Utc::now(),
+    )
+    .await
+    .map(Json)
+    .map_err(report_to_response)
+}
+
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct RecoveryBatchView {
     pub id: i64,

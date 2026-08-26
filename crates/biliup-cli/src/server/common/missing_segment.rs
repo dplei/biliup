@@ -118,6 +118,49 @@ pub async fn recover_stale_upload_attempts(
     Ok(result.rows_affected())
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MissingSegmentHealth {
+    /// `upload_missing_segment.status` counts across all lifecycle_version=2 rows — the direct
+    /// answer to "how many pending/uploading/failed/succeeded/source_missing segments exist now".
+    pub status_counts: std::collections::HashMap<String, i64>,
+    /// Rows still `uploading` past `STALE_ATTEMPT_AFTER` that the background recovery loop
+    /// (`start_stale_attempt_recovery`) has not yet converged back to `failed`.
+    pub stale_uploading_count: i64,
+    pub oldest_stale_uploading_secs: Option<i64>,
+}
+
+pub async fn missing_segment_health(
+    pool: &ConnectionPool,
+    now: DateTime<Utc>,
+) -> AppResult<MissingSegmentHealth> {
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM upload_missing_segment \
+         WHERE lifecycle_version = 2 GROUP BY status",
+    )
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    let cutoff = now - STALE_ATTEMPT_AFTER;
+    let stale: Vec<(DateTime<Utc>,)> = sqlx::query_as(
+        "SELECT COALESCE(last_progress_at, upload_started_at, updated_at) \
+         FROM upload_missing_segment \
+         WHERE lifecycle_version = 2 AND status = 'uploading' \
+           AND COALESCE(last_progress_at, upload_started_at, updated_at) <= ?1",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(MissingSegmentHealth {
+        status_counts: counts.into_iter().collect(),
+        stale_uploading_count: stale.len() as i64,
+        oldest_stale_uploading_secs: stale
+            .iter()
+            .map(|(since,)| (now - *since).num_seconds())
+            .max(),
+    })
+}
+
 pub fn start_stale_attempt_recovery(pool: ConnectionPool) {
     tokio::spawn(async move {
         loop {
@@ -573,6 +616,51 @@ mod tests {
         assert_eq!((state.1, state.2), (3, 2));
         assert_eq!(state.3, None);
         assert_eq!(state.4, "stale_uploading_lease");
+    }
+
+    #[tokio::test]
+    async fn health_reports_status_counts_and_only_the_stale_uploading_row() {
+        let (_dir, pool) = test_pool().await;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 18, 12, 10, 0)
+            .unwrap();
+
+        let pending = insert_missing_row_with_status(&pool, "pending", "/tmp/pending.flv").await;
+        let fresh_uploading =
+            insert_missing_row_with_status(&pool, "uploading", "/tmp/fresh.flv").await;
+        let stale_uploading =
+            insert_missing_row_with_status(&pool, "uploading", "/tmp/stale.flv").await;
+        for (id, progress_age) in [
+            (fresh_uploading, chrono::Duration::seconds(30)),
+            (stale_uploading, chrono::Duration::minutes(9)),
+        ] {
+            sqlx::query(
+                "UPDATE upload_missing_segment \
+                 SET lifecycle_version = 2, last_progress_at = ?1 WHERE id = ?2",
+            )
+            .bind(now - progress_age)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE upload_missing_segment SET lifecycle_version = 2 WHERE id = ?")
+            .bind(pending)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let health = missing_segment_health(&pool, now).await.unwrap();
+        assert_eq!(health.status_counts.get("pending"), Some(&1));
+        assert_eq!(health.status_counts.get("uploading"), Some(&2));
+        assert_eq!(
+            health.stale_uploading_count, 1,
+            "only the row idle past STALE_ATTEMPT_AFTER counts as stale"
+        );
+        assert_eq!(
+            health.oldest_stale_uploading_secs,
+            Some(chrono::Duration::minutes(9).num_seconds())
+        );
     }
 
     #[tokio::test]

@@ -112,7 +112,10 @@ pub async fn enroll_validated_segment(
 
     for delay in ENROLLMENT_RETRY_DELAYS {
         match enroll_in_database(&store.pool, request).await {
-            Ok(enrollment) => return Ok(EnrollmentOutcome::Enrolled(enrollment)),
+            Ok(enrollment) => {
+                log_enrolled(&enrollment);
+                return Ok(EnrollmentOutcome::Enrolled(enrollment));
+            }
             Err(error) => {
                 warn!(?error, file = %request.normalized_file_path.display(), "segment enrollment transaction failed; retrying");
                 tokio::time::sleep(delay).await;
@@ -120,7 +123,10 @@ pub async fn enroll_validated_segment(
         }
     }
     match enroll_in_database(&store.pool, request).await {
-        Ok(enrollment) => Ok(EnrollmentOutcome::Enrolled(enrollment)),
+        Ok(enrollment) => {
+            log_enrolled(&enrollment);
+            Ok(EnrollmentOutcome::Enrolled(enrollment))
+        }
         Err(error) => {
             let manifest = write_outbox_manifest(&store.outbox_directory, request)?;
             error!(
@@ -132,6 +138,20 @@ pub async fn enroll_validated_segment(
             Ok(EnrollmentOutcome::Outboxed(manifest))
         }
     }
+}
+
+/// The one log line every validated segment produces on its way to becoming durable: without it
+/// there is no way to count validated/enrolled throughput from logs alone (outbox and rejection
+/// paths already log; this was the missing success case).
+fn log_enrolled(enrollment: &SegmentEnrollment) {
+    info!(
+        missing_id = enrollment.missing_id,
+        upload_session_id = enrollment.upload_session_id,
+        segment_order = enrollment.segment_order,
+        duplicate = enrollment.duplicate,
+        total_bytes = enrollment.total_bytes,
+        "segment validated and enrolled"
+    );
 }
 
 /// Reports the finalized session which closes this StreamerInfo, or `None` when a non-finalized

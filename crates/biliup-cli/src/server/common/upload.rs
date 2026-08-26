@@ -651,6 +651,7 @@ async fn submit_session(
         SubmitClaim::Blocked {
             completeness,
             changed,
+            blocked_count,
         } => {
             warn!(
                 session = session_row_id,
@@ -660,6 +661,7 @@ async fn submit_session(
                 failed = completeness.failed,
                 source_missing = completeness.source_missing,
                 deleting = completeness.deleting,
+                blocked_count,
                 reasons = ?completeness.reasons,
                 "session submit blocked by incomplete lifecycle ledger"
             );
@@ -829,6 +831,13 @@ pub async fn claim_enrolled_attempt(
     .await
     .change_context(AppError::Unknown)?;
     if result.rows_affected() == 1 {
+        info!(
+            missing_id = enrollment.missing_id,
+            attempt = short_attempt_id(&token),
+            line,
+            recovery_index,
+            "upload attempt started"
+        );
         return Ok(AttemptClaim::Claimed(token));
     }
     let state = sqlx::query_as::<_, (String, Option<String>, chrono::DateTime<chrono::Utc>)>(
@@ -858,23 +867,43 @@ pub async fn fail_enrolled_attempt(
     error: String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<bool> {
-    let updated = sqlx::query(
+    // `last_error` is stored durably and rendered verbatim on the missing-uploads page, so it
+    // gets the same Cookie/token/query-string scrub as the line-health error summary, not just
+    // the tracing log line below (attempt_token itself is a random UUID lease id, not a secret).
+    let error = sanitize_error(&error);
+    let updated_attempts = sqlx::query_scalar::<_, i64>(
         "UPDATE upload_missing_segment \
          SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
              next_retry_at = ?1, last_error = ?2, attempt_token = NULL, current_line = NULL, \
              updated_at = ?3 \
          WHERE id = ?4 AND lifecycle_version = 2 AND status = 'uploading' \
-           AND attempt_token = ?5",
+           AND attempt_token = ?5 \
+         RETURNING attempts",
     )
     .bind(now + chrono::Duration::minutes(10))
-    .bind(error)
+    .bind(&error)
     .bind(now)
     .bind(missing_id)
     .bind(attempt_token)
-    .execute(pool)
+    .fetch_optional(pool)
     .await
     .change_context(AppError::Unknown)?;
-    Ok(updated.rows_affected() == 1)
+    if let Some(attempts) = updated_attempts {
+        info!(
+            missing_id,
+            attempt = short_attempt_id(attempt_token),
+            attempts,
+            reason = %error,
+            "upload attempt ended"
+        );
+    }
+    Ok(updated_attempts.is_some())
+}
+
+/// First 8 hex chars of the attempt's UUID lease token — enough to correlate log lines for one
+/// attempt without printing the full token on every line.
+fn short_attempt_id(attempt_token: &str) -> &str {
+    attempt_token.get(..8).unwrap_or(attempt_token)
 }
 
 /// Commit the remote Video, lifecycle success and session ordering atomically. The lifecycle row
@@ -953,6 +982,13 @@ pub async fn persist_segment(
         .await
         .change_context(AppError::Unknown)?;
     tx.commit().await.change_context(AppError::Unknown)?;
+    info!(
+        missing_id = enrollment.missing_id,
+        attempt = short_attempt_id(attempt_token),
+        segment_order = enrollment.segment_order,
+        total_bytes,
+        "upload attempt completed"
+    );
     archive.session_row_id = Some(enrollment.upload_session_id);
     archive.videos = videos;
     Ok(())
@@ -1378,6 +1414,7 @@ async fn upload_single_file(
     }
     let t = instant.elapsed().as_millis();
     info!(
+        line = line_key,
         "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
         t as f64 / 1000.,
         total_size as f64 / 1000. / t as f64
@@ -1392,18 +1429,36 @@ async fn record_line_kind_failure(
     error: &Kind,
 ) {
     let kind = classify_kind(error);
+    // `summary` is already redacted by `sanitize_error` (strips Cookie/token/auth query params);
+    // every log below must keep using this value instead of the raw `error`/`error:?`.
     let summary = sanitize_error(&format!("{error:?}"));
-    match upload_line_health::record_failure(pool, line_key, kind, &summary, chrono::Utc::now())
-        .await
-    {
-        Ok(true) => notify_alert(
-            webhook,
-            "biliup 上传线路 TLS 熔断",
-            &format!(
-                "B 站上游需续签 {line_key} 证书；该线路已冷却 24 小时，上传会自动换线。请勿关闭 TLS 证书验证。"
-            ),
-        ),
-        Ok(false) => {}
+    let now = chrono::Utc::now();
+    match upload_line_health::record_failure(pool, line_key, kind, &summary, now).await {
+        Ok(tripped) => {
+            let cooldown_remaining = match upload_line_health::acquire_line(pool, line_key, now)
+                .await
+            {
+                Ok(LineAvailability::Cooling { until, .. }) => Some((until - now).num_seconds()),
+                _ => None,
+            };
+            warn!(
+                line = line_key,
+                kind = kind.as_str(),
+                error = %summary,
+                breaker_tripped = tripped,
+                cooldown_remaining_secs = cooldown_remaining,
+                "upload line failure recorded"
+            );
+            if tripped {
+                notify_alert(
+                    webhook,
+                    "biliup 上传线路 TLS 熔断",
+                    &format!(
+                        "B 站上游需续签 {line_key} 证书；该线路已冷却 24 小时，上传会自动换线。请勿关闭 TLS 证书验证。"
+                    ),
+                );
+            }
+        }
         Err(db_error) => warn!(
             ?db_error,
             line = line_key,
@@ -1413,20 +1468,33 @@ async fn record_line_kind_failure(
 }
 
 async fn record_watchdog_failure(context: &UploadContext, kind: UploadFailureKind, summary: &str) {
-    if let Err(error) = upload_line_health::record_failure(
-        &context.pool,
-        &context.line_key,
-        kind,
-        summary,
-        chrono::Utc::now(),
-    )
-    .await
+    let now = chrono::Utc::now();
+    match upload_line_health::record_failure(&context.pool, &context.line_key, kind, summary, now)
+        .await
     {
-        warn!(
+        Ok(tripped) => {
+            let cooldown_remaining =
+                match upload_line_health::acquire_line(&context.pool, &context.line_key, now).await
+                {
+                    Ok(LineAvailability::Cooling { until, .. }) => {
+                        Some((until - now).num_seconds())
+                    }
+                    _ => None,
+                };
+            warn!(
+                line = context.line_key,
+                kind = kind.as_str(),
+                error = summary,
+                breaker_tripped = tripped,
+                cooldown_remaining_secs = cooldown_remaining,
+                "upload line failure recorded"
+            );
+        }
+        Err(error) => warn!(
             ?error,
             line = context.line_key,
             "failed to persist watchdog line failure"
-        );
+        ),
     }
 }
 
@@ -1545,6 +1613,13 @@ async fn upload_enrolled_with_watchdog(
                 )));
             }
             AttemptEvent::NoProgressTimeout => {
+                warn!(
+                    missing_id,
+                    watchdog = "no_progress",
+                    uploaded_bytes = persisted_bytes,
+                    idle_secs = last_persist.elapsed().as_secs(),
+                    "upload watchdog fired"
+                );
                 record_watchdog_failure(
                     context,
                     UploadFailureKind::RequestTimeout,
@@ -1556,6 +1631,13 @@ async fn upload_enrolled_with_watchdog(
                 )));
             }
             AttemptEvent::TotalUploadTimeout => {
+                warn!(
+                    missing_id,
+                    watchdog = "total_upload",
+                    uploaded_bytes = persisted_bytes,
+                    idle_secs = last_persist.elapsed().as_secs(),
+                    "upload watchdog fired"
+                );
                 record_watchdog_failure(
                     context,
                     UploadFailureKind::RequestTimeout,
@@ -2119,6 +2201,7 @@ pub async fn upload(
         upload_line_health::record_success(pool, &line_key).await?;
         let t = instant.elapsed().as_millis();
         info!(
+            line = &line_key,
             "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
             t as f64 / 1000.,
             total_size as f64 / 1000. / t as f64

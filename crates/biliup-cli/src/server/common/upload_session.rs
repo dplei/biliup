@@ -127,6 +127,8 @@ pub enum SubmitClaim {
     Blocked {
         completeness: SessionCompleteness,
         changed: bool,
+        /// Cumulative count of blocked submit attempts for this session (`upload_session.blocked_count`).
+        blocked_count: i64,
     },
     AlreadyClaimed,
     Finalized,
@@ -335,21 +337,23 @@ pub async fn claim_complete_session(
         .await
         .change_context(AppError::Unknown)?;
         let changed = previous.as_deref() != Some(signature.as_str());
-        sqlx::query(
+        let blocked_count = sqlx::query_scalar::<_, i64>(
             "UPDATE upload_session SET submit_state = 'blocked_missing_segments', \
              last_submit_error = ?1, blocked_signature = ?2, \
-             blocked_count = blocked_count + 1 WHERE id = ?3",
+             blocked_count = blocked_count + 1 WHERE id = ?3 \
+             RETURNING blocked_count",
         )
         .bind(completeness.summary())
         .bind(signature)
         .bind(session_row_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
         tx.commit().await.change_context(AppError::Unknown)?;
         return Ok(SubmitClaim::Blocked {
             completeness,
             changed,
+            blocked_count,
         });
     }
 
