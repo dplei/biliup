@@ -127,6 +127,7 @@ docker compose pull && docker compose up -d
 | build 中途 Docker Desktop 自己挂 | `open -a Docker` 重启，build 前先 `docker info` 确认。 |
 | 公共镜像源（docker.1ms.run 等）拉用户私有仓库 403 | 公共源对用户私有仓库无权，已弃用，统一走 ACR。 |
 | 构建到 `maturin build` 才报 `E0004: non-exhaustive patterns: Commands::X not covered` | 给 CLI 加了子命令但只改了 `biliup-cli/src/main.rs`，漏了 `stream-gears/src/server.rs::_main` 里的同一个 match。本地 `-p biliup-cli` 查不出来，见 §2「check 的盲区」。补上分支，并用 `cargo check --workspace` 复验。 |
+| `pip3 install` 报 `Could not install packages ... No such file or directory: '/tmp/biliup-<旧版本>.whl\n/tmp/biliup-<新版本>.whl'` | `workspace.package.version` 真正变了号（此前每次发版 Cargo.toml 版本号都停在原地，只换 docker tag，wheel 文件名从未变过、被同名覆盖）。`target/wheels/` 在 wheel-builder 阶段是持久 cache mount，旧版本号的 wheel 文件不会被自动清理，新旧两个 `.whl` 一起被 `cp target/wheels/*.whl /wheels/` 拷进 `/tmp`，`ls /tmp/biliup*.whl` 匹配到两个文件把 `$whl` 撑成两行。已在 `Dockerfile` 的 wheel-builder RUN 里 `maturin build` 前加 `rm -rf target/wheels`，每次构建先清空该目录（`1.3.0-uploadreliability` 起）。 |
 
 ---
 

@@ -48,6 +48,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 	--mount=type=cache,target=/usr/local/cargo/git \
 	--mount=type=cache,target=/biliup/target \
 	set -eux; \
+	rm -rf target/wheels; \
 	maturin build --release; \
 	mkdir -p /wheels; \
 	cp target/wheels/*.whl /wheels/;
