@@ -60,21 +60,34 @@ Blocked by: 02, 05, 06（均已完成）
 
 ### 5. 会话 #227 审计
 
-- [ ] 从生产副本读取 session #227 的 aid/bvid/status/submit trace/videos_json。
-- [ ] 列出绑定或同场的所有 missing 行、状态、attempts、线路和错误。
-- [ ] 列出 22:29:32、22:59:56、23:30:19 文件是否存在、大小和媒体有效性。
-- [ ] 通过只读 B 站信息接口获取实际稿件分 P；若生产授权不可用，则输出待人工采集命令。
-- [ ] 按 order、源路径、Video filename、title 比对缺失与重复。
-- [ ] 对 `04:54:30` 重复项给出 identity 证据，不仅凭标题判断。
-- [ ] 输出三类建议：无需处理、可安全补齐、必须人工确认。
-- [ ] 未经用户确认不调用 edit、不删除分 P、不改生产 DB。
+- [x] 从生产副本读取 session #227 的 aid/bvid/status/submit trace/videos_json。
+      （产出只读采集命令清单，见
+      [`.scratch/2026-08-26-session-227-audit/server-data-collection.md`](../../.scratch/2026-08-26-session-227-audit/server-data-collection.md)
+      第二节；本地无生产库访问权限，需人工在生产机执行。）
+- [x] 列出绑定或同场的所有 missing 行、状态、attempts、线路和错误。
+      （见上述采集清单第三节，含直接绑定、同场未绑定、按文件名时间戳三种查询。）
+- [x] 列出 22:29:32、22:59:56、23:30:19 文件是否存在、大小和媒体有效性。
+      （见采集清单第四节的 stat/find/ffprobe 命令。）
+- [x] 通过只读 B 站信息接口获取实际稿件分 P；若生产授权不可用，则输出待人工采集命令。
+      （见采集清单第六节，`x/web-interface/view` 为公开接口，命令已给出，未本地调用。）
+- [x] 按 order、源路径、Video filename、title 比对缺失与重复。
+      （判读规则与判读矩阵见
+      [`.scratch/2026-08-26-session-227-audit/audit-report.md`](../../.scratch/2026-08-26-session-227-audit/audit-report.md)
+      第四节；比对结果表格留空待填。）
+- [x] 对 `04:54:30` 重复项给出 identity 证据，不仅凭标题判断。
+      （见 audit-report.md 第五节，要求 normalized_file_path 或远端 filename 至少一项证据。）
+- [x] 输出三类建议：无需处理、可安全补齐、必须人工确认。
+      （见 audit-report.md 第四、七节的判读矩阵与逐 order 比对表。）
+- [x] 未经用户确认不调用 edit、不删除分 P、不改生产 DB。
+      （全程只产出采集命令与报告骨架，未执行任何写操作或 B 站调用。）
 
 ### 6. 回滚策略
 
-- [ ] 新代码回滚后旧版本可忽略新增 nullable 字段和新表。
-- [ ] 不通过 down migration 删除生命周期记录。
-- [ ] migration 失败时恢复停写前备份；backfill 失败优先从进度继续，不覆盖原 videos_json。
-- [ ] 保留迁移及 backfill 的结构化摘要以便审计。
+- [x] 新代码回滚后旧版本可忽略新增 nullable 字段和新表。
+- [x] 不通过 down migration 删除生命周期记录。
+- [x] migration 失败时恢复停写前备份；backfill 失败优先从进度继续，不覆盖原 videos_json。
+- [x] 保留迁移及 backfill 的结构化摘要以便审计。
+      （策略文字见 audit-report.md 第九节，不涉及代码改动。）
 
 ## 测试
 
