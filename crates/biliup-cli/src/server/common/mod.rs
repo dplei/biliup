@@ -7,6 +7,7 @@ pub mod audio_normalization;
 pub mod cookie_health;
 pub mod cover_generator;
 pub mod download;
+pub mod lifecycle_backfill;
 pub mod missing_segment;
 /// 用户提供路径的安全解析（静态文件接口与后续的图片上传共用）
 pub mod path_safety;

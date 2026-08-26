@@ -10,7 +10,9 @@ use biliup_cli::uploader::{
 
 use clap::Parser;
 
+use biliup_cli::server::common::lifecycle_backfill::run_lifecycle_backfill;
 use biliup_cli::server::errors::AppResult;
+use biliup_cli::server::infrastructure::connection_pool::ConnectionManager;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -170,6 +172,24 @@ async fn main() -> AppResult<()> {
                 max_pages,
             )
             .await?
+        }
+        Commands::BackfillLifecycle { database, dry_run } => {
+            let pool = ConnectionManager::new_pool(&database).await?;
+            let summary = run_lifecycle_backfill(&pool, dry_run).await?;
+            println!(
+                "回填{}：会话 {}，迁移行 {}，synthetic 行 {}，冲突行 {}",
+                if dry_run { "预演" } else { "完成" },
+                summary.processed_sessions,
+                summary.migrated_rows,
+                summary.synthetic_rows,
+                summary.conflict_rows
+            );
+            if summary.conflict_rows > 0 {
+                println!(
+                    "存在冲突行，相关会话已被完整性闸门阻止投稿；\
+                     请查询 upload_lifecycle_backfill_event 后人工处理。"
+                );
+            }
         }
     };
     Ok(())

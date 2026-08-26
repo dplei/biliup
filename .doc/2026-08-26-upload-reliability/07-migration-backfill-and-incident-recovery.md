@@ -38,14 +38,19 @@ Blocked by: 02, 05, 06（均已完成）
 
 ### 3. 可重复 backfill
 
-- [ ] 实现带版本标记和进度日志的 Rust backfill，可中断后继续。
-- [ ] 对每个非 finalized 活动 session 解析 `videos_json`。
-- [ ] 能按 title/filename stem 与 filelist/missing 对应的 Video，写回对应 lifecycle 行的 `video_json` 和 succeeded。
-- [ ] 无法对应本地路径的旧 Video 创建 `legacy://session/{id}/part/{order}` synthetic succeeded 基线。
-- [ ] synthetic 行只用于完整性基线，不参与本地文件恢复。
-- [ ] 同路径存在多条旧 active 行时，优先保留 succeeded；否则保留最新有效状态，并合并最大 attempts、最新错误和最完整目标绑定。
-- [ ] 不自动合并两个均声称不同远端 Video 的冲突，标记 Conflict 并阻止投稿。
-- [ ] 清洗完成后填 normalized path 和 lifecycle_version=2；每批 transaction 提交。
+- [x] 实现带版本标记和进度日志的 Rust backfill，可中断后继续。
+- [x] 对每个非 finalized 活动 session 解析 `videos_json`。
+- [x] 能按 title/filename stem 与 filelist/missing 对应的 Video，写回对应 lifecycle 行的 `video_json` 和 succeeded。
+- [x] 无法对应本地路径的旧 Video 创建 `legacy://session/{id}/part/{order}` synthetic succeeded 基线。
+- [x] synthetic 行只用于完整性基线，不参与本地文件恢复。
+- [x] 同路径存在多条旧 active 行时，优先保留 succeeded；否则保留最新有效状态，并合并最大 attempts、最新错误和最完整目标绑定。
+- [x] 不自动合并两个均声称不同远端 Video 的冲突，标记 Conflict 并阻止投稿。
+- [x] 清洗完成后填 normalized path 和 lifecycle_version=2；每批 transaction 提交。
+
+实现：[`lifecycle_backfill.rs`](../../crates/biliup-cli/src/server/common/lifecycle_backfill.rs)，
+入口 `biliup backfill-lifecycle [--database PATH] [--dry-run]`。断点写在与数据同一个事务里，
+重复行不删除而是 `status=merged_duplicate` 且脱离 session 账本，两个不同远端 Video 的冲突记为
+`status=conflict`（完整性闸门视作 unknown，持续阻塞投稿）。
 
 ### 4. finalized 历史处理
 

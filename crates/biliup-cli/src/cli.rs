@@ -226,6 +226,16 @@ pub enum Commands {
         #[arg(short, long)]
         max_pages: Option<u32>,
     },
+    /// 把历史投稿会话回填成 v2 生命周期账本（可中断续跑，不会投稿）
+    BackfillLifecycle {
+        /// 数据库路径
+        #[arg(long, default_value = "data/data.sqlite3")]
+        database: String,
+
+        /// 只输出第一批会话的计划，不写库
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// 模糊半径必须是非负的有限数。放任负值或 NaN 会被静默忽略，
