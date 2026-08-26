@@ -9,10 +9,13 @@ use crate::server::common::cover_generator::{
 };
 use crate::server::common::missing_segment::{
     due_missing_segments_for_session, enqueue_pending_segment, mark_retry_failure,
-    mark_retry_success, next_missing_segment_order, patch_studio_videos, upload_line_for_recovery,
+    mark_retry_success, next_missing_segment_order, patch_studio_videos,
 };
 use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
+use crate::server::common::upload_line_health::{
+    self, LineAvailability, UploadFailureKind, classify_kind, sanitize_error,
+};
 use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
     LiveArchive, active_sessions_for_room, get_streamer_info, insert_session_video_at_order,
@@ -69,6 +72,8 @@ struct UploadContext {
     client: StatelessClient,
     rate_gate: UploadRateGateSettings,
     pool: ConnectionPool,
+    line_key: String,
+    health_webhook: Option<String>,
 }
 
 static GLOBAL_UPLOAD_SEMAPHORE: OnceLock<std::sync::Arc<Semaphore>> = OnceLock::new();
@@ -351,32 +356,141 @@ async fn initialize_upload_context(
     // 会直接返回 Err。此处带退避重试，避免一次网络抽风就把整场上传  rx 提前 drop、报销整场录像。
     let bilibili = login_with_retry(&cookie_file).await?;
 
-    // 获取上传线路
-    let line = get_upload_line(&client.client, &config.lines).await?;
+    // 获取上传线路。显式配置也必须服从持久熔断；冷却时按恢复序列回退。
+    let selected = select_configured_line(
+        pool,
+        &client.client,
+        &config.lines,
+        config.cookie_health_webhook.as_deref(),
+    )
+    .await?;
 
     Ok(UploadContext {
         bilibili,
-        line,
+        line: selected.line,
         threads: config.threads as usize,
         client: client.clone(),
         rate_gate: UploadRateGateSettings::from(config),
         pool: pool.clone(),
+        line_key: selected.key,
+        health_webhook: config.cookie_health_webhook.clone(),
     })
 }
 
-async fn get_upload_line(client: &reqwest::Client, line: &str) -> AppResult<Line> {
-    let line = match line {
-        "bda2" => line::bda2(),
-        "bda" => line::bda(),
-        "tx" => line::tx(),
-        "txa" => line::txa(),
-        "bldsa" => line::bldsa(),
-        "alia" => line::alia(),
-        _ => Probe::probe(client)
-            .await
-            .change_context(AppError::Unknown)?,
-    };
-    Ok(line)
+fn explicit_upload_line(line: &str) -> Option<Line> {
+    match line {
+        "bda2" => Some(line::bda2()),
+        "bda" => Some(line::bda()),
+        "tx" => Some(line::tx()),
+        "txa" => Some(line::txa()),
+        "bldsa" => Some(line::bldsa()),
+        "alia" => Some(line::alia()),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct SelectedLine {
+    line: Line,
+    key: String,
+    recovery_index: Option<i64>,
+}
+
+async fn probe_healthy_line(
+    pool: &ConnectionPool,
+    client: &reqwest::Client,
+    webhook: Option<&str>,
+) -> AppResult<SelectedLine> {
+    let excluded = upload_line_health::active_cooldowns(pool, chrono::Utc::now())
+        .await?
+        .into_iter()
+        .map(|row| row.line_key)
+        .collect::<Vec<_>>();
+    let (line, failures) = Probe::probe_excluding_with_failures(client, &excluded)
+        .await
+        .change_context(AppError::Unknown)?;
+    for failure in failures {
+        record_line_kind_failure(pool, &failure.line_key, webhook, &failure.error).await;
+    }
+    let key = line.key().to_string();
+    Ok(SelectedLine {
+        line,
+        key,
+        recovery_index: None,
+    })
+}
+
+async fn select_configured_line(
+    pool: &ConnectionPool,
+    client: &reqwest::Client,
+    configured: &str,
+    webhook: Option<&str>,
+) -> AppResult<SelectedLine> {
+    if let Some(line) = explicit_upload_line(configured) {
+        match upload_line_health::acquire_line(pool, configured, chrono::Utc::now()).await? {
+            LineAvailability::Available => {
+                return Ok(SelectedLine {
+                    line,
+                    key: configured.to_string(),
+                    recovery_index: None,
+                });
+            }
+            LineAvailability::Cooling { until, reason } => warn!(
+                line = configured,
+                %until,
+                ?reason,
+                "configured upload line is cooling; overriding to the next healthy line"
+            ),
+        }
+    } else if configured.eq_ignore_ascii_case("auto") || configured.is_empty() {
+        return probe_healthy_line(pool, client, webhook).await;
+    }
+    select_recovery_line(pool, client, 0, webhook).await
+}
+
+/// Recovery order is deliberately bda2 -> tx -> auto. bldsa is never an implicit candidate.
+async fn select_recovery_line(
+    pool: &ConnectionPool,
+    client: &reqwest::Client,
+    start_index: i64,
+    webhook: Option<&str>,
+) -> AppResult<SelectedLine> {
+    const CANDIDATES: [&str; 3] = ["bda2", "tx", "auto"];
+    let start = start_index.rem_euclid(CANDIDATES.len() as i64) as usize;
+    for offset in 0..CANDIDATES.len() {
+        let index = (start + offset) % CANDIDATES.len();
+        let key = CANDIDATES[index];
+        if key == "auto" {
+            match probe_healthy_line(pool, client, webhook).await {
+                Ok(mut selected) => {
+                    selected.recovery_index = Some(index as i64);
+                    return Ok(selected);
+                }
+                Err(error) => {
+                    warn!(?error, "healthy upload line auto probe failed");
+                    continue;
+                }
+            }
+        }
+        match upload_line_health::acquire_line(pool, key, chrono::Utc::now()).await? {
+            LineAvailability::Available => {
+                return Ok(SelectedLine {
+                    line: explicit_upload_line(key).expect("fixed recovery line"),
+                    key: key.to_string(),
+                    recovery_index: Some(index as i64),
+                });
+            }
+            LineAvailability::Cooling { until, reason } => info!(
+                line = key,
+                %until,
+                ?reason,
+                "skipping cooling upload line"
+            ),
+        }
+    }
+    Err(error_stack::Report::new(AppError::Custom(
+        "no healthy upload line is currently available; attempt remains due".to_string(),
+    )))
 }
 
 pub(crate) fn segment_paths(event: &SegmentInfo) -> Vec<PathBuf> {
@@ -617,18 +731,21 @@ async fn claim_enrolled_attempt(
     pool: &ConnectionPool,
     enrollment: &SegmentEnrollment,
     line: &str,
+    recovery_index: Option<i64>,
 ) -> AppResult<AttemptClaim> {
     let token = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
     let result = sqlx::query(
         "UPDATE upload_missing_segment \
          SET status = 'uploading', attempt_token = ?1, current_line = ?2, \
-             upload_started_at = ?3, last_progress_at = ?3, uploaded_bytes = 0, updated_at = ?3 \
-         WHERE id = ?4 AND lifecycle_version = 2 AND status IN ('pending', 'failed') \
-           AND next_retry_at <= ?3 AND attempt_token IS NULL",
+             line_index = COALESCE(?3, line_index), upload_started_at = ?4, \
+             last_progress_at = ?4, uploaded_bytes = 0, updated_at = ?4 \
+         WHERE id = ?5 AND lifecycle_version = 2 AND status IN ('pending', 'failed') \
+           AND next_retry_at <= ?4 AND attempt_token IS NULL",
     )
     .bind(&token)
     .bind(line)
+    .bind(recovery_index)
     .bind(now)
     .bind(enrollment.missing_id)
     .execute(pool)
@@ -959,12 +1076,8 @@ async fn pipeline_upload_videos(
         );
         maybe_capture_reference_sample(&original_path, &sample_store).await;
 
-        let AttemptClaim::Claimed(attempt_token) = claim_enrolled_attempt(
-            ctx.pool(),
-            &enrollment,
-            &format!("{:?}", upload_context.line),
-        )
-        .await?
+        let AttemptClaim::Claimed(attempt_token) =
+            claim_enrolled_attempt(ctx.pool(), &enrollment, &upload_context.line_key, None).await?
         else {
             info!(
                 missing_id = enrollment.missing_id,
@@ -1122,6 +1235,8 @@ async fn upload_single_file(
         client,
         rate_gate,
         pool,
+        line_key,
+        health_webhook,
     } = context;
 
     info!(
@@ -1149,13 +1264,14 @@ async fn upload_single_file(
         }
         Err(error) => {
             upload_rate_gate::record_non_rate_limit_failure(*rate_gate).await;
+            record_line_kind_failure(pool, line_key, health_webhook.as_deref(), &error).await;
             return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
         }
     };
 
     let instant = Instant::now();
 
-    let video = uploader
+    let video = match uploader
         .upload_with_observer(
             client.clone(),
             *limit,
@@ -1173,7 +1289,20 @@ async fn upload_single_file(
             },
         )
         .await
-        .change_context(AppError::Unknown)?;
+    {
+        Ok(video) => video,
+        Err(error) => {
+            record_line_kind_failure(pool, line_key, health_webhook.as_deref(), &error).await;
+            return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+        }
+    };
+    if let Err(error) = upload_line_health::record_success(pool, line_key).await {
+        warn!(
+            ?error,
+            line = line_key,
+            "failed to clear upload line breaker after success"
+        );
+    }
     let t = instant.elapsed().as_millis();
     info!(
         "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
@@ -1181,6 +1310,51 @@ async fn upload_single_file(
         total_size as f64 / 1000. / t as f64
     );
     Ok(video)
+}
+
+async fn record_line_kind_failure(
+    pool: &ConnectionPool,
+    line_key: &str,
+    webhook: Option<&str>,
+    error: &Kind,
+) {
+    let kind = classify_kind(error);
+    let summary = sanitize_error(&format!("{error:?}"));
+    match upload_line_health::record_failure(pool, line_key, kind, &summary, chrono::Utc::now())
+        .await
+    {
+        Ok(true) => notify_alert(
+            webhook,
+            "biliup 上传线路 TLS 熔断",
+            &format!(
+                "B 站上游需续签 {line_key} 证书；该线路已冷却 24 小时，上传会自动换线。请勿关闭 TLS 证书验证。"
+            ),
+        ),
+        Ok(false) => {}
+        Err(db_error) => warn!(
+            ?db_error,
+            line = line_key,
+            "failed to persist upload line failure"
+        ),
+    }
+}
+
+async fn record_watchdog_failure(context: &UploadContext, kind: UploadFailureKind, summary: &str) {
+    if let Err(error) = upload_line_health::record_failure(
+        &context.pool,
+        &context.line_key,
+        kind,
+        summary,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        warn!(
+            ?error,
+            line = context.line_key,
+            "failed to persist watchdog line failure"
+        );
+    }
 }
 
 async fn persist_attempt_progress(
@@ -1298,11 +1472,23 @@ async fn upload_enrolled_with_watchdog(
                 )));
             }
             AttemptEvent::NoProgressTimeout => {
+                record_watchdog_failure(
+                    context,
+                    UploadFailureKind::RequestTimeout,
+                    "no_progress_timeout",
+                )
+                .await;
                 return Err(error_stack::Report::new(AppError::Custom(
                     "no_progress_timeout".to_string(),
                 )));
             }
             AttemptEvent::TotalUploadTimeout => {
+                record_watchdog_failure(
+                    context,
+                    UploadFailureKind::RequestTimeout,
+                    "total_upload_timeout",
+                )
+                .await;
                 return Err(error_stack::Report::new(AppError::Custom(
                     "total_upload_timeout".to_string(),
                 )));
@@ -1370,7 +1556,24 @@ async fn recover_due_missing_segments(
     let now = chrono::Utc::now();
     let rows = due_missing_segments_for_session(ctx.pool(), session_row_id, now).await?;
     for mut row in rows {
-        let line_index = row.line_index;
+        let selected = match select_recovery_line(
+            ctx.pool(),
+            &upload_context.client.client,
+            row.line_index,
+            upload_context.health_webhook.as_deref(),
+        )
+        .await
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                warn!(
+                    missing_id = row.id,
+                    ?error,
+                    "no recovery line available; keeping row due"
+                );
+                continue;
+            }
+        };
         let file_path = row.file_path.clone();
         let segment_order = row.segment_order;
         let row_id = row.id;
@@ -1390,9 +1593,13 @@ async fn recover_due_missing_segments(
             duplicate: false,
         });
         let attempt_token = if let Some(enrollment) = &v2_enrollment {
-            let line = format!("recovery-{line_index}");
-            let AttemptClaim::Claimed(token) =
-                claim_enrolled_attempt(ctx.pool(), enrollment, &line).await?
+            let AttemptClaim::Claimed(token) = claim_enrolled_attempt(
+                ctx.pool(),
+                enrollment,
+                &selected.key,
+                selected.recovery_index,
+            )
+            .await?
             else {
                 continue;
             };
@@ -1407,34 +1614,15 @@ async fn recover_due_missing_segments(
             None
         };
 
-        let selected_line = upload_line_for_recovery(line_index);
-        let recovery_context = if let Some(line) = selected_line {
-            let line_str = match line {
-                UploadLine::Bda2 => "bda2",
-                UploadLine::Tx => "tx",
-                UploadLine::Bldsa => "bldsa",
-                // Unknown future variant: fall through to probe instead of silently misrouting to bda2
-                _ => "auto",
-            };
-            UploadContext {
-                bilibili: upload_context.bilibili.clone(),
-                line: get_upload_line(&upload_context.client.client, line_str).await?,
-                threads: upload_context.threads,
-                client: upload_context.client.clone(),
-                rate_gate: upload_context.rate_gate,
-                pool: upload_context.pool.clone(),
-            }
-        } else {
-            UploadContext {
-                bilibili: upload_context.bilibili.clone(),
-                line: Probe::probe(&upload_context.client.client)
-                    .await
-                    .change_context(AppError::Unknown)?,
-                threads: upload_context.threads,
-                client: upload_context.client.clone(),
-                rate_gate: upload_context.rate_gate,
-                pool: upload_context.pool.clone(),
-            }
+        let recovery_context = UploadContext {
+            bilibili: upload_context.bilibili.clone(),
+            line: selected.line,
+            threads: upload_context.threads,
+            client: upload_context.client.clone(),
+            rate_gate: upload_context.rate_gate,
+            pool: upload_context.pool.clone(),
+            line_key: selected.key,
+            health_webhook: upload_context.health_webhook.clone(),
         };
 
         let path = PathBuf::from(&file_path);
@@ -1723,7 +1911,7 @@ pub async fn upload(
 
     let client = StatelessClient::default();
     let mut videos = Vec::new();
-    let line = match line {
+    let requested_line = match line {
         Some(UploadLine::Bldsa) => line::bldsa(),
         Some(UploadLine::Cnbldsa) => line::cnbldsa(),
         Some(UploadLine::Andsa) => line::andsa(),
@@ -1739,10 +1927,38 @@ pub async fn upload(
         // Some(UploadLine::Bda) => line::bda(),
         Some(UploadLine::Txa) => line::txa(),
         Some(UploadLine::Alia) => line::alia(),
-        _ => Probe::probe(&client.client)
-            .await
-            .change_context(AppError::Unknown)?,
+        _ => {
+            probe_healthy_line(
+                pool,
+                &client.client,
+                config.cookie_health_webhook.as_deref(),
+            )
+            .await?
+            .line
+        }
     };
+    let requested_key = requested_line.key().to_string();
+    let selected = match upload_line_health::acquire_line(pool, &requested_key, chrono::Utc::now())
+        .await?
+    {
+        LineAvailability::Available => SelectedLine {
+            line: requested_line,
+            key: requested_key,
+            recovery_index: None,
+        },
+        LineAvailability::Cooling { until, reason } => {
+            warn!(line = requested_key, %until, ?reason, "explicit upload line is cooling; overriding");
+            select_recovery_line(
+                pool,
+                &client.client,
+                0,
+                config.cookie_health_webhook.as_deref(),
+            )
+            .await?
+        }
+    };
+    let line = selected.line;
+    let line_key = selected.key;
     for video_path in video_paths {
         println!(
             "{:?}",
@@ -1770,13 +1986,20 @@ pub async fn upload(
             }
             Err(error) => {
                 upload_rate_gate::record_non_rate_limit_failure(settings).await;
+                record_line_kind_failure(
+                    pool,
+                    &line_key,
+                    config.cookie_health_webhook.as_deref(),
+                    &error,
+                )
+                .await;
                 return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
             }
         };
 
         let instant = Instant::now();
 
-        let video = uploader
+        let video = match uploader
             .upload(client.clone(), limit, |vs| {
                 vs.map(|vs| {
                     let chunk = vs?;
@@ -1785,7 +2008,20 @@ pub async fn upload(
                 })
             })
             .await
-            .change_context_lazy(|| AppError::Unknown)?;
+        {
+            Ok(video) => video,
+            Err(error) => {
+                record_line_kind_failure(
+                    pool,
+                    &line_key,
+                    config.cookie_health_webhook.as_deref(),
+                    &error,
+                )
+                .await;
+                return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+            }
+        };
+        upload_line_health::record_success(pool, &line_key).await?;
         let t = instant.elapsed().as_millis();
         info!(
             "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
@@ -2089,36 +2325,48 @@ pub async fn manual_recover_missing_segment(
     } else {
         None
     };
-    let attempt_token = if let Some(enrollment) = &v2_enrollment {
-        let line_label = match upload_line_for_recovery(row.line_index) {
-            Some(UploadLine::Bda2) => "bda2",
-            Some(UploadLine::Tx) => "tx",
-            Some(UploadLine::Bldsa) => "bldsa",
-            _ => "auto",
-        };
-        let token = match claim_enrolled_attempt(pool, enrollment, line_label).await? {
-            AttemptClaim::Claimed(token) => token,
-            AttemptClaim::AlreadyRunning => {
-                return Err(error_stack::Report::new(AppError::Custom(
-                    "missing segment already has a running upload attempt".to_string(),
-                )));
-            }
-            AttemptClaim::AlreadyCompleted => {
-                return Err(error_stack::Report::new(AppError::Custom(
-                    "missing segment upload is already completed".to_string(),
-                )));
-            }
-            AttemptClaim::NotDue => {
-                return Err(error_stack::Report::new(AppError::Custom(
-                    "missing segment retry is not due yet".to_string(),
-                )));
-            }
-            AttemptClaim::NotClaimable(status) => {
-                return Err(error_stack::Report::new(AppError::Custom(format!(
-                    "missing segment status '{status}' cannot be claimed"
-                ))));
-            }
-        };
+    let selected_recovery = if v2_enrollment.is_some() {
+        Some(
+            select_recovery_line(
+                pool,
+                &StatelessClient::default().client,
+                row.line_index,
+                config.cookie_health_webhook.as_deref(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let attempt_token = if let (Some(enrollment), Some(selected)) =
+        (&v2_enrollment, &selected_recovery)
+    {
+        let token =
+            match claim_enrolled_attempt(pool, enrollment, &selected.key, selected.recovery_index)
+                .await?
+            {
+                AttemptClaim::Claimed(token) => token,
+                AttemptClaim::AlreadyRunning => {
+                    return Err(error_stack::Report::new(AppError::Custom(
+                        "missing segment already has a running upload attempt".to_string(),
+                    )));
+                }
+                AttemptClaim::AlreadyCompleted => {
+                    return Err(error_stack::Report::new(AppError::Custom(
+                        "missing segment upload is already completed".to_string(),
+                    )));
+                }
+                AttemptClaim::NotDue => {
+                    return Err(error_stack::Report::new(AppError::Custom(
+                        "missing segment retry is not due yet".to_string(),
+                    )));
+                }
+                AttemptClaim::NotClaimable(status) => {
+                    return Err(error_stack::Report::new(AppError::Custom(format!(
+                        "missing segment status '{status}' cannot be claimed"
+                    ))));
+                }
+            };
         Some(token)
     } else {
         let claimed = sqlx::query(
@@ -2171,21 +2419,9 @@ pub async fn manual_recover_missing_segment(
             pool,
         )
         .await?;
-        if v2_enrollment.is_some() {
-            upload_context.line = match upload_line_for_recovery(row.line_index) {
-                Some(line) => {
-                    let line_name = match line {
-                        UploadLine::Bda2 => "bda2",
-                        UploadLine::Tx => "tx",
-                        UploadLine::Bldsa => "bldsa",
-                        _ => "auto",
-                    };
-                    get_upload_line(&upload_context.client.client, line_name).await?
-                }
-                None => Probe::probe(&upload_context.client.client)
-                    .await
-                    .change_context(AppError::Unknown)?,
-            };
+        if let Some(selected) = &selected_recovery {
+            upload_context.line = selected.line.clone();
+            upload_context.line_key = selected.key.clone();
         }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
@@ -2632,7 +2868,7 @@ mod tests {
     async fn v2_upload_success_commits_video_lifecycle_and_session_atomically() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "atomic-success.flv").await;
-        let token = claim_enrolled_attempt(&pool, &enrollment, "test")
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test", None)
             .await
             .unwrap()
             .unwrap();
@@ -2681,8 +2917,8 @@ mod tests {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "concurrent-claim.flv").await;
         let (left, right) = tokio::join!(
-            claim_enrolled_attempt(&pool, &enrollment, "bda2"),
-            claim_enrolled_attempt(&pool, &enrollment, "tx"),
+            claim_enrolled_attempt(&pool, &enrollment, "bda2", None),
+            claim_enrolled_attempt(&pool, &enrollment, "tx", None),
         );
         let claims = [left.unwrap(), right.unwrap()];
         let tokens = claims
@@ -2704,10 +2940,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_bldsa_cooldown_is_overridden_by_bda2() {
+        let (_directory, pool) = deferred_test_pool().await;
+        upload_line_health::record_failure(
+            &pool,
+            "bldsa",
+            UploadFailureKind::CertificateExpired,
+            "certificate expired",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let selected = select_configured_line(&pool, &reqwest::Client::new(), "bldsa", None)
+            .await
+            .unwrap();
+        assert_eq!(selected.key, "bda2");
+        assert_eq!(selected.line.key(), "bda2");
+    }
+
+    #[tokio::test]
+    async fn recovery_skips_cooling_bda2_and_selects_tx_without_bldsa() {
+        let (_directory, pool) = deferred_test_pool().await;
+        upload_line_health::record_failure(
+            &pool,
+            "bda2",
+            UploadFailureKind::Transport,
+            "connection reset",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let selected = select_recovery_line(&pool, &reqwest::Client::new(), 0, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.key, "tx");
+        assert_eq!(selected.recovery_index, Some(1));
+        assert_ne!(selected.line.key(), "bldsa");
+    }
+
+    #[tokio::test]
     async fn revoked_attempt_cannot_publish_delayed_success_over_new_lease() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "delayed-success.flv").await;
-        let old_token = claim_enrolled_attempt(&pool, &enrollment, "bda2")
+        let old_token = claim_enrolled_attempt(&pool, &enrollment, "bda2", None)
             .await
             .unwrap()
             .unwrap();
@@ -2728,7 +3005,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let new_token = claim_enrolled_attempt(&pool, &enrollment, "tx")
+        let new_token = claim_enrolled_attempt(&pool, &enrollment, "tx", None)
             .await
             .unwrap()
             .unwrap();
@@ -2762,7 +3039,7 @@ mod tests {
     async fn v2_session_write_failure_rolls_back_lifecycle_success() {
         let (directory, pool) = deferred_test_pool().await;
         let enrollment = v2_enrollment(&pool, directory.path(), "atomic-rollback.flv").await;
-        let token = claim_enrolled_attempt(&pool, &enrollment, "test")
+        let token = claim_enrolled_attempt(&pool, &enrollment, "test", None)
             .await
             .unwrap()
             .unwrap();
@@ -2802,11 +3079,11 @@ mod tests {
         let (directory, pool) = deferred_test_pool().await;
         let first = v2_enrollment(&pool, directory.path(), "order-0.flv").await;
         let second = v2_enrollment(&pool, directory.path(), "order-1.flv").await;
-        let first_token = claim_enrolled_attempt(&pool, &first, "test")
+        let first_token = claim_enrolled_attempt(&pool, &first, "test", None)
             .await
             .unwrap()
             .unwrap();
-        let second_token = claim_enrolled_attempt(&pool, &second, "test")
+        let second_token = claim_enrolled_attempt(&pool, &second, "test", None)
             .await
             .unwrap()
             .unwrap();

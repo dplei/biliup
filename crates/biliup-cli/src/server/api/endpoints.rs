@@ -5,6 +5,7 @@ use crate::server::common::upload::{
     build_studio, manual_recover_missing_segment, rescan_local_valid_segments,
     retry_missing_segment, submit_to_bilibili, upload,
 };
+use crate::server::common::upload_line_health;
 use crate::server::common::upload_session::{
     get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
 };
@@ -737,6 +738,17 @@ pub struct MissingSegmentView {
     pub session_aid: Option<i64>,
     pub session_bvid: Option<String>,
     pub session_status: Option<String>,
+    pub next_line: String,
+    pub line_skip_reason: Option<String>,
+}
+
+pub async fn get_upload_line_health(
+    State(service_register): State<ServiceRegister>,
+) -> Result<Json<Vec<upload_line_health::UploadLineHealth>>, Response> {
+    upload_line_health::all_health(&service_register.pool)
+        .await
+        .map(Json)
+        .map_err(report_to_response)
 }
 
 pub async fn get_missing_uploads(
@@ -776,14 +788,39 @@ pub async fn get_missing_uploads(
         }
     }
 
+    let cooling_lines = upload_line_health::active_cooldowns(&service_register.pool, Utc::now())
+        .await
+        .map_err(report_to_response)?
+        .into_iter()
+        .map(|line| (line.line_key, line.last_failure_kind))
+        .collect::<std::collections::HashMap<_, _>>();
+
     let views = rows
         .into_iter()
         .map(|r| {
             let sess = r.upload_session_id.and_then(|id| session_map.get(&id));
+            const LINES: [&str; 3] = ["bda2", "tx", "auto"];
+            let start = r.line_index.rem_euclid(LINES.len() as i64) as usize;
+            let mut next_line = LINES[start].to_string();
+            let mut skipped = Vec::new();
+            for offset in 0..LINES.len() {
+                let candidate = LINES[(start + offset) % LINES.len()];
+                if candidate == "auto" || !cooling_lines.contains_key(candidate) {
+                    next_line = candidate.to_string();
+                    break;
+                }
+                let reason = cooling_lines
+                    .get(candidate)
+                    .and_then(|reason| reason.as_deref())
+                    .unwrap_or("cooldown");
+                skipped.push(format!("{candidate}: {reason}"));
+            }
             MissingSegmentView {
                 session_aid: sess.and_then(|s| s.0),
                 session_bvid: sess.and_then(|s| s.1.clone()),
                 session_status: sess.map(|s| s.2.clone()),
+                next_line,
+                line_skip_reason: (!skipped.is_empty()).then(|| skipped.join("; ")),
                 segment: r,
             }
         })

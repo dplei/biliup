@@ -30,6 +30,8 @@ interface MissingSegment {
   session_aid: number | null
   session_bvid: string | null
   session_status: string | null
+  next_line: string
+  line_skip_reason: string | null
 }
 
 interface StreamerInfo {
@@ -46,9 +48,6 @@ interface RescanResult {
   skipped_known: number
   skipped_invalid: number
 }
-
-const FALLBACK_LINES = ['bda2', 'tx', 'bldsa', 'auto']
-const lineName = (i: number) => FALLBACK_LINES[((i % 4) + 4) % 4] ?? 'auto'
 
 const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; text: string }> = {
   pending: { color: 'grey', text: '待补传' },
@@ -206,8 +205,17 @@ export default function MissingRecovery() {
     {
       title: '下次线路',
       dataIndex: 'line_index',
-      width: 100,
-      render: (i: number) => lineName(i),
+      width: 180,
+      render: (_: number, record: MissingSegment) => (
+        <div>
+          <div>{record.next_line}</div>
+          {record.line_skip_reason && (
+            <Text type="tertiary" size="small">
+              已跳过 {record.line_skip_reason}
+            </Text>
+          )}
+        </div>
+      ),
     },
     {
       title: '下次重试',

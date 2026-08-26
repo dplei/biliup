@@ -35,6 +35,15 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/app.rs` | 组装会话、认证、CORS、业务路由与静态回退，启动 Axum，并在退出信号后清理服务资源。 | `ApplicationController::serve`、`shutdown_signal` |
+| `crates/biliup-cli/src/server/common/upload.rs` | 编排直播分段上传、缺失补传、attempt lease/watchdog、线路选择以及远端结果落库。 | `process_with_upload`、`select_recovery_line`、`upload_enrolled_with_watchdog`、`manual_recover_missing_segment` |
+| `crates/biliup-cli/src/server/common/upload_line_health.rs` | 分类上传网络错误并持久维护单线路失败次数、冷却和到期单探测租约。 | `UploadFailureKind`、`acquire_line`、`record_failure`、`record_success` |
+| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点，包括缺失分段列表/操作与上传健康状态查询。 | `get_missing_uploads`、`get_upload_line_health`、`recover_missing_upload` |
+
+## 上传核心
+
+| 文件 | 主要作用 | 关键符号 |
+| --- | --- | --- |
+| `crates/biliup/src/uploader/line.rs` | 定义 B 站上传线路、健康过滤后的自动探测、pre-upload 与服务端确认分块进度。 | `Line`、`Probe::probe_excluding`、`Parcel::upload_with_observer`、`UploadProgress` |
 
 ## 仓库维护
 
@@ -48,3 +57,6 @@
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/server.rs`（`server::_main`）：PyO3 主循环规范化参数后委派实际 CLI 执行。
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-cli/src/lib.rs`（`run`）：`server` 子命令进入 Web 服务启动编排。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`select_recovery_line`）：所有服务端上传入口在 claim 前选择健康线路，并在成功、网络错误或 watchdog 超时后更新持久健康状态。
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`）：恢复与自动模式把冷却线路排除在实际探测请求之外。
+- `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。

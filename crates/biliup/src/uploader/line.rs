@@ -118,6 +118,30 @@ pub struct Probe {
     probe: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub struct ProbeFailure {
+    pub line_key: String,
+    pub error: crate::error::Kind,
+}
+
+fn choose_line_and_failures<I>(candidates: I) -> Result<(Line, Vec<ProbeFailure>)>
+where
+    I: IntoIterator<Item = (Line, Option<crate::error::Kind>)>,
+{
+    let mut failures = Vec::new();
+    let line = choose_fastest_successful_line(candidates.into_iter().map(|(line, error)| {
+        let succeeded = error.is_none();
+        if let Some(error) = error {
+            failures.push(ProbeFailure {
+                line_key: line.key().to_string(),
+                error,
+            });
+        }
+        (line, succeeded)
+    }))?;
+    Ok((line, failures))
+}
+
 pub fn choose_fastest_successful_line<I>(candidates: I) -> Result<Line>
 where
     I: IntoIterator<Item = (Line, bool)>,
@@ -136,6 +160,19 @@ const PROBE_CONCURRENCY: usize = 4;
 
 impl Probe {
     pub async fn probe(client: &reqwest::Client) -> Result<Line> {
+        Self::probe_excluding(client, &[]).await
+    }
+
+    pub async fn probe_excluding(client: &reqwest::Client, excluded: &[String]) -> Result<Line> {
+        Self::probe_excluding_with_failures(client, excluded)
+            .await
+            .map(|(line, _)| line)
+    }
+
+    pub async fn probe_excluding_with_failures(
+        client: &reqwest::Client,
+        excluded: &[String],
+    ) -> Result<(Line, Vec<ProbeFailure>)> {
         let res: Self = client
             .get("https://member.bilibili.com/preupload?r=probe")
             .timeout(PROBE_INDEX_TIMEOUT)
@@ -144,10 +181,15 @@ impl Probe {
             .json()
             .await?;
 
-        let total_lines = res.lines.len();
+        let lines: Vec<_> = res
+            .lines
+            .into_iter()
+            .filter(|line| !excluded.iter().any(|key| key == line.key()))
+            .collect();
+        let total_lines = lines.len();
         let probe = res.probe;
         let client = client.clone();
-        let probe_lines = futures::stream::iter(res.lines.into_iter().map(|line| {
+        let probe_lines = futures::stream::iter(lines.into_iter().map(|line| {
             let probe = probe.clone();
             let client = client.clone();
             async move { Probe::probe_line(probe, line, client).await }
@@ -177,14 +219,14 @@ impl Probe {
             }
         }
 
-        choose_fastest_successful_line(candidates)
+        choose_line_and_failures(candidates)
     }
 
     async fn probe_line(
         probe: serde_json::Value,
         mut line: Line,
         client: reqwest::Client,
-    ) -> (Line, bool) {
+    ) -> (Line, Option<crate::error::Kind>) {
         let url = format!("https:{}", line.probe_url);
         let instant = Instant::now();
         let ping_result = Probe::ping(&probe, &url, &client)
@@ -195,16 +237,19 @@ impl Probe {
             Ok(resp) if resp.status().is_success() => {
                 line.cost = instant.elapsed().as_millis();
                 info!(query = %line.query, cost = line.cost, "upload line probe succeeded");
-                (line, true)
+                (line, None)
             }
             Ok(resp) => {
                 let status = resp.status();
                 warn!(query = %line.query, %status, "upload line probe returned non-success status");
-                (line, false)
+                (
+                    line,
+                    Some(Custom(format!("upload line probe returned HTTP {status}"))),
+                )
             }
             Err(err) => {
                 warn!(query = %line.query, error = %err, "upload line probe failed");
-                (line, false)
+                (line, Some(err.into()))
             }
         }
     }
@@ -234,6 +279,13 @@ pub struct Line {
 }
 
 impl Line {
+    pub fn key(&self) -> &str {
+        self.query
+            .split('&')
+            .find_map(|part| part.strip_prefix("upcdn="))
+            .unwrap_or("auto")
+    }
+
     pub async fn pre_upload(&self, bili: &BiliBili, video_file: VideoFile) -> Result<Parcel> {
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
@@ -523,5 +575,20 @@ mod tests {
         let err = choose_fastest_successful_line(candidates).unwrap_err();
 
         assert!(err.to_string().contains("no upload line probe succeeded"));
+    }
+
+    #[test]
+    fn successful_auto_probe_preserves_other_line_failures_for_breaker() {
+        let mut healthy = bda2();
+        healthy.cost = 20;
+        let (selected, failures) = choose_line_and_failures(vec![
+            (bldsa(), Some(Custom("certificate has expired".to_string()))),
+            (healthy, None),
+        ])
+        .unwrap();
+
+        assert_eq!(selected.key(), "bda2");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].line_key, "bldsa");
     }
 }

@@ -4,6 +4,9 @@ use biliup_cli::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     import_outbox_once, normalize_segment_path,
 };
+use biliup_cli::server::common::upload_line_health::{
+    LineAvailability, UploadFailureKind, acquire_line, record_failure,
+};
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
 use chrono::Duration;
 use std::collections::HashSet;
@@ -362,9 +365,45 @@ async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
 }
 
 #[tokio::test]
-#[ignore = "contract for tasks 03 and 04: watchdog, cancellation and TLS breaker"]
 async fn target_05_watchdogs_release_permit_and_tls_failure_fails_over() {
-    panic!("invariants 5 and 7 violated: stuck upload or certificate failure does not fail over");
+    let clock = FakeClock::incident_start();
+    let last_progress = clock.now();
+    let mut stuck = FakeUploader::new(clock.clone(), 1).inject_at(
+        UploadCheckpoint::Chunk(0),
+        InjectedUploadResult::PermanentPending,
+    );
+    assert!(matches!(
+        stuck.poll(),
+        FakeUploadPoll::Reached(UploadCheckpoint::Probe)
+    ));
+    assert!(matches!(
+        stuck.poll(),
+        FakeUploadPoll::Reached(UploadCheckpoint::PreUpload)
+    ));
+    assert_eq!(stuck.poll(), FakeUploadPoll::Pending);
+    clock.advance(Duration::minutes(5));
+    assert!(clock.now() - last_progress >= Duration::minutes(5));
+
+    let db = IncidentDb::new().await;
+    assert!(
+        record_failure(
+            &db.pool,
+            "bldsa",
+            UploadFailureKind::CertificateExpired,
+            "certificate expired",
+            clock.now(),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(matches!(
+        acquire_line(&db.pool, "bldsa", clock.now()).await.unwrap(),
+        LineAvailability::Cooling { .. }
+    ));
+    assert_eq!(
+        acquire_line(&db.pool, "bda2", clock.now()).await.unwrap(),
+        LineAvailability::Available
+    );
 }
 
 #[tokio::test]

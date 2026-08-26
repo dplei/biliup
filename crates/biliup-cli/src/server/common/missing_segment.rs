@@ -14,14 +14,12 @@ const STALE_ATTEMPT_AFTER: chrono::Duration = chrono::Duration::minutes(5);
 pub enum RecoveryUploadLine {
     Bda2,
     Tx,
-    Bldsa,
     Auto,
 }
 
-pub const FALLBACK_LINES: [RecoveryUploadLine; 4] = [
+pub const FALLBACK_LINES: [RecoveryUploadLine; 3] = [
     RecoveryUploadLine::Bda2,
     RecoveryUploadLine::Tx,
-    RecoveryUploadLine::Bldsa,
     RecoveryUploadLine::Auto,
 ];
 
@@ -381,7 +379,6 @@ pub fn upload_line_for_recovery(index: i64) -> Option<UploadLine> {
     match FALLBACK_LINES[index.rem_euclid(FALLBACK_LINES.len() as i64) as usize] {
         RecoveryUploadLine::Bda2 => Some(UploadLine::Bda2),
         RecoveryUploadLine::Tx => Some(UploadLine::Tx),
-        RecoveryUploadLine::Bldsa => Some(UploadLine::Bldsa),
         RecoveryUploadLine::Auto => None,
     }
 }
@@ -867,9 +864,9 @@ mod tests {
     fn rotates_upload_lines_through_all_fallbacks() {
         assert_eq!(next_line_index(0), 1);
         assert_eq!(next_line_index(1), 2);
-        assert_eq!(next_line_index(2), 3);
-        assert_eq!(next_line_index(3), 0);
-        assert_eq!(next_line_index(7), 0);
+        assert_eq!(next_line_index(2), 0);
+        assert_eq!(next_line_index(3), 1);
+        assert_eq!(next_line_index(7), 2);
     }
 
     #[test]
