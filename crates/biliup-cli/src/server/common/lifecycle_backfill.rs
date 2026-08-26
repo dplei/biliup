@@ -16,7 +16,7 @@
 //! interrupted run resumes without replaying committed work and without duplicating synthetic rows.
 
 use crate::server::common::segment_enrollment::normalize_segment_path;
-use crate::server::common::upload_session::{filename_stem, parse_videos};
+use crate::server::common::upload_session::filename_stem;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use biliup::bilibili::Video;
@@ -235,6 +235,16 @@ pub fn plan_session(session_id: i64, videos: &[Video], rows: Vec<LegacyRow>) -> 
     plan
 }
 
+/// `None` means the snapshot exists but cannot be trusted. An absent or empty snapshot is a
+/// legitimate "never submitted" session and parses as no published parts.
+fn published_parts(videos_json: &str) -> Option<Vec<Video>> {
+    let trimmed = videos_json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Some(Vec::new());
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
 #[derive(Debug, Clone)]
 struct MergedRow {
     id: i64,
@@ -403,13 +413,25 @@ async fn backfill_one_session(
         .await?;
     } else if rows.iter().all(|row| row.lifecycle_version == 2) {
         record_event(&mut tx, session_id, None, "skipped", "already lifecycle v2").await?;
-    } else {
+    } else if let Some(videos) = published_parts(videos_json) {
         let plan = plan_session(
             session_id,
-            &parse_videos(videos_json),
+            &videos,
             rows.into_iter().map(|row| row.row).collect(),
         );
         counts = apply_plan(&mut tx, session_id, &plan).await?;
+    } else {
+        // Reading a corrupt snapshot as "nothing published yet" would mark every local row as
+        // still owed and re-upload parts the archive may already contain. Leave the session on v1
+        // so the gate keeps blocking it, and let an operator repair the snapshot.
+        record_event(
+            &mut tx,
+            session_id,
+            None,
+            "corrupt_videos_json",
+            "published part snapshot is unparseable; session left at lifecycle v1",
+        )
+        .await?;
     }
 
     advance_journal(&mut tx, session_id, counts).await?;
@@ -921,6 +943,84 @@ mod tests {
         .unwrap();
         assert_eq!(kinds, ["skipped_finalized", "skipped"]);
         assert_eq!(empty, finalized + 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_legacy_rows_survive_migration_and_merge_on_backfill() {
+        let (_dir, pool) = seeded_pool().await;
+        let videos = serde_json::to_string(&[video("dup", "remote-0")]).unwrap();
+        let session = legacy_session(&pool, "uploading", &videos).await;
+        // The legacy schema already made file_path unique per streamer, so a historical duplicate
+        // can only be the same file spelled differently — which is exactly why rows are merged on
+        // the normalized path rather than on the stored string.
+        legacy_missing(&pool, session, "/media/dup.flv", 0).await;
+        legacy_missing(&pool, session, "/media/./dup.flv", 1).await;
+        legacy_missing(&pool, session, "/media/sub/../dup.flv", 2).await;
+
+        let summary = run_lifecycle_backfill(&pool, false).await.unwrap();
+        assert_eq!(summary.migrated_rows, 1, "three rows, one source identity");
+        assert_eq!(summary.conflict_rows, 0);
+
+        let ledger = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM upload_missing_segment WHERE upload_session_id = ?1",
+        )
+        .bind(session)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger, ["succeeded"]);
+        let detached = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_missing_segment \
+             WHERE upload_session_id IS NULL AND status = ?1",
+        )
+        .bind(MERGED_DUPLICATE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detached, 2, "duplicates are detached, never deleted");
+        assert!(
+            session_completeness(&pool, session)
+                .await
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_published_snapshot_blocks_instead_of_re_uploading() {
+        let (_dir, pool) = seeded_pool().await;
+        let session = legacy_session(&pool, "uploading", "[{\"filename\":").await;
+        legacy_missing(&pool, session, "/media/part-0.flv", 0).await;
+
+        let summary = run_lifecycle_backfill(&pool, false).await.unwrap();
+        assert_eq!(summary.processed_sessions, 1);
+        assert_eq!(
+            summary.migrated_rows, 0,
+            "an unreadable snapshot must not be read as 'nothing published yet'"
+        );
+
+        let version = sqlx::query_scalar::<_, i64>(
+            "SELECT lifecycle_version FROM upload_missing_segment WHERE upload_session_id = ?1",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(version, 1);
+        let kind = sqlx::query_scalar::<_, String>(
+            "SELECT kind FROM upload_lifecycle_backfill_event WHERE upload_session_id = ?1",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kind, "corrupt_videos_json");
+        assert!(
+            !session_completeness(&pool, session)
+                .await
+                .unwrap()
+                .is_complete()
+        );
     }
 
     #[tokio::test]

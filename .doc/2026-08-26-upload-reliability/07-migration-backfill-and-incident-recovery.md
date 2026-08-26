@@ -78,11 +78,17 @@ Blocked by: 02, 05, 06（均已完成）
 
 ## 测试
 
-- [ ] 用旧 schema fixture 启动并自动迁移成功。
-- [ ] 重复、损坏和空 videos_json 数据均不会导致启动崩溃。
-- [ ] backfill 运行两次结果一致。
-- [ ] 中断后继续不会重复 synthetic 行。
-- [ ] 迁移后的 active legacy session 能通过完整性闸门正确判断。
+- [ ] 用旧 schema fixture 启动并自动迁移成功。（留待 08 对生产副本执行；单测覆盖的是
+  「历史重复不会让 v2 唯一索引建不起来」这一兼容性质）
+- [x] 重复、损坏和空 videos_json 数据均不会导致启动崩溃。
+- [x] backfill 运行两次结果一致。
+- [x] 中断后继续不会重复 synthetic 行。
+- [x] 迁移后的 active legacy session 能通过完整性闸门正确判断。
+
+补充结论：旧 schema 的 `(live_streamer_id, file_path)` 已是唯一约束，因此「同路径多条旧 active 行」
+只可能是同一文件的不同路径写法，合并必须基于 `normalize_segment_path` 而不是原始字符串。
+另外，非空但解析失败的 `videos_json` 不得当作「尚未投稿」——那会把已发布分 P 对应的本地行判为
+待补传并重新上传。这类会话保持 lifecycle v1、记 `corrupt_videos_json` 事件，由闸门继续阻塞。
 
 ## 验收标准
 
