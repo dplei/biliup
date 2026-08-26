@@ -283,6 +283,21 @@ impl SegmentEventProcessor {
                     );
                     return Ok(());
                 }
+                EnrollmentOutcome::FinalizedRejected { session_id } => {
+                    warn!(
+                        file = %event.prev_file_path.display(),
+                        session_id,
+                        "late validated segment belongs to a finalized session; retained locally without reopening upload work"
+                    );
+                    return Ok(());
+                }
+                EnrollmentOutcome::SourceMissing => {
+                    warn!(
+                        file = %event.prev_file_path.display(),
+                        "validated segment disappeared before enrollment; no retry row was created"
+                    );
+                    return Ok(());
+                }
             }
         } else {
             sqlx::query(

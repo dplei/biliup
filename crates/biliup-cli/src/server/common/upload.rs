@@ -12,6 +12,14 @@ use crate::server::common::missing_segment::{
     mark_retry_success, next_missing_segment_order, patch_studio_videos,
 };
 use crate::server::common::path_safety::single_segment_name;
+use crate::server::common::recovery_eligibility::{
+    RecoveryEligibility, check_recovery_eligibility, finalized_session_for_streamer_info,
+    mark_source_missing, record_recovery_audit,
+};
+use crate::server::common::segment_enrollment::{
+    EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
+    normalize_segment_path,
+};
 use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
 use crate::server::common::upload_line_health::{
     self, LineAvailability, UploadFailureKind, classify_kind, sanitize_error,
@@ -1620,6 +1628,28 @@ async fn recover_due_missing_segments(
     let now = chrono::Utc::now();
     let rows = due_missing_segments_for_session(ctx.pool(), session_row_id, now).await?;
     for mut row in rows {
+        match check_recovery_eligibility(ctx.pool(), &row, None, now).await? {
+            RecoveryEligibility::Eligible => {}
+            RecoveryEligibility::SourceMissing => {
+                mark_source_missing(
+                    ctx.pool(),
+                    row.id,
+                    "source file is no longer a regular file during silent recovery",
+                    now,
+                )
+                .await?;
+                info!(missing_id = row.id, file = %row.file_path, "silent recovery stopped: source missing");
+                continue;
+            }
+            decision => {
+                info!(
+                    missing_id = row.id,
+                    ?decision,
+                    "silent recovery skipped ineligible segment"
+                );
+                continue;
+            }
+        }
         let selected = match select_recovery_line(
             ctx.pool(),
             &upload_context.client.client,
@@ -2107,6 +2137,7 @@ pub struct LocalSegmentRescanResult {
     pub queued: usize,
     pub skipped_known: usize,
     pub skipped_invalid: usize,
+    pub skipped_finalized: bool,
 }
 
 fn is_rescan_filename_candidate(
@@ -2125,6 +2156,17 @@ fn resolve_recorded_path(root: &Path, path: impl AsRef<Path>) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+/// Studio does not expose our local lifecycle id. A remote filename is the only safe identity:
+/// titles intentionally collide for different source segments. Checking it before `edit_by_app`
+/// makes a retried finalized legacy recovery idempotent.
+fn studio_already_contains_video(studio: &Studio, video: &Video) -> bool {
+    !video.filename.is_empty()
+        && studio
+            .videos
+            .iter()
+            .any(|existing| existing.filename == video.filename)
 }
 
 /// 按主播本场 StreamerInfo 补扫本地有效媒体，并绑定到该场未完成的 upload_session。
@@ -2161,7 +2203,33 @@ pub async fn rescan_local_valid_segments(
     .change_context(AppError::Unknown)?;
     let session = match session {
         Some(session) => session,
-        None => insert_uploading_session(pool, live_streamer.id, streamer_info_id, &[]).await?,
+        None => {
+            if let Some(session_id) =
+                finalized_session_for_streamer_info(pool, live_streamer.id, streamer_info_id)
+                    .await?
+            {
+                record_recovery_audit(
+                    pool,
+                    live_streamer.id,
+                    streamer_info_id,
+                    working_directory,
+                    "rescan_skipped_finalized_session",
+                    chrono::Utc::now(),
+                )
+                .await?;
+                return Ok(LocalSegmentRescanResult {
+                    live_streamer_id: live_streamer.id,
+                    streamer_info_id,
+                    upload_session_id: session_id,
+                    scanned: 0,
+                    queued: 0,
+                    skipped_known: 0,
+                    skipped_invalid: 0,
+                    skipped_finalized: true,
+                });
+            }
+            insert_uploading_session(pool, live_streamer.id, streamer_info_id, &[]).await?
+        }
     };
     let videos = parse_videos(&session.videos_json);
     let uploaded_stems: HashSet<String> = videos
@@ -2252,8 +2320,8 @@ pub async fn rescan_local_valid_segments(
         queued: 0,
         skipped_known: 0,
         skipped_invalid: 0,
+        skipped_finalized: false,
     };
-    let mut segment_order = next_missing_segment_order(pool, session.id, videos.len()).await?;
     for path in candidates {
         if !path.is_file() {
             continue;
@@ -2270,28 +2338,35 @@ pub async fn rescan_local_valid_segments(
             continue;
         }
         let danmaku_path = path.with_extension("xml");
-        let danmaku_path = danmaku_path.is_file().then_some(danmaku_path);
-        enqueue_pending_segment(
-            pool,
-            live_streamer.id,
+        let request = EnrollmentRequest {
+            live_streamer_id: live_streamer.id,
             streamer_info_id,
-            Some(session.id),
-            session.aid,
-            &path,
-            danmaku_path.as_deref(),
-            segment_order,
-            "manual local rescan recovered an untracked valid segment".to_string(),
-            chrono::Utc::now(),
-        )
-        .await?;
-        info!(
-            file = %path.display(),
-            session = session.id,
-            segment_order,
-            "本地补扫：有效遗留分段已登记到缺失补传"
-        );
-        segment_order = segment_order.saturating_add(1);
-        result.queued += 1;
+            file_path: path.clone(),
+            normalized_file_path: normalize_segment_path(&path)?,
+            danmaku_file_path: danmaku_path.is_file().then_some(danmaku_path),
+            total_bytes: std::fs::metadata(&path)
+                .change_context(AppError::Unknown)?
+                .len(),
+            now: chrono::Utc::now(),
+            recovery_window_minutes: config.recovery_window_minutes.unwrap_or(30) as i64,
+        };
+        match enroll_validated_segment(&EnrollmentStore::production(pool.clone()), &request).await?
+        {
+            EnrollmentOutcome::Enrolled(enrollment) if enrollment.duplicate => {
+                result.skipped_known += 1;
+            }
+            EnrollmentOutcome::Enrolled(enrollment) => {
+                info!(
+                    file = %path.display(), session = enrollment.upload_session_id,
+                    segment_order = enrollment.segment_order,
+                    "本地补扫：有效遗留分段已登记到缺失补传"
+                );
+                result.queued += 1;
+            }
+            EnrollmentOutcome::FinalizedRejected { .. } => result.skipped_finalized = true,
+            EnrollmentOutcome::SourceMissing => {}
+            EnrollmentOutcome::Outboxed(_) => {}
+        }
     }
     Ok(result)
 }
@@ -2344,7 +2419,7 @@ pub async fn manual_recover_missing_segment(
     config: &Config,
     pool: &ConnectionPool,
     missing_id: i64,
-) -> AppResult<()> {
+) -> AppResult<RecoveryEligibility> {
     let mut row = UploadMissingSegment::select()
         .where_("id = ?")
         .bind(missing_id)
@@ -2353,6 +2428,22 @@ pub async fn manual_recover_missing_segment(
         .change_context(AppError::Unknown)?;
 
     let claim_now = chrono::Utc::now();
+    // A source_missing row is only made claimable by an explicit recheck after its exact path
+    // has reappeared. Silent recovery never performs this transition.
+    if row.status == "source_missing" && Path::new(&row.file_path).is_file() {
+        sqlx::query(
+            "UPDATE upload_missing_segment SET status = 'failed', next_retry_at = ?1, \
+             last_error = 'source file reappeared; manual recovery requested', updated_at = ?1 \
+             WHERE id = ?2 AND status = 'source_missing'",
+        )
+        .bind(claim_now)
+        .bind(missing_id)
+        .execute(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+        row.status = "failed".to_string();
+        row.next_retry_at = claim_now;
+    }
     if row.lifecycle_version == 2 && matches!(row.status.as_str(), "pending" | "failed") {
         sqlx::query(
             "UPDATE upload_missing_segment SET next_retry_at = ?1, updated_at = ?1 \
@@ -2365,11 +2456,24 @@ pub async fn manual_recover_missing_segment(
         .change_context(AppError::Unknown)?;
         row.next_retry_at = claim_now;
     }
+    let eligibility = check_recovery_eligibility(pool, &row, None, claim_now).await?;
+    match eligibility {
+        RecoveryEligibility::Eligible | RecoveryEligibility::LegacyFinalizedEdit => {}
+        RecoveryEligibility::SourceMissing => {
+            mark_source_missing(
+                pool,
+                row.id,
+                "source file is no longer a regular file during manual recovery",
+                claim_now,
+            )
+            .await?;
+            return Ok(RecoveryEligibility::SourceMissing);
+        }
+        decision => return Ok(decision),
+    }
     let v2_enrollment = if row.lifecycle_version == 2 {
         let Some(session_id) = row.upload_session_id else {
-            return Err(error_stack::Report::new(AppError::Custom(
-                "v2 lifecycle row is missing its upload session".to_string(),
-            )));
+            return Ok(RecoveryEligibility::Conflict);
         };
         Some(SegmentEnrollment {
             missing_id: row.id,
@@ -2411,24 +2515,20 @@ pub async fn manual_recover_missing_segment(
             {
                 AttemptClaim::Claimed(token) => token,
                 AttemptClaim::AlreadyRunning => {
-                    return Err(error_stack::Report::new(AppError::Custom(
-                        "missing segment already has a running upload attempt".to_string(),
-                    )));
+                    return Ok(RecoveryEligibility::AlreadyRunning);
                 }
                 AttemptClaim::AlreadyCompleted => {
-                    return Err(error_stack::Report::new(AppError::Custom(
-                        "missing segment upload is already completed".to_string(),
-                    )));
+                    return Ok(RecoveryEligibility::AlreadySucceeded);
                 }
                 AttemptClaim::NotDue => {
-                    return Err(error_stack::Report::new(AppError::Custom(
-                        "missing segment retry is not due yet".to_string(),
-                    )));
+                    return Ok(RecoveryEligibility::Conflict);
                 }
                 AttemptClaim::NotClaimable(status) => {
-                    return Err(error_stack::Report::new(AppError::Custom(format!(
-                        "missing segment status '{status}' cannot be claimed"
-                    ))));
+                    warn!(
+                        missing_id,
+                        status, "manual recovery claim rejected after eligibility check"
+                    );
+                    return Ok(RecoveryEligibility::Conflict);
                 }
             };
         Some(token)
@@ -2443,7 +2543,7 @@ pub async fn manual_recover_missing_segment(
         .await
         .change_context(AppError::Unknown)?;
         if claimed.rows_affected() == 0 {
-            return Ok(());
+            return Ok(RecoveryEligibility::AlreadyRunning);
         }
         None
     };
@@ -2451,7 +2551,7 @@ pub async fn manual_recover_missing_segment(
     // Perform the upload + edit/insert inside a fallible scope so that any failure
     // resets the row to 'failed' and persists the error before returning.
     let span = tracing::info_span!("session", session = row.upload_session_id);
-    let upload_result: AppResult<()> = async {
+    let upload_result: AppResult<RecoveryEligibility> = async {
         // A database error while the live uploader was creating its local session may have left
         // this row unbound. Materialize a recoverable session before uploading so the manual
         // action has a durable destination instead of failing forever with neither session nor aid.
@@ -2544,16 +2644,23 @@ pub async fn manual_recover_missing_segment(
                     .studio_data(&Vid::Aid(aid as u64), None)
                     .await
                     .change_context(AppError::Unknown)?;
-                patch_studio_videos(&mut studio, video.clone(), row.segment_order);
-                bilibili
-                    .edit_by_app(&studio, None)
-                    .await
-                    .change_context(AppError::Unknown)?;
-                info!(
-                    aid,
-                    segment_order = row.segment_order,
-                    "manual_recover_edit_archive：手动补传已追加到稿件"
-                );
+                if studio_already_contains_video(&studio, &video) {
+                    info!(
+                        aid,
+                        "manual_recover_edit_archive：远端已存在相同视频，跳过重复编辑"
+                    );
+                } else {
+                    patch_studio_videos(&mut studio, video.clone(), row.segment_order);
+                    bilibili
+                        .edit_by_app(&studio, None)
+                        .await
+                        .change_context(AppError::Unknown)?;
+                    info!(
+                        aid,
+                        segment_order = row.segment_order,
+                        "manual_recover_edit_archive：手动补传已追加到稿件"
+                    );
+                }
             } else {
                 if v2_enrollment.is_none() {
                     insert_session_video_at_order(
@@ -2576,16 +2683,23 @@ pub async fn manual_recover_missing_segment(
                 .studio_data(&Vid::Aid(aid as u64), None)
                 .await
                 .change_context(AppError::Unknown)?;
-            patch_studio_videos(&mut studio, video.clone(), row.segment_order);
-            bilibili
-                .edit_by_app(&studio, None)
-                .await
-                .change_context(AppError::Unknown)?;
-            info!(
-                aid,
-                segment_order = row.segment_order,
-                "manual_recover_edit_archive：手动补传已追加到稿件"
-            );
+            if studio_already_contains_video(&studio, &video) {
+                info!(
+                    aid,
+                    "manual_recover_edit_archive：远端已存在相同视频，跳过重复编辑"
+                );
+            } else {
+                patch_studio_videos(&mut studio, video.clone(), row.segment_order);
+                bilibili
+                    .edit_by_app(&studio, None)
+                    .await
+                    .change_context(AppError::Unknown)?;
+                info!(
+                    aid,
+                    segment_order = row.segment_order,
+                    "manual_recover_edit_archive：手动补传已追加到稿件"
+                );
+            }
         } else {
             return Err(error_stack::Report::new(AppError::Custom(
                 "missing segment has neither upload_session_id nor aid".to_string(),
@@ -2620,13 +2734,13 @@ pub async fn manual_recover_missing_segment(
             );
         }
 
-        Ok(())
+        Ok(eligibility)
     }
     .instrument(span)
     .await;
 
     match upload_result {
-        Ok(()) => {
+        Ok(decision) => {
             if v2_enrollment.is_none() {
                 mark_retry_success(&mut row, chrono::Utc::now());
                 row = row
@@ -2635,7 +2749,7 @@ pub async fn manual_recover_missing_segment(
                     .change_context(AppError::Unknown)?;
                 let _ = row;
             }
-            Ok(())
+            Ok(decision)
         }
         Err(e) => {
             if let Some(token) = &attempt_token {
@@ -2656,7 +2770,7 @@ pub async fn retry_missing_segment(
     config: &Config,
     pool: &ConnectionPool,
     missing_id: i64,
-) -> AppResult<()> {
+) -> AppResult<RecoveryEligibility> {
     let row = UploadMissingSegment::select()
         .where_("id = ?")
         .bind(missing_id)
@@ -2665,9 +2779,7 @@ pub async fn retry_missing_segment(
         .change_context(AppError::Unknown)?;
 
     if row.status == "succeeded" {
-        return Err(error_stack::Report::new(AppError::Custom(
-            "missing segment upload is already completed".to_string(),
-        )));
+        return Ok(RecoveryEligibility::AlreadySucceeded);
     }
 
     if row.status == "uploading" {
@@ -3381,6 +3493,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_count, 0, "空片段不得出现在缺失补传");
+    }
+
+    #[tokio::test]
+    async fn finalized_session_rescan_does_not_create_a_replacement_session() {
+        let (dir, pool) = deferred_test_pool().await;
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (10, 'https://example.com/live', 'test')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upload_session SET status = 'finalized' WHERE id = 30")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let result = rescan_local_valid_segments(&Config::default(), &pool, 20, dir.path())
+            .await
+            .unwrap();
+
+        assert!(result.skipped_finalized);
+        assert_eq!(result.upload_session_id, 30);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let missing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_missing_segment")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((sessions, missing), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn vanished_v2_source_becomes_terminal_without_incrementing_attempts() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "vanished-source.flv").await;
+        std::fs::remove_file(directory.path().join("vanished-source.flv")).unwrap();
+        let row = UploadMissingSegment::select()
+            .where_("id = ?")
+            .bind(enrollment.missing_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            check_recovery_eligibility(&pool, &row, None, chrono::Utc::now())
+                .await
+                .unwrap(),
+            RecoveryEligibility::SourceMissing
+        );
+        assert!(
+            mark_source_missing(&pool, row.id, "test source removed", chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mark_source_missing(&pool, row.id, "must be idempotent", chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        let state = sqlx::query_as::<_, (String, i64, Option<String>)>(
+            "SELECT status, attempts, attempt_token FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(row.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("source_missing".to_string(), 0, None));
+    }
+
+    #[tokio::test]
+    async fn late_validated_segment_is_audited_without_reopening_finalized_session() {
+        let (directory, pool) = deferred_test_pool().await;
+        sqlx::query("UPDATE upload_session SET status = 'finalized' WHERE id = 30")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let path = directory.path().join("late-after-finalize.flv");
+        std::fs::write(&path, b"synthetic upload bytes").unwrap();
+        let request = EnrollmentRequest {
+            live_streamer_id: 10,
+            streamer_info_id: 20,
+            file_path: path.clone(),
+            normalized_file_path: normalize_segment_path(&path).unwrap(),
+            danmaku_file_path: None,
+            total_bytes: std::fs::metadata(&path).unwrap().len(),
+            now: chrono::Utc::now(),
+            recovery_window_minutes: 30,
+        };
+        let outcome = enroll_validated_segment(
+            &EnrollmentStore::new(pool.clone(), directory.path().join("outbox")),
+            &request,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            EnrollmentOutcome::FinalizedRejected { session_id: 30 }
+        ));
+        let counts = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM upload_session), \
+                    (SELECT COUNT(*) FROM upload_missing_segment), \
+                    (SELECT COUNT(*) FROM upload_recovery_audit)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (1, 0, 1));
     }
 
     const LIVE_URL: &str = "https://live.douyin.com/123456";

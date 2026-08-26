@@ -489,7 +489,7 @@ pub fn missing_status_where(status: Option<&str>) -> &'static str {
     match status {
         Some("succeeded") => "status = 'succeeded'",
         Some("all") => "1 = 1",
-        _ => "status IN ('pending', 'failed', 'uploading')",
+        _ => "status IN ('pending', 'failed', 'uploading', 'source_missing')",
     }
 }
 
@@ -997,11 +997,11 @@ mod tests {
     fn missing_status_where_maps_filter_to_sql() {
         assert_eq!(
             missing_status_where(None),
-            "status IN ('pending', 'failed', 'uploading')"
+            "status IN ('pending', 'failed', 'uploading', 'source_missing')"
         );
         assert_eq!(
             missing_status_where(Some("active")),
-            "status IN ('pending', 'failed', 'uploading')"
+            "status IN ('pending', 'failed', 'uploading', 'source_missing')"
         );
         assert_eq!(
             missing_status_where(Some("succeeded")),
@@ -1011,7 +1011,7 @@ mod tests {
         // 非法值归一到 active，避免注入与意外全表
         assert_eq!(
             missing_status_where(Some("garbage")),
-            "status IN ('pending', 'failed', 'uploading')"
+            "status IN ('pending', 'failed', 'uploading', 'source_missing')"
         );
     }
 

@@ -440,9 +440,80 @@ async fn target_05_watchdogs_release_permit_and_tls_failure_fails_over() {
 }
 
 #[tokio::test]
-#[ignore = "contract for task 06: source_missing and finalized eligibility"]
 async fn target_06_source_missing_stops_retries_and_finalized_stays_closed() {
-    panic!("invariants 6 and 8 violated: finalized/source-missing recovery created active work");
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.insert_session("finalized", "[]").await;
+    let source = media.path().join("late-segment.flv");
+    let request = EnrollmentRequest {
+        live_streamer_id: INCIDENT_ROOM_ID,
+        streamer_info_id: INCIDENT_STREAMER_INFO_ID,
+        file_path: source.clone(),
+        normalized_file_path: normalize_segment_path(&source).unwrap(),
+        danmaku_file_path: None,
+        total_bytes: 0,
+        now: FakeClock::incident_start().now(),
+        recovery_window_minutes: 30,
+    };
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+
+    assert!(matches!(
+        enroll_validated_segment(&store, &request).await.unwrap(),
+        EnrollmentOutcome::SourceMissing
+    ));
+    assert_eq!(db.counts().await, (1, 0));
+
+    write_synthetic_valid_flv(&source);
+    assert!(matches!(
+        enroll_validated_segment(&store, &request).await.unwrap(),
+        EnrollmentOutcome::FinalizedRejected {
+            session_id: INCIDENT_SESSION_ID
+        }
+    ));
+    assert_eq!(db.counts().await, (1, 0));
+    let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_recovery_audit")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count, 2, "both rejected paths stay auditable");
+}
+
+#[tokio::test]
+async fn target_06_outbox_import_respects_a_finalized_session_boundary() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let unavailable_db = IncidentDb::new().await;
+    unavailable_db.pool.close().await;
+    let unavailable_store =
+        EnrollmentStore::new(unavailable_db.pool.clone(), outbox.path().to_path_buf());
+    let path = media.path().join("late-outboxed.flv");
+    write_synthetic_valid_flv(&path);
+    let request = enrollment_request(&path);
+
+    // Invariant 1: the finalized guard cannot query an unreachable database, and must not turn a
+    // validated segment into an error instead of a durable record.
+    let outcome = enroll_validated_segment(&unavailable_store, &request)
+        .await
+        .unwrap();
+    let EnrollmentOutcome::Outboxed(manifest) = outcome else {
+        panic!("the finalized guard must not defeat the outbox fallback");
+    };
+
+    // Invariant 6: the session is finalized by the time the database recovers, so the deferred
+    // manifest must not reopen it.
+    let recovered_db = IncidentDb::new().await;
+    recovered_db.insert_session("finalized", "[]").await;
+    let recovered_store =
+        EnrollmentStore::new(recovered_db.pool.clone(), outbox.path().to_path_buf());
+    assert_eq!(import_outbox_once(&recovered_store).await.unwrap(), 0);
+    assert_eq!(recovered_db.counts().await, (1, 0));
+    assert!(!manifest.exists());
+    let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_recovery_audit")
+        .fetch_one(&recovered_db.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count, 1, "the discarded manifest stays auditable");
 }
 
 #[test]

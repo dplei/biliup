@@ -849,11 +849,14 @@ pub async fn recover_missing_upload(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let config = service_register.config.read().unwrap().clone();
-    manual_recover_missing_segment(&config, &service_register.pool, id)
+    let eligibility = manual_recover_missing_segment(&config, &service_register.pool, id)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": matches!(&eligibility, crate::server::common::recovery_eligibility::RecoveryEligibility::Eligible | crate::server::common::recovery_eligibility::RecoveryEligibility::LegacyFinalizedEdit),
+        "eligibility": eligibility,
+    })))
 }
 
 #[derive(serde::Deserialize)]
@@ -950,9 +953,12 @@ pub async fn retry_missing_upload(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let config = service_register.config.read().unwrap().clone();
-    retry_missing_segment(&config, &service_register.pool, id)
+    let eligibility = retry_missing_segment(&config, &service_register.pool, id)
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({
+        "ok": matches!(&eligibility, crate::server::common::recovery_eligibility::RecoveryEligibility::Eligible | crate::server::common::recovery_eligibility::RecoveryEligibility::LegacyFinalizedEdit),
+        "eligibility": eligibility,
+    })))
 }

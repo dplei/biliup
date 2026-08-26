@@ -1,3 +1,6 @@
+use crate::server::common::recovery_eligibility::{
+    finalized_session_for_streamer_info, record_recovery_audit,
+};
 use crate::server::core::downloader::SegmentEnrollment;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -32,6 +35,14 @@ pub struct EnrollmentRequest {
 pub enum EnrollmentOutcome {
     Enrolled(SegmentEnrollment),
     Outboxed(PathBuf),
+    /// The segment arrived after this exact local stream had already been finalized. It is
+    /// auditable, but deliberately has no lifecycle row to avoid reopening a submitted archive.
+    FinalizedRejected {
+        session_id: i64,
+    },
+    /// A segment vanished between validation and durable enrollment. No active retry row is
+    /// created for a source which cannot be opened.
+    SourceMissing,
 }
 
 #[derive(Clone)]
@@ -84,6 +95,21 @@ pub async fn enroll_validated_segment(
     store: &EnrollmentStore,
     request: &EnrollmentRequest,
 ) -> AppResult<EnrollmentOutcome> {
+    if !request.file_path.is_file() {
+        audit_recovery_best_effort(&store.pool, request, "source_missing_before_enrollment").await;
+        return Ok(EnrollmentOutcome::SourceMissing);
+    }
+
+    if let Some(session_id) = finalized_boundary_for(&store.pool, request).await {
+        audit_recovery_best_effort(
+            &store.pool,
+            request,
+            "late_validated_segment_for_finalized_session",
+        )
+        .await;
+        return Ok(EnrollmentOutcome::FinalizedRejected { session_id });
+    }
+
     for delay in ENROLLMENT_RETRY_DELAYS {
         match enroll_in_database(&store.pool, request).await {
             Ok(enrollment) => return Ok(EnrollmentOutcome::Enrolled(enrollment)),
@@ -105,6 +131,77 @@ pub async fn enroll_validated_segment(
             );
             Ok(EnrollmentOutcome::Outboxed(manifest))
         }
+    }
+}
+
+/// Reports the finalized session which closes this StreamerInfo, or `None` when a non-finalized
+/// session exists (a new live run may legitimately reuse the room).
+///
+/// A database which cannot answer must never be read as "finalized": invariant 1 requires a
+/// validated segment to reach the fsynced outbox rather than be dropped, and `import_outbox_once`
+/// re-checks this same boundary once the database is reachable again.
+async fn finalized_boundary_for(pool: &ConnectionPool, request: &EnrollmentRequest) -> Option<i64> {
+    let active_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM upload_session WHERE live_streamer_id = ?1 AND streamer_info_id = ?2 \
+         AND status != 'finalized' LIMIT 1",
+    )
+    .bind(request.live_streamer_id)
+    .bind(request.streamer_info_id)
+    .fetch_optional(pool)
+    .await;
+    match active_exists {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                ?error,
+                file = %request.normalized_file_path.display(),
+                "cannot read session boundary; deferring the finalized guard to outbox import"
+            );
+            return None;
+        }
+    }
+    match finalized_session_for_streamer_info(
+        pool,
+        request.live_streamer_id,
+        request.streamer_info_id,
+    )
+    .await
+    {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            warn!(
+                ?error,
+                file = %request.normalized_file_path.display(),
+                "cannot read finalized sessions; deferring the finalized guard to outbox import"
+            );
+            None
+        }
+    }
+}
+
+/// The audit row explains a rejection; losing it must not turn a decided outcome into an error.
+async fn audit_recovery_best_effort(
+    pool: &ConnectionPool,
+    request: &EnrollmentRequest,
+    reason: &str,
+) {
+    if let Err(error) = record_recovery_audit(
+        pool,
+        request.live_streamer_id,
+        request.streamer_info_id,
+        &request.file_path,
+        reason,
+        request.now,
+    )
+    .await
+    {
+        warn!(
+            ?error,
+            reason,
+            file = %request.normalized_file_path.display(),
+            "upload recovery audit row not recorded"
+        );
     }
 }
 
@@ -268,6 +365,22 @@ async fn find_or_create_session(
         .await?;
         return Ok(id);
     }
+    // Keep the finalized boundary inside the enrollment transaction as well. The public
+    // preflight above gives callers a useful outcome; this closes its check/insert race.
+    if sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM upload_session WHERE live_streamer_id = ?1 AND streamer_info_id = ?2 \
+         AND status = 'finalized' LIMIT 1",
+    )
+    .bind(request.live_streamer_id)
+    .bind(request.streamer_info_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some()
+    {
+        return Err(sqlx::Error::Protocol(
+            "upload session is finalized; enrollment rejected".to_string(),
+        ));
+    }
     let result = sqlx::query(
         "INSERT INTO upload_session \
          (live_streamer_id, streamer_info_id, aid, bvid, videos_json, status, created_at, updated_at, \
@@ -344,6 +457,23 @@ pub async fn import_outbox_once(store: &EnrollmentStore) -> AppResult<usize> {
         let bytes = std::fs::read(&path).change_context(AppError::Unknown)?;
         let request: EnrollmentRequest =
             serde_json::from_slice(&bytes).change_context(AppError::Unknown)?;
+        // The manifest was written while the database was unreachable, so the finalized guard in
+        // enroll_validated_segment could not run. Re-check it here before the row is created.
+        if let Some(session_id) = finalized_boundary_for(&store.pool, &request).await {
+            audit_recovery_best_effort(
+                &store.pool,
+                &request,
+                "late_outbox_manifest_for_finalized_session",
+            )
+            .await;
+            std::fs::remove_file(&path).change_context(AppError::Unknown)?;
+            warn!(
+                session_id,
+                manifest = %path.display(),
+                "discarded outbox manifest for an already finalized session"
+            );
+            continue;
+        }
         match enroll_in_database(&store.pool, &request).await {
             Ok(enrollment) => {
                 std::fs::remove_file(&path).change_context(AppError::Unknown)?;

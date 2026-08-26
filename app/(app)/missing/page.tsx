@@ -63,6 +63,7 @@ interface RescanResult {
   queued: number
   skipped_known: number
   skipped_invalid: number
+  skipped_finalized: boolean
 }
 
 const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; text: string }> = {
@@ -70,6 +71,7 @@ const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; 
   failed: { color: 'red', text: '失败' },
   uploading: { color: 'orange', text: '补传中' },
   succeeded: { color: 'green', text: '已完成' },
+  source_missing: { color: 'grey', text: '源文件缺失' },
 }
 
 const fmtTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—')
@@ -137,8 +139,10 @@ export default function MissingRecovery() {
         arg: { streamer_info_id: rescanStreamerInfoId },
       })) as RescanResult
       Toast.success(
-        `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
-          `${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
+        result.skipped_finalized
+          ? `会话 #${result.upload_session_id} 已投稿完成，补扫未创建新的补传任务`
+          : `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
+            `${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
       )
       setStatusFilter('active')
       await mutate()
@@ -152,8 +156,17 @@ export default function MissingRecovery() {
   const handleRecover = async (id: number) => {
     setRecoveringId(id)
     try {
-      await sendRequest(`/v1/uploads/missing/${id}/recover`, { arg: {} })
-      Toast.success('补传成功，已补进对应稿件或待提交会话')
+      const result = (await sendRequest(`/v1/uploads/missing/${id}/recover`, { arg: {} })) as {
+        ok: boolean
+        eligibility: string
+      }
+      if (!result.ok) {
+        Toast.warning(`未执行补传：${result.eligibility}`)
+      } else if (result.eligibility === 'legacy_finalized_edit') {
+        Toast.success('已补进现有稿件；该编辑可能触发重新审核')
+      } else {
+        Toast.success('补传成功，已补进对应稿件或待提交会话')
+      }
       await mutate()
     } catch (e: any) {
       Toast.error(`补传失败：${e?.message ?? e}`)
@@ -165,8 +178,12 @@ export default function MissingRecovery() {
   const handleRetry = async (id: number) => {
     setRetryingId(id)
     try {
-      await sendRequest(`/v1/uploads/missing/${id}/retry`, { arg: {} })
-      Toast.success('已重新发起补投')
+      const result = (await sendRequest(`/v1/uploads/missing/${id}/retry`, { arg: {} })) as {
+        ok: boolean
+        eligibility: string
+      }
+      if (result.ok) Toast.success('已重新发起补投')
+      else Toast.warning(`未重新发起：${result.eligibility}`)
       await mutate()
     } catch (e: any) {
       Toast.error(`重新补投失败：${e?.message ?? e}`)
@@ -322,6 +339,30 @@ export default function MissingRecovery() {
       fixed: 'right' as const,
       render: (_: unknown, record: MissingSegment) => {
         if (record.status === 'succeeded') return '—'
+
+        if (record.status === 'source_missing') {
+          return (
+            <div style={{ display: 'flex', gap: 4 }}>
+              <Button
+                theme="borderless"
+                icon={<IconRefresh />}
+                loading={recoveringId === record.id}
+                onClick={() => handleRecover(record.id)}
+              >
+                重新检查文件
+              </Button>
+              <Popconfirm
+                title="删除这条缺失记录？"
+                content="仅删除本地记录；源文件已经不存在。"
+                okText="删除"
+                okButtonProps={{ type: 'danger' }}
+                onConfirm={() => handleDelete(record.id)}
+              >
+                <Button theme="borderless" type="danger" icon={<IconDeleteStroked />} loading={deletingId === record.id} />
+              </Popconfirm>
+            </div>
+          )
+        }
 
         if (record.status === 'uploading') {
           return (
