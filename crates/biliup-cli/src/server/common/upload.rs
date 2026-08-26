@@ -1281,7 +1281,7 @@ async fn upload_single_file_with_repair(
     repair_enabled: bool,
     normalization_enabled: bool,
     target_lufs: f64,
-    progress_tx: Option<mpsc::UnboundedSender<UploadProgress>>,
+    activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
     let normalization = if normalization_enabled {
         normalize_for_upload(original_path, target_lufs, &SystemAudioFfmpeg::default()).await
@@ -1315,7 +1315,7 @@ async fn upload_single_file_with_repair(
     let result = {
         // CPU/磁盘处理不占网络上传 permit。
         let _permit = acquire_global_upload_permit().await;
-        upload_single_file(&upload_path, context, progress_tx).await
+        upload_single_file(&upload_path, context, activity_tx).await
     };
     match result {
         Ok(video) => Ok((video, outcome, normalization_artifact)),
@@ -1334,7 +1334,7 @@ async fn upload_single_file_with_repair(
 async fn upload_single_file(
     file_path: &Path,
     context: &UploadContext,
-    progress_tx: Option<mpsc::UnboundedSender<UploadProgress>>,
+    activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<Video> {
     let video_path = file_path;
     let UploadContext {
@@ -1379,6 +1379,17 @@ async fn upload_single_file(
     };
 
     let instant = Instant::now();
+    if let Some(tx) = &activity_tx {
+        let _ = tx.send(UploadActivity::TransferStarted {
+            file_path: video_path.to_path_buf(),
+            total_bytes: total_size,
+        });
+    }
+    info!(
+        file = %video_path.display(),
+        total_bytes = total_size,
+        "upload transfer started"
+    );
 
     let video = match uploader
         .upload_with_observer(
@@ -1392,8 +1403,8 @@ async fn upload_single_file(
                 })
             },
             move |progress| {
-                if let Some(tx) = &progress_tx {
-                    let _ = tx.send(progress);
+                if let Some(tx) = &activity_tx {
+                    let _ = tx.send(UploadActivity::Progress(progress));
                 }
             },
         )
@@ -1529,8 +1540,17 @@ enum AttemptEvent<T> {
     Cancelled,
     NoProgressTimeout,
     TotalUploadTimeout,
+    Activity(UploadActivity),
+    ActivityClosed,
+}
+
+#[derive(Debug)]
+enum UploadActivity {
+    TransferStarted {
+        file_path: PathBuf,
+        total_bytes: u64,
+    },
     Progress(UploadProgress),
-    ProgressClosed,
 }
 
 async fn next_attempt_event<F>(
@@ -1538,8 +1558,9 @@ async fn next_attempt_event<F>(
     cancellation: &CancellationToken,
     mut no_progress: Pin<&mut tokio::time::Sleep>,
     mut total: Pin<&mut tokio::time::Sleep>,
-    progress_rx: &mut mpsc::UnboundedReceiver<UploadProgress>,
-    progress_open: bool,
+    activity_rx: &mut mpsc::UnboundedReceiver<UploadActivity>,
+    activity_open: bool,
+    watchdog_enabled: bool,
 ) -> AttemptEvent<F::Output>
 where
     F: Future,
@@ -1547,11 +1568,11 @@ where
     tokio::select! {
         result = &mut upload => AttemptEvent::Completed(result),
         _ = cancellation.cancelled() => AttemptEvent::Cancelled,
-        _ = &mut no_progress => AttemptEvent::NoProgressTimeout,
-        _ = &mut total => AttemptEvent::TotalUploadTimeout,
-        progress = progress_rx.recv(), if progress_open => match progress {
-            Some(progress) => AttemptEvent::Progress(progress),
-            None => AttemptEvent::ProgressClosed,
+        _ = &mut no_progress, if watchdog_enabled => AttemptEvent::NoProgressTimeout,
+        _ = &mut total, if watchdog_enabled => AttemptEvent::TotalUploadTimeout,
+        activity = activity_rx.recv(), if activity_open => match activity {
+            Some(activity) => AttemptEvent::Activity(activity),
+            None => AttemptEvent::ActivityClosed,
         },
     }
 }
@@ -1573,14 +1594,14 @@ async fn upload_enrolled_with_watchdog(
     Option<AttemptGuard>,
 )> {
     let (guard, cancellation) = register_attempt(missing_id, attempt_token);
-    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
     let upload = upload_single_file_with_repair(
         original_path,
         context,
         repair_enabled,
         normalization_enabled,
         target_lufs,
-        Some(progress_tx),
+        Some(activity_tx),
     );
     pin!(upload);
 
@@ -1590,7 +1611,14 @@ async fn upload_enrolled_with_watchdog(
     pin!(total);
     let mut last_persist = Instant::now();
     let mut persisted_bytes = 0u64;
-    let mut progress_open = true;
+    let mut activity_open = true;
+    let mut watchdog_enabled = false;
+    info!(
+        missing_id,
+        watchdog = "paused",
+        phase = "preprocessing",
+        "upload watchdog is not enabled until upload transfer starts"
+    );
 
     loop {
         match next_attempt_event(
@@ -1598,8 +1626,9 @@ async fn upload_enrolled_with_watchdog(
             &cancellation,
             no_progress.as_mut(),
             total.as_mut(),
-            &mut progress_rx,
-            progress_open,
+            &mut activity_rx,
+            activity_open,
+            watchdog_enabled,
         )
         .await
         {
@@ -1648,8 +1677,40 @@ async fn upload_enrolled_with_watchdog(
                     "total_upload_timeout".to_string(),
                 )));
             }
-            AttemptEvent::ProgressClosed => progress_open = false,
-            AttemptEvent::Progress(progress) => {
+            AttemptEvent::ActivityClosed => activity_open = false,
+            AttemptEvent::Activity(UploadActivity::TransferStarted {
+                file_path,
+                total_bytes,
+            }) => {
+                let now = tokio::time::Instant::now();
+                no_progress.as_mut().reset(now + NO_PROGRESS_TIMEOUT);
+                total.as_mut().reset(now + TOTAL_UPLOAD_TIMEOUT);
+                last_persist = Instant::now();
+                watchdog_enabled = true;
+                info!(
+                    missing_id,
+                    watchdog = "enabled",
+                    file = %file_path.display(),
+                    total_bytes,
+                    no_progress_timeout_secs = NO_PROGRESS_TIMEOUT.as_secs(),
+                    "upload watchdog now monitors transferred network bytes"
+                );
+            }
+            AttemptEvent::Activity(UploadActivity::Progress(progress)) => {
+                // Both activity variants share a channel, so this is normally already true.  The
+                // defensive branch keeps the 5-minute network watchdog correct if an uploader
+                // implementation ever emits a progress callback before its start signal.
+                if !watchdog_enabled {
+                    let now = tokio::time::Instant::now();
+                    no_progress.as_mut().reset(now + NO_PROGRESS_TIMEOUT);
+                    total.as_mut().reset(now + TOTAL_UPLOAD_TIMEOUT);
+                    watchdog_enabled = true;
+                    info!(
+                        missing_id,
+                        watchdog = "enabled",
+                        "upload progress enabled watchdog monitoring"
+                    );
+                }
                 no_progress
                     .as_mut()
                     .reset(tokio::time::Instant::now() + NO_PROGRESS_TIMEOUT);
@@ -3003,7 +3064,7 @@ mod tests {
         let total = tokio::time::sleep(Duration::from_secs(1));
         pin!(no_progress);
         pin!(total);
-        let (_progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (_activity_tx, mut activity_rx) = mpsc::unbounded_channel();
 
         assert!(
             tokio::time::timeout(
@@ -3013,7 +3074,8 @@ mod tests {
                     &cancellation,
                     no_progress.as_mut(),
                     total.as_mut(),
-                    &mut progress_rx,
+                    &mut activity_rx,
+                    true,
                     true,
                 ),
             )
@@ -3027,11 +3089,62 @@ mod tests {
                 &cancellation,
                 no_progress.as_mut(),
                 total.as_mut(),
-                &mut progress_rx,
+                &mut activity_rx,
+                true,
                 true,
             )
             .await,
             AttemptEvent::NoProgressTimeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_is_disabled_until_upload_transfer_starts() {
+        let upload = std::future::pending::<()>();
+        pin!(upload);
+        let cancellation = CancellationToken::new();
+        let no_progress = tokio::time::sleep(Duration::from_millis(20));
+        let total = tokio::time::sleep(Duration::from_millis(20));
+        pin!(no_progress);
+        pin!(total);
+        let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(60),
+                next_attempt_event(
+                    upload.as_mut(),
+                    &cancellation,
+                    no_progress.as_mut(),
+                    total.as_mut(),
+                    &mut activity_rx,
+                    true,
+                    false,
+                ),
+            )
+            .await
+            .is_err(),
+            "preprocessing must not consume either upload watchdog deadline"
+        );
+
+        activity_tx
+            .send(UploadActivity::TransferStarted {
+                file_path: PathBuf::from("normalized.flv"),
+                total_bytes: 1024,
+            })
+            .unwrap();
+        assert!(matches!(
+            next_attempt_event(
+                upload.as_mut(),
+                &cancellation,
+                no_progress.as_mut(),
+                total.as_mut(),
+                &mut activity_rx,
+                true,
+                false,
+            )
+            .await,
+            AttemptEvent::Activity(UploadActivity::TransferStarted { .. })
         ));
     }
 
@@ -3046,17 +3159,17 @@ mod tests {
         let total = tokio::time::sleep(Duration::from_millis(260));
         pin!(no_progress);
         pin!(total);
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let (activity_tx, mut activity_rx) = mpsc::unbounded_channel();
         let sender = tokio::spawn(async move {
             for chunk_index in 0..20 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                if progress_tx
-                    .send(UploadProgress {
+                if activity_tx
+                    .send(UploadActivity::Progress(UploadProgress {
                         chunk_bytes: 1024,
                         uploaded_bytes: (chunk_index + 1) * 1024,
                         total_bytes: 100 * 1024,
                         chunk_index: chunk_index as usize,
-                    })
+                    }))
                     .is_err()
                 {
                     break;
@@ -3070,12 +3183,13 @@ mod tests {
                 &cancellation,
                 no_progress.as_mut(),
                 total.as_mut(),
-                &mut progress_rx,
+                &mut activity_rx,
+                true,
                 true,
             )
             .await
             {
-                AttemptEvent::Progress(_) => no_progress
+                AttemptEvent::Activity(UploadActivity::Progress(_)) => no_progress
                     .as_mut()
                     .reset(tokio::time::Instant::now() + no_progress_duration),
                 AttemptEvent::TotalUploadTimeout => break,
@@ -3106,13 +3220,14 @@ mod tests {
             let total = tokio::time::sleep(Duration::from_secs(1));
             pin!(no_progress);
             pin!(total);
-            let (_progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+            let (_activity_tx, mut activity_rx) = mpsc::unbounded_channel();
             next_attempt_event(
                 upload.as_mut(),
                 &task_cancellation,
                 no_progress.as_mut(),
                 total.as_mut(),
-                &mut progress_rx,
+                &mut activity_rx,
+                true,
                 true,
             )
             .await

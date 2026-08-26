@@ -2,8 +2,9 @@ use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -17,6 +18,10 @@ const SAMPLE_DIR: &str = "audio-normalization";
 const SAMPLE_FILE: &str = "sample.m4a";
 const CAPTURE_NEXT: &str = "capture-next";
 static NORMALIZE_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+/// Artifacts which belong to this process and may still be read by an upload.  A fresh process
+/// has an empty set, so its first normalization pass can safely remove leftovers from a crash.
+static ACTIVE_NORMALIZATION_ARTIFACTS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub struct LoudnessTarget(pub f64);
@@ -54,6 +59,14 @@ pub trait AudioFfmpegRunner: Send + Sync {
 pub struct TempArtifact(PathBuf);
 
 impl TempArtifact {
+    fn normalization_output(path: PathBuf) -> Self {
+        ACTIVE_NORMALIZATION_ARTIFACTS
+            .lock()
+            .expect("active normalization artifacts mutex poisoned")
+            .insert(path.clone());
+        Self(path)
+    }
+
     pub fn path(&self) -> &Path {
         &self.0
     }
@@ -64,6 +77,10 @@ impl TempArtifact {
 
 impl Drop for TempArtifact {
     fn drop(&mut self) {
+        ACTIVE_NORMALIZATION_ARTIFACTS
+            .lock()
+            .expect("active normalization artifacts mutex poisoned")
+            .remove(&self.0);
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -191,7 +208,7 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
 ) -> NormalizationOutcome {
     let started = std::time::Instant::now();
     if let Some(directory) = source.parent() {
-        cleanup_stale_normalization_artifacts(directory).await;
+        cleanup_orphaned_normalization_artifacts(directory).await;
     }
     if !matches!(tokio::fs::metadata(source).await, Ok(m) if m.len() > 0) {
         return NormalizationOutcome::Original {
@@ -201,13 +218,14 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     let input = match runner.probe(source).await {
         Ok(v) => v,
         Err(error) => {
-            warn!(file=%source.display(), ?error, "audio normalization probe failed");
+            warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during probe");
             return NormalizationOutcome::Original {
                 reason: OriginalReason::ProbeFailed,
             };
         }
     };
     if input.primary_audio_stream.is_none() {
+        info!(audio_normalization = "skipped", file = %source.display(), "audio normalization skipped: no audio stream");
         return NormalizationOutcome::Original {
             reason: OriginalReason::NoAudio,
         };
@@ -217,10 +235,16 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
         .await
         .expect("normalization semaphore open");
     let target = LoudnessTarget(target_lufs);
+    info!(
+        audio_normalization = "started",
+        file = %source.display(),
+        target_lufs,
+        "audio normalization started"
+    );
     let stderr = match runner.measure(source, target).await {
         Ok(v) => v,
         Err(error) => {
-            warn!(file=%source.display(), ?error, "audio normalization measure failed");
+            warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during measure");
             return NormalizationOutcome::Original {
                 reason: OriginalReason::MeasureFailed,
             };
@@ -229,26 +253,28 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     let measurement = match parse_loudnorm_measurement(&stderr) {
         Ok(v) => v,
         Err(error) => {
-            warn!(file=%source.display(), ?error, "invalid loudnorm measurement");
+            warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed: invalid measurement");
             return NormalizationOutcome::Original {
                 reason: OriginalReason::InvalidMeasurement,
             };
         }
     };
-    let output = normalized_temp_path(source);
+    // Construct the guard before starting ffmpeg: cancellation/drop then removes a partially
+    // written .part file as well as a completed one.
+    let artifact = TempArtifact::normalization_output(normalized_temp_path(source));
     if let Err(error) = runner
-        .transcode(source, &output, target, &measurement)
+        .transcode(source, artifact.path(), target, &measurement)
         .await
     {
-        let _ = tokio::fs::remove_file(&output).await;
-        warn!(file=%source.display(), ?error, "audio normalization transcode failed");
+        artifact.cleanup().await;
+        warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during transcode");
         return NormalizationOutcome::Original {
             reason: OriginalReason::TranscodeFailed,
         };
     }
-    let valid_file = matches!(tokio::fs::metadata(&output).await, Ok(m) if m.len() > 0);
+    let valid_file = matches!(tokio::fs::metadata(artifact.path()).await, Ok(m) if m.len() > 0);
     let output_probe = if valid_file {
-        runner.probe(&output).await.ok()
+        runner.probe(artifact.path()).await.ok()
     } else {
         None
     };
@@ -258,25 +284,28 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
             && v.duration_seconds.unwrap_or(0.0) > 0.0
     });
     if !valid {
-        let _ = tokio::fs::remove_file(&output).await;
+        artifact.cleanup().await;
+        warn!(audio_normalization = "failed", file=%source.display(), "audio normalization produced invalid output");
         return NormalizationOutcome::Original {
             reason: OriginalReason::InvalidOutput,
         };
     }
-    let size = tokio::fs::metadata(&output)
+    let size = tokio::fs::metadata(artifact.path())
         .await
         .map(|m| m.len())
         .unwrap_or(0);
-    info!(audio_normalization="completed", file=%source.display(), target_lufs,
-        input_lufs=measurement.input_i, elapsed_ms=started.elapsed().as_millis(), output_size_bytes=size);
+    info!(audio_normalization="completed", file=%source.display(), output=%artifact.path().display(), target_lufs,
+        input_lufs=measurement.input_i, elapsed_ms=started.elapsed().as_millis(), output_size_bytes=size,
+        "audio normalization completed");
     NormalizationOutcome::Normalized {
-        artifact: TempArtifact(output),
+        artifact,
         measurement,
     }
 }
 
-/// 仅扫描当前录像目录的一层，只删除超过 24 小时且严格命中本功能命名模式的孤儿件。
-async fn cleanup_stale_normalization_artifacts(directory: &Path) {
+/// 仅扫描当前录像目录的一层。当前进程未登记的 `.part` 都来自上次失败或重启，立即清理；
+/// 已完成但仍在上传的 artifact 会留在登记表中，绝不会被下一段的预处理误删。
+async fn cleanup_orphaned_normalization_artifacts(directory: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
         return;
     };
@@ -286,15 +315,13 @@ async fn cleanup_stale_normalization_artifacts(directory: &Path) {
         if !name.contains(".audio-normalized-") || !name.contains(".part.") {
             continue;
         }
-        let stale = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > Duration::from_secs(24 * 60 * 60));
-        if stale {
-            let _ = tokio::fs::remove_file(entry.path()).await;
+        let path = entry.path();
+        let active = ACTIVE_NORMALIZATION_ARTIFACTS
+            .lock()
+            .expect("active normalization artifacts mutex poisoned")
+            .contains(&path);
+        if !active && tokio::fs::remove_file(&path).await.is_ok() {
+            info!(file = %path.display(), "removed orphaned audio normalization temporary file");
         }
     }
 }
@@ -803,5 +830,21 @@ mod tests {
                 reason: OriginalReason::MeasureFailed
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn orphaned_partial_artifacts_are_removed_without_touching_active_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("old.audio-normalized-deadbeef.part.flv");
+        let active = dir.path().join("active.audio-normalized-deadbeef.part.flv");
+        tokio::fs::write(&orphan, b"orphan").await.unwrap();
+        tokio::fs::write(&active, b"active").await.unwrap();
+        let active_artifact = TempArtifact::normalization_output(active.clone());
+
+        cleanup_orphaned_normalization_artifacts(dir.path()).await;
+
+        assert!(!tokio::fs::try_exists(orphan).await.unwrap());
+        assert!(tokio::fs::try_exists(&active).await.unwrap());
+        drop(active_artifact);
     }
 }
