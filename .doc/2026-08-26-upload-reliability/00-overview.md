@@ -46,16 +46,27 @@ Status: ready-for-agent
 | 04 | 上传线路健康与 TLS 熔断 | ✅ 已完成（`a738e6b`） | 01、02 | 已与 03 attempt 状态机集成 |
 | 05 | session 完整性与分 P 排序 | ✅ 已完成（`17ff807`） | 01、02 | 已统一正常下播与重启补提交闸门 |
 | 06 | 补传幂等与 finalized 防护 | ✅ 已完成（`8f1df43`） | 02、05 | 已与 03/04 的重试行为集成 |
-| 07 | 迁移、回填与事故数据恢复 | 待实施 | 02、05、06 | 所有数据语义确定后执行 |
-| 08 | 验证、灰度与可观测性 | 待实施 | 01–07 | 最后执行 |
+| 07 | 迁移、回填与事故数据恢复 | ✅ 已完成（`d7fe4ee`、`6054a96`；#227 只读审计见 `c934ba0`） | 02、05、06 | 所有数据语义确定后执行 |
+| 08 | 验证、灰度与可观测性 | 🟡 部分完成（第 1–4 节，`14864d0`）；第 5–8 节待人工执行 | 01–07 | 最后执行 |
 
 ## 下一任务建议
 
-推荐继续实施 **07：迁移、回填与事故数据恢复**。
+08 号任务的第 1–4 节（静态/单元验证、端到端故障矩阵覆盖、结构化日志、API/页面验收）已由 agent
+完成，见 [`08-verification-rollout-and-observability.md`](./08-verification-rollout-and-observability.md)。
+第 5–8 节（测试主播灰度、amd64 buildx 构建、生产部署、7 天观察、回滚）是人工运维步骤，需要仓库
+主人在有真实直播和生产机器权限的环境里手动执行，agent 不会尝试代跑。
 
-任务 06 已加入统一的 `check_recovery_eligibility` 只读资格判定、`source_missing` 终态收敛，以及 enrollment 与 outbox 导入两处的 finalized 边界防护（数据库不可达时该守卫降级放行，边界改由导入阶段复查，以免破坏不变量 1）。
+任务 07 的 backfill 只在遇到无法读取的历史分段快照时才会拒绝执行（`6054a96`），避免用错误的
+identity 静默合并/覆盖旧数据；会话 #227 的只读采集清单与审计报告骨架已产出
+（`.scratch/2026-08-26-session-227-audit/`），采集结果仍需人工在生产库上跑清单里的 SQL/curl 命令
+后回填。
 
-任务 07 需要注意：11–15 号 migration 均已随 02、04、05、06 落地，本任务不再新增 schema，只实现 Rust backfill（复用已建的 `upload_lifecycle_backfill` 断点日志表）与会话 #227 的只读审计。
+08 号任务第 1 节复查时发现并修复了一个真实的编译回归：`crates/stream-gears/src/server.rs`
+（生产实际运行的 CLI 分发路径，`cargo check -p biliup-cli` 看不到它）没有处理 07 号任务新增的
+`Commands::BackfillLifecycle`，`cargo check --workspace` 会失败。第 3/4 节复查还补上了几处此前
+完全没有日志的环节（enrollment 成功路径、attempt_token 生命周期、watchdog 触发、每线路失败分
+类），并修了一处 `upload_missing_segment.last_error` 未脱敏就写库/展示的问题，统一复用已有的
+`sanitize_error`。
 
 01 的六条 `target_*` 契约测试均已由生产实现兑现，不再有 `#[ignore]` 占位。
 
