@@ -14,4 +14,6 @@ pub mod endpoints;
 pub mod recording_lease;
 /// 单页应用静态文件处理
 pub mod spa;
+/// 主动检查直播流
+pub mod stream_check;
 pub mod ws;

@@ -63,6 +63,27 @@ export async function setRecordingState(id: number, paused: boolean) {
 	await handleResponse(res);
 }
 
+export interface CheckStreamResponse {
+	/** 后端给出的结论标识，前端据此决定提示语气；message 是可以直接展示的中文说明。 */
+	outcome:
+		| 'started'
+		| 'offline'
+		| 'already_recording'
+		| 'checking'
+		| 'paused'
+		| 'no_upload_template'
+		| 'download_pool_full'
+		| 'lease_rejected';
+	message: string;
+}
+
+/** 立刻检查一次直播流；开播的话后端会当场接上录制，不必等下一轮轮询。 */
+export async function checkStreamNow(id: number): Promise<CheckStreamResponse> {
+	const res = await fetch(`${API_BASE}/v1/streamers/${id}/check`, { method: 'POST' });
+	await handleResponse(res);
+	return res.json();
+}
+
 export async function saveRecordingLease(
 	id: number,
 	payload: { expires_at: string; customer_note: string; expected_lease_id: number | null },

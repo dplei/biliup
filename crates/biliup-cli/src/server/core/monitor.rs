@@ -19,6 +19,49 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+/// 一次开播检查的结论。轮询循环只用它决定要不要等待间隔，主动检查接口把它翻译成人话。
+#[derive(Debug, Clone)]
+pub enum CheckOutcome {
+    /// 已开播，录制流程已拉起。
+    Started,
+    /// 平台返回未开播。
+    Offline,
+    /// 未绑定投稿模板，按既定策略不录。
+    NoUploadTemplate,
+    /// 下载池已满，本次不检查。
+    DownloadPoolFull,
+    /// 录制租约拒绝了这一场。
+    LeaseRejected,
+    /// 已开播但登记录制会话失败。
+    StartFailed,
+    /// 检查直播间本身出错（已脱敏）。
+    CheckFailed(String),
+}
+
+/// 主动检查的结果：要么真检查了一次，要么说明为什么没检查。
+#[derive(Debug, Clone)]
+pub enum ManualCheckResult {
+    /// 完成了一次检查。
+    Checked(CheckOutcome),
+    /// 房间不在监控中（刚被删除，或 URL 没有匹配的平台插件）。
+    NotFound,
+    /// 已经在录制，不需要再连一次。
+    Recording,
+    /// 已暂停录制，主动检查不越过人工暂停。
+    Paused,
+    /// 轮询循环正在检查这个房间，让它出结果就好。
+    Busy,
+}
+
+/// 摘队列的结果。只在 Actor 内部产生，保证「判断状态 + 摘走房间」是一步原子操作。
+enum ManualCheckTake {
+    Ready(Arc<Worker>, Arc<dyn LivePlugin + Send + Sync>),
+    NotFound,
+    Recording,
+    Paused,
+    Busy,
+}
+
 /// 房间处理器
 /// 管理多个直播间的状态和操作
 #[derive(Debug)]
@@ -79,10 +122,8 @@ impl Monitor {
     /// 启动客户端监控循环
     ///
     /// # 参数
-    /// * `rooms_handle` - 房间处理器
+    /// * `platform_name` - 平台名称
     /// * `plugin` - 下载插件
-    /// * `actor_handle` - Actor处理器
-    /// * `interval` - 监控间隔（秒）
     pub(crate) async fn start_monitor(
         self: &Arc<Self>,
         platform_name: &str,
@@ -91,148 +132,197 @@ impl Monitor {
         info!("start -> [{platform_name}]");
         // 获取下一个要检查的房间
         while let Some(room) = self.next(platform_name).await {
-            // 更新状态为等待中
-            room.change_status(Stage::Download, WorkerStatus::Pending)
-                .await;
-            let url = room.get_streamer().url.clone();
-            let cfg = room.get_config();
-            let interval = cfg.event_loop_interval;
-            let webhook = cfg.cookie_health_webhook.clone();
-            // 未绑定投稿模板：不录制（录了传不上、还白占磁盘）。前端据 /v1/streamers 返回的
-            // upload_streamers_id==null 显示「缺少投稿」标签。绑定后 worker 会重建并恢复录制。
-            if room.get_upload_config().is_none() {
-                room.change_status(Stage::Download, WorkerStatus::Idle)
-                    .await;
-                debug!(url = url, "未绑定投稿模板，跳过录制（缺少投稿）");
-                self.wake_waker(room.id()).await;
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+            let interval = room.get_config().event_loop_interval;
+            // 租约拒绝和建会话失败这两条路径上房间已经离开队列，历史行为是立刻轮到下一个
+            // 房间、不消耗本轮检查间隔，这里保持不变。
+            if matches!(
+                self.check_room_once(&room, &plugin).await,
+                CheckOutcome::LeaseRejected | CheckOutcome::StartFailed
+            ) {
                 continue;
             }
-            let Some(download_permit) = self.try_acquire_download_slot(&room).await else {
-                self.wake_waker(room.id()).await;
-                tokio::time::sleep(Duration::from_secs(interval)).await;
-                continue;
-            };
-            let request = live_request(&room);
-            // 检查直播状态
-            match plugin.check_stream(request).await {
-                Ok(LiveStatus::Live { stream }) => {
-                    // 检查成功（cookie 工作正常）
-                    cookie_health::record_success(platform_name, webhook.as_deref());
-                    let sql_no_id = streamer_info(&stream);
-                    // 同一场直播不该有两个身份。此前每检测到一次开播就无条件插入一行
-                    // streamer_info，于是「录制中重启」必然换掉 ctx.id()，会话续接的两条路
-                    // 同时失效，一场直播被拆成两个会话、两个稿件。
-                    let reused = match reusable_streamer_info(
-                        &self.pool,
-                        room.live_streamer.id,
-                        &sql_no_id.url,
-                        sql_no_id.live_session_key.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(reused) => reused,
-                        Err(e) => {
-                            // 查不到就当没有：宁可多建一行（退回今天的行为），也不能因为一次
-                            // 读库失败就拒绝录制。
-                            error!(e=?e, "查询同场 streamer_info 失败，按新开一场处理");
-                            None
-                        }
-                    };
-                    let is_reused = reused.is_some();
-                    if !recording_lease::admit_detected_session(
-                        &self.pool,
-                        &room,
-                        reused.as_ref().map(|row| row.id),
-                        sql_no_id.live_session_key.as_deref(),
-                        sql_no_id.date,
-                        is_reused,
-                        chrono::Utc::now(),
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        error!(error = ?error, live_streamer_id = room.id(), "录制租约准入检查失败，保守拒绝本场");
-                        false
-                    })
-                    {
-                        continue;
-                    }
-                    let insert = match reused {
-                        Some(existing) => {
-                            info!(
-                                url = url,
-                                streamer_info = existing.id,
-                                live_session_key = ?sql_no_id.live_session_key,
-                                "room: is live -> 续接同一场直播（复用 streamer_info）"
-                            );
-                            existing
-                        }
-                        None => match StreamerInfo::builder()
-                            .url(sql_no_id.url.clone())
-                            .name(room.live_streamer.remark.clone())
-                            .title(sql_no_id.title.clone())
-                            .date(sql_no_id.date)
-                            .live_cover_path(sql_no_id.live_cover_path.clone())
-                            .live_session_key(sql_no_id.live_session_key.clone())
-                            .insert(&self.pool)
-                            .await
-                        {
-                            Ok(insert) => insert,
-                            Err(e) => {
-                                error!(e=?e, "插入数据库失败");
-                                self.wake_waker(room.id()).await;
-                                continue;
-                            }
-                        },
-                    };
-                    info!(url = url, "room: is live -> 开播了");
-
-                    let context = Context::new(
-                        insert.id,
-                        room.clone(),
-                        self.pool.clone(),
-                        *stream,
-                        is_reused,
-                    );
-                    let downloader = plugin.clone();
-                    let uploader = self.uploader.clone();
-                    let rooms_handle = Arc::clone(self);
-
-                    // 只能在已经拿到下载池许可后启动录制。许可移动到任务内并持有到流程结束，
-                    // 因此 pool1_size 只在这里表达，不再通过下载 Actor 池或消息队列重复限流。
-                    tokio::spawn(async move {
-                        let _download_permit = download_permit;
-                        start_download_workflow(downloader, context, uploader, rooms_handle).await;
-                    });
-
-                    info!("成功开始录制 {}", url);
-                }
-                Ok(LiveStatus::Offline) => {
-                    // 未开播也是一次成功的检查（cookie 正常，只是主播没播）
-                    cookie_health::record_success(platform_name, webhook.as_deref());
-                    self.wake_waker(room.id()).await;
-                    debug!(url = room.get_streamer().url, "未开播")
-                }
-                Err(e) => {
-                    // 健康模块会区分鉴权失败与普通传输/服务端错误。
-                    let sanitized_error = cookie_health::redact_sensitive(&format!("{e:?}"));
-                    cookie_health::record_error(
-                        platform_name,
-                        &sanitized_error,
-                        webhook.as_deref(),
-                    );
-                    self.wake_waker(room.id()).await;
-                    error!(
-                        error = sanitized_error,
-                        ctx = room.get_streamer().url,
-                        "检查直播间出错"
-                    )
-                }
-            };
             // 等待下一次检查
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
         info!("exit -> [{platform_name}]")
+    }
+
+    /// 对单个房间做一次开播检查，命中开播就地拉起录制。
+    ///
+    /// 轮询循环和「主动检查」接口共用这一份实现：会话复用、租约准入、下载许可这些判断一旦
+    /// 分裂成两份，两条路径迟早会对同一场直播给出不同结论。
+    ///
+    /// 调用前提是房间已经不在轮询队列里（轮询用 `next` 弹出，主动检查用 `take_for_check`
+    /// 摘走）。没能拉起录制的分支都会自己 `wake_waker` 放回队列。
+    pub(crate) async fn check_room_once(
+        self: &Arc<Self>,
+        room: &Arc<Worker>,
+        plugin: &Arc<dyn LivePlugin + Send + Sync>,
+    ) -> CheckOutcome {
+        let platform_name = plugin.name();
+        // 更新状态为等待中
+        room.change_status(Stage::Download, WorkerStatus::Pending)
+            .await;
+        let url = room.get_streamer().url.clone();
+        let webhook = room.get_config().cookie_health_webhook.clone();
+        // 未绑定投稿模板：不录制（录了传不上、还白占磁盘）。前端据 /v1/streamers 返回的
+        // upload_streamers_id==null 显示「缺少投稿」标签。绑定后 worker 会重建并恢复录制。
+        if room.get_upload_config().is_none() {
+            room.change_status(Stage::Download, WorkerStatus::Idle)
+                .await;
+            debug!(url = url, "未绑定投稿模板，跳过录制（缺少投稿）");
+            self.wake_waker(room.id()).await;
+            return CheckOutcome::NoUploadTemplate;
+        }
+        let Some(download_permit) = self.try_acquire_download_slot(room).await else {
+            self.wake_waker(room.id()).await;
+            return CheckOutcome::DownloadPoolFull;
+        };
+        let request = live_request(room);
+        // 检查直播状态
+        match plugin.check_stream(request).await {
+            Ok(LiveStatus::Live { stream }) => {
+                // 检查成功（cookie 工作正常）
+                cookie_health::record_success(platform_name, webhook.as_deref());
+                let sql_no_id = streamer_info(&stream);
+                // 同一场直播不该有两个身份。此前每检测到一次开播就无条件插入一行
+                // streamer_info，于是「录制中重启」必然换掉 ctx.id()，会话续接的两条路
+                // 同时失效，一场直播被拆成两个会话、两个稿件。
+                let reused = match reusable_streamer_info(
+                    &self.pool,
+                    room.live_streamer.id,
+                    &sql_no_id.url,
+                    sql_no_id.live_session_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(reused) => reused,
+                    Err(e) => {
+                        // 查不到就当没有：宁可多建一行（退回今天的行为），也不能因为一次
+                        // 读库失败就拒绝录制。
+                        error!(e=?e, "查询同场 streamer_info 失败，按新开一场处理");
+                        None
+                    }
+                };
+                let is_reused = reused.is_some();
+                if !recording_lease::admit_detected_session(
+                    &self.pool,
+                    room,
+                    reused.as_ref().map(|row| row.id),
+                    sql_no_id.live_session_key.as_deref(),
+                    sql_no_id.date,
+                    is_reused,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    error!(error = ?error, live_streamer_id = room.id(), "录制租约准入检查失败，保守拒绝本场");
+                    false
+                })
+                {
+                    return CheckOutcome::LeaseRejected;
+                }
+                let insert = match reused {
+                    Some(existing) => {
+                        info!(
+                            url = url,
+                            streamer_info = existing.id,
+                            live_session_key = ?sql_no_id.live_session_key,
+                            "room: is live -> 续接同一场直播（复用 streamer_info）"
+                        );
+                        existing
+                    }
+                    None => match StreamerInfo::builder()
+                        .url(sql_no_id.url.clone())
+                        .name(room.live_streamer.remark.clone())
+                        .title(sql_no_id.title.clone())
+                        .date(sql_no_id.date)
+                        .live_cover_path(sql_no_id.live_cover_path.clone())
+                        .live_session_key(sql_no_id.live_session_key.clone())
+                        .insert(&self.pool)
+                        .await
+                    {
+                        Ok(insert) => insert,
+                        Err(e) => {
+                            error!(e=?e, "插入数据库失败");
+                            self.wake_waker(room.id()).await;
+                            return CheckOutcome::StartFailed;
+                        }
+                    },
+                };
+                info!(url = url, "room: is live -> 开播了");
+
+                let context = Context::new(
+                    insert.id,
+                    room.clone(),
+                    self.pool.clone(),
+                    *stream,
+                    is_reused,
+                );
+                let downloader = Arc::clone(plugin);
+                let uploader = self.uploader.clone();
+                let rooms_handle = Arc::clone(self);
+
+                // 只能在已经拿到下载池许可后启动录制。许可移动到任务内并持有到流程结束，
+                // 因此 pool1_size 只在这里表达，不再通过下载 Actor 池或消息队列重复限流。
+                tokio::spawn(async move {
+                    let _download_permit = download_permit;
+                    start_download_workflow(downloader, context, uploader, rooms_handle).await;
+                });
+
+                info!("成功开始录制 {}", url);
+                CheckOutcome::Started
+            }
+            Ok(LiveStatus::Offline) => {
+                // 未开播也是一次成功的检查（cookie 正常，只是主播没播）
+                cookie_health::record_success(platform_name, webhook.as_deref());
+                self.wake_waker(room.id()).await;
+                debug!(url = url, "未开播");
+                CheckOutcome::Offline
+            }
+            Err(e) => {
+                // 健康模块会区分鉴权失败与普通传输/服务端错误。
+                let sanitized_error = cookie_health::redact_sensitive(&format!("{e:?}"));
+                cookie_health::record_error(platform_name, &sanitized_error, webhook.as_deref());
+                self.wake_waker(room.id()).await;
+                error!(error = sanitized_error, ctx = url, "检查直播间出错");
+                CheckOutcome::CheckFailed(sanitized_error)
+            }
+        }
+    }
+
+    /// 立刻检查一个直播间，不等轮询轮到它。
+    ///
+    /// 服务重启后轮询要绕完一整圈才轮到某个房间，已经在播的场次就白等；这里把那一次检查
+    /// 提前。摘队列这一步在 Actor 里完成，所以不会和轮询循环同时检查同一个房间。
+    pub async fn check_now(self: &Arc<Self>, id: i64) -> ManualCheckResult {
+        match self.take_for_check(id).await {
+            ManualCheckTake::Ready(room, plugin) => {
+                info!(
+                    live_streamer_id = id,
+                    url = room.get_streamer().url,
+                    "主动检查直播流"
+                );
+                ManualCheckResult::Checked(self.check_room_once(&room, &plugin).await)
+            }
+            ManualCheckTake::NotFound => ManualCheckResult::NotFound,
+            ManualCheckTake::Recording => ManualCheckResult::Recording,
+            ManualCheckTake::Paused => ManualCheckResult::Paused,
+            ManualCheckTake::Busy => ManualCheckResult::Busy,
+        }
+    }
+
+    /// 从轮询队列里摘走房间，拿到它的独占检查权。
+    async fn take_for_check(self: &Arc<Self>, id: i64) -> ManualCheckTake {
+        let (send, recv) = oneshot::channel();
+        let _ = self
+            .sender
+            .send(ActorMessage::TakeForCheck {
+                respond_to: send,
+                id,
+            })
+            .await;
+        recv.await.expect("Actor task has been killed")
     }
 
     async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<OwnedSemaphorePermit> {
@@ -463,6 +553,11 @@ enum ActorMessage {
     ),
     /// 移出工作队列
     MakeWaker(oneshot::Sender<()>, i64),
+    /// 摘走一个房间做主动检查
+    TakeForCheck {
+        respond_to: oneshot::Sender<ManualCheckTake>,
+        id: i64,
+    },
     Shutdown,
 }
 
@@ -540,6 +635,11 @@ impl RoomsActor {
                     self.pop(id);
                     // `let _ =` 忽略发送时的任何错误
                     let _ = respond_to.send(());
+                }
+                ActorMessage::TakeForCheck { respond_to, id } => {
+                    let take = self.take_for_check(id);
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(take);
                 }
                 ActorMessage::AddPlugin(respond_to, plugin) => {
                     self.add_plugin(plugin);
@@ -633,6 +733,34 @@ impl RoomsActor {
         Some(plugin)
     }
 
+    /// 摘走房间，交给主动检查独占。
+    ///
+    /// 「不在任何队列里」等价于轮询循环此刻正拿着它检查（`next` 已经弹出、还没 `wake_waker`
+    /// 放回），这时候直接返回 Busy，不去开第二次检查——那会让同一场直播被拉起两次录制。
+    fn take_for_check(&mut self, id: i64) -> ManualCheckTake {
+        let Some(worker) = self.get_worker(id) else {
+            return ManualCheckTake::NotFound;
+        };
+        let status = worker.downloader_status.read().unwrap().clone();
+        match status {
+            WorkerStatus::Working(_) => return ManualCheckTake::Recording,
+            WorkerStatus::Pause => return ManualCheckTake::Paused,
+            _ => {}
+        }
+        let Some(plugin) = self.matches(&worker.live_streamer.url) else {
+            return ManualCheckTake::NotFound;
+        };
+        let Some(queue) = self.platforms.get_mut(plugin.name()) else {
+            return ManualCheckTake::Busy;
+        };
+        let Some(pos) = queue.iter().position(|w| w.id() == id) else {
+            return ManualCheckTake::Busy;
+        };
+        queue.remove(pos);
+        *worker.downloader_status.write().unwrap() = WorkerStatus::Pending;
+        ManualCheckTake::Ready(worker, plugin)
+    }
+
     /// 移出工作队列
     fn pop(&mut self, id: i64) {
         for (_name, queue) in self.platforms.iter_mut() {
@@ -687,4 +815,89 @@ impl RoomsActor {
 
 fn reuse_vec_arc<'a, T: 'a, U: Iterator<Item = &'a Arc<T>>>(v: &mut U) -> Vec<Arc<T>> {
     v.into_iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::config::Config;
+    use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+    use biliup::downloader::live::builtin_plugins;
+
+    fn worker(id: i64) -> Arc<Worker> {
+        Arc::new(Worker::new(
+            LiveStreamer {
+                id,
+                url: format!("https://live.bilibili.com/{id}"),
+                remark: format!("主播{id}"),
+                filename_prefix: None,
+                time_range: None,
+                upload_streamers_id: None,
+                format: None,
+                override_cfg: None,
+                preprocessor: None,
+                segment_processor: None,
+                downloaded_processor: None,
+                postprocessor: None,
+                opt_args: None,
+                excluded_keywords: None,
+                cover_background: None,
+            },
+            None,
+            Arc::new(RwLock::new(Config::default())),
+            biliup::client::StatelessClient::default(),
+        ))
+    }
+
+    fn actor_with(room: &Arc<Worker>) -> RoomsActor {
+        let (_send, recv) = tokio::sync::mpsc::channel(1);
+        let mut actor = RoomsActor::new(recv);
+        for plugin in builtin_plugins() {
+            actor.add_plugin(plugin);
+        }
+        actor.add(room.clone());
+        actor
+    }
+
+    /// 主动检查必须把房间摘出队列，且同一时刻只能有一个检查者：否则轮询和按钮会对同一场
+    /// 直播各拉起一次录制。
+    #[test]
+    fn manual_check_takes_room_out_of_queue_exactly_once() {
+        let room = worker(1);
+        let mut actor = actor_with(&room);
+
+        assert!(matches!(
+            actor.take_for_check(1),
+            ManualCheckTake::Ready(..)
+        ));
+        assert!(matches!(actor.take_for_check(1), ManualCheckTake::Busy));
+
+        // 检查结束放回队列后，才允许下一次主动检查。
+        actor.push_back(1);
+        assert!(matches!(
+            actor.take_for_check(1),
+            ManualCheckTake::Ready(..)
+        ));
+    }
+
+    /// 主动检查不越过人工暂停。
+    #[test]
+    fn manual_check_refuses_paused_room() {
+        let room = worker(2);
+        *room.downloader_status.write().unwrap() = WorkerStatus::Pause;
+        let mut actor = actor_with(&room);
+
+        assert!(matches!(actor.take_for_check(2), ManualCheckTake::Paused));
+    }
+
+    #[test]
+    fn manual_check_reports_unknown_room() {
+        let room = worker(3);
+        let mut actor = actor_with(&room);
+
+        assert!(matches!(
+            actor.take_for_check(99),
+            ManualCheckTake::NotFound
+        ));
+    }
 }

@@ -26,6 +26,7 @@ import { LiveStreamerEntity, put, requestDelete, sendRequest } from '../../lib/a
 import useSWRMutation from 'swr/mutation'
 import {PauseButton} from "@/app/ui/StreamerActions/PauseButton";
 import RecordingLeaseButton from '@/app/ui/StreamerActions/RecordingLeaseButton'
+import CheckStreamButton from '@/app/ui/StreamerActions/CheckStreamButton'
 
 export default function Home() {
   const { Header, Content } = Layout
@@ -307,6 +308,8 @@ export default function Home() {
                       <TemplateModal onOk={handleUpdate} entity={item}>
                         <Button theme="borderless" icon={<IconEdit2Stroked />}></Button>
                       </TemplateModal>
+                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
+                      <CheckStreamButton streamer={item} />
                       <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
                       <PauseButton streamer={item}/>
                       <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>

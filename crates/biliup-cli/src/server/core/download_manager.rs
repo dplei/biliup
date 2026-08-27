@@ -1,5 +1,5 @@
 use crate::server::common::upload::UActor;
-use crate::server::core::monitor::Monitor;
+use crate::server::core::monitor::{ManualCheckResult, Monitor};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::context::{Stage, Worker, WorkerStatus};
 use async_channel::bounded;
@@ -79,6 +79,11 @@ impl DownloadManager {
 
     pub async fn wake_waker(&self, id: i64) {
         self.rooms_handle.wake_waker(id).await;
+    }
+
+    /// 立刻检查一个直播间是否开播，不等轮询轮到它。
+    pub async fn check_room_now(&self, id: i64) -> ManualCheckResult {
+        self.rooms_handle.check_now(id).await
     }
 
     pub async fn get_room_by_id(&self, id: i64) -> Option<Arc<Worker>> {

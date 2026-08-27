@@ -19,6 +19,7 @@ use crate::server::api::endpoints::{
 use crate::server::api::recording_lease::{
     delete_recording_lease, put_recording_lease, put_recording_state, toggle_recording_state,
 };
+use crate::server::api::stream_check::check_stream_now;
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
 use crate::server::infrastructure::service_register::ServiceRegister;
@@ -43,6 +44,8 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         )
         .route("/v1/streamers/{id}", delete(delete_streamers_endpoint)) // 删除主播
         .route("/v1/streamers/{id}/pause", put(toggle_recording_state))
+        // 主动检查直播流：不等轮询轮到这个房间，立刻检查一次并在开播时接上录制。
+        .route("/v1/streamers/{id}/check", post(check_stream_now))
         .route(
             "/v1/streamers/{id}/recording-state",
             put(put_recording_state),
