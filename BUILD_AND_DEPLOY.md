@@ -105,13 +105,25 @@ docker push crpi-yk3f2yyofxzjbjyy.cn-hangzhou.personal.cr.aliyuncs.com/peari/bil
 # (4) 验证远端 manifest（可选）
 docker buildx imagetools inspect \
   crpi-yk3f2yyofxzjbjyy.cn-hangzhou.personal.cr.aliyuncs.com/peari/biliup:latest
-
-# (5) 服务器（ECS）拉取并重启
-#     ⚠️ 不要让本助手 SSH 进生产机，由用户自己操作
-docker compose pull && docker compose up -d
 ```
+
+### 推完 ACR 就算发完了——ECS 会自己更新
+
+**不需要手动 `docker compose pull`，也不需要提醒仓库主人去执行它。**
+ECS 侧已配置定时任务：自动检查 `:latest` 是否有新镜像，并在**空闲时段**（没有正在进行的
+录制/上传）自动拉取重启。所以发布流程到第 (4) 步为止；剩下的交给定时任务，不必守着看。
+
+- 助手的职责终点 = 推送成功 + 远端 digest 核对 + 补 §6 版本历史。
+- ⚠️ 仍然**不要让本助手 SSH 进生产机**——无论是部署、看日志还是「确认一下有没有起来」。
+- 想立刻生效（例如修的是正在犯病的线上问题）时，才由仓库主人自己手动执行：
+  ```bash
+  docker compose pull && docker compose up -d
+  ```
+- 因为更新落在空闲时段，**新版本不是推完就立刻上线**；排查线上现象前先确认跑的是哪个 digest，
+  别拿旧版本的行为对着新代码看。
+
 > `live-recorder/docker-compose.yml` 已用 `image: <acr>/peari/biliup:latest` + `pull_policy: always`，
-> 生产钉版本号更稳，但 `:latest` 也可用。
+> 生产钉版本号更稳，但 `:latest` 也可用（自动更新依赖的正是 `:latest`）。
 
 ---
 
