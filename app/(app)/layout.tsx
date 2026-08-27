@@ -237,8 +237,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         setIsCollapsed(!isCollapsed)
     }, [isCollapsed])
     return (
-        <html lang="zh-Hans">
-        <body style={{ width: '100%' }}>
         <SeLayout className="components-layout-demo semi-light-scrollbar">
             <Sider>
                 <Nav
@@ -296,8 +294,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </Sider>
             <SeLayout style={{ height: '100vh' }}>{children}</SeLayout>
         </SeLayout>
-        </body>
-        </html>
     )
 }
 
