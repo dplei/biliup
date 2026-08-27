@@ -14,6 +14,8 @@ use tracing::info;
 #[derive(Debug, Deserialize)]
 pub struct PutRecordingLeaseRequest {
     pub expires_at: DateTime<Utc>,
+    /// 选填；不传等同于空备注。
+    #[serde(default)]
     pub customer_note: String,
     pub expected_lease_id: Option<i64>,
 }
@@ -49,11 +51,11 @@ pub async fn put_recording_lease(
     streamer_exists(&state, id).await?;
     let now = Utc::now();
     payload.customer_note = payload.customer_note.trim().to_string();
-    let note_len = payload.customer_note.chars().count();
-    if !(1..=200).contains(&note_len) {
+    // 备注是选填的：留空存空串，通知文案自己兜底，不必为此改列约束。
+    if payload.customer_note.chars().count() > 200 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
-            "客户/需求备注去除首尾空格后须为 1 到 200 个字符",
+            "客户/需求备注去除首尾空格后不得超过 200 个字符",
         ));
     }
     if payload.expires_at <= now {

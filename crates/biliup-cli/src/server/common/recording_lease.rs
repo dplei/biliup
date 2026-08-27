@@ -679,9 +679,15 @@ fn notification_message(row: &NotificationLease) -> (String, String) {
         } else {
             String::new()
         };
+    // 备注选填，留空时给占位，别推送出一行光秃秃的「客户/需求：」。
+    let customer_note = if lease.customer_note.trim().is_empty() {
+        "（未填写）"
+    } else {
+        lease.customer_note.trim()
+    };
     let content = format!(
         "客户/需求：{}\n直播间：{}\n地址：{}\n约定到期：{} (Asia/Shanghai){}\n实际暂停：{}\n租约事件：#{}",
-        lease.customer_note,
+        customer_note,
         row.remark,
         row.url,
         format_shanghai(lease.expires_at),

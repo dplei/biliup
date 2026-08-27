@@ -22,10 +22,14 @@ export const CheckStreamButton: React.FC<CheckStreamButtonProps> = ({ streamer }
         setLoading(true);
         try {
             const res = await checkStreamNow(streamer.id);
-            const notify = res.outcome === 'started' ? Notification.success : Notification.info;
-            notify({ title: streamer.remark, content: res.message, duration: 4 });
             // 无论开播与否都刷新一次：状态标签、画质标签都来自这个列表。
             await mutate('/v1/streamers');
+            // Semi 的 Notification 方法依赖 this，摘成变量再调用会在内部 addNotice 处炸。
+            if (res.outcome === 'started') {
+                Notification.success({ title: streamer.remark, content: res.message, duration: 4 });
+            } else {
+                Notification.info({ title: streamer.remark, content: res.message, duration: 4 });
+            }
         } catch (error) {
             Notification.error({
                 title: '检查直播流失败',

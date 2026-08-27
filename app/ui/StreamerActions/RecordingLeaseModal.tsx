@@ -66,8 +66,8 @@ export default function RecordingLeaseModal({ streamer, visible, onClose }: Prop
       return
     }
     const trimmed = note.trim()
-    if (!trimmed || Array.from(trimmed).length > 200) {
-      Notification.error({ title: '备注无效', content: '客户/需求备注须为 1 到 200 个字符' })
+    if (Array.from(trimmed).length > 200) {
+      Notification.error({ title: '备注无效', content: '客户/需求备注不得超过 200 个字符' })
       return
     }
     setSaving(true)
@@ -173,13 +173,13 @@ export default function RecordingLeaseModal({ streamer, visible, onClose }: Prop
         </label>
 
         <label style={{ width: '100%' }}>
-          <Typography.Text strong>客户/需求备注</Typography.Text>
+          <Typography.Text strong>客户/需求备注（选填）</Typography.Text>
           <Input
             value={note}
             onChange={setNote}
             maxLength={200}
             showClear
-            placeholder="必填，例如：客户 A · 八月活动"
+            placeholder="选填，例如：客户 A · 八月活动"
             style={{ marginTop: 8 }}
           />
           <Typography.Text type="tertiary">{Array.from(note).length}/200</Typography.Text>
