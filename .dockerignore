@@ -12,3 +12,5 @@ out/
 # 运行时生成物 / 凭证（.env* 为已跟踪的构建配置，不可忽略）
 cookies.json
 data/
+# 本机 cargo 配置（含指向 Homebrew Python 的 PYO3_PYTHON，进了镜像会让 Linux 构建找错解释器）
+.cargo/
