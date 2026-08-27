@@ -132,7 +132,7 @@ ECS 侧已配置定时任务：自动检查 `:latest` 是否有新镜像，并�
 | 现象 | 原因 / 解法 |
 |---|---|
 | `FROM` 拉基础镜像 **403 Forbidden** | `~/.docker/daemon.json` 配的阿里云个人加速器 `bf6423da.mirror.aliyuncs.com` 2024 起仅限 ECS 内网。用上面的 buildx 代理构建器绕开（docker-container 驱动不读 daemon.json）。 |
-| 构建第 2 步 `resolve image config for docker-image://docker.io/docker/dockerfile:1` **DeadlineExceeded** | `# syntax=` 那行的镜像解析要经 **dockerd**，撞上 `~/.docker/daemon.json` 里只对 ECS 内网开放的加速器 `bf6423da.mirror.aliyuncs.com` 就一直超时。构建器本身没问题（docker-container 驱动不读 daemon.json，容器内手工取 token / 拉 manifest 都正常），重启 buildkit 容器也无效。解法：先 `docker pull docker/dockerfile:1` 把 syntax 镜像拉进本地 image store（mirror 超时后 dockerd 会自己 fallback 到官方，要等几分钟），之后 resolve 命中本地即可继续。 |
+| 构建第 2 步 `resolve image config for docker-image://docker.io/docker/dockerfile:1` **DeadlineExceeded** | `# syntax=` 那行的镜像解析走 **dockerd**，不是构建器，而 dockerd 这条出网路径很慢。实测：拉 20KB 的 `hello-world` 要 14s，拉 40MB 的 `docker/dockerfile:1` 要 5 分钟以上，而 resolve 只有 30s deadline。（`daemon.json` 里的 `bf6423da.mirror.aliyuncs.com` 对非 ECS 内网是 **403 快速拒绝**（0.12s），dockerd 立刻 fallback，它只是多一跳、**不是元凶**；慢在 fallback 后经 Docker Desktop 内建代理 `http.docker.internal:3128` 出网。）构建器自身没问题——docker-container 驱动不读 daemon.json，走我们显式配的 Clash 7890，同一个 manifest 3s 到手，所以重启 buildkit 容器无效。解法：先 `docker pull docker/dockerfile:1` 把 syntax 镜像拉进本地 image store（慢但会成功），之后 resolve 命中本地即可继续；镜像留在本地就不会再犯。 |
 | 拉取镜像 **not found**（私有仓库） | 没 login，或该 tag 当时确实没推进 `biliup` 仓库。先 `docker login`，再确认 push 目标正确。 |
 | push 落到错仓库（曾误落 `biliupatest`） | 目标仓库须在 ACR 控制台先以「本地仓库」类型建好且状态正常，否则可能落到别处。 |
 | maturin `SSL connect error: unexpected eof` / `download of shell-words failed` | Cargo.lock 变动后容器内重新 `cargo fetch`，撞上 Clash 代理瞬时 TLS 断。**非代码问题，重试即可**。 |
