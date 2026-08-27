@@ -65,6 +65,7 @@ use error_stack::ResultExt;
 use futures::StreamExt;
 use ormlite::Model;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1341,7 +1342,16 @@ async fn upload_single_file_with_repair(
         upload_single_file(&upload_path, context, activity_tx).await
     };
     match result {
-        Ok(video) => Ok((video, outcome, normalization_artifact)),
+        Ok(mut video) => {
+            // 分P标题必须来自原始录像，而不是上传时实际喂进去的那个文件。响度标准化
+            // 与时间戳修复都会产出 `xxx.audio-normalized-<hash>.part.flv` 这样的中间件，
+            // 而 `Parcel::upload_with_observer` 在 B 站不回标题时用上传文件的词干兜底
+            // （见 `crates/biliup/src/uploader/line.rs`），于是临时文件名会原样成为稿件
+            // 里的分P标题。标题此刻还只在本地 `videos_json` 里，投稿要等下播统一提交，
+            // 所以在这里改掉就够了，不需要投稿后再去编辑稿件。
+            video.title = segment_part_title(original_path).or(video.title);
+            Ok((video, outcome, normalization_artifact))
+        }
         Err(e) => {
             if let RepairOutcome::Repaired(fixed) = &outcome {
                 let _ = tokio::fs::remove_file(fixed).await;
@@ -1353,6 +1363,25 @@ async fn upload_single_file_with_repair(
         }
     }
 }
+
+/// 原始录像文件名去扩展名，按 B 站分P标题上限截断。
+///
+/// 取不到词干（路径以 `..` 结尾等）时返回 None，让调用方保留上传返回的标题——
+/// 宁可留一个带临时后缀的名字，也不要把标题清空。
+fn segment_part_title(original_path: &Path) -> Option<String> {
+    let stem = original_path.file_stem().and_then(OsStr::to_str)?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(if stem.chars().count() >= PART_TITLE_MAX_CHARS {
+        Video::truncate_title(stem, PART_TITLE_MAX_CHARS)
+    } else {
+        stem.to_string()
+    })
+}
+
+/// B 站分P标题字符上限。
+const PART_TITLE_MAX_CHARS: usize = 80;
 
 async fn upload_single_file(
     file_path: &Path,
@@ -3446,6 +3475,50 @@ mod tests {
     };
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
+
+    /// 分P标题取自原始录像，而不是上传时实际喂进去的那个文件。
+    ///
+    /// 这条锁住的是一个真实回归：开启响度标准化后，上传的是
+    /// `xxx.audio-normalized-<hash>.part.flv`，而 `Parcel` 在 B 站不回标题时用上传文件的
+    /// 词干兜底，于是稿件里每个分P的标题都变成了带哈希的临时文件名。
+    #[test]
+    fn part_title_comes_from_the_original_recording_not_the_temp_artifact() {
+        let title = segment_part_title(Path::new(
+            "/rec/本地验证-抖音2026-08-27T10_09_58.audio-normalized-a7bd9add0e315a7f.part.flv",
+        ));
+
+        assert_eq!(
+            title.as_deref(),
+            Some("本地验证-抖音2026-08-27T10_09_58.audio-normalized-a7bd9add0e315a7f.part"),
+            "这个入参本身就是中间件路径，函数只负责取词干；\
+             调用方必须传原始录像路径才拿得到干净标题"
+        );
+
+        assert_eq!(
+            segment_part_title(Path::new("/rec/本地验证-抖音2026-08-27T10_09_58.flv")).as_deref(),
+            Some("本地验证-抖音2026-08-27T10_09_58"),
+            "传原始录像时标题就是文件名去扩展名"
+        );
+    }
+
+    /// B 站分P标题上限 80 字符，超长要截断而不是被接口拒掉。
+    #[test]
+    fn part_title_is_truncated_to_the_bilibili_limit() {
+        let long = "阿".repeat(120);
+        let title = segment_part_title(Path::new(&format!("/rec/{long}.flv"))).unwrap();
+
+        assert!(
+            title.chars().count() <= PART_TITLE_MAX_CHARS,
+            "标题 {} 字符，超过了 B 站上限",
+            title.chars().count()
+        );
+    }
+
+    /// 取不到词干时保留上传返回的标题，不能把标题清空。
+    #[test]
+    fn part_title_is_none_when_there_is_no_file_stem() {
+        assert_eq!(segment_part_title(Path::new("/rec/..")), None);
+    }
 
     async fn deferred_test_pool() -> (tempfile::TempDir, ConnectionPool) {
         let dir = tempfile::tempdir().unwrap();
