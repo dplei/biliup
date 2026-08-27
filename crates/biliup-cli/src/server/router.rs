@@ -12,9 +12,12 @@ use crate::server::api::endpoints::{
     get_streamers_endpoint, get_upload_enrollment_health, get_upload_line_health,
     get_upload_missing_segment_health, get_upload_rate_health, get_upload_streamer_endpoint,
     get_upload_streamers_endpoint, get_users_endpoint, get_videos, login_by_qrcode,
-    pause_streamers_endpoint, post_streamers_endpoint, post_uploads, put_configuration,
-    put_streamers_endpoint, recover_missing_upload, recover_session_uploads,
-    rescan_missing_uploads, retry_missing_upload, stop_missing_upload,
+    post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
+    recover_missing_upload, recover_session_uploads, rescan_missing_uploads, retry_missing_upload,
+    stop_missing_upload,
+};
+use crate::server::api::recording_lease::{
+    delete_recording_lease, put_recording_lease, put_recording_state, toggle_recording_state,
 };
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
@@ -39,7 +42,19 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
                 .put(put_streamers_endpoint), // 更新主播
         )
         .route("/v1/streamers/{id}", delete(delete_streamers_endpoint)) // 删除主播
-        .route("/v1/streamers/{id}/pause", put(pause_streamers_endpoint))
+        .route("/v1/streamers/{id}/pause", put(toggle_recording_state))
+        .route(
+            "/v1/streamers/{id}/recording-state",
+            put(put_recording_state),
+        )
+        .route(
+            "/v1/streamers/{id}/recording-lease",
+            put(put_recording_lease),
+        )
+        .route(
+            "/v1/streamers/{id}/recording-lease/{lease_id}",
+            delete(delete_recording_lease),
+        )
         // 配置管理路由
         .route(
             "/v1/configuration",

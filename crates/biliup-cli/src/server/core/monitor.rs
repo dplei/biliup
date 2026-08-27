@@ -1,5 +1,6 @@
 use crate::server::common::cookie_health;
 use crate::server::common::download::start_download_workflow;
+use crate::server::common::recording_lease;
 use crate::server::common::upload::UploaderMessage;
 use crate::server::common::upload_session::reusable_streamer_info;
 use crate::server::core::live::{live_request, streamer_info};
@@ -138,6 +139,24 @@ impl Monitor {
                             None
                         }
                     };
+                    let is_reused = reused.is_some();
+                    if !recording_lease::admit_detected_session(
+                        &self.pool,
+                        &room,
+                        reused.as_ref().map(|row| row.id),
+                        sql_no_id.live_session_key.as_deref(),
+                        sql_no_id.date,
+                        is_reused,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        error!(error = ?error, live_streamer_id = room.id(), "录制租约准入检查失败，保守拒绝本场");
+                        false
+                    })
+                    {
+                        continue;
+                    }
                     let insert = match reused {
                         Some(existing) => {
                             info!(
@@ -168,7 +187,13 @@ impl Monitor {
                     };
                     info!(url = url, "room: is live -> 开播了");
 
-                    let context = Context::new(insert.id, room.clone(), self.pool.clone(), *stream);
+                    let context = Context::new(
+                        insert.id,
+                        room.clone(),
+                        self.pool.clone(),
+                        *stream,
+                        is_reused,
+                    );
                     let downloader = plugin.clone();
                     let uploader = self.uploader.clone();
                     let rooms_handle = Arc::clone(self);
@@ -533,11 +558,24 @@ impl RoomsActor {
 
         match self.platforms.entry(platform_name) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().push_back(worker.clone());
+                if !matches!(
+                    *worker.downloader_status.read().unwrap(),
+                    WorkerStatus::Pause
+                ) {
+                    entry.get_mut().push_back(worker.clone());
+                }
                 // entry.remove(); // 可以删除
             }
             Entry::Vacant(entry) => {
-                entry.insert(VecDeque::from([worker.clone()])); // 插入新值
+                let queue = if matches!(
+                    *worker.downloader_status.read().unwrap(),
+                    WorkerStatus::Pause
+                ) {
+                    VecDeque::new()
+                } else {
+                    VecDeque::from([worker.clone()])
+                };
+                entry.insert(queue); // 插入新值
             }
         }
         debug!("Added room [{}]", worker.live_streamer.url);

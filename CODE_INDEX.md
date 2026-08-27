@@ -30,6 +30,9 @@
 | `app/layout.tsx` | Next.js 根布局，设置中文页面语言、全局样式和应用级 `body` 容器。 | `RootLayout` |
 | `app/(app)/page.tsx` | 应用根页面的路由入口，直接把用户重定向到直播管理页。 | `Home` |
 | `app/(app)/layout.tsx` | `(app)` 分组的侧边导航布局：Semi `Layout`/`Nav` 骨架、路由映射、折叠态与主题切换入口；只渲染布局结构，`html`/`body` 由根布局独占。 | `Layout`、`isSub` |
+| `app/(app)/streamers/page.tsx` | 直播管理卡片列表：聚合主播运行状态与画质标签，并提供编辑、暂停、删除和单房间配置覆写入口。 | `Home` |
+| `app/ui/StreamerActions/RecordingLeaseModal.tsx` | 录制期限的创建、延期、清除与状态/通知反馈弹窗，负责把浏览器本地选择转换为明确 UTC 时间点。 | `RecordingLeaseModal` |
+| `app/ui/StreamerActions/PauseButton.tsx` | 以显式目标状态暂停/恢复单个直播间；到期暂停的恢复入口会禁用并提示先处理期限。 | `PauseButton`、`setRecordingState` |
 | `app/(app)/missing/page.tsx` | 缺失补传控制页：轮询补传列表，展示 attempt 阶段/进度/线路健康/会话完整性与线路切换历史，并触发补传、换线重投、停止、删除与本场补扫。 | `MissingRecovery`、`AttemptHistoryPanel` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |
 
@@ -39,12 +42,17 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/core/monitor.rs` | 轮询各房间开播状态，命中开播时按平台场次键复用或新建本场 `streamer_info`，并在下载许可下拉起录制流程。 | `live_request` |
 | `crates/biliup-cli/src/server/common/download.rs` | 录制主流程与分段事件处理：拉流、断线重试、切片校验，并把有效分段登记后交给上传管道。 | `start_download_workflow`、`DownloadTask`、`SegmentEventProcessor` |
+| `crates/biliup-cli/src/server/infrastructure/context.rs` | 持有单房间 Worker 的下载/上传运行状态与当前录制画质，并在下载状态离开 Working 时安全停止对应任务。 | `Worker`、`WorkerStatus`、`Stage`、`Worker::change_status` |
+| `crates/biliup-cli/src/server/infrastructure/models/live_streamer.rs` | 定义持久化直播间配置及其新增载荷；该模型的全字段更新语义要求独立运行状态不要混入主播配置。 | `LiveStreamer`、`InsertLiveStreamer` |
 
 ## Web 服务边界
 
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/app.rs` | 组装会话、认证、CORS、业务路由与静态回退，启动 Axum，并在退出信号后清理服务资源。 | `ApplicationController::serve`、`shutdown_signal` |
+| `crates/biliup-cli/src/server/common/cookie_health.rs` | 维护平台 Cookie 健康快照，并为钉钉、企微和通用 URL 提供共享 Webhook 告警分发。 | `record_success`、`record_error`、`notify_alert`、`snapshot` |
+| `crates/biliup-cli/src/server/common/recording_lease.rs` | 实现录制租约的持久状态机、纯到期/准入决策、CAS 扫描、下播收敛和带 claim/退避的通知投递。 | `RecordingLease`、`due_action`、`admit_detected_session`、`complete_grace_session`、`scan_due_recording_leases` |
+| `crates/biliup-cli/src/server/api/recording_lease.rs` | 提供租约创建/替换/清除与幂等录制状态接口，并将输入校验、乐观并发和到期恢复守卫映射为 400/404/409。 | `put_recording_lease`、`delete_recording_lease`、`put_recording_state` |
 | `crates/biliup-cli/src/server/common/upload.rs` | 编排直播分段上传、缺失补传、attempt lease/watchdog（分阶段计时）、线路决策入口以及远端结果落库；补传拆成「同步 claim + 后台执行」两段。 | `process_with_upload`、`decide_upload_line`、`upload_enrolled_with_watchdog`、`claim_manual_recovery`、`run_claimed_recovery`、`stop_missing_segment_attempt`、`segment_part_title` |
 | `crates/biliup-cli/src/server/common/attempt_lease.rs` | 定义 attempt 的三个阶段与各自的收割判据，提供心跳/阶段落库和 `upload_attempt` 历史表的读写。 | `AttemptPhase`、`classify_stale_lease`、`preprocess_deadline`、`record_heartbeat`、`close_attempt_history` |
 | `crates/biliup-cli/src/server/common/upload_line_selection.rs` | 全仓唯一的上传线路决策：纯函数规划（配置/手动优先、冷却回退、auto 兜底）加一步 probe 解析。 | `plan_upload_line`、`resolve_planned_line`、`LinePlan`、`LineSource`、`cooling_lines` |
@@ -91,6 +99,10 @@
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`、`Parcel::upload_with_observer`）：恢复与自动模式把冷却线路排除在实际探测请求之外；上传返回的 `Video` 标题由上传文件名兜底，而喂进去的是响度标准化/时间戳修复的中间件，因此 `upload_single_file_with_repair` 必须用原始录像名覆盖分P标题。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/download.rs`（`start_download_workflow`）：开播检测插入 `streamer_info` 后，以该行 id 作为本场 Context 身份进入录制与上传流水线。
+- `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`admit_detected_session`）：直播检测在写入新场次和启动下载前读取活动租约；到期后只允许可证明匹配的持久 grace 场次。
+- `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`complete_grace_session`）：确认下播并处理尾段后，先 CAS 到期暂停再决定是否把 Worker 放回轮询队列。
+- `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`start_recording_lease_tasks`）：Web 服务同级运行五秒到期扫描和可靠通知扫描，并在 shutdown 时中止二者。
+- `app/ui/StreamerActions/RecordingLeaseModal.tsx` → `crates/biliup-cli/src/server/api/recording_lease.rs`（租约 mutation）：弹窗提交明确 UTC 时间、当前租约 id 和客户备注，后端返回权威状态与服务器时间。
 - `crates/biliup/src/uploader/line.rs` → `crates/biliup/src/uploader/line/upos.rs`（`Upos::upload_stream`）：线路对象把实际分块传输委派给 upos 协议实现，观察者回调据此产生已确认字节进度。
 - `app/(app)/missing/page.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_missing_uploads`）：补传页的列表、进度与「下次线路」全部来自该接口的聚合视图。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/missing_segment.rs`（`missing_segment_health`）：健康接口按状态实时计数 + 识别尚未被 60 秒自愈周期收敛的 stale uploading 行，不必等后台任务打日志才能观测。

@@ -124,9 +124,12 @@ async fn import_config_streamers(path: &Path, service_register: &ServiceRegister
             )?,
         )
         .await?;
+        let worker = service_register.worker(live_streamer.clone(), upload_config);
+        server::common::recording_lease::apply_initial_state(&service_register.pool, &worker)
+            .await?;
         service_register
             .managers
-            .add_room(service_register.worker(live_streamer.clone(), upload_config))
+            .add_room(worker)
             .await
             .ok_or_else(|| {
                 Report::new(AppError::Custom(format!(
@@ -148,9 +151,12 @@ async fn import_database_streamers(service_register: &ServiceRegister) -> AppRes
         let upload_config =
             repositories::get_upload_config(&service_register.pool, live_streamer.id).await?;
 
+        let worker = service_register.worker(live_streamer.clone(), upload_config);
+        server::common::recording_lease::apply_initial_state(&service_register.pool, &worker)
+            .await?;
         service_register
             .managers
-            .add_room(service_register.worker(live_streamer.clone(), upload_config))
+            .add_room(worker)
             .await
             .ok_or_else(|| {
                 Report::new(AppError::Custom(format!(

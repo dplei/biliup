@@ -38,6 +38,55 @@ export async function put<T>(url: string, { arg }: { arg: T }) {
 	return res;
 }
 
+export interface RecordingLeaseEntity {
+	id: number;
+	expires_at: string;
+	customer_note: string;
+	state: 'scheduled' | 'grace_current_session' | 'expired_paused';
+	effective_paused_at?: string | null;
+	notification_status: 'not_ready' | 'pending' | 'sending' | 'failed' | 'sent' | 'not_configured';
+	last_notification_error?: string | null;
+	notified_at?: string | null;
+}
+
+export interface RecordingLeaseMutationResponse {
+	recording_lease: RecordingLeaseEntity | null;
+	server_now: string;
+}
+
+export async function setRecordingState(id: number, paused: boolean) {
+	const res = await fetch(`${API_BASE}/v1/streamers/${id}/recording-state`, {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paused }),
+	});
+	await handleResponse(res);
+}
+
+export async function saveRecordingLease(
+	id: number,
+	payload: { expires_at: string; customer_note: string; expected_lease_id: number | null },
+): Promise<RecordingLeaseMutationResponse> {
+	const res = await fetch(`${API_BASE}/v1/streamers/${id}/recording-lease`, {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload),
+	});
+	await handleResponse(res);
+	return res.json();
+}
+
+export async function clearRecordingLease(
+	id: number,
+	leaseId: number,
+): Promise<RecordingLeaseMutationResponse> {
+	const res = await fetch(`${API_BASE}/v1/streamers/${id}/recording-lease/${leaseId}`, {
+		method: 'DELETE',
+	});
+	await handleResponse(res);
+	return res.json();
+}
+
 async function handleResponse(res: Response) {
 	// 如果未登录，统一跳转
 	if (res.status === 401) {
@@ -173,6 +222,8 @@ export interface LiveStreamerEntity {
 	opt_args?: string[];
 	override?: Record<string, any>;
 	recording_quality?: string;
+	recording_lease?: RecordingLeaseEntity | null;
+	server_now?: string;
 	/** 主播级封面背景图文件名，覆盖所属上传模板的同名设置；留空则回退到模板的背景。 */
 	cover_background?: string;
 }

@@ -15,6 +15,14 @@ use std::sync::{Arc, RwLock};
 use struct_patch::Patch;
 use tracing::{error, info};
 
+/// 当前真正运行的录制场次。租约扫描只信这份运行时快照，不从历史数据库行猜测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRecordingSnapshot {
+    pub streamer_info_id: i64,
+    pub live_session_key: Option<String>,
+    pub recording_started_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// 应用程序上下文，包含工作器和扩展信息
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -24,6 +32,7 @@ pub struct Context {
     stream: LiveStream,
     streamer_info: StreamerInfo,
     pool: ConnectionPool,
+    reused_session: bool,
 }
 
 impl Context {
@@ -31,7 +40,13 @@ impl Context {
     ///
     /// # 参数
     /// * `worker` - 工作器实例的Arc引用
-    pub fn new(id: i64, worker: Arc<Worker>, pool: ConnectionPool, stream: LiveStream) -> Self {
+    pub fn new(
+        id: i64,
+        worker: Arc<Worker>,
+        pool: ConnectionPool,
+        stream: LiveStream,
+        reused_session: bool,
+    ) -> Self {
         let mut streamer_info = streamer_info(&stream);
         streamer_info.id = id;
         Self {
@@ -40,6 +55,7 @@ impl Context {
             stream,
             streamer_info,
             pool,
+            reused_session,
         }
     }
 
@@ -105,6 +121,10 @@ impl Context {
         &self.streamer_info
     }
 
+    pub fn reused_session(&self) -> bool {
+        self.reused_session
+    }
+
     pub fn download_config(&self, stream: &LiveStream) -> DownloadConfig {
         let config = self.config();
         // 确定文件格式后缀
@@ -151,6 +171,8 @@ pub struct Worker {
     pub client: StatelessClient,
     /// 当前录制的实际画质代码（仅录制中有值，用于前端 tag）
     pub recording_quality: RwLock<Option<String>>,
+    /// 当前下载任务的稳定身份；任务开始前写入，完整退出后清理。
+    active_recording: RwLock<Option<ActiveRecordingSnapshot>>,
 }
 
 impl Worker {
@@ -175,6 +197,7 @@ impl Worker {
             config,
             client,
             recording_quality: RwLock::new(None),
+            active_recording: RwLock::new(None),
         }
     }
 
@@ -200,6 +223,19 @@ impl Worker {
 
     pub fn recording_quality(&self) -> Option<String> {
         self.recording_quality.read().unwrap().clone()
+    }
+
+    pub fn set_active_recording(&self, snapshot: Option<ActiveRecordingSnapshot>) {
+        *self.active_recording.write().unwrap() = snapshot;
+    }
+
+    pub fn active_recording(&self) -> Option<ActiveRecordingSnapshot> {
+        self.active_recording.read().unwrap().clone()
+    }
+
+    /// 下载任务自身退出时使用：只落最终状态，不能反过来 `stop()` 并等待自己。
+    pub fn finish_download_status(&self, status: WorkerStatus) {
+        *self.downloader_status.write().unwrap() = status;
     }
 
     /// 获取覆写配置

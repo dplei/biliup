@@ -1,26 +1,14 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { useSWRConfig } from 'swr';
-import useSWRMutation from 'swr/mutation';
-import {Button} from "@douyinfe/semi-ui";
+import {Button, Notification, Tooltip} from "@douyinfe/semi-ui";
 import {IconPause, IconPlay} from "@douyinfe/semi-icons";
-import {API_BASE, LiveStreamerEntity} from "@/app/lib/api-streamer";
+import {LiveStreamerEntity, setRecordingState} from "@/app/lib/api-streamer";
 
 interface PauseButtonProps {
     streamer: LiveStreamerEntity;
     onSuccess?: () => void;
     onError?: (error: Error) => void;
 }
-
-// 暂停主播
-export const pauseStreamer = async (url: string,  ) => {
-    const response = await fetch(API_BASE + url,
-        {
-            method: 'PUT',
-            // headers: {'Content-Type': 'application/json'},
-        }
-);
-    return response;
-};
 
 export const PauseButton: React.FC<PauseButtonProps> = ({
                                                             streamer,
@@ -29,24 +17,29 @@ export const PauseButton: React.FC<PauseButtonProps> = ({
                                                         }) => {
     const { mutate } = useSWRConfig();
 
-    const { trigger: pauseTrigger } = useSWRMutation(
-        `/v1/streamers/${streamer.id}/pause`,
-        pauseStreamer
-    );
-
     const handlePause = async () => {
         try {
-            await pauseTrigger();
+            await setRecordingState(streamer.id, streamer.status !== 'Pause');
             // 重新加载列表数据
             await mutate('/v1/streamers');
             onSuccess?.();
         } catch (error) {
             console.error('暂停失败:', error);
+            Notification.error({
+                title: '录制状态更新失败',
+                content: (error as Error).message,
+            });
             onError?.(error as Error);
         }
     };
 
+    const leaseExpired = streamer.recording_lease?.state === 'expired_paused';
+    const isResume = streamer.status === 'Pause';
+    const disabled = leaseExpired && isResume;
+
     return (
-        <Button onClick={handlePause} icon={streamer.status === 'Pause'? <IconPlay />: <IconPause />} theme="borderless" aria-label="暂停" />
+        <Tooltip content={disabled ? '录制期限已到期，请先延期或清除期限' : isResume ? '恢复录制' : '暂停录制'}>
+            <Button disabled={disabled} onClick={handlePause} icon={isResume ? <IconPlay />: <IconPause />} theme="borderless" aria-label={isResume ? '恢复录制' : '暂停录制'} />
+        </Tooltip>
     );
 };

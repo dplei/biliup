@@ -242,53 +242,79 @@ fn notify(webhook: Option<&str>, title: &str, content: &str) {
     let title = title.to_string();
     let content = content.to_string();
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let result = if url.contains("oapi.dingtalk.com") {
-            // 钉钉自定义机器人：需 {msgtype:text, text:{content}}。安全设置用「自定义关键词」
-            // 时，文案必须含该关键词——这里固定前缀「【biliup】」，用户把关键词设为 biliup 即可。
-            let body = json!({
-                "msgtype": "text",
-                "text": { "content": format!("【biliup】{title}\n{content}") }
-            })
-            .to_string();
-            client
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-        } else if url.contains("qyapi.weixin.qq.com") {
-            // 企业微信群机器人：同样需 {msgtype:text, text:{content}}
-            let body = json!({
-                "msgtype": "text",
-                "text": { "content": format!("{title}\n{content}") }
-            })
-            .to_string();
-            client
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-        } else if url.contains("{title}") || url.contains("{content}") {
-            let final_url = url
-                .replace("{title}", &urlencoding::encode(&title))
-                .replace("{content}", &urlencoding::encode(&content));
-            client.get(&final_url).send().await
-        } else {
-            let body = json!({ "title": title, "content": content }).to_string();
-            client
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-        };
-        match result {
-            Ok(resp) => info!(status = ?resp.status(), "cookie 健康通知已发送"),
-            Err(e) => warn!(error = ?e, "cookie 健康通知发送失败"),
+        match send_webhook(&url, &title, &content).await {
+            Ok(()) => info!("cookie 健康通知已发送"),
+            Err(e) => warn!(error = e, "cookie 健康通知发送失败"),
         }
     });
+}
+
+/// 可等待、可判定投递结果的 Webhook 底层传输。租约通知以它作为持久重试边界；
+/// 原有健康告警继续由上面的 fire-and-forget 包装调用。
+pub async fn send_webhook(url: &str, title: &str, content: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("创建 Webhook 客户端失败：{error}"))?;
+    let is_dingtalk = url.contains("oapi.dingtalk.com");
+    let response = if is_dingtalk {
+        // 钉钉自定义机器人：固定带 biliup 关键词，便于使用机器人的关键词安全策略。
+        let body = json!({
+            "msgtype": "text",
+            "text": { "content": format!("【biliup】{title}\n{content}") }
+        });
+        client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+    } else if url.contains("qyapi.weixin.qq.com") {
+        let body = json!({
+            "msgtype": "text",
+            "text": { "content": format!("{title}\n{content}") }
+        });
+        client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+    } else if url.contains("{title}") || url.contains("{content}") {
+        let final_url = url
+            .replace("{title}", &urlencoding::encode(title))
+            .replace("{content}", &urlencoding::encode(content));
+        client.get(&final_url).send().await
+    } else {
+        client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&json!({ "title": title, "content": content }))
+            .send()
+            .await
+    }
+    .map_err(|error| format!("Webhook 请求失败：{error}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Webhook 响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("Webhook 返回 HTTP {status}"));
+    }
+    if is_dingtalk {
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|error| format!("钉钉响应不是合法 JSON：{error}"))?;
+        if json.get("errcode").and_then(|value| value.as_i64()) != Some(0) {
+            let message = json
+                .get("errmsg")
+                .and_then(|value| value.as_str())
+                .unwrap_or("未知错误");
+            return Err(format!("钉钉机器人拒绝消息：{message}"));
+        }
+    }
+    Ok(())
 }
 
 /// 对外告警入口：复用 cookie 健康的 webhook 分发逻辑，用于时间戳修复等其它告警场景。

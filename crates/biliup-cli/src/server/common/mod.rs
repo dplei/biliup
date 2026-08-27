@@ -12,6 +12,8 @@ pub mod lifecycle_backfill;
 pub mod missing_segment;
 /// 用户提供路径的安全解析（静态文件接口与后续的图片上传共用）
 pub mod path_safety;
+/// 单直播间录制租约：持久状态机、到期扫描、录制准入与可靠通知。
+pub mod recording_lease;
 pub mod recovery_eligibility;
 /// 到期补传的主动扫描与后台执行（接口只 claim，上传在这里跑）
 pub mod recovery_scheduler;

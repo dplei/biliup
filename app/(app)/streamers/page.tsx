@@ -25,6 +25,7 @@ import OverrideModal from '../../ui/OverrideModal'
 import { LiveStreamerEntity, put, requestDelete, sendRequest } from '../../lib/api-streamer'
 import useSWRMutation from 'swr/mutation'
 import {PauseButton} from "@/app/ui/StreamerActions/PauseButton";
+import RecordingLeaseButton from '@/app/ui/StreamerActions/RecordingLeaseButton'
 
 export default function Home() {
   const { Header, Content } = Layout
@@ -89,6 +90,16 @@ export default function Home() {
           {(qualityName[live.recording_quality] ?? live.recording_quality)} 录制中
         </Tag>
       ) : null
+    let leaseTag = null
+    if (live.recording_lease?.state === 'scheduled') {
+      const expiry = new Date(live.recording_lease.expires_at)
+      const label = `${String(expiry.getMonth() + 1).padStart(2, '0')}-${String(expiry.getDate()).padStart(2, '0')} ${String(expiry.getHours()).padStart(2, '0')}:${String(expiry.getMinutes()).padStart(2, '0')}`
+      leaseTag = <Tag color="light-blue" style={{ marginLeft: 4 }}>录制至 {label}</Tag>
+    } else if (live.recording_lease?.state === 'grace_current_session') {
+      leaseTag = <Tag color="orange" style={{ marginLeft: 4 }}>已到期 · 本场结束后暂停</Tag>
+    } else if (live.recording_lease?.state === 'expired_paused') {
+      leaseTag = <Tag color="pink" style={{ marginLeft: 4 }}>已到期暂停</Tag>
+    }
     return {
       ...handleEntityPostprocessor(live),
       statusTag: (
@@ -96,6 +107,7 @@ export default function Home() {
           {statusTag}
           {recordingTag}
           {missingUpload}
+          {leaseTag}
         </>
       ),
     }
@@ -243,7 +255,20 @@ export default function Home() {
                     }
                   }
                 >
-                  <div style={{ position: 'absolute', right: 20, top: 9 }}>{item.statusTag}</div>
+                  <div
+                    style={{
+                      position: 'absolute',
+                      right: 20,
+                      top: 9,
+                      maxWidth: 'calc(100% - 40px)',
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      justifyContent: 'flex-end',
+                      gap: 4,
+                    }}
+                  >
+                    {item.statusTag}
+                  </div>
 
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                       {item.upload_status === "Pending" ? <Badge count={<IconUpload />}> </Badge> : null}
@@ -297,6 +322,8 @@ export default function Home() {
                       <OverrideModal onOk={handleUpdate} entity={item}>
                         <Button theme="borderless" icon={<IconWrench />}></Button>
                       </OverrideModal>
+                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
+                      <RecordingLeaseButton streamer={item} />
                     </ButtonGroup>
                   </div>
                 </Card>

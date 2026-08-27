@@ -1,4 +1,5 @@
 use crate::server::common::cookie_health;
+use crate::server::common::recording_lease;
 use crate::server::common::route_health::{HealthUpdate, RouteHealthState, RouteSelection};
 use crate::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
@@ -13,7 +14,9 @@ use crate::server::core::downloader::{
 use crate::server::core::live::{danmaku_client, downloader_runtime, live_request};
 use crate::server::core::monitor::Monitor;
 use crate::server::errors::{AppError, AppResult};
-use crate::server::infrastructure::context::{Context, Stage, WorkerStatus};
+use crate::server::infrastructure::context::{
+    ActiveRecordingSnapshot, Context, Stage, WorkerStatus,
+};
 use crate::server::infrastructure::models::hook_step::process;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
@@ -1135,9 +1138,28 @@ impl DownloadTask {
         {
             error!("Error stopping danmaku client: {}", e);
         }
-        // 清理资源
-        // 确保状态更新和资源清理
-        rooms_handle.wake_waker(ctx.worker_id()).await;
+        // 租约的本场结束边界必须先于重新入队。数据库异常时保守留在 Pause，避免在状态不明时
+        // 偷跑下一场；上传管道和后处理不受影响。
+        let lease_paused = match recording_lease::complete_grace_session(
+            ctx.pool(),
+            ctx.worker(),
+            ctx.id(),
+            ctx.streamer_info().live_session_key.as_deref(),
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok(paused) => paused,
+            Err(report) => {
+                error!(error = ?report, live_streamer_id = ctx.worker_id(), streamer_info_id = ctx.id(), "本场结束时租约收敛失败，保守暂停轮询");
+                ctx.worker().finish_download_status(WorkerStatus::Pause);
+                true
+            }
+        };
+        ctx.worker().set_active_recording(None);
+        if !lease_paused {
+            rooms_handle.wake_waker(ctx.worker_id()).await;
+        }
         info!("Download task completed: {:?}", result);
         self.done_notify.notify_one();
         Ok(())
@@ -1280,6 +1302,43 @@ pub async fn start_download_workflow(
     sender: Sender<UploaderMessage>,
     rooms_handle: Arc<Monitor>,
 ) {
+    let recording_started_at = chrono::Utc::now();
+    ctx.worker()
+        .set_active_recording(Some(ActiveRecordingSnapshot {
+            streamer_info_id: ctx.id(),
+            live_session_key: ctx.streamer_info().live_session_key.clone(),
+            recording_started_at,
+        }));
+    let candidate_started_at = if ctx.reused_session() {
+        ctx.streamer_info().date
+    } else {
+        recording_started_at
+    };
+    match recording_lease::admit_detected_session(
+        ctx.pool(),
+        ctx.worker(),
+        Some(ctx.id()),
+        ctx.streamer_info().live_session_key.as_deref(),
+        candidate_started_at,
+        ctx.reused_session(),
+        recording_started_at,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            ctx.worker().set_active_recording(None);
+            remove_blocked_new_streamer_info(&ctx).await;
+            return;
+        }
+        Err(report) => {
+            error!(error = ?report, live_streamer_id = ctx.worker_id(), streamer_info_id = ctx.id(), "录制启动前租约准入失败，保守拒绝本场");
+            ctx.worker().set_active_recording(None);
+            ctx.worker().finish_download_status(WorkerStatus::Pause);
+            remove_blocked_new_streamer_info(&ctx).await;
+            return;
+        }
+    }
     let task = Arc::new(DownloadTask::new(downloader_runtime(
         ctx.config().downloader,
         ctx.live_stream(),
@@ -1321,6 +1380,9 @@ pub async fn start_download_workflow(
     process(&[], &ctx.live_streamer().preprocessor).await;
 
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
+    // execute 的正常路径会在确认下播边界清理；早期初始化错误也必须清掉，避免扫描器把
+    // 已退出任务误认为仍在录制。
+    ctx.worker().set_active_recording(None);
 
     ctx.worker().set_recording_quality(None);
 
@@ -1331,6 +1393,33 @@ pub async fn start_download_workflow(
         ctx.live_streamer().url,
         ctx.status(Stage::Download)
     );
+}
+
+/// Monitor 的首次准入与任务真正启动之间仍有一个很窄的调度窗口。若期限恰在其中生效，
+/// 最终准入会拒绝；这里同时移除尚未产生任何文件/会话的新身份，确保到期后不会留下“下一场”行。
+async fn remove_blocked_new_streamer_info(ctx: &Context) {
+    if ctx.reused_session() {
+        return;
+    }
+    match sqlx::query("DELETE FROM streamerinfo WHERE id = ?1")
+        .bind(ctx.id())
+        .execute(ctx.pool())
+        .await
+    {
+        Ok(result) if result.rows_affected() == 1 => info!(
+            event = "recording_lease_new_session_identity_removed",
+            live_streamer_id = ctx.worker_id(),
+            streamer_info_id = ctx.id(),
+            "已移除被期限最终准入阻止的新场次身份"
+        ),
+        Ok(_) => {}
+        Err(error) => error!(
+            error = ?error,
+            live_streamer_id = ctx.worker_id(),
+            streamer_info_id = ctx.id(),
+            "清理被期限阻止的新场次身份失败"
+        ),
+    }
 }
 
 #[cfg(test)]

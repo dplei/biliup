@@ -5,6 +5,9 @@ use crate::server::api::auth;
 use crate::server::api::spa::static_handler;
 use crate::server::api::ws::ws_logs;
 use crate::server::common::missing_segment::start_stale_attempt_recovery;
+use crate::server::common::recording_lease::{
+    RecordingLeaseTaskHandles, start_recording_lease_tasks,
+};
 use crate::server::common::recovery_scheduler::start_due_recovery_scan;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::service_register::ServiceRegister;
@@ -50,6 +53,12 @@ impl ApplicationController {
         start_due_recovery_scan(
             service_register.config.clone(),
             service_register.pool.clone(),
+        );
+
+        let recording_lease_tasks = start_recording_lease_tasks(
+            service_register.pool.clone(),
+            service_register.managers.clone(),
+            service_register.config.clone(),
         );
 
         // 启动定期清理过期会话的任务
@@ -107,6 +116,7 @@ impl ApplicationController {
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(
                 deletion_task.abort_handle(),
+                recording_lease_tasks,
                 service_register,
             ))
             .await
@@ -140,6 +150,7 @@ impl ApplicationController {
 /// 优雅关闭信号处理
 async fn shutdown_signal(
     deletion_task_abort_handle: AbortHandle,
+    recording_lease_tasks: RecordingLeaseTaskHandles,
     service_register: ServiceRegister,
 ) {
     // 监听Ctrl+C信号
@@ -167,5 +178,6 @@ async fn shutdown_signal(
         _ = ctrl_c => { deletion_task_abort_handle.abort() },
         _ = terminate => { deletion_task_abort_handle.abort() },
     }
+    recording_lease_tasks.abort();
     service_register.cleanup().await;
 }

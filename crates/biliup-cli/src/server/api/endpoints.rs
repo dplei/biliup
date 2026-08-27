@@ -1,6 +1,7 @@
 use crate::server::common::missing_segment::{
     MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
 };
+use crate::server::common::recording_lease;
 use crate::server::common::recovery_eligibility::RecoveryEligibility;
 use crate::server::common::recovery_scheduler::{recover_due_segments, spawn_claimed_recovery};
 use crate::server::common::upload::{
@@ -57,9 +58,14 @@ pub async fn get_streamers_endpoint(
     State(managers): State<Arc<DownloadManager>>,
 ) -> Result<Json<Vec<LiveStreamerResponse>>, Response> {
     let live_streamers = get_all_streamer(&pool).await.map_err(report_to_response)?;
+    let mut leases = recording_lease::current_lease_projections(&pool)
+        .await
+        .map_err(report_to_response)?;
     let mut results = Vec::new();
+    let server_now = Utc::now();
     let workers = managers.get_rooms().await;
     for x in live_streamers {
+        let live_streamer_id = x.id;
         let option = workers
             .clone()
             .into_iter()
@@ -79,6 +85,8 @@ pub async fn get_streamers_endpoint(
                 .map(|t| format!("{:?}", *t.uploader_status.read().unwrap()))
                 .unwrap_or_default(),
             recording_quality,
+            recording_lease: leases.remove(&live_streamer_id),
+            server_now,
         });
     }
     Ok(Json(results))
@@ -100,10 +108,11 @@ pub async fn post_streamers_endpoint(
     let upload_config = get_upload_config(&pool, live_streamers.id)
         .await
         .map_err(report_to_response)?;
-    let Some(_) = managers
-        .add_room(service_register.worker(live_streamers.clone(), upload_config))
+    let worker = service_register.worker(live_streamers.clone(), upload_config);
+    recording_lease::apply_initial_state(&pool, &worker)
         .await
-    else {
+        .map_err(report_to_response)?;
+    let Some(_) = managers.add_room(worker).await else {
         info!("not supported url: {}", url);
         return Err((StatusCode::BAD_REQUEST, "Not supported url").into_response());
     };
@@ -144,8 +153,12 @@ pub async fn put_streamers_endpoint(
         .await
         .map_err(report_to_response)?;
 
+    let worker = service_register.worker(streamer.clone(), upload_config);
+    recording_lease::apply_initial_state(&pool, &worker)
+        .await
+        .map_err(report_to_response)?;
     managers
-        .add_room(service_register.worker(streamer.clone(), upload_config))
+        .add_room(worker)
         .await
         .ok_or(AppError::Unknown)
         .map_err(report_to_response)?;
