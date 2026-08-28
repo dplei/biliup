@@ -9,6 +9,7 @@ use crate::server::common::recording_lease::{
     RecordingLeaseTaskHandles, start_recording_lease_tasks,
 };
 use crate::server::common::recovery_scheduler::start_due_recovery_scan;
+use crate::server::common::submission_scheduler::start_submission_reconciliation_scan;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::infrastructure::users::Backend;
@@ -51,6 +52,14 @@ impl ApplicationController {
         // pipeline, so after a restart they waited for the streamer to go live again. This loop
         // claims them on its own, in `segment_order`, reusing each session's existing archive.
         start_due_recovery_scan(
+            service_register.config.clone(),
+            service_register.pool.clone(),
+        );
+
+        // Event wakeups are intentionally best-effort. This database-driven loop runs once at
+        // startup and periodically afterwards so a restart between durable close intent and task
+        // creation cannot strand an otherwise complete session.
+        start_submission_reconciliation_scan(
             service_register.config.clone(),
             service_register.pool.clone(),
         );

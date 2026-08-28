@@ -19,6 +19,8 @@ pub mod recovery_eligibility;
 pub mod recovery_scheduler;
 pub mod route_health;
 pub mod segment_enrollment;
+/// 数据库驱动的待投稿会话启动/周期协调扫描。
+pub mod submission_scheduler;
 /// 上传前时间戳异常检测与修复
 pub mod timestamp_repair;
 pub mod upload;

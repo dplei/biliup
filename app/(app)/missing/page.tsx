@@ -102,6 +102,44 @@ interface SessionCompleteness {
   reasons: string[]
 }
 
+type PendingSubmitAction =
+  | 'waiting_segments'
+  | 'ready_to_submit'
+  | 'submitting'
+  | 'retry_scheduled'
+  | 'manual_inspection'
+
+interface PendingSubmitSession {
+  id: number
+  live_streamer_id: number
+  streamer_info_id: number
+  streamer_name: string
+  stream_title: string
+  stream_started_at: string
+  submit_requested_at: string
+  submit_state: string | null
+  submit_attempts: number
+  submit_retry_attempts: number
+  last_submit_at: string | null
+  last_submit_error: string | null
+  next_submit_at: string | null
+  submit_claimed: boolean
+  action: PendingSubmitAction
+  action_message: string
+  completeness: SessionCompleteness
+  aid: number | null
+  bvid: string | null
+  status: string
+}
+
+interface SessionRecoveryAccepted {
+  upload_session_id: number
+  segments_started: number[]
+  segments_busy: boolean
+  submission_queued: boolean
+  blocking_summary: { code: string; message: string; segment_ids: number[] } | null
+}
+
 interface StreamerInfo {
   id: number
   name: string
@@ -150,6 +188,14 @@ const OUTCOME_META: Record<string, { color: 'green' | 'red' | 'orange' | 'grey';
   stale: { color: 'grey', text: '租约超时' },
 }
 
+const SUBMIT_ACTION_META: Record<PendingSubmitAction, { color: 'green' | 'red' | 'orange' | 'grey'; text: string }> = {
+  waiting_segments: { color: 'orange', text: '等待分段' },
+  ready_to_submit: { color: 'green', text: '待投稿' },
+  submitting: { color: 'orange', text: '投稿中' },
+  retry_scheduled: { color: 'orange', text: '退避重试' },
+  manual_inspection: { color: 'red', text: '需人工核对' },
+}
+
 // 可手动指定的线路。空串表示「跟随配置」，也就是不传 line 参数。
 const LINE_OPTIONS = [
   { value: '', label: '跟随配置' },
@@ -191,10 +237,18 @@ export default function MissingRecovery() {
   const { data: lineHealth } = useSWR<UploadLineHealth[]>('/v1/health/upload-lines', fetcher, {
     refreshInterval: 15000,
   })
+  const {
+    data: pendingSessions,
+    isLoading: pendingSessionsLoading,
+    mutate: mutatePendingSessions,
+  } = useSWR<PendingSubmitSession[]>('/v1/uploads/sessions/pending', fetcher, {
+    refreshInterval: 5000,
+  })
   const [recoveringId, setRecoveringId] = useState<number | null>(null)
   const [retryingId, setRetryingId] = useState<number | null>(null)
   const [stoppingId, setStoppingId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [recoveringSessionId, setRecoveringSessionId] = useState<number | null>(null)
   // 每行各自的线路选择；空串（或缺省）表示「跟随配置」。
   const [lineChoice, setLineChoice] = useState<Record<number, string>>({})
   const [rescanStreamerInfoId, setRescanStreamerInfoId] = useState<number | null>(null)
@@ -216,19 +270,6 @@ export default function MissingRecovery() {
     () => (lineHealth ?? []).filter((line) => line.cooldown_until != null && new Date(line.cooldown_until).getTime() > now),
     [lineHealth, now],
   )
-  const blockedSessions = useMemo(() => {
-    const byId = new Map<number, MissingSegment>()
-    for (const row of rows ?? []) {
-      if (
-        row.upload_session_id != null &&
-        row.session_status !== 'finalized' &&
-        row.session_submit_state === 'blocked_missing_segments'
-      ) {
-        byId.set(row.upload_session_id, row)
-      }
-    }
-    return Array.from(byId.values())
-  }, [rows])
   useEffect(() => {
     if (rescanStreamerInfoId == null && recentStreamerInfos.length > 0) {
       setRescanStreamerInfoId(recentStreamerInfos[0].id)
@@ -351,6 +392,31 @@ export default function MissingRecovery() {
       Toast.error(`删除失败：${e?.message ?? e}`)
     } finally {
       setDeletingId(null)
+    }
+  }
+
+  const handleSessionRecover = async (id: number) => {
+    setRecoveringSessionId(id)
+    try {
+      const result = (await sendRequest(`/v1/uploads/sessions/${id}/recover`, {
+        arg: {},
+      })) as SessionRecoveryAccepted
+      if (result.segments_started.length > 0) {
+        Toast.success(`会话 #${id} 已开始补传 ${result.segments_started.length} 个分段`)
+      } else if (result.submission_queued) {
+        Toast.success(`会话 #${id} 已排队投稿，页面会自动刷新结果`)
+      } else if (result.blocking_summary) {
+        Toast.warning(result.blocking_summary.message)
+      } else if (result.segments_busy) {
+        Toast.warning(`会话 #${id} 已有恢复任务在运行`)
+      } else {
+        Toast.info(`会话 #${id} 状态已刷新`)
+      }
+      await Promise.all([mutate(), mutatePendingSessions()])
+    } catch (e: any) {
+      Toast.error(`恢复会话失败：${e?.message ?? e}`)
+    } finally {
+      setRecoveringSessionId(null)
     }
   }
 
@@ -696,7 +762,11 @@ export default function MissingRecovery() {
                 { value: 'all', label: '全部' },
               ]}
             />
-            <Button icon={<IconRefresh />} type="tertiary" onClick={() => mutate()}>
+            <Button
+              icon={<IconRefresh />}
+              type="tertiary"
+              onClick={() => Promise.all([mutate(), mutatePendingSessions()])}
+            >
               刷新
             </Button>
           </div>
@@ -723,38 +793,75 @@ export default function MissingRecovery() {
             </div>
           </div>
         )}
-        {blockedSessions.map((row) => {
-          const completeness = row.session_completeness
-          if (!completeness) return null
-          const incomplete = Math.max(
-            completeness.reasons.length > 0 ? 1 : 0,
-            completeness.total_expected - completeness.valid_videos,
-          )
-          return (
-            <div
-              key={row.upload_session_id!}
-              style={{
-                marginBottom: 16,
-                padding: 12,
-                borderRadius: 6,
-                background: 'var(--semi-color-warning-light-default)',
-              }}
-            >
-              <Text strong>会话 #{row.upload_session_id} 因 {incomplete} 个未完成分段暂停投稿</Text>
-              <div>
-                <Text type="tertiary" size="small">
-                  待传 {completeness.pending} · 上传中 {completeness.uploading} · 失败 {completeness.failed} ·
-                  源文件缺失 {completeness.source_missing} · 删除中 {completeness.deleting} · 异常 {completeness.unknown}
-                </Text>
-              </div>
-              {completeness.earliest_blocking_segment_id != null && (
-                <a href={`#missing-segment-${completeness.earliest_blocking_segment_id}`}>
-                  查看最早阻塞分段 #{completeness.earliest_blocking_segment_id}
-                </a>
-              )}
+        <section style={{ marginBottom: 24 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+            <Text strong style={{ fontSize: 16 }}>待投稿会话</Text>
+            <Text type="tertiary" size="small">独立于下方缺失分段筛选</Text>
+          </div>
+          {pendingSessionsLoading && <Text type="tertiary">正在读取待投稿状态…</Text>}
+          {!pendingSessionsLoading && (pendingSessions?.length ?? 0) === 0 && (
+            <div style={{ padding: 12, borderRadius: 6, background: 'var(--semi-color-fill-0)' }}>
+              <Text type="tertiary">当前没有待投稿会话</Text>
             </div>
-          )
-        })}
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {(pendingSessions ?? []).map((session) => {
+              const meta = SUBMIT_ACTION_META[session.action]
+              const completeness = session.completeness
+              const canRecover = !['submitting', 'manual_inspection'].includes(session.action)
+              return (
+                <div
+                  key={session.id}
+                  style={{
+                    padding: 12,
+                    borderRadius: 6,
+                    border: '1px solid var(--semi-color-border)',
+                    background: session.action === 'manual_inspection'
+                      ? 'var(--semi-color-danger-light-default)'
+                      : 'var(--semi-color-warning-light-default)',
+                  }}
+                >
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <Text strong>会话 #{session.id} · {session.streamer_name}</Text>
+                    <Tag color={meta.color}>{meta.text}</Tag>
+                    <Text type="tertiary" size="small">{session.stream_title}</Text>
+                  </div>
+                  <div style={{ marginTop: 4 }}><Text>{session.action_message}</Text></div>
+                  <div>
+                    <Text type="tertiary" size="small">
+                      分段 {completeness.succeeded}/{completeness.total_expected} · 远端投稿 {session.submit_attempts} 次 ·
+                      退避 {session.submit_retry_attempts} 次 ·
+                      请求于 {fmtTime(session.submit_requested_at)}
+                      {session.next_submit_at ? ` · 下次 ${fmtTime(session.next_submit_at)}` : ''}
+                    </Text>
+                  </div>
+                  {session.last_submit_error && (
+                    <div><Text type="danger" size="small">最近错误：{session.last_submit_error}</Text></div>
+                  )}
+                  <div style={{ display: 'flex', gap: 12, marginTop: 8, alignItems: 'center' }}>
+                    {session.action === 'waiting_segments' && completeness.earliest_blocking_segment_id != null && (
+                      <a href={`#missing-segment-${completeness.earliest_blocking_segment_id}`}>
+                        查看阻塞分段 #{completeness.earliest_blocking_segment_id}
+                      </a>
+                    )}
+                    {canRecover && (
+                      <Button
+                        size="small"
+                        loading={recoveringSessionId === session.id}
+                        onClick={() => handleSessionRecover(session.id)}
+                      >
+                        恢复会话
+                      </Button>
+                    )}
+                    {session.action === 'manual_inspection' && (
+                      <Text type="danger" size="small">为避免重复稿件，此状态不提供普通重试按钮</Text>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </section>
         <Text type="tertiary" style={{ display: 'block', marginBottom: 16 }}>
           录制期间上传失败、尚未补传的分段。下播提交前会自动换线重试到期的分段；这里可手动立即补传，
           补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，

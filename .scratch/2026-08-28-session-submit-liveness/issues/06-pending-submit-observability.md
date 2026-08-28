@@ -1,6 +1,6 @@
 # 06 — 待投稿会话 API、页面与通知
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 04, 05
 
 ## 背景
@@ -49,3 +49,13 @@ Blocked by: 04, 05
 - API 状态映射单测。
 - 前端至少覆盖 waiting/ready/submitting/retry/manual-inspection 五种渲染状态。
 - `tsc --noEmit` 与 `next build`。
+
+## Answer
+
+新增 `GET /v1/uploads/sessions/pending`，直接从有持久投稿意图的非 finalized 会话构建视图，返回主播/
+场次、投稿次数与时间、最近错误、claim、完整性、aid/bvid/status，以及后端稳定映射的
+`waiting_segments`、`ready_to_submit`、`submitting`、`retry_scheduled`、`manual_inspection` 五态。
+补传页新增独立的“待投稿会话”区域，不受 missing 状态筛选影响；可安全恢复的状态调用 04 的会话
+recover 并按结构化响应提示，`ok_no_aid` 或陈旧/不确定 claim 只显示人工核对且不提供普通重试按钮。
+分段不完整通知继续按 blocking signature 去重，账本完整但明确失败则使用独立的退避重试通知文案。
+后端测试覆盖五态映射、完整会话在活动 missing 列表为空时仍可见，以及不确定 claim 不被释放。

@@ -1,6 +1,6 @@
 # 2026-08-28 投稿会话活性修复：总览与任务拆分
 
-Status: ready-for-agent
+Status: ready-for-human
 
 来源：[`dplei/biliup#1`](https://github.com/dplei/biliup/issues/1) 及
 [`2026-08-28 再次复现`](https://github.com/dplei/biliup/issues/1#issuecomment-5447934912)。

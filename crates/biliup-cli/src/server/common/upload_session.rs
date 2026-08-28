@@ -413,11 +413,12 @@ pub async fn claim_complete_session(
         let blocked_count = sqlx::query_scalar::<_, i64>(
             "UPDATE upload_session SET submit_state = 'blocked_missing_segments', \
              last_submit_error = ?1, blocked_signature = ?2, \
-             blocked_count = blocked_count + 1 WHERE id = ?3 \
+             blocked_count = blocked_count + 1, updated_at = ?3 WHERE id = ?4 \
              RETURNING blocked_count",
         )
         .bind(completeness.summary())
         .bind(signature)
+        .bind(now)
         .bind(session_row_id)
         .fetch_one(&mut *tx)
         .await
@@ -670,6 +671,7 @@ pub async fn schedule_submit_retry(
         "UPDATE upload_session SET submit_state = 'failed', last_submit_error = ?1, \
          last_submit_at = CASE WHEN ?2 THEN ?3 ELSE last_submit_at END, \
          submit_attempts = submit_attempts + CASE WHEN ?2 THEN 1 ELSE 0 END, \
+         submit_retry_attempts = submit_retry_attempts + 1, \
          submit_claim_token = NULL, submit_claimed_at = NULL, next_submit_at = ?4, \
          updated_at = ?3 WHERE id = ?5 AND status != 'finalized' \
          AND submit_claim_token = ?6",
@@ -1049,8 +1051,9 @@ mod tests {
             .await
             .unwrap()
         );
-        let (next_at, attempts): (DateTime<Utc>, i64) = sqlx::query_as(
-            "SELECT next_submit_at, submit_attempts FROM upload_session WHERE id = 70",
+        let (next_at, attempts, retries): (DateTime<Utc>, i64, i64) = sqlx::query_as(
+            "SELECT next_submit_at, submit_attempts, submit_retry_attempts \
+             FROM upload_session WHERE id = 70",
         )
         .fetch_one(&pool)
         .await
@@ -1059,6 +1062,10 @@ mod tests {
         assert_eq!(
             attempts, 1,
             "only a real remote attempt increments attempts"
+        );
+        assert_eq!(
+            retries, 2,
+            "every definite failure advances durable retry backoff"
         );
     }
 

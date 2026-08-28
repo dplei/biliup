@@ -7,6 +7,7 @@ use biliup_cli::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     import_outbox_once, normalize_segment_path,
 };
+use biliup_cli::server::common::submission_scheduler::due_submission_session_ids;
 use biliup_cli::server::common::upload::{
     AttemptClaim, claim_enrolled_attempt, fail_enrolled_attempt, persist_segment,
 };
@@ -15,13 +16,15 @@ use biliup_cli::server::common::upload_line_health::{
 };
 use biliup_cli::server::common::upload_line_selection::LineSource;
 use biliup_cli::server::common::upload_session::{
-    LiveArchive, SubmitClaim, claim_complete_session, parse_videos,
+    LiveArchive, SubmitClaim, claim_complete_session, mark_submit_anomaly, mark_submitted,
+    parse_videos, request_session_submit, schedule_submit_retry,
 };
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
 use biliup_cli::server::config::Config;
 use biliup_cli::server::core::downloader::SegmentEnrollment;
 use biliup_cli::server::infrastructure::connection_pool::{ConnectionManager, ConnectionPool};
 use chrono::Duration;
+use futures::future::join_all;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use support::upload_reliability::*;
@@ -913,6 +916,244 @@ async fn target_08_two_broadcasts_are_never_merged() {
     );
 }
 
+/// The production race from the incident: the close wakeup sees the tail still uploading, then
+/// several independent wakeups arrive once it succeeds. The durable claim must turn those wakes
+/// into one ordered remote payload and one finalized archive.
+#[tokio::test]
+async fn submit_liveness_01_tail_race_and_concurrent_wakeups_are_exactly_once() {
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let now = FakeClock::incident_start().now();
+    request_session_submit(&db.pool, INCIDENT_SESSION_ID, now)
+        .await
+        .unwrap();
+    for order in 0..4 {
+        insert_submit_ledger_segment(
+            &db.pool,
+            1_000 + order,
+            order,
+            if order == 3 { "uploading" } else { "succeeded" },
+        )
+        .await;
+    }
+    let submit = SubmitSpy::default();
+
+    let first = claim_complete_session(&db.pool, INCIDENT_SESSION_ID)
+        .await
+        .unwrap();
+    let SubmitClaim::Blocked { completeness, .. } = first else {
+        panic!("the first close wakeup must observe the tail as incomplete");
+    };
+    assert_eq!(completeness.uploading, 1);
+    assert_eq!(submit.calls(), 0);
+
+    let tail = uploaded_video("part-3");
+    sqlx::query(
+        "UPDATE upload_missing_segment SET status = 'succeeded', video_json = ?1 \
+         WHERE id = 1003",
+    )
+    .bind(serde_json::to_string(&tail).unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let outcomes =
+        join_all((0..4).map(|_| claim_complete_session(&db.pool, INCIDENT_SESSION_ID))).await;
+    let mut winning_claim = None;
+    for outcome in outcomes {
+        match outcome.unwrap() {
+            SubmitClaim::Claimed { token, videos } => {
+                assert!(winning_claim.is_none(), "only one wakeup may own submit");
+                assert_eq!(
+                    videos
+                        .iter()
+                        .map(|video| video.filename.as_str())
+                        .collect::<Vec<_>>(),
+                    ["part-0", "part-1", "part-2", "part-3"]
+                );
+                submit.submit();
+                winning_claim = Some(token);
+            }
+            SubmitClaim::AlreadyClaimed => {}
+            other => panic!("unexpected concurrent gate result: {other:?}"),
+        }
+    }
+    let token = winning_claim.expect("one wakeup must acquire the claim");
+    mark_submitted(
+        &db.pool,
+        INCIDENT_SESSION_ID,
+        &token,
+        88_001,
+        Some("BV1incident".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(submit.calls(), 1);
+    let row: (String, Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT status, aid, bvid FROM upload_session WHERE id = ?1")
+            .bind(INCIDENT_SESSION_ID)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row,
+        (
+            "finalized".to_string(),
+            Some(88_001),
+            Some("BV1incident".to_string())
+        )
+    );
+}
+
+#[tokio::test]
+async fn submit_liveness_02_restart_scan_and_manual_null_recovery_are_distinct() {
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let now = FakeClock::incident_start().now();
+    insert_submit_ledger_segment(&db.pool, 2_000, 0, "succeeded").await;
+
+    // Historical NULL sessions are intentionally invisible to automatic startup scans.
+    assert!(
+        due_submission_session_ids(&db.pool, now, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // An operator recovery is the durable authorization. A new process sees it without needing
+    // another live event and can claim the already-complete ledger.
+    request_session_submit(&db.pool, INCIDENT_SESSION_ID, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        due_submission_session_ids(&db.pool, now, true)
+            .await
+            .unwrap(),
+        vec![INCIDENT_SESSION_ID]
+    );
+    let SubmitClaim::Claimed { token, videos } =
+        claim_complete_session(&db.pool, INCIDENT_SESSION_ID)
+            .await
+            .unwrap()
+    else {
+        panic!("the restarted scanner must be able to claim a complete requested session");
+    };
+    assert_eq!(videos[0].filename, "part-0");
+    let submit = SubmitSpy::default();
+    submit.submit();
+    mark_submitted(
+        &db.pool,
+        INCIDENT_SESSION_ID,
+        &token,
+        88_002,
+        Some("BV1restart".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(submit.calls(), 1);
+}
+
+#[tokio::test]
+async fn submit_liveness_03_live_session_without_intent_is_never_scanned_and_stays_open() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let now = FakeClock::incident_start().now();
+    insert_submit_ledger_segment(&db.pool, 3_000, 0, "succeeded").await;
+
+    for offset in [0, 60, 600] {
+        assert!(
+            due_submission_session_ids(&db.pool, now + Duration::seconds(offset), false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a complete ledger is not a close signal"
+        );
+    }
+
+    let next_path = media.path().join("still-live-part.flv");
+    write_synthetic_valid_flv(&next_path);
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let next = enroll_once(&store, &next_path).await;
+    assert_eq!(next.upload_session_id, INCIDENT_SESSION_ID);
+}
+
+#[tokio::test]
+async fn submit_liveness_04_retry_deadline_and_uncertain_claim_are_safe() {
+    let db = IncidentDb::new().await;
+    db.insert_session("uploading", "[]").await;
+    let now = FakeClock::incident_start().now();
+    insert_submit_ledger_segment(&db.pool, 4_000, 0, "succeeded").await;
+    request_session_submit(&db.pool, INCIDENT_SESSION_ID, now)
+        .await
+        .unwrap();
+
+    let SubmitClaim::Claimed { token, .. } = claim_complete_session(&db.pool, INCIDENT_SESSION_ID)
+        .await
+        .unwrap()
+    else {
+        panic!("complete session should be claimable");
+    };
+    let retry_at = now + Duration::minutes(5);
+    assert!(
+        schedule_submit_retry(
+            &db.pool,
+            INCIDENT_SESSION_ID,
+            &token,
+            retry_at,
+            "definite failure".to_string(),
+            true,
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        due_submission_session_ids(&db.pool, retry_at - Duration::milliseconds(1), false,)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        due_submission_session_ids(&db.pool, retry_at, false)
+            .await
+            .unwrap(),
+        vec![INCIDENT_SESSION_ID]
+    );
+
+    let SubmitClaim::Claimed { token, .. } = claim_complete_session(&db.pool, INCIDENT_SESSION_ID)
+        .await
+        .unwrap()
+    else {
+        panic!("the session should be claimable once retry is due");
+    };
+    mark_submit_anomaly(
+        &db.pool,
+        INCIDENT_SESSION_ID,
+        &token,
+        "ok_no_aid",
+        "remote accepted without aid".to_string(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        due_submission_session_ids(&db.pool, retry_at + Duration::days(1), false)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an uncertain remote result retains its claim and is never auto-retried"
+    );
+    let state: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT submit_state, submit_claim_token FROM upload_session WHERE id = ?1")
+            .bind(INCIDENT_SESSION_ID)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(state.0.as_deref(), Some("ok_no_aid"));
+    assert_eq!(state.1.as_deref(), Some(token.as_str()));
+}
+
 async fn lease_state(pool: &ConnectionPool, missing_id: i64) -> (String, Option<String>) {
     sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT status, attempt_token FROM upload_missing_segment WHERE id = ?",
@@ -963,6 +1204,31 @@ fn uploaded_video(name: &str) -> Video {
         filename: name.to_string(),
         desc: String::new(),
     }
+}
+
+async fn insert_submit_ledger_segment(pool: &ConnectionPool, id: i64, order: i64, status: &str) {
+    let now = FakeClock::incident_start().now();
+    let video_json = (status == "succeeded")
+        .then(|| serde_json::to_string(&uploaded_video(&format!("part-{order}"))).unwrap());
+    sqlx::query(
+        "INSERT INTO upload_missing_segment \
+         (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+          normalized_file_path, segment_order, status, next_retry_at, created_at, updated_at, \
+          lifecycle_version, video_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?8, ?8, 2, ?9)",
+    )
+    .bind(id)
+    .bind(INCIDENT_ROOM_ID)
+    .bind(INCIDENT_STREAMER_INFO_ID)
+    .bind(INCIDENT_SESSION_ID)
+    .bind(format!("/fixture/part-{order}.flv"))
+    .bind(order)
+    .bind(status)
+    .bind(now)
+    .bind(video_json)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn enrollment_request(path: &Path) -> EnrollmentRequest {

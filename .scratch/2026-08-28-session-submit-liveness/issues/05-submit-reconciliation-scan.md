@@ -1,6 +1,6 @@
 # 05 — 启动与周期补提交扫描
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02
 
 ## 背景
@@ -39,3 +39,13 @@ Blocked by: 02
 
 - 用 fake clock 覆盖启动立即扫描、退避未到/已到、blocked 漏事件兜底。
 - 并发扫描与 `persist_segment` 唤醒的单次提交断言。
+
+## Answer
+
+新增数据库驱动的 `submission_scheduler`：服务启动立即扫描，之后每分钟扫描有
+`submit_requested_at`、未 finalized、无 claim 且退避已到期的会话；`ok_no_aid` 和异常的
+claim-less `submitting` 会被保守排除。每批最多读取 128 个会话、最多并发协调 2 个，并按
+blocked/submitted/retry/claim/manual 等结果记录结构化日志。新增独立持久的
+`submit_retry_attempts`（不污染只统计真实远端请求的 `submit_attempts`）；明确失败的指数退避增加了有界抖动，
+周期扫描与事件唤醒重叠时仍由数据库 submit claim 去重。fake-clock 测试覆盖启动扫描、未到/已到
+退避、活跃无意图、finalized 与不确定状态排除。

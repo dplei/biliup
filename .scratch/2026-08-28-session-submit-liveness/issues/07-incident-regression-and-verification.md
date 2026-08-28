@@ -1,6 +1,6 @@
 # 07 — 事故回归与端到端验证
 
-Status: ready-for-agent
+Status: ready-for-human
 Blocked by: 03, 04, 05, 06
 
 ## 背景
@@ -48,3 +48,19 @@ Blocked by: 03, 04, 05, 06
 - 一场真实多分段直播正常产生单一稿件；日志能串起
   `submit_requested -> blocked/ready -> claimed -> submitted`。
 - 本任务只在验证完成后标记 resolved，并把提交、测试和部署证据写入 `## Answer`。
+
+## Answer
+
+自动化与本地构建部分已完成。`upload_reliability_incident.rs` 新增四组完全无外网的投稿活性回归，
+覆盖：尾段晚到时首次 blocked、四路并发唤醒 exactly-once、四个 filename 按 `segment_order` 重建并
+finalize；重启扫描接管持久投稿意图；历史 NULL 会话只在人工授权后进入扫描；活跃无意图会话多轮扫描
+不投稿且仍可继续 enrollment；明确失败到期前/后选择；`ok_no_aid` 保留 claim 并永不自动重试。
+API 单测另覆盖 waiting/ready/submitting/retry/manual 五态和 source_missing/unknown 等阻塞文案。
+
+已通过 `SQLX_OFFLINE=true cargo check --workspace`、`cargo test -p biliup-cli`、
+`cargo test --workspace`、`npx tsc --noEmit`、`npm run build`、格式检查与 Code Index 校验；测试模式不读取
+Cookie、不触碰真实 B 站。
+
+仍需人工/部署授权的验收：备份生产 SQLite 后部署 migration 20，执行只读历史数据核对，并观察至少一场
+真实多分段直播只产生一个稿件。未执行这三项生产操作，因此按约定保持 `ready-for-human`，不虚报
+`resolved`。

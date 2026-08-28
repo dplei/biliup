@@ -868,6 +868,175 @@ pub async fn get_missing_uploads(
     Ok(Json(views))
 }
 
+/// Stable operator-facing state for a session with durable submit intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingSubmitAction {
+    WaitingSegments,
+    ReadyToSubmit,
+    Submitting,
+    RetryScheduled,
+    ManualInspection,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PendingSubmitRow {
+    id: i64,
+    live_streamer_id: i64,
+    streamer_info_id: i64,
+    streamer_name: String,
+    stream_title: String,
+    stream_started_at: chrono::DateTime<Utc>,
+    submit_requested_at: chrono::DateTime<Utc>,
+    submit_state: Option<String>,
+    submit_attempts: i64,
+    submit_retry_attempts: i64,
+    last_submit_at: Option<chrono::DateTime<Utc>>,
+    last_submit_error: Option<String>,
+    next_submit_at: Option<chrono::DateTime<Utc>>,
+    submit_claim_token: Option<String>,
+    submit_claimed_at: Option<chrono::DateTime<Utc>>,
+    aid: Option<i64>,
+    bvid: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PendingSubmitSessionView {
+    pub id: i64,
+    pub live_streamer_id: i64,
+    pub streamer_info_id: i64,
+    pub streamer_name: String,
+    pub stream_title: String,
+    pub stream_started_at: chrono::DateTime<Utc>,
+    pub submit_requested_at: chrono::DateTime<Utc>,
+    pub submit_state: Option<String>,
+    pub submit_attempts: i64,
+    pub submit_retry_attempts: i64,
+    pub last_submit_at: Option<chrono::DateTime<Utc>>,
+    pub last_submit_error: Option<String>,
+    pub next_submit_at: Option<chrono::DateTime<Utc>>,
+    pub submit_claimed: bool,
+    pub action: PendingSubmitAction,
+    pub action_message: String,
+    pub completeness: SessionCompleteness,
+    pub aid: Option<i64>,
+    pub bvid: Option<String>,
+    pub status: String,
+}
+
+const ACTIVE_SUBMIT_DISPLAY_WINDOW: chrono::Duration = chrono::Duration::minutes(15);
+
+fn pending_submit_action(
+    row: &PendingSubmitRow,
+    completeness: &SessionCompleteness,
+    now: chrono::DateTime<Utc>,
+) -> (PendingSubmitAction, String) {
+    if row.submit_claim_token.is_some() {
+        if row.submit_state.as_deref() == Some("submitting")
+            && row
+                .submit_claimed_at
+                .is_some_and(|claimed| claimed >= now - ACTIVE_SUBMIT_DISPLAY_WINDOW)
+        {
+            return (
+                PendingSubmitAction::Submitting,
+                "投稿协调器已取得唯一 claim，正在提交；请勿重复操作。".to_string(),
+            );
+        }
+        let message = if row.submit_state.as_deref() == Some("ok_no_aid") {
+            "远端可能已接受投稿但没有返回稳定 aid；请先在创作中心核对，系统不会自动重投。"
+        } else {
+            "投稿 claim 长时间未收敛或结果不确定；请人工核对远端稿件，系统不会自动偷取 claim。"
+        };
+        return (PendingSubmitAction::ManualInspection, message.to_string());
+    }
+    if matches!(
+        row.submit_state.as_deref(),
+        Some("ok_no_aid" | "submitting")
+    ) {
+        return (
+            PendingSubmitAction::ManualInspection,
+            "会话处于不确定投稿状态但缺少可验证的 claim；请人工检查数据库与远端稿件。".to_string(),
+        );
+    }
+    if !completeness.is_complete() {
+        return (
+            PendingSubmitAction::WaitingSegments,
+            format!(
+                "仍有 {} 个未完成或异常分段，需先完成分段恢复。",
+                completeness.incomplete_count()
+            ),
+        );
+    }
+    if let Some(next_at) = row.next_submit_at
+        && next_at > now
+    {
+        return (
+            PendingSubmitAction::RetryScheduled,
+            format!("上次投稿明确失败，系统将在 {next_at} 后自动重试。"),
+        );
+    }
+    (
+        PendingSubmitAction::ReadyToSubmit,
+        "分段账本已完整，等待投稿协调器领取；可手动再次唤醒。".to_string(),
+    )
+}
+
+/// Sessions awaiting the one-shot submission, independent of the missing-segment filter.
+pub async fn get_pending_submit_sessions(
+    State(service_register): State<ServiceRegister>,
+) -> Result<Json<Vec<PendingSubmitSessionView>>, Response> {
+    let rows = sqlx::query_as::<_, PendingSubmitRow>(
+        "SELECT s.id, s.live_streamer_id, s.streamer_info_id, \
+                COALESCE(NULLIF(l.remark, ''), i.name) AS streamer_name, \
+                i.title AS stream_title, i.date AS stream_started_at, \
+                s.submit_requested_at, s.submit_state, s.submit_attempts, \
+                s.submit_retry_attempts, s.last_submit_at, \
+                s.last_submit_error, s.next_submit_at, s.submit_claim_token, \
+                s.submit_claimed_at, s.aid, s.bvid, s.status \
+         FROM upload_session s \
+         JOIN streamerinfo i ON i.id = s.streamer_info_id \
+         JOIN livestreamers l ON l.id = s.live_streamer_id \
+         WHERE s.status != 'finalized' AND s.submit_requested_at IS NOT NULL \
+         ORDER BY s.submit_requested_at ASC, s.id ASC",
+    )
+    .fetch_all(&service_register.pool)
+    .await
+    .change_context(AppError::Unknown)
+    .map_err(report_to_response)?;
+    let now = Utc::now();
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let completeness = session_completeness(&service_register.pool, row.id)
+            .await
+            .map_err(report_to_response)?;
+        let (action, action_message) = pending_submit_action(&row, &completeness, now);
+        views.push(PendingSubmitSessionView {
+            id: row.id,
+            live_streamer_id: row.live_streamer_id,
+            streamer_info_id: row.streamer_info_id,
+            streamer_name: row.streamer_name,
+            stream_title: row.stream_title,
+            stream_started_at: row.stream_started_at,
+            submit_requested_at: row.submit_requested_at,
+            submit_state: row.submit_state,
+            submit_attempts: row.submit_attempts,
+            submit_retry_attempts: row.submit_retry_attempts,
+            last_submit_at: row.last_submit_at,
+            last_submit_error: row.last_submit_error,
+            next_submit_at: row.next_submit_at,
+            submit_claimed: row.submit_claim_token.is_some(),
+            action,
+            action_message,
+            completeness,
+            aid: row.aid,
+            bvid: row.bvid,
+            status: row.status,
+        });
+    }
+    Ok(Json(views))
+}
+
 /// Optional per-task line override from the recovery page. `None` (or `"auto"`) means "follow
 /// configuration"; anything else is honoured unless that line is cooling.
 #[derive(serde::Deserialize, Default)]
@@ -1167,6 +1336,15 @@ fn recovery_blocking_summary(
             segment_ids: busy_ids,
         });
     }
+    if let Some(next_at) = snapshot.next_submit_at
+        && next_at > Utc::now()
+    {
+        return Some(SessionRecoveryBlockingSummary {
+            code: "submit_retry_scheduled",
+            message: format!("投稿已进入退避，将在 {next_at} 后由后台扫描自动重试。"),
+            segment_ids: Vec::new(),
+        });
+    }
     if completeness.is_complete() {
         return None;
     }
@@ -1271,8 +1449,11 @@ pub async fn recover_session_uploads(
         .map_err(report_to_response)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "upload session not found").into_response())?;
     let segments_busy = recovery_group_busy || !busy_ids.is_empty();
-    let submission_queued =
-        result.started.is_empty() && !segments_busy && snapshot.submit_claim_token.is_none();
+    let submission_due = snapshot.next_submit_at.is_none_or(|next_at| next_at <= now);
+    let submission_queued = result.started.is_empty()
+        && !segments_busy
+        && snapshot.submit_claim_token.is_none()
+        && submission_due;
     let blocking_summary = recovery_blocking_summary(
         &snapshot,
         &completeness,
@@ -1340,6 +1521,126 @@ pub async fn get_missing_upload_attempts(
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
     Ok(Json(rows))
+}
+
+#[cfg(test)]
+mod pending_submit_view_tests {
+    use super::*;
+
+    fn row(now: chrono::DateTime<Utc>) -> PendingSubmitRow {
+        PendingSubmitRow {
+            id: 1,
+            live_streamer_id: 2,
+            streamer_info_id: 3,
+            streamer_name: "test".to_string(),
+            stream_title: "test".to_string(),
+            stream_started_at: now,
+            submit_requested_at: now,
+            submit_state: None,
+            submit_attempts: 0,
+            submit_retry_attempts: 0,
+            last_submit_at: None,
+            last_submit_error: None,
+            next_submit_at: None,
+            submit_claim_token: None,
+            submit_claimed_at: None,
+            aid: None,
+            bvid: None,
+            status: "uploading".to_string(),
+        }
+    }
+
+    fn complete() -> SessionCompleteness {
+        SessionCompleteness {
+            total_expected: 1,
+            valid_videos: 1,
+            succeeded: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn maps_all_five_pending_submit_actions() {
+        let now = Utc::now();
+        let mut value = row(now);
+        let incomplete = SessionCompleteness {
+            total_expected: 1,
+            pending: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            pending_submit_action(&value, &incomplete, now).0,
+            PendingSubmitAction::WaitingSegments
+        );
+        assert_eq!(
+            pending_submit_action(&value, &complete(), now).0,
+            PendingSubmitAction::ReadyToSubmit
+        );
+
+        value.submit_state = Some("submitting".to_string());
+        value.submit_claim_token = Some("claim".to_string());
+        value.submit_claimed_at = Some(now);
+        assert_eq!(
+            pending_submit_action(&value, &complete(), now).0,
+            PendingSubmitAction::Submitting
+        );
+
+        value.submit_state = Some("failed".to_string());
+        value.submit_claim_token = None;
+        value.submit_claimed_at = None;
+        value.next_submit_at = Some(now + chrono::Duration::minutes(1));
+        assert_eq!(
+            pending_submit_action(&value, &complete(), now).0,
+            PendingSubmitAction::RetryScheduled
+        );
+
+        value.submit_state = Some("ok_no_aid".to_string());
+        value.submit_claim_token = Some("uncertain".to_string());
+        value.next_submit_at = None;
+        assert_eq!(
+            pending_submit_action(&value, &complete(), now).0,
+            PendingSubmitAction::ManualInspection
+        );
+    }
+
+    #[test]
+    fn stale_submit_claim_requires_manual_inspection_without_releasing_it() {
+        let now = Utc::now();
+        let mut value = row(now);
+        value.submit_state = Some("submitting".to_string());
+        value.submit_claim_token = Some("held".to_string());
+        value.submit_claimed_at = Some(now - chrono::Duration::hours(1));
+
+        assert_eq!(
+            pending_submit_action(&value, &complete(), now).0,
+            PendingSubmitAction::ManualInspection
+        );
+        assert_eq!(value.submit_claim_token.as_deref(), Some("held"));
+    }
+
+    #[test]
+    fn unknown_lifecycle_state_has_an_actionable_recovery_blocker() {
+        let snapshot = SessionRecoverySnapshot {
+            status: "uploading".to_string(),
+            submit_state: Some("blocked_missing_segments".to_string()),
+            submit_requested_at: Some(Utc::now()),
+            next_submit_at: None,
+            submit_claim_token: None,
+            last_submit_error: None,
+        };
+        let completeness = SessionCompleteness {
+            total_expected: 1,
+            unknown: 1,
+            earliest_blocking_segment_id: Some(42),
+            reasons: vec!["segment #42 has unknown status".to_string()],
+            ..Default::default()
+        };
+
+        let blocker =
+            recovery_blocking_summary(&snapshot, &completeness, &[], Vec::new(), false).unwrap();
+        assert_eq!(blocker.code, "unknown_segment_state");
+        assert_eq!(blocker.segment_ids, vec![42]);
+    }
 }
 
 #[cfg(test)]
@@ -1473,6 +1774,29 @@ mod session_recovery_tests {
                 .await
                 .unwrap();
         assert!(requested.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_session_view_does_not_depend_on_active_missing_filter() {
+        let (_directory, service) = service().await;
+        insert_session(&service.pool, 706, "uploading").await;
+        insert_segment(
+            &service.pool,
+            706,
+            7061,
+            "succeeded",
+            std::path::Path::new("/already-complete.flv"),
+        )
+        .await;
+        request_session_submit(&service.pool, 706, Utc::now())
+            .await
+            .unwrap();
+
+        let Json(views) = get_pending_submit_sessions(State(service)).await.unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, 706);
+        assert_eq!(views[0].action, PendingSubmitAction::ReadyToSubmit);
+        assert!(views[0].completeness.is_complete());
     }
 
     #[tokio::test]

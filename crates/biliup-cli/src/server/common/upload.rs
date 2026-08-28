@@ -65,6 +65,7 @@ use biliup::uploader::util::SubmitOption;
 use error_stack::ResultExt;
 use futures::StreamExt;
 use ormlite::Model;
+use rand::Rng;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::future::Future;
@@ -654,8 +655,15 @@ fn submit_retry_at(
     let exponent = u32::try_from(submit_attempts.max(0))
         .unwrap_or(u32::MAX)
         .min(10);
-    let seconds = SUBMIT_RETRY_BASE_SECS
+    let base_seconds = SUBMIT_RETRY_BASE_SECS
         .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(SUBMIT_RETRY_MAX_SECS);
+    // Spread failures from one scan batch across nearby ticks while keeping the documented hard
+    // upper bound. At the cap the jitter naturally becomes zero.
+    let jitter_ceiling = (base_seconds / 5).max(1);
+    let jitter = rand::thread_rng().gen_range(0..=jitter_ceiling);
+    let seconds = base_seconds
+        .saturating_add(jitter)
         .min(SUBMIT_RETRY_MAX_SECS);
     now + chrono::Duration::seconds(seconds)
 }
@@ -664,11 +672,18 @@ async fn retry_submission(
     pool: &ConnectionPool,
     session_row_id: i64,
     claim_token: &str,
-    submit_attempts: i64,
     error: String,
     remote_attempted: bool,
+    webhook: Option<&str>,
 ) -> AppResult<SessionSubmissionOutcome> {
-    let next_at = submit_retry_at(submit_attempts, chrono::Utc::now());
+    let retry_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT submit_retry_attempts FROM upload_session WHERE id = ?1",
+    )
+    .bind(session_row_id)
+    .fetch_one(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    let next_at = submit_retry_at(retry_attempts, chrono::Utc::now());
     if !schedule_submit_retry(
         pool,
         session_row_id,
@@ -683,6 +698,14 @@ async fn retry_submission(
             reason: format!("submit claim was lost while scheduling a retry after: {error}"),
         });
     }
+    notify_alert(
+        webhook,
+        "投稿将在退避后重试",
+        &format!(
+            "会话 #{session_row_id} 的分段账本已完整，但本次投稿明确失败；系统将在 {next_at} 后自动重试。最近错误：{}",
+            sanitize_error(&error)
+        ),
+    );
     Ok(SessionSubmissionOutcome::RetryScheduled { next_at, error })
 }
 
@@ -733,6 +756,7 @@ pub async fn reconcile_session_submission(
         .fetch_one(pool)
         .await
         .change_context(AppError::Unknown)?;
+    let submit_webhook = config.cookie_health_webhook.as_deref();
     let (claim_token, videos) = match claim_complete_session(pool, session_row_id).await? {
         SubmitClaim::Claimed { token, videos } => (token, videos),
         SubmitClaim::Blocked {
@@ -787,9 +811,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 format!("load streamer_info failed: {error:?}"),
                 false,
+                submit_webhook,
             )
             .await;
         }
@@ -806,9 +830,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 format!("load live_streamer failed: {error:?}"),
                 false,
+                submit_webhook,
             )
             .await;
         }
@@ -818,9 +842,9 @@ pub async fn reconcile_session_submission(
             pool,
             session_row_id,
             &claim_token,
-            session.submit_attempts,
             "live_streamer has no upload template".to_string(),
             false,
+            submit_webhook,
         )
         .await;
     };
@@ -836,9 +860,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 format!("load upload template failed: {error:?}"),
                 false,
+                submit_webhook,
             )
             .await;
         }
@@ -858,9 +882,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 format!("cookie login failed: {error:?}"),
                 false,
+                submit_webhook,
             )
             .await;
         }
@@ -881,9 +905,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 format!("build_studio failed: {error:?}"),
                 false,
+                submit_webhook,
             )
             .await;
         }
@@ -910,9 +934,9 @@ pub async fn reconcile_session_submission(
                 pool,
                 session_row_id,
                 &claim_token,
-                session.submit_attempts,
                 msg,
                 true,
+                submit_webhook,
             )
             .await;
         }
@@ -4032,10 +4056,9 @@ mod tests {
     #[test]
     fn submit_retry_backoff_is_bounded() {
         let now = chrono::Utc::now();
-        assert_eq!(
-            submit_retry_at(0, now),
-            now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS)
-        );
+        let first = submit_retry_at(0, now);
+        assert!(first >= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS));
+        assert!(first <= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
         assert_eq!(
             submit_retry_at(100, now),
             now + chrono::Duration::seconds(SUBMIT_RETRY_MAX_SECS)
