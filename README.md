@@ -1,12 +1,12 @@
 <div align="center">
-  <img src="https://docs.biliup.rs/home.png" alt="biliup" width="220" height="220"/>
+  <img src="public/logo.png" alt="biliup" width="200" height="200"/>
 
   <h3>biliup · dplei fork</h3>
   <p>面向 7×24 无人值守录播 → 自动投稿的增强分支</p>
 
 [![License](https://img.shields.io/github/license/biliup/biliup)](./LICENSE)
 [![Upstream](https://img.shields.io/badge/upstream-biliup%2Fbiliup-blue)](https://github.com/biliup/biliup)
-[![Stars](https://img.shields.io/github/stars/dplei/biliup?label=Stars)](https://github.com/dplei/biliup/stargazers)
+[![Stars](https://img.shields.io/github/stars/dplei/biliup?label=Stars)](https://github.com/dplei/biliup)
 
 </div>
 
@@ -220,4 +220,4 @@ Rust 后端 + 精简 Python 包 + Next.js 前端的混合架构：
 
 ## ⭐ Stars
 
-[![Star History Chart](https://api.star-history.com/svg?repos=biliup/biliup&type=Date)](https://star-history.com/#biliup/biliup&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=biliup/biliup,dplei/biliup&type=Date)](https://star-history.com/#biliup/biliup&dplei/biliup&Date)
