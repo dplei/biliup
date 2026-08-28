@@ -13,6 +13,28 @@ use sqlx::{Row, Sqlite, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Result of monotonically recording that a broadcast has closed and must eventually submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestSessionSubmit {
+    Requested {
+        requested_at: DateTime<Utc>,
+        newly_requested: bool,
+    },
+    Finalized,
+    NotFound,
+}
+
+/// Cheap session-level preflight used before the completeness gate or any network work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSubmitReadiness {
+    NotRequested,
+    NotDue(DateTime<Utc>),
+    Claimed { state: Option<String> },
+    Ready,
+    Finalized,
+    NotFound,
+}
+
 /// Does `session` belong to a *different* broadcast than `live_session_key`?
 ///
 /// Only a key-vs-key mismatch counts. A missing key on either side is "unknown", not "different",
@@ -413,7 +435,8 @@ pub async fn claim_complete_session(
     let updated = sqlx::query(
         "UPDATE upload_session SET videos_json = ?1, submit_claim_token = ?2, \
          submit_claimed_at = ?3, submit_state = 'submitting', last_submit_error = NULL, \
-         blocked_signature = NULL, updated_at = ?3 WHERE id = ?4 AND status != 'finalized' \
+         blocked_signature = NULL, next_submit_at = NULL, updated_at = ?3 \
+         WHERE id = ?4 AND status != 'finalized' \
          AND submit_claim_token IS NULL",
     )
     .bind(videos_json)
@@ -537,11 +560,130 @@ pub async fn insert_uploading_session(
         last_submit_at: None,
         last_submit_error: None,
         submit_state: None,
+        submit_requested_at: None,
+        next_submit_at: None,
         live_session_key: None,
     }
     .insert(pool)
     .await
     .change_context(AppError::Unknown)
+}
+
+/// Persist the goal that this session must eventually be submitted.
+///
+/// The timestamp is monotonic: repeated wakeups preserve the first durable close boundary. A
+/// finalized session is never reopened.
+pub async fn request_session_submit(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    now: DateTime<Utc>,
+) -> AppResult<RequestSessionSubmit> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .change_context(AppError::Unknown)?;
+    let row = sqlx::query("SELECT status, submit_requested_at FROM upload_session WHERE id = ?1")
+        .bind(session_row_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)?;
+    let Some(row) = row else {
+        tx.commit().await.change_context(AppError::Unknown)?;
+        return Ok(RequestSessionSubmit::NotFound);
+    };
+    if row.get::<String, _>("status") == "finalized" {
+        tx.commit().await.change_context(AppError::Unknown)?;
+        return Ok(RequestSessionSubmit::Finalized);
+    }
+    let existing = row.get::<Option<DateTime<Utc>>, _>("submit_requested_at");
+    let requested_at = existing.unwrap_or(now);
+    if existing.is_none() {
+        sqlx::query(
+            "UPDATE upload_session SET submit_requested_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status != 'finalized' AND submit_requested_at IS NULL",
+        )
+        .bind(requested_at)
+        .bind(session_row_id)
+        .execute(&mut *tx)
+        .await
+        .change_context(AppError::Unknown)?;
+    }
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(RequestSessionSubmit::Requested {
+        requested_at,
+        newly_requested: existing.is_none(),
+    })
+}
+
+/// Read only session-level submit state. This query deliberately does not aggregate lifecycle
+/// rows; the strict ledger check remains `claim_complete_session` after this cheap preflight.
+pub async fn session_submit_readiness(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    now: DateTime<Utc>,
+) -> AppResult<SessionSubmitReadiness> {
+    let row = sqlx::query(
+        "SELECT status, submit_requested_at, next_submit_at, submit_claim_token, submit_state \
+         FROM upload_session WHERE id = ?1",
+    )
+    .bind(session_row_id)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    let Some(row) = row else {
+        return Ok(SessionSubmitReadiness::NotFound);
+    };
+    if row.get::<String, _>("status") == "finalized" {
+        return Ok(SessionSubmitReadiness::Finalized);
+    }
+    if row
+        .get::<Option<DateTime<Utc>>, _>("submit_requested_at")
+        .is_none()
+    {
+        return Ok(SessionSubmitReadiness::NotRequested);
+    }
+    if row.get::<Option<String>, _>("submit_claim_token").is_some() {
+        return Ok(SessionSubmitReadiness::Claimed {
+            state: row.get("submit_state"),
+        });
+    }
+    if let Some(next_at) = row.get::<Option<DateTime<Utc>>, _>("next_submit_at")
+        && next_at > now
+    {
+        return Ok(SessionSubmitReadiness::NotDue(next_at));
+    }
+    Ok(SessionSubmitReadiness::Ready)
+}
+
+/// Release a definitely-safe claim and throttle the next automatic attempt. This must not be used
+/// after an ambiguous remote success; those paths preserve the claim for manual inspection.
+pub async fn schedule_submit_retry(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    claim_token: &str,
+    next_at: DateTime<Utc>,
+    error: String,
+    remote_attempted: bool,
+) -> AppResult<bool> {
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE upload_session SET submit_state = 'failed', last_submit_error = ?1, \
+         last_submit_at = CASE WHEN ?2 THEN ?3 ELSE last_submit_at END, \
+         submit_attempts = submit_attempts + CASE WHEN ?2 THEN 1 ELSE 0 END, \
+         submit_claim_token = NULL, submit_claimed_at = NULL, next_submit_at = ?4, \
+         updated_at = ?3 WHERE id = ?5 AND status != 'finalized' \
+         AND submit_claim_token = ?6",
+    )
+    .bind(error)
+    .bind(remote_attempted)
+    .bind(now)
+    .bind(next_at)
+    .bind(session_row_id)
+    .bind(claim_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(updated.rows_affected() == 1)
 }
 
 /// 按 id 查会话所属的 StreamerInfo（补提交废弃会话时，需用它当时的标题/时间构建 studio）。
@@ -659,7 +801,7 @@ pub async fn mark_submitted(
         "UPDATE upload_session SET aid = ?1, bvid = ?2, status = 'finalized', \
          submit_state = 'ok_with_aid', last_submit_at = ?3, last_submit_error = NULL, \
          submit_attempts = submit_attempts + 1, submit_claim_token = NULL, \
-         submit_claimed_at = NULL, updated_at = ?3 \
+         submit_claimed_at = NULL, next_submit_at = NULL, updated_at = ?3 \
          WHERE id = ?4 AND status != 'finalized' AND submit_claim_token = ?5",
     )
     .bind(i64::try_from(aid).unwrap_or(i64::MAX))
@@ -692,7 +834,8 @@ pub async fn mark_submit_anomaly(
         "UPDATE upload_session SET submit_state = ?1, last_submit_error = ?2, \
          last_submit_at = ?3, submit_attempts = submit_attempts + 1, \
          submit_claim_token = CASE WHEN ?4 THEN NULL ELSE submit_claim_token END, \
-         submit_claimed_at = CASE WHEN ?4 THEN NULL ELSE submit_claimed_at END, updated_at = ?3 \
+         submit_claimed_at = CASE WHEN ?4 THEN NULL ELSE submit_claimed_at END, \
+         next_submit_at = NULL, updated_at = ?3 \
          WHERE id = ?5 AND submit_claim_token = ?6",
     )
     .bind(state)
@@ -813,6 +956,173 @@ mod tests {
         (directory, pool)
     }
 
+    #[tokio::test]
+    async fn submit_request_is_monotonic_and_never_reopens_finalized_session() {
+        let (_directory, pool) = completeness_pool().await;
+        let first = Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap();
+        let later = first + chrono::Duration::minutes(5);
+
+        assert_eq!(
+            request_session_submit(&pool, 70, first).await.unwrap(),
+            RequestSessionSubmit::Requested {
+                requested_at: first,
+                newly_requested: true,
+            }
+        );
+        assert_eq!(
+            request_session_submit(&pool, 70, later).await.unwrap(),
+            RequestSessionSubmit::Requested {
+                requested_at: first,
+                newly_requested: false,
+            }
+        );
+        let stored: DateTime<Utc> =
+            sqlx::query_scalar("SELECT submit_requested_at FROM upload_session WHERE id = 70")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, first);
+
+        sqlx::query("UPDATE upload_session SET status = 'finalized' WHERE id = 70")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_session_submit(&pool, 70, later).await.unwrap(),
+            RequestSessionSubmit::Finalized
+        );
+        assert_eq!(
+            session_submit_readiness(&pool, 70, later).await.unwrap(),
+            SessionSubmitReadiness::Finalized
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_schedule_releases_owned_claim_and_advances_due_time() {
+        let (_directory, pool) = completeness_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap();
+        request_session_submit(&pool, 70, now).await.unwrap();
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'claim-1', \
+             submit_claimed_at = ?1 WHERE id = 70",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let first_due = now + chrono::Duration::seconds(30);
+        assert!(
+            schedule_submit_retry(
+                &pool,
+                70,
+                "claim-1",
+                first_due,
+                "definite failure".into(),
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            session_submit_readiness(&pool, 70, now).await.unwrap(),
+            SessionSubmitReadiness::NotDue(first_due)
+        );
+
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'claim-2', \
+             submit_claimed_at = ?1 WHERE id = 70",
+        )
+        .bind(first_due)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second_due = now + chrono::Duration::minutes(2);
+        assert!(
+            schedule_submit_retry(
+                &pool,
+                70,
+                "claim-2",
+                second_due,
+                "failed again".into(),
+                false,
+            )
+            .await
+            .unwrap()
+        );
+        let (next_at, attempts): (DateTime<Utc>, i64) = sqlx::query_as(
+            "SELECT next_submit_at, submit_attempts FROM upload_session WHERE id = 70",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next_at, second_due);
+        assert_eq!(
+            attempts, 1,
+            "only a real remote attempt increments attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_only_safe_blocked_sessions() {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE upload_session (\
+                id INTEGER PRIMARY KEY, status TEXT NOT NULL, created_at DATETIME NOT NULL, \
+                updated_at DATETIME NOT NULL, last_submit_at DATETIME, submit_state TEXT, \
+                submit_claim_token TEXT\
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 9, 0, 0).unwrap();
+        for (id, status, state) in [
+            (1_i64, "uploading", Some("blocked_missing_segments")),
+            (2, "uploading", None),
+            (3, "finalized", Some("blocked_missing_segments")),
+        ] {
+            sqlx::query(
+                "INSERT INTO upload_session \
+                 (id, status, created_at, updated_at, submit_state) VALUES (?1, ?2, ?3, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(now)
+            .bind(state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/19_add_session_submit_intent.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(i64, Option<DateTime<Utc>>)> =
+            sqlx::query_as("SELECT id, submit_requested_at FROM upload_session ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(1, Some(now)), (2, None), (3, None)]);
+        let index_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' \
+             AND name = 'ix_upload_session_submit_coordination'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(index_sql.contains("submit_requested_at is not null"));
+        assert!(index_sql.contains("submit_claim_token is null"));
+    }
+
     async fn insert_ledger(
         pool: &ConnectionPool,
         id: i64,
@@ -856,6 +1166,8 @@ mod tests {
             last_submit_at: None,
             last_submit_error: None,
             submit_state: None,
+            submit_requested_at: None,
+            next_submit_at: None,
         }
     }
 

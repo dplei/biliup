@@ -18,6 +18,7 @@ use biliup_cli::server::common::upload_session::{
     LiveArchive, SubmitClaim, claim_complete_session, parse_videos,
 };
 use biliup_cli::server::common::util::{FileValidator, MediaValidation};
+use biliup_cli::server::config::Config;
 use biliup_cli::server::core::downloader::SegmentEnrollment;
 use biliup_cli::server::infrastructure::connection_pool::{ConnectionManager, ConnectionPool};
 use chrono::Duration;
@@ -482,6 +483,7 @@ async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
     let outbox = tempfile::tempdir().unwrap();
     let db = IncidentDb::new().await;
     let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let config: Config = serde_yaml::from_str("{}").unwrap();
     let first_path = media.path().join("ordered-0.flv");
     let second_path = media.path().join("ordered-1.flv");
     write_synthetic_valid_flv(&first_path);
@@ -517,6 +519,7 @@ async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
     let mut archive = LiveArchive::default();
     assert!(
         persist_segment(
+            &config,
             &db.pool,
             &mut archive,
             uploaded_video("remote-stale-part-1"),
@@ -528,6 +531,7 @@ async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
         "invariant 5: a revoked lease cannot publish a delayed success"
     );
     persist_segment(
+        &config,
         &db.pool,
         &mut archive,
         uploaded_video("remote-part-1"),
@@ -540,6 +544,7 @@ async fn target_04_replays_and_late_attempts_produce_one_ordered_part() {
     // The later segment finished first, so the session must be rebuilt in enrollment order.
     let first_token = claim_lease(&db.pool, &first, "bda2").await;
     persist_segment(
+        &config,
         &db.pool,
         &mut archive,
         uploaded_video("remote-part-0"),

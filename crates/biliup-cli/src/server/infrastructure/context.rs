@@ -83,6 +83,12 @@ impl Context {
         self.worker.get_config()
     }
 
+    /// Global config before this room's override. Session-id coordinators reload the room and
+    /// apply that override themselves so every trigger observes the same effective settings.
+    pub fn global_config(&self) -> Config {
+        self.worker.get_global_config()
+    }
+
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
     }
@@ -247,6 +253,10 @@ impl Worker {
             cfg.apply(cfg_p)
         }
         cfg
+    }
+
+    pub fn get_global_config(&self) -> Config {
+        self.config.read().unwrap().clone()
     }
 
     /// 更改工作器状态

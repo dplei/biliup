@@ -125,8 +125,12 @@ pub struct UploadSession {
     pub last_submit_at: Option<DateTime<Utc>>,
     /// 最近一次投稿异常摘要（成功且有 aid 时为 None）。
     pub last_submit_error: Option<String>,
-    /// 投稿结果：ok_with_aid / ok_no_aid / failed；None=未投。
+    /// 最近一次投稿闸门/投稿结果；它描述观察结果，不表示本场是否应该投稿。
     pub submit_state: Option<String>,
+    /// 本场生产端已经关闭、最终必须投稿的持久意图。None 表示仍可能产生新分段。
+    pub submit_requested_at: Option<DateTime<Utc>>,
+    /// 明确失败后的下一次自动协调时间；不确定远端结果由 claim 阻断，不使用此字段重试。
+    pub next_submit_at: Option<DateTime<Utc>>,
     /// 本会话归属的场次标识，跨重启续接的第一判据。
     pub live_session_key: Option<String>,
 }

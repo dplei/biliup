@@ -5,7 +5,8 @@ use crate::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     normalize_segment_path,
 };
-use crate::server::common::upload::UploaderMessage;
+use crate::server::common::upload::{SubmissionTrigger, UploaderMessage, spawn_session_submission};
+use crate::server::common::upload_session::{RequestSessionSubmit, request_session_submit};
 use crate::server::common::util::{FileValidator, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
 use crate::server::core::downloader::{
@@ -21,6 +22,7 @@ use crate::server::infrastructure::models::hook_step::process;
 use async_channel::Sender;
 use biliup::downloader::live::{LivePlugin, LiveStatus, LiveStream};
 use error_stack::{ResultExt, bail};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -80,6 +82,7 @@ pub struct SegmentEventProcessor {
     recovery_batch_max_files: usize,
     recovery_retry_interval: Duration,
     pending_short_segments: Vec<SegmentInfo>,
+    enrolled_session_ids: HashSet<i64>,
     stats: SegmentProcessingStats,
 }
 
@@ -93,6 +96,32 @@ struct SegmentProcessingStats {
     invalid_segments: u64,
     segments_queued_for_upload: u64,
     upload_queue_peak_depth: usize,
+}
+
+async fn persist_closed_session_intents(
+    pool: &crate::server::infrastructure::connection_pool::ConnectionPool,
+    enrolled_session_ids: &HashSet<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<i64> {
+    let mut requested = Vec::new();
+    let mut session_ids: Vec<_> = enrolled_session_ids.iter().copied().collect();
+    session_ids.sort_unstable();
+    for session_id in session_ids {
+        match request_session_submit(pool, session_id, now).await {
+            Ok(RequestSessionSubmit::Requested { .. }) => requested.push(session_id),
+            Ok(outcome) => info!(
+                session = session_id,
+                ?outcome,
+                "本场结束边界无需重新写入投稿意图"
+            ),
+            Err(error) => error!(
+                session = session_id,
+                ?error,
+                "本场结束边界写入投稿意图失败；本地文件与 lifecycle 状态保持不变，可由人工 recover"
+            ),
+        }
+    }
+    requested
 }
 
 impl SegmentEventProcessor {
@@ -109,6 +138,7 @@ impl SegmentEventProcessor {
                 config.recoverable_short_retry_interval_secs,
             ),
             pending_short_segments: Vec::new(),
+            enrolled_session_ids: HashSet::new(),
             stats: SegmentProcessingStats::default(),
             ctx,
         }
@@ -174,7 +204,26 @@ impl SegmentEventProcessor {
     }
 
     pub async fn finish(&mut self) -> AppResult<()> {
-        self.flush_pending_short_segments().await
+        let flush_result = self.flush_pending_short_segments().await;
+        let requested = persist_closed_session_intents(
+            self.ctx.pool(),
+            &self.enrolled_session_ids,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        // Intent is durable before the sender is dropped. The uploader may still be processing a
+        // long tail segment; closing here lets its receiver finish after draining the queue.
+        self.channel.take();
+        for session_id in requested {
+            spawn_session_submission(
+                self.ctx.global_config(),
+                self.ctx.pool().clone(),
+                session_id,
+                SubmissionTrigger::DownloadClosed,
+            );
+        }
+        flush_result
     }
 
     async fn flush_pending_short_segments(&mut self) -> AppResult<()> {
@@ -263,6 +312,8 @@ impl SegmentEventProcessor {
             let store = EnrollmentStore::production(self.ctx.pool().clone());
             match enroll_validated_segment(&store, &request).await? {
                 EnrollmentOutcome::Enrolled(enrollment) => {
+                    self.enrolled_session_ids
+                        .insert(enrollment.upload_session_id);
                     info!(
                         file = %event.prev_file_path.display(),
                         missing_id = enrollment.missing_id,
@@ -1424,7 +1475,12 @@ async fn remove_blocked_new_streamer_info(ctx: &Context) {
 
 #[cfg(test)]
 mod retry_state_tests {
-    use super::{OfflineRetryState, exponential_backoff};
+    use super::{OfflineRetryState, exponential_backoff, persist_closed_session_intents};
+    use crate::server::infrastructure::connection_pool::{
+        ConnectionManager, test_support::migrated_pool,
+    };
+    use chrono::{TimeZone, Utc};
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1460,6 +1516,41 @@ mod retry_state_tests {
         assert!(offline.offline_since.is_none());
         assert_eq!(offline.offline_retry_count, 0);
         assert!(!offline.record_unavailable(start + Duration::from_secs(30), grace));
+    }
+
+    #[tokio::test]
+    async fn close_boundary_persists_intent_before_any_submission_wakeup() {
+        let (directory, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 45, 0).unwrap();
+        for (id, status) in [(31_i64, "uploading"), (32, "finalized")] {
+            sqlx::query(
+                "INSERT INTO upload_session \
+                 (id, live_streamer_id, streamer_info_id, videos_json, status, created_at, updated_at) \
+                 VALUES (?1, 10, 20, '[]', ?2, ?3, ?3)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ids = HashSet::from([31_i64, 32_i64]);
+
+        let requested = persist_closed_session_intents(&pool, &ids, now).await;
+
+        assert_eq!(requested, vec![31]);
+        drop(pool);
+        let reopened =
+            ConnectionManager::new_pool(directory.path().join("test.db").to_str().unwrap())
+                .await
+                .unwrap();
+        let rows: Vec<(i64, Option<chrono::DateTime<Utc>>)> =
+            sqlx::query_as("SELECT id, submit_requested_at FROM upload_session ORDER BY id")
+                .fetch_all(&reopened)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(31, Some(now)), (32, None)]);
     }
 }
 

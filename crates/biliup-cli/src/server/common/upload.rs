@@ -31,11 +31,12 @@ use crate::server::common::upload_line_selection::{
 };
 use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
-    LiveArchive, SubmitClaim, active_sessions_for_room, claim_complete_session, get_streamer_info,
+    LiveArchive, RequestSessionSubmit, SessionCompleteness, SessionSubmitReadiness, SubmitClaim,
+    active_sessions_for_room, claim_complete_session, get_streamer_info,
     insert_session_video_at_order, insert_uploading_session, mark_submit_anomaly, mark_submitted,
-    parse_videos, reattach_session, release_submit_claim, select_recovery_candidate,
-    select_stale_session_indices, submit_claim_is_owned, submit_state_label,
-    touch_session_activity,
+    parse_videos, reattach_session, request_session_submit, schedule_submit_retry,
+    select_recovery_candidate, select_stale_session_indices, session_submit_readiness,
+    submit_claim_is_owned, submit_state_label, touch_session_activity,
 };
 use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
@@ -120,6 +121,87 @@ const TOTAL_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_BYTES: u64 = 16 * 1024 * 1024;
+const SUBMIT_RETRY_BASE_SECS: i64 = 30;
+const SUBMIT_RETRY_MAX_SECS: i64 = 30 * 60;
+
+/// Why the idempotent session-level submission coordinator was woken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionTrigger {
+    DownloadClosed,
+    SegmentPersisted,
+    StaleSession,
+    ManualRecovery,
+    StartupScan,
+    PeriodicScan,
+}
+
+impl SubmissionTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DownloadClosed => "download_closed",
+            Self::SegmentPersisted => "segment_persisted",
+            Self::StaleSession => "stale_session",
+            Self::ManualRecovery => "manual_recovery",
+            Self::StartupScan => "startup_scan",
+            Self::PeriodicScan => "periodic_scan",
+        }
+    }
+}
+
+/// Stable outcome vocabulary shared by every submission wakeup source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSubmissionOutcome {
+    NotRequested,
+    NotDue {
+        next_at: chrono::DateTime<chrono::Utc>,
+    },
+    Blocked {
+        completeness: SessionCompleteness,
+    },
+    ClaimedElsewhere,
+    Finalized,
+    Submitted {
+        aid: u64,
+        bvid: Option<String>,
+    },
+    RetryScheduled {
+        next_at: chrono::DateTime<chrono::Utc>,
+        error: String,
+    },
+    ManualInspectionRequired {
+        reason: String,
+    },
+}
+
+/// Fire-and-forget wakeup used after durable local state transitions. The coordinator owns all
+/// deduplication and returns immediately for blocked, not-due or already-claimed sessions.
+pub fn spawn_session_submission(
+    config: Config,
+    pool: ConnectionPool,
+    session_row_id: i64,
+    trigger: SubmissionTrigger,
+) {
+    tokio::spawn(async move {
+        match reconcile_session_submission(&config, &pool, session_row_id, trigger).await {
+            Ok(outcome) => {
+                info!(
+                    session = session_row_id,
+                    ?trigger,
+                    ?outcome,
+                    "会话投稿协调唤醒完成"
+                )
+            }
+            Err(error) => {
+                error!(
+                    session = session_row_id,
+                    ?trigger,
+                    ?error,
+                    "会话投稿协调唤醒失败"
+                )
+            }
+        }
+    });
+}
 
 #[derive(Clone)]
 struct AttemptRegistration {
@@ -294,9 +376,7 @@ pub async fn process_with_upload(
     // 下播后一次性提交（整场只审一次，避免「过审后追加→重新审核」）。
     let span = tracing::info_span!("session", session = tracing::field::Empty);
     async {
-        let archive =
-            pipeline_upload_videos(rx, &upload_context, upload_config, &segment_processors, ctx)
-                .await?;
+        let archive = pipeline_upload_videos(rx, &upload_context, &segment_processors, ctx).await?;
 
         if let Some(mut archive) = archive
             && let Some(row_id) = archive.session_row_id
@@ -307,20 +387,16 @@ pub async fn process_with_upload(
             {
                 error!(?e, row_id, "静默补传缺失分段失败，继续提交已成功分段");
             }
-            let config = ctx.config();
-            if let Err(e) = submit_session(
-                &upload_context,
+            match reconcile_session_submission(
+                &ctx.global_config(),
                 ctx.pool(),
-                upload_config,
-                ctx.live_streamer().cover_background.as_deref(),
-                config.season_section_id,
-                config.submit_api.as_deref(),
-                ctx.streamer_info(),
                 row_id,
+                SubmissionTrigger::DownloadClosed,
             )
             .await
             {
-                error!(?e, "下播一次性提交失败，保持 uploading 待下次补提交");
+                Ok(outcome) => info!(?outcome, "下播会话投稿协调完成"),
+                Err(error) => error!(?error, "下播会话投稿协调失败，保持 durable intent"),
             }
         }
         Ok::<(), error_stack::Report<AppError>>(())
@@ -571,19 +647,92 @@ async fn defer_segments_after_upload_init_failure(
     summary
 }
 
-/// 一次性提交一个会话累积的全部分段：构建 studio → submit_by_app → 写回 aid 并 finalize → 加合集。
-/// 仅在成功拿到 aid 时才 finalize；失败保持 uploading，留待下次开播补提交。
-/// `streamer_info` 决定标题/时间，补提交废弃会话时传该会话当时的 streamer_info。
-async fn submit_session(
-    upload_context: &UploadContext,
+fn submit_retry_at(
+    submit_attempts: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let exponent = u32::try_from(submit_attempts.max(0))
+        .unwrap_or(u32::MAX)
+        .min(10);
+    let seconds = SUBMIT_RETRY_BASE_SECS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(SUBMIT_RETRY_MAX_SECS);
+    now + chrono::Duration::seconds(seconds)
+}
+
+async fn retry_submission(
     pool: &ConnectionPool,
-    upload_config: &UploadStreamer,
-    streamer_background: Option<&str>,
-    season_section_id: Option<i64>,
-    submit_api: Option<&str>,
-    streamer_info: &StreamerInfo,
     session_row_id: i64,
-) -> AppResult<()> {
+    claim_token: &str,
+    submit_attempts: i64,
+    error: String,
+    remote_attempted: bool,
+) -> AppResult<SessionSubmissionOutcome> {
+    let next_at = submit_retry_at(submit_attempts, chrono::Utc::now());
+    if !schedule_submit_retry(
+        pool,
+        session_row_id,
+        claim_token,
+        next_at,
+        error.clone(),
+        remote_attempted,
+    )
+    .await?
+    {
+        return Ok(SessionSubmissionOutcome::ManualInspectionRequired {
+            reason: format!("submit claim was lost while scheduling a retry after: {error}"),
+        });
+    }
+    Ok(SessionSubmissionOutcome::RetryScheduled { next_at, error })
+}
+
+/// Reconcile one closed upload session using its durable id only.
+///
+/// Every caller enters through this function. It checks intent and retry timing before touching
+/// the lifecycle ledger, uses `claim_complete_session` as the sole remote side-effect gate, then
+/// loads the historical streamer/template and applies the room override. No network request runs
+/// inside a SQLite transaction.
+pub async fn reconcile_session_submission(
+    config: &Config,
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    trigger: SubmissionTrigger,
+) -> AppResult<SessionSubmissionOutcome> {
+    let now = chrono::Utc::now();
+    match session_submit_readiness(pool, session_row_id, now).await? {
+        SessionSubmitReadiness::NotRequested => {
+            return Ok(SessionSubmissionOutcome::NotRequested);
+        }
+        SessionSubmitReadiness::NotDue(next_at) => {
+            return Ok(SessionSubmissionOutcome::NotDue { next_at });
+        }
+        SessionSubmitReadiness::Claimed { state } => {
+            return if state.as_deref() == Some("ok_no_aid") {
+                Ok(SessionSubmissionOutcome::ManualInspectionRequired {
+                    reason: "remote accepted submission without a stable aid; claim preserved"
+                        .to_string(),
+                })
+            } else {
+                Ok(SessionSubmissionOutcome::ClaimedElsewhere)
+            };
+        }
+        SessionSubmitReadiness::Finalized => {
+            return Ok(SessionSubmissionOutcome::Finalized);
+        }
+        SessionSubmitReadiness::NotFound => {
+            return Err(error_stack::Report::new(AppError::Custom(format!(
+                "upload session {session_row_id} does not exist"
+            ))));
+        }
+        SessionSubmitReadiness::Ready => {}
+    }
+
+    let session = UploadSession::select()
+        .where_("id = ?")
+        .bind(session_row_id)
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)?;
     let (claim_token, videos) = match claim_complete_session(pool, session_row_id).await? {
         SubmitClaim::Claimed { token, videos } => (token, videos),
         SubmitClaim::Blocked {
@@ -605,7 +754,7 @@ async fn submit_session(
             );
             if changed {
                 notify_alert(
-                    upload_context.health_webhook.as_deref(),
+                    config.cookie_health_webhook.as_deref(),
                     "投稿已暂停：存在未完成分段",
                     &format!(
                         "会话 #{session_row_id} 因 {} 个未完成或异常分段暂停投稿；请在缺失补传页面处理。",
@@ -613,29 +762,114 @@ async fn submit_session(
                     ),
                 );
             }
-            return Ok(());
+            return Ok(SessionSubmissionOutcome::Blocked { completeness });
         }
         SubmitClaim::AlreadyClaimed => {
             info!(
                 session = session_row_id,
                 "session submit already claimed; skipping duplicate finalize"
             );
-            return Ok(());
+            return Ok(SessionSubmissionOutcome::ClaimedElsewhere);
         }
         SubmitClaim::Finalized => {
             info!(
                 session = session_row_id,
                 "session already finalized; skipping submit"
             );
-            return Ok(());
+            return Ok(SessionSubmissionOutcome::Finalized);
         }
     };
-    let bilibili = &upload_context.bilibili;
-    let recorder = Recorder::new(upload_config.title.clone(), streamer_info.clone());
+
+    let streamer_info = match get_streamer_info(pool, session.streamer_info_id).await {
+        Ok(streamer_info) => streamer_info,
+        Err(error) => {
+            return retry_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                session.submit_attempts,
+                format!("load streamer_info failed: {error:?}"),
+                false,
+            )
+            .await;
+        }
+    };
+    let live_streamer = match LiveStreamer::select()
+        .where_("id = ?")
+        .bind(session.live_streamer_id)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(live_streamer) => live_streamer,
+        Err(error) => {
+            return retry_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                session.submit_attempts,
+                format!("load live_streamer failed: {error:?}"),
+                false,
+            )
+            .await;
+        }
+    };
+    let Some(upload_streamers_id) = live_streamer.upload_streamers_id else {
+        return retry_submission(
+            pool,
+            session_row_id,
+            &claim_token,
+            session.submit_attempts,
+            "live_streamer has no upload template".to_string(),
+            false,
+        )
+        .await;
+    };
+    let upload_config = match UploadStreamer::select()
+        .where_("id = ?")
+        .bind(upload_streamers_id)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(upload_config) => upload_config,
+        Err(error) => {
+            return retry_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                session.submit_attempts,
+                format!("load upload template failed: {error:?}"),
+                false,
+            )
+            .await;
+        }
+    };
+    let mut effective_config = config.clone();
+    if let Some(override_config) = live_streamer.override_cfg.clone() {
+        effective_config.apply(override_config);
+    }
+    let cookie_file = upload_config
+        .user_cookie
+        .clone()
+        .unwrap_or_else(|| "cookies.json".to_string());
+    let bilibili = match login_with_retry(&cookie_file).await {
+        Ok(bilibili) => bilibili,
+        Err(error) => {
+            return retry_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                session.submit_attempts,
+                format!("cookie login failed: {error:?}"),
+                false,
+            )
+            .await;
+        }
+    };
+    let recorder = Recorder::new(upload_config.title.clone(), streamer_info);
     let studio = match build_studio(
-        upload_config,
-        streamer_background,
-        bilibili,
+        &upload_config,
+        live_streamer.cover_background.as_deref(),
+        &bilibili,
         videos.clone(),
         &recorder,
     )
@@ -643,14 +877,15 @@ async fn submit_session(
     {
         Ok(studio) => studio,
         Err(error) => {
-            let _ = release_submit_claim(
+            return retry_submission(
                 pool,
                 session_row_id,
                 &claim_token,
+                session.submit_attempts,
                 format!("build_studio failed: {error:?}"),
+                false,
             )
             .await;
-            return Err(error);
         }
     };
     if !submit_claim_is_owned(pool, session_row_id, &claim_token).await? {
@@ -661,20 +896,25 @@ async fn submit_session(
     info!(
         n_videos = videos.len(),
         title = %recorder.format_filename(),
+        trigger = trigger.as_str(),
         "submit_attempt：开始下播一次性投稿"
     );
-    let resp = match submit_to_bilibili(bilibili, &studio, submit_api).await {
+    let resp = match submit_to_bilibili(&bilibili, &studio, effective_config.submit_api.as_deref())
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             let msg = format!("{e:?}");
-            let state = submit_state_label(None, true); // "failed"
             error!(error = %msg, "submit_failed：投稿接口失败，保持 uploading 待补提交");
-            if let Err(db) =
-                mark_submit_anomaly(pool, session_row_id, &claim_token, state, msg, true).await
-            {
-                error!(?db, "写回 submit_state=failed 失败");
-            }
-            return Err(e);
+            return retry_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                session.submit_attempts,
+                msg,
+                true,
+            )
+            .await;
         }
     };
     let aid = resp
@@ -693,9 +933,9 @@ async fn submit_session(
         Some(aid_val) => {
             // 提交成功即 finalize（mark_submitted 内部写 submit_state="ok_with_aid"）；
             // 写回失败仅告警（稿件已在 B 站，重复提交风险大于收益）。
-            if let Err(e) =
-                mark_submitted(pool, session_row_id, &claim_token, aid_val, bvid.clone()).await
-            {
+            let writeback =
+                mark_submitted(pool, session_row_id, &claim_token, aid_val, bvid.clone()).await;
+            if let Err(e) = &writeback {
                 error!(
                     ?e,
                     aid = aid_val,
@@ -704,9 +944,17 @@ async fn submit_session(
             } else {
                 info!(aid = aid_val, bvid = ?bvid, "submit_ok_with_aid：投稿成功并已写回 aid");
             }
-            if let Some(section_id) = season_section_id {
-                add_archive_to_season_with_retry(bilibili, section_id, aid_val).await;
+            if let Some(section_id) = effective_config.season_section_id {
+                add_archive_to_season_with_retry(&bilibili, section_id, aid_val).await;
             }
+            if let Err(error) = writeback {
+                return Ok(SessionSubmissionOutcome::ManualInspectionRequired {
+                    reason: format!(
+                        "remote submission returned aid {aid_val}, but local writeback failed: {error:?}"
+                    ),
+                });
+            }
+            return Ok(SessionSubmissionOutcome::Submitted { aid: aid_val, bvid });
         }
         None => {
             let state = submit_state_label(aid, false); // "ok_no_aid"
@@ -714,14 +962,21 @@ async fn submit_session(
             error!(resp = ?resp, "submit_ok_no_aid：投稿 code==0 但响应缺少 aid，未 finalize（待下次开播补提交）");
             // The remote accepted the request but returned no stable id. Preserve the claim so a
             // restart cannot blindly create a duplicate submission.
-            if let Err(db) =
-                mark_submit_anomaly(pool, session_row_id, &claim_token, state, msg, false).await
+            if let Err(db) = mark_submit_anomaly(
+                pool,
+                session_row_id,
+                &claim_token,
+                state,
+                msg.clone(),
+                false,
+            )
+            .await
             {
                 error!(?db, "写回 submit_state=ok_no_aid 失败");
             }
+            return Ok(SessionSubmissionOutcome::ManualInspectionRequired { reason: msg });
         }
     }
-    Ok(())
 }
 
 /// The outcome of competing for the single valid attempt on a lifecycle row (invariant 5).
@@ -903,6 +1158,7 @@ fn short_attempt_id(attempt_token: &str) -> &str {
 /// Commit the remote Video, lifecycle success and session ordering atomically. The lifecycle row
 /// is permanent: it is the idempotency identity for later event replays and rescans.
 pub async fn persist_segment(
+    config: &Config,
     pool: &ConnectionPool,
     archive: &mut LiveArchive,
     video: Video,
@@ -998,6 +1254,27 @@ pub async fn persist_segment(
     );
     archive.session_row_id = Some(enrollment.upload_session_id);
     archive.videos = videos;
+    match session_submit_readiness(pool, enrollment.upload_session_id, chrono::Utc::now()).await {
+        Ok(SessionSubmitReadiness::Ready | SessionSubmitReadiness::NotDue(_)) => {
+            spawn_session_submission(
+                config.clone(),
+                pool.clone(),
+                enrollment.upload_session_id,
+                SubmissionTrigger::SegmentPersisted,
+            );
+        }
+        Ok(
+            SessionSubmitReadiness::NotRequested
+            | SessionSubmitReadiness::Claimed { .. }
+            | SessionSubmitReadiness::Finalized
+            | SessionSubmitReadiness::NotFound,
+        ) => {}
+        Err(error) => warn!(
+            ?error,
+            session = enrollment.upload_session_id,
+            "分段成功后读取投稿意图失败；durable 分段保持成功，等待后续协调"
+        ),
+    }
     Ok(())
 }
 
@@ -1005,11 +1282,7 @@ pub async fn persist_segment(
 /// 1) 先把「已废弃」会话（超窗口仍未提交）一次性补提交并 finalize，避免分段永远滞留未投稿；
 /// 2) 再续接「窗口内」的会话（重启打断的同一场）继续累积，下播统一提交；
 /// 3) 都没有则全新开始。
-async fn prepare_archive(
-    upload_context: &UploadContext,
-    upload_config: &UploadStreamer,
-    ctx: &Context,
-) -> AppResult<LiveArchive> {
+async fn prepare_archive(upload_context: &UploadContext, ctx: &Context) -> AppResult<LiveArchive> {
     let room_id = ctx.worker_id();
     let config = ctx.config();
     let window = config
@@ -1043,35 +1316,39 @@ async fn prepare_archive(
                 "补提交废弃会话：先行补传缺失分段失败，继续处理已成功分段"
             );
         }
-        let streamer_info = match get_streamer_info(ctx.pool(), stale.streamer_info_id).await {
-            Ok(si) => si,
-            Err(e) => {
-                warn!(
-                    ?e,
-                    row_id = stale.id,
-                    "补提交废弃会话：取 StreamerInfo 失败，跳过"
-                );
-                continue;
-            }
-        };
         info!(
             row_id = stale.id,
             n = archive.videos.len(),
             "补提交上一场未提交的废弃会话"
         );
-        if let Err(e) = submit_session(
-            upload_context,
+        match request_session_submit(ctx.pool(), stale.id, chrono::Utc::now()).await {
+            Ok(RequestSessionSubmit::Requested { .. }) => {}
+            Ok(other) => {
+                info!(row_id = stale.id, ?other, "废弃会话无需重新请求投稿");
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    row_id = stale.id,
+                    "补提交废弃会话：写入投稿意图失败"
+                );
+                continue;
+            }
+        }
+        if let Err(error) = reconcile_session_submission(
+            &ctx.global_config(),
             ctx.pool(),
-            upload_config,
-            ctx.live_streamer().cover_background.as_deref(),
-            config.season_section_id,
-            config.submit_api.as_deref(),
-            &streamer_info,
             stale.id,
+            SubmissionTrigger::StaleSession,
         )
         .await
         {
-            warn!(?e, row_id = stale.id, "补提交废弃会话失败，下次开播再试");
+            warn!(
+                ?error,
+                row_id = stale.id,
+                "补提交废弃会话失败，durable intent 保持待重试"
+            );
         }
     }
 
@@ -1142,11 +1419,10 @@ async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
 async fn pipeline_upload_videos(
     rx: Receiver<SegmentInfo>,
     upload_context: &UploadContext,
-    upload_config: &UploadStreamer,
     segment_processors: &[HookStep],
     ctx: &Context,
 ) -> AppResult<Option<LiveArchive>> {
-    let mut archive = prepare_archive(upload_context, upload_config, ctx).await?;
+    let mut archive = prepare_archive(upload_context, ctx).await?;
     pin!(rx);
     while let Some(event) = rx.next().await {
         let Some(enrollment) = event.enrollment.clone() else {
@@ -1231,9 +1507,15 @@ async fn pipeline_upload_videos(
         {
             Ok((video, outcome, _normalization_artifact, _attempt_guard)) => {
                 // 上传成功后落库累积。落库失败则保留本地文件（不删），保证「未 durable 不删」。
-                if let Err(e) =
-                    persist_segment(ctx.pool(), &mut archive, video, &enrollment, &attempt_token)
-                        .await
+                if let Err(e) = persist_segment(
+                    &ctx.global_config(),
+                    ctx.pool(),
+                    &mut archive,
+                    video,
+                    &enrollment,
+                    &attempt_token,
+                )
+                .await
                 {
                     error!(file = ?original_path, "落库累积失败，保留本地文件: {:?}", e);
                     // Repaired 的临时修复件未 durable，清理掉避免残留。
@@ -2235,7 +2517,15 @@ async fn recover_due_missing_segments(
         match result {
             Ok((video, outcome, _normalization_artifact, _attempt_guard)) => {
                 if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
-                    persist_segment(ctx.pool(), archive, video, enrollment, token).await?;
+                    persist_segment(
+                        &ctx.global_config(),
+                        ctx.pool(),
+                        archive,
+                        video,
+                        enrollment,
+                        token,
+                    )
+                    .await?;
                 } else {
                     let updated = insert_session_video_at_order(
                         ctx.pool(),
@@ -3283,7 +3573,7 @@ pub async fn run_claimed_recovery(
                 bvid: session.bvid,
                 videos: parse_videos(&session.videos_json),
             };
-            persist_segment(pool, &mut archive, video, enrollment, token).await?;
+            persist_segment(config, pool, &mut archive, video, enrollment, token).await?;
         }
 
         // 补传成功并入稿/入会话后，按主播 postprocessor 清理本地文件，对齐自动补传路径
@@ -3476,6 +3766,10 @@ mod tests {
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::TimeZone;
 
+    fn test_config() -> Config {
+        serde_yaml::from_str("{}").expect("default test config")
+    }
+
     /// 分P标题取自原始录像，而不是上传时实际喂进去的那个文件。
     ///
     /// 这条锁住的是一个真实回归：开启响度标准化后，上传的是
@@ -3545,6 +3839,207 @@ mod tests {
         .await
         .unwrap();
         (dir, pool)
+    }
+
+    #[tokio::test]
+    async fn submission_coordinator_requires_durable_intent_before_ledger_or_network_work() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::SegmentPersisted,)
+                .await
+                .unwrap(),
+            SessionSubmissionOutcome::NotRequested
+        );
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT submit_state FROM upload_session WHERE id = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            state, None,
+            "not-requested sessions never enter the ledger gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_requested_session_blocks_before_loading_remote_context() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+              segment_order, status, next_retry_at, created_at, updated_at, lifecycle_version) \
+             VALUES (40, 10, 20, 30, '/pending.flv', 0, 'pending', ?1, ?1, ?1, 2)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        request_session_submit(&pool, 30, now).await.unwrap();
+
+        let outcome =
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::DownloadClosed)
+                .await
+                .unwrap();
+        assert!(matches!(outcome, SessionSubmissionOutcome::Blocked { .. }));
+        let (claim, attempts): (Option<String>, i64) = sqlx::query_as(
+            "SELECT submit_claim_token, submit_attempts FROM upload_session WHERE id = 30",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim, None);
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn definite_preparation_failure_releases_claim_with_bounded_retry() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        let now = chrono::Utc::now();
+        let video = Video::new("uploaded-part");
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+              segment_order, status, next_retry_at, created_at, updated_at, lifecycle_version, video_json) \
+             VALUES (41, 10, 20, 30, '/done.flv', 0, 'succeeded', ?1, ?1, ?1, 2, ?2)",
+        )
+        .bind(now)
+        .bind(serde_json::to_string(&video).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        request_session_submit(&pool, 30, now).await.unwrap();
+
+        let outcome =
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::DownloadClosed)
+                .await
+                .unwrap();
+        let SessionSubmissionOutcome::RetryScheduled { next_at, error } = outcome else {
+            panic!("expected retry scheduling")
+        };
+        assert!(error.contains("load live_streamer failed"));
+        assert!(next_at > now);
+        assert!(next_at <= now + chrono::Duration::minutes(31));
+        let (claim, state): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT submit_claim_token, submit_state FROM upload_session WHERE id = 30",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(claim, None);
+        assert_eq!(state.as_deref(), Some("failed"));
+    }
+
+    #[tokio::test]
+    async fn final_segment_success_wakes_a_previously_blocked_requested_session() {
+        let (directory, pool) = deferred_test_pool().await;
+        let config = test_config();
+        let enrollment = v2_enrollment(&pool, directory.path(), "late-tail.flv").await;
+        request_session_submit(&pool, 30, chrono::Utc::now())
+            .await
+            .unwrap();
+        let first =
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::DownloadClosed)
+                .await
+                .unwrap();
+        assert!(matches!(first, SessionSubmissionOutcome::Blocked { .. }));
+
+        let token = claim_enrolled_attempt(&pool, &enrollment, "tx", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = LiveArchive::default();
+        persist_segment(
+            &config,
+            &pool,
+            &mut archive,
+            uploaded_video("late-tail-remote"),
+            &enrollment,
+            &token,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state: Option<String> =
+                    sqlx::query_scalar("SELECT submit_state FROM upload_session WHERE id = 30")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                if state.as_deref() == Some("failed") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("persist wakeup should reach the coordinator");
+        let next_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT next_submit_at FROM upload_session WHERE id = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            next_at.is_some(),
+            "complete ledger advanced past blocked into retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_segment_without_close_intent_never_wakes_submission() {
+        let (directory, pool) = deferred_test_pool().await;
+        let config = test_config();
+        let enrollment = v2_enrollment(&pool, directory.path(), "live-middle.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "tx", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut archive = LiveArchive::default();
+
+        persist_segment(
+            &config,
+            &pool,
+            &mut archive,
+            uploaded_video("live-middle-remote"),
+            &enrollment,
+            &token,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (intent, state, claim): (
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT submit_requested_at, submit_state, submit_claim_token \
+                 FROM upload_session WHERE id = 30",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(intent, None);
+        assert_eq!(state, None);
+        assert_eq!(claim, None);
+    }
+
+    #[test]
+    fn submit_retry_backoff_is_bounded() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            submit_retry_at(0, now),
+            now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS)
+        );
+        assert_eq!(
+            submit_retry_at(100, now),
+            now + chrono::Duration::seconds(SUBMIT_RETRY_MAX_SECS)
+        );
     }
 
     #[test]
@@ -4017,9 +4512,16 @@ mod tests {
         };
         let uploaded = uploaded_video("remote-atomic");
 
-        persist_segment(&pool, &mut archive, uploaded.clone(), &enrollment, &token)
-            .await
-            .unwrap();
+        persist_segment(
+            &test_config(),
+            &pool,
+            &mut archive,
+            uploaded.clone(),
+            &enrollment,
+            &token,
+        )
+        .await
+        .unwrap();
 
         let lifecycle = sqlx::query_as::<_, (String, Option<String>, i64, Option<String>)>(
             "SELECT status, video_json, uploaded_bytes, attempt_token \
@@ -4173,6 +4675,7 @@ mod tests {
 
         assert!(
             persist_segment(
+                &test_config(),
                 &pool,
                 &mut archive,
                 uploaded_video("late-old"),
@@ -4183,6 +4686,7 @@ mod tests {
             .is_err()
         );
         persist_segment(
+            &test_config(),
             &pool,
             &mut archive,
             uploaded_video("current-new"),
@@ -4212,6 +4716,7 @@ mod tests {
 
         assert!(
             persist_segment(
+                &test_config(),
                 &pool,
                 &mut archive,
                 uploaded_video("must-rollback"),
@@ -4250,6 +4755,7 @@ mod tests {
         let mut archive = LiveArchive::default();
 
         persist_segment(
+            &test_config(),
             &pool,
             &mut archive,
             uploaded_video("remote-order-1"),
@@ -4262,6 +4768,7 @@ mod tests {
         assert_eq!(archive.videos[0].filename, "remote-order-1");
 
         persist_segment(
+            &test_config(),
             &pool,
             &mut archive,
             uploaded_video("remote-order-0"),
