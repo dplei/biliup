@@ -181,7 +181,7 @@ const TemplateModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
                 填写后，本主播每次投稿成功会自动把新稿件加入该 B 站「视频合集」（一主播一合集）。
                 <br />
                 section_id 获取：浏览器打开 <code>/bili/seasons?user=投稿模板里的cookie文件路径</code>
-                （如 <code>/bili/seasons?user=data/16416555.json</code>），在返回 JSON 里找
+                （如 <code>/bili/seasons?user=data/&lt;你的UID&gt;.json</code>），在返回 JSON 里找
                 <code>seasons[].sections.sections[].id</code> 即为分区ID。
               </div>
             }

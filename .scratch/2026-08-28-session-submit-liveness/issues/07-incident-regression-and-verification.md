@@ -74,8 +74,8 @@ Cookie、不触碰真实 B 站。
 `succeeded`。两条 uploading 会话（id 232、233，`submit_state=NULL`，创建于 2026-08-28T02:51，相差 1 秒）
 属于 2.6 节「不得批量猜测、只能人工 recover」那一类，迁移刻意不动它们。
 
-**步骤 7 的真实多分段直播已在本机 dev 环境完成，一场直播只产生一个稿件 `BV1iTtc6vEzH`**
-（aid 117172026351590，`is_only_self=1`）。抖音真实直播，origin 档 flv 15Mbps，`segment_time` 临时改为
+**步骤 7 的真实多分段直播已在本机 dev 环境完成，一场直播只产生一个稿件**
+（`is_only_self=1`）。抖音真实直播，origin 档 flv 15Mbps，`segment_time` 临时改为
 3 分钟以复现竞态，5 个分段全部经 `bda2` 上传成功。为稳定命中竞态窗口，在尾段仍在 transferring 时
 人工暂停房间触发生产端关闭，而非等待自然下播；关闭边界与自然下播共用同一条路径。
 
@@ -89,7 +89,7 @@ Cookie、不触碰真实 B 站。
 15:49:41  会话投稿协调唤醒完成  trigger=DownloadClosed  outcome=Blocked{total_expected:5, succeeded:3}
 15:50:27  trigger=SegmentPersisted  outcome=Blocked{succeeded:4, uploading:1}
 15:51:01  submit_attempt：开始下播一次性投稿  n_videos=5  trigger="segment_persisted"
-15:51:02  code:0  aid=117172026351590  bvid=BV1iTtc6vEzH
+15:51:02  code:0  投稿成功（aid/bvid 略）
 15:51:02  会话投稿协调唤醒完成  trigger=SegmentPersisted  outcome=Submitted
 ```
 

@@ -65,3 +65,8 @@ AGENTS.md
 !.claude/skills/
 # macOS
 .DS_Store
+
+# 个人部署链路文档：ACR 实例、账号、镜像 digest、服务器细节，只对仓库主人有用，
+# 不进公开仓库（本地保留，内容照常写全）。
+BUILD_AND_DEPLOY.md
+DEPLOY_UPLOAD_INIT_RECOVERY.md
