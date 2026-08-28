@@ -1,6 +1,6 @@
 # 04 — recover 接口投稿兜底
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02
 
 ## 背景
@@ -36,3 +36,11 @@ Blocked by: 02
 
 - API 集成覆盖：完整空转旧案例、仍需补传、busy、source_missing、finalized、已有 submit claim。
 - 断言接口快速返回，远端动作在后台执行。
+
+## Answer
+
+`POST /v1/uploads/sessions/{id}/recover` 现在先幂等持久化人工投稿意图，再领取到期分段；没有可领取的
+分段且不存在运行中的 attempt/submit claim 时，会异步唤醒统一投稿协调器并立即返回 202。响应包含
+分段启动/busy、投稿排队、当前会话投稿状态、完整性及可操作的阻塞摘要；`source_missing`、`deleting`、
+未知状态和不确定 submit claim 均不会再以空数组冒充恢复成功。端点回归覆盖历史完整会话、待补传、
+busy、`source_missing`、finalized/不存在及保留 claim 的防重复语义。

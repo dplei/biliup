@@ -66,7 +66,7 @@
 | `crates/biliup-cli/src/server/common/lifecycle_backfill.rs` | 把历史会话的 videos_json 与遗留 missing 行回填成 v2 生命周期账本，合并重复源、生成 legacy:// 基线并按会话断点续跑。 | `run_lifecycle_backfill`、`plan_session`、`BackfillPlan` |
 | `crates/biliup-cli/src/server/common/upload_line_health.rs` | 分类上传网络错误并持久维护单线路失败次数、冷却和到期单探测租约。 | `UploadFailureKind`、`acquire_line`、`record_failure`、`record_success` |
 | `crates/biliup-cli/src/server/router.rs` | 声明全部 v1 HTTP 路由与静态回退，是查「某个接口存不存在、挂在哪个 handler」的唯一入口。 | `router` |
-| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失分段列表（含后端算好的「下次线路」）、补传/重投/停止/按会话恢复、attempt 历史与上传健康查询。补传类端点只 claim，不等上传。 | `get_missing_uploads`、`recover_missing_upload`、`stop_missing_upload`、`recover_session_uploads`、`get_missing_upload_attempts` |
+| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失分段列表（含后端算好的「下次线路」）、补传/重投/停止/按会话恢复、attempt 历史与上传健康查询。分段补传端点只 claim、不等上传；按会话恢复还会持久化人工投稿授权，并在无分段工作时异步唤醒统一投稿协调器。 | `get_missing_uploads`、`recover_missing_upload`、`stop_missing_upload`、`recover_session_uploads`、`get_missing_upload_attempts` |
 | `crates/biliup-cli/src/server/common/missing_segment.rs` | 缺失分段的补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与重试延迟。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment` |
 
 ## 上传核心

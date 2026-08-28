@@ -114,7 +114,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             "/v1/uploads/missing/{id}/attempts",
             get(get_missing_upload_attempts),
         )
-        // 按会话恢复：只领取该会话已有的待补传行，复用它的 aid/bvid，不新建投稿会话。
+        // 按会话恢复：持久化人工收尾授权，优先领取待补传行；账本已齐时异步唤醒投稿协调器。
         .route(
             "/v1/uploads/sessions/{id}/recover",
             post(recover_session_uploads),

@@ -5,14 +5,15 @@ use crate::server::common::recording_lease;
 use crate::server::common::recovery_eligibility::RecoveryEligibility;
 use crate::server::common::recovery_scheduler::{recover_due_segments, spawn_claimed_recovery};
 use crate::server::common::upload::{
-    RecoveryClaim, StopAttemptOutcome, build_studio, claim_manual_recovery, claim_retry_recovery,
-    rescan_local_valid_segments, stop_missing_segment_attempt, submit_to_bilibili, upload,
+    RecoveryClaim, StopAttemptOutcome, SubmissionTrigger, build_studio, claim_manual_recovery,
+    claim_retry_recovery, rescan_local_valid_segments, spawn_session_submission,
+    stop_missing_segment_attempt, submit_to_bilibili, upload,
 };
 use crate::server::common::upload_line_health;
 use crate::server::common::upload_line_selection::{cooling_lines, plan_upload_line};
 use crate::server::common::upload_session::{
-    SessionCompleteness, get_streamer_info as load_streamer_info, match_streamer_by_filename,
-    missing_status_where, session_completeness,
+    RequestSessionSubmit, SessionCompleteness, get_streamer_info as load_streamer_info,
+    match_streamer_by_filename, missing_status_where, request_session_submit, session_completeness,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
@@ -1063,41 +1064,249 @@ pub async fn stop_missing_upload(
     Ok(Json(outcome))
 }
 
-/// Recover everything still outstanding in one session, reusing its existing `aid`/`bvid`.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionRecoveryBlockingSummary {
+    /// Stable machine-readable reason for the current wait.
+    pub code: &'static str,
+    /// Operator-facing explanation. It intentionally does not expose source file paths.
+    pub message: String,
+    /// Lifecycle rows involved in this particular wait, when applicable.
+    pub segment_ids: Vec<i64>,
+}
+
+/// Immediate state returned after a whole-session recovery request is accepted.
+///
+/// Upload and submission themselves always remain detached. The page can render this snapshot and
+/// then poll the session/missing-upload views instead of holding the request open until Bilibili
+/// responds.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionRecoveryAccepted {
+    pub upload_session_id: i64,
+    pub segments_started: Vec<i64>,
+    pub segments_busy: bool,
+    pub submission_queued: bool,
+    pub blocking_summary: Option<SessionRecoveryBlockingSummary>,
+    pub session_status: String,
+    pub submit_state: Option<String>,
+    pub submit_requested_at: chrono::DateTime<Utc>,
+    pub next_submit_at: Option<chrono::DateTime<Utc>>,
+    pub submit_claimed: bool,
+    pub last_submit_error: Option<String>,
+    pub completeness: SessionCompleteness,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SessionRecoverySnapshot {
+    status: String,
+    submit_state: Option<String>,
+    submit_requested_at: Option<chrono::DateTime<Utc>>,
+    next_submit_at: Option<chrono::DateTime<Utc>>,
+    submit_claim_token: Option<String>,
+    last_submit_error: Option<String>,
+}
+
+async fn session_recovery_snapshot(
+    pool: &ConnectionPool,
+    session_id: i64,
+) -> Result<Option<SessionRecoverySnapshot>, Report<AppError>> {
+    sqlx::query_as(
+        "SELECT status, submit_state, submit_requested_at, next_submit_at, submit_claim_token, \
+                last_submit_error FROM upload_session WHERE id = ?1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
+async fn uploading_segment_ids(
+    pool: &ConnectionPool,
+    session_id: i64,
+) -> Result<Vec<i64>, Report<AppError>> {
+    sqlx::query_scalar(
+        "SELECT id FROM upload_missing_segment \
+         WHERE upload_session_id = ?1 AND status = 'uploading' ORDER BY segment_order, id",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
+fn recovery_blocking_summary(
+    snapshot: &SessionRecoverySnapshot,
+    completeness: &SessionCompleteness,
+    started: &[i64],
+    busy_ids: Vec<i64>,
+    recovery_group_busy: bool,
+) -> Option<SessionRecoveryBlockingSummary> {
+    if snapshot.submit_claim_token.is_some() {
+        let message = if snapshot.submit_state.as_deref() == Some("ok_no_aid") {
+            "远端可能已接受投稿，但没有可确认的 aid；已保留投稿 claim，请先人工核对稿件。"
+                .to_string()
+        } else {
+            "会话已有投稿 claim，投稿正在进行或远端结果尚未确认；不会自动发起第二稿。".to_string()
+        };
+        return Some(SessionRecoveryBlockingSummary {
+            code: "submission_claimed",
+            message,
+            segment_ids: Vec::new(),
+        });
+    }
+    if !started.is_empty() {
+        return Some(SessionRecoveryBlockingSummary {
+            code: "segments_recovering",
+            message: "已在后台开始补传分段；最后一个分段成功后会自动重新检查投稿。".to_string(),
+            segment_ids: started.to_vec(),
+        });
+    }
+    if recovery_group_busy || !busy_ids.is_empty() {
+        return Some(SessionRecoveryBlockingSummary {
+            code: "segments_busy",
+            message: "该会话已有分段恢复任务在运行；本次请求没有抢占现有 attempt。".to_string(),
+            segment_ids: busy_ids,
+        });
+    }
+    if completeness.is_complete() {
+        return None;
+    }
+
+    let (code, action) = if completeness.source_missing > 0 {
+        (
+            "source_missing",
+            "源文件不存在，无法自动补传；请恢复原文件后重试，或人工处理该分段。",
+        )
+    } else if completeness.deleting > 0 {
+        (
+            "deleting",
+            "分段正在删除，当前不能补传或投稿；请等待删除完成后刷新。",
+        )
+    } else if completeness.unknown > 0 {
+        (
+            "unknown_segment_state",
+            "存在未知生命周期状态，无法自动完成；请检查分段记录。",
+        )
+    } else if completeness.pending + completeness.failed > 0 {
+        (
+            "segments_not_due",
+            "仍有待补传分段，但当前没有可领取的任务；请等待重试时间或检查最近错误。",
+        )
+    } else {
+        (
+            "incomplete_ledger",
+            "会话账本尚不完整，提交协调器会保持阻塞；请检查分段状态。",
+        )
+    };
+    Some(SessionRecoveryBlockingSummary {
+        code,
+        message: action.to_string(),
+        segment_ids: completeness
+            .earliest_blocking_segment_id
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// Recover everything still outstanding in one session and make the operator's submit intent
+/// durable.
 ///
 /// Deliberately distinct from `rescan`: rescan is for "the file is on disk but has no row", this
-/// is for "the row exists but nobody is running it". It never creates a submission session.
+/// is for "the row exists but nobody is running it". If no segment work is claimable, it wakes the
+/// shared session submission coordinator; it never performs a remote upload or submit inline.
 pub async fn recover_session_uploads(
     State(service_register): State<ServiceRegister>,
     axum::extract::Path(id): axum::extract::Path<i64>,
-) -> Result<Json<serde_json::Value>, Response> {
-    let status = sqlx::query_scalar::<_, String>("SELECT status FROM upload_session WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&service_register.pool)
+) -> Result<(StatusCode, Json<SessionRecoveryAccepted>), Response> {
+    let now = Utc::now();
+    let requested_at = match request_session_submit(&service_register.pool, id, now)
         .await
-        .change_context(AppError::Unknown)
-        .map_err(report_to_response)?;
-    match status.as_deref() {
-        None => return Err((StatusCode::NOT_FOUND, "upload session not found").into_response()),
-        Some("finalized") => {
+        .map_err(report_to_response)?
+    {
+        RequestSessionSubmit::NotFound => {
+            return Err((StatusCode::NOT_FOUND, "upload session not found").into_response());
+        }
+        RequestSessionSubmit::Finalized => {
             return Err((
                 StatusCode::CONFLICT,
                 "该会话已投稿完成，不会为它创建新的补传任务",
             )
                 .into_response());
         }
-        Some(_) => {}
-    }
-    let config = service_register.config.read().unwrap().clone();
-    let result = recover_due_segments(&config, &service_register.pool, Some(id), Utc::now())
+        RequestSessionSubmit::Requested { requested_at, .. } => requested_at,
+    };
+
+    // An individual recovery click and an older recovery run do not necessarily own the
+    // scheduler's in-process group key. The durable attempt state is therefore the authoritative
+    // busy signal and must be inspected independently of `busy_sessions` below.
+    let uploading_before = uploading_segment_ids(&service_register.pool, id)
         .await
         .map_err(report_to_response)?;
-    Ok(Json(serde_json::json!({
-        "upload_session_id": id,
-        "started": result.started,
-        "skipped": result.skipped,
-        "busy": !result.busy_sessions.is_empty(),
-    })))
+    let config = service_register.config.read().unwrap().clone();
+    let result = recover_due_segments(&config, &service_register.pool, Some(id), now)
+        .await
+        .map_err(report_to_response)?;
+    let recovery_group_busy = !result.busy_sessions.is_empty();
+    let uploading_after = uploading_segment_ids(&service_register.pool, id)
+        .await
+        .map_err(report_to_response)?;
+    let started_set = result
+        .started
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut busy_ids = uploading_before;
+    busy_ids.extend(
+        uploading_after
+            .into_iter()
+            .filter(|segment_id| !started_set.contains(segment_id)),
+    );
+    busy_ids.sort_unstable();
+    busy_ids.dedup();
+
+    let completeness = session_completeness(&service_register.pool, id)
+        .await
+        .map_err(report_to_response)?;
+    let snapshot = session_recovery_snapshot(&service_register.pool, id)
+        .await
+        .map_err(report_to_response)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "upload session not found").into_response())?;
+    let segments_busy = recovery_group_busy || !busy_ids.is_empty();
+    let submission_queued =
+        result.started.is_empty() && !segments_busy && snapshot.submit_claim_token.is_none();
+    let blocking_summary = recovery_blocking_summary(
+        &snapshot,
+        &completeness,
+        &result.started,
+        busy_ids,
+        recovery_group_busy,
+    );
+
+    if submission_queued {
+        spawn_session_submission(
+            config,
+            service_register.pool.clone(),
+            id,
+            SubmissionTrigger::ManualRecovery,
+        );
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SessionRecoveryAccepted {
+            upload_session_id: id,
+            segments_started: result.started,
+            segments_busy,
+            submission_queued,
+            blocking_summary,
+            session_status: snapshot.status,
+            submit_state: snapshot.submit_state,
+            submit_requested_at: snapshot.submit_requested_at.unwrap_or(requested_at),
+            next_submit_at: snapshot.next_submit_at,
+            submit_claimed: snapshot.submit_claim_token.is_some(),
+            last_submit_error: snapshot.last_submit_error,
+            completeness,
+        }),
+    ))
 }
 
 /// One historical attempt on a lifecycle row, newest first.
@@ -1131,4 +1340,256 @@ pub async fn get_missing_upload_attempts(
     .change_context(AppError::Unknown)
     .map_err(report_to_response)?;
     Ok(Json(rows))
+}
+
+#[cfg(test)]
+mod session_recovery_tests {
+    use super::*;
+    use crate::server::core::download_manager::DownloadManager;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use biliup::bilibili::Video;
+    use tracing_subscriber::{EnvFilter, Registry, reload};
+
+    async fn service() -> (tempfile::TempDir, ServiceRegister) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("session-recovery.db");
+        let pool = ConnectionManager::new_pool(database.to_str().unwrap())
+            .await
+            .unwrap();
+        // A direct line keeps the due-segment contract test deterministic and network-free while
+        // the claim is being prepared. The detached upload may fail after the response returns.
+        let config = Config {
+            lines: "bda2".to_string(),
+            ..Config::default()
+        };
+        let (_filter_layer, log_handle) =
+            reload::Layer::<EnvFilter, Registry>::new(EnvFilter::new("off"));
+        let manager = DownloadManager::new(1, 0, pool.clone());
+        let service =
+            ServiceRegister::new(pool, Arc::new(RwLock::new(config)), manager, log_handle).await;
+        (directory, service)
+    }
+
+    async fn insert_session(pool: &ConnectionPool, id: i64, status: &str) {
+        let now = Utc::now();
+        let room_id = id + 10_000;
+        let streamer_info_id = id + 20_000;
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (?1, ?2, ?3)")
+            .bind(room_id)
+            .bind(format!("https://example.invalid/live/{id}"))
+            .bind(format!("recover-{id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '')",
+        )
+        .bind(streamer_info_id)
+        .bind(format!("recover-{id}"))
+        .bind(format!("https://example.invalid/live/{id}"))
+        .bind("session recovery test")
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_session \
+             (id, live_streamer_id, streamer_info_id, videos_json, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, '[]', ?4, ?5, ?5)",
+        )
+        .bind(id)
+        .bind(room_id)
+        .bind(streamer_info_id)
+        .bind(status)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_segment(
+        pool: &ConnectionPool,
+        session_id: i64,
+        segment_id: i64,
+        status: &str,
+        file_path: &std::path::Path,
+    ) {
+        let now = Utc::now();
+        let video_json = (status == "succeeded").then(|| {
+            serde_json::to_string(&Video {
+                title: Some(format!("part-{segment_id}")),
+                filename: format!("remote-{segment_id}"),
+                desc: String::new(),
+            })
+            .unwrap()
+        });
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+              normalized_file_path, segment_order, status, next_retry_at, created_at, updated_at, \
+              lifecycle_version, video_json) \
+             SELECT ?1, live_streamer_id, streamer_info_id, id, ?2, ?2, 0, ?3, ?4, ?4, ?4, 2, ?5 \
+             FROM upload_session WHERE id = ?6",
+        )
+        .bind(segment_id)
+        .bind(file_path.display().to_string())
+        .bind(status)
+        .bind(now)
+        .bind(video_json)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_legacy_session_records_intent_and_queues_submit() {
+        let (_directory, service) = service().await;
+        insert_session(&service.pool, 701, "uploading").await;
+        insert_segment(
+            &service.pool,
+            701,
+            7011,
+            "succeeded",
+            std::path::Path::new("/already-uploaded.flv"),
+        )
+        .await;
+
+        let (status, Json(response)) =
+            recover_session_uploads(State(service.clone()), axum::extract::Path(701))
+                .await
+                .unwrap();
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(response.segments_started.is_empty());
+        assert!(!response.segments_busy);
+        assert!(response.submission_queued);
+        assert!(response.blocking_summary.is_none());
+        assert!(response.completeness.is_complete());
+        let requested: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT submit_requested_at FROM upload_session WHERE id = 701")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap();
+        assert!(requested.is_some());
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_running_segments_return_actionable_blockers() {
+        let (_directory, service) = service().await;
+        insert_session(&service.pool, 702, "uploading").await;
+        insert_segment(
+            &service.pool,
+            702,
+            7021,
+            "source_missing",
+            std::path::Path::new("/gone.flv"),
+        )
+        .await;
+        let (_, Json(missing)) =
+            recover_session_uploads(State(service.clone()), axum::extract::Path(702))
+                .await
+                .unwrap();
+        assert!(missing.submission_queued);
+        assert_eq!(
+            missing.blocking_summary.as_ref().map(|item| item.code),
+            Some("source_missing")
+        );
+
+        insert_session(&service.pool, 703, "uploading").await;
+        insert_segment(
+            &service.pool,
+            703,
+            7031,
+            "uploading",
+            std::path::Path::new("/running.flv"),
+        )
+        .await;
+        let (_, Json(running)) =
+            recover_session_uploads(State(service.clone()), axum::extract::Path(703))
+                .await
+                .unwrap();
+        assert!(running.segments_busy);
+        assert!(!running.submission_queued);
+        assert_eq!(
+            running.blocking_summary.as_ref().map(|item| item.code),
+            Some("segments_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_submit_claim_requires_inspection_and_is_not_requeued() {
+        let (_directory, service) = service().await;
+        insert_session(&service.pool, 704, "uploading").await;
+        insert_segment(
+            &service.pool,
+            704,
+            7041,
+            "succeeded",
+            std::path::Path::new("/accepted-remotely.flv"),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'uncertain-claim', \
+             submit_claimed_at = ?1, submit_state = 'ok_no_aid' WHERE id = 704",
+        )
+        .bind(Utc::now())
+        .execute(&service.pool)
+        .await
+        .unwrap();
+
+        let (_, Json(response)) =
+            recover_session_uploads(State(service.clone()), axum::extract::Path(704))
+                .await
+                .unwrap();
+        assert!(response.submit_claimed);
+        assert!(!response.submission_queued);
+        assert_eq!(
+            response.blocking_summary.as_ref().map(|item| item.code),
+            Some("submission_claimed")
+        );
+    }
+
+    #[tokio::test]
+    async fn due_segment_is_claimed_but_remote_work_is_not_awaited() {
+        let (directory, service) = service().await;
+        insert_session(&service.pool, 705, "uploading").await;
+        let file = directory.path().join("due.flv");
+        std::fs::write(&file, b"not real media").unwrap();
+        insert_segment(&service.pool, 705, 7051, "pending", &file).await;
+
+        let (status, Json(response)) =
+            recover_session_uploads(State(service.clone()), axum::extract::Path(705))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response.segments_started, vec![7051]);
+        assert!(!response.submission_queued);
+        assert_eq!(
+            response.blocking_summary.as_ref().map(|item| item.code),
+            Some("segments_recovering")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_and_finalized_sessions_keep_their_http_contract() {
+        let (_directory, service) = service().await;
+        let missing = recover_session_uploads(State(service.clone()), axum::extract::Path(706))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        insert_session(&service.pool, 707, "finalized").await;
+        let finalized = recover_session_uploads(State(service.clone()), axum::extract::Path(707))
+            .await
+            .unwrap_err();
+        assert_eq!(finalized.status(), StatusCode::CONFLICT);
+        let requested: Option<chrono::DateTime<Utc>> =
+            sqlx::query_scalar("SELECT submit_requested_at FROM upload_session WHERE id = 707")
+                .fetch_one(&service.pool)
+                .await
+                .unwrap();
+        assert!(requested.is_none());
+    }
 }
