@@ -1,4 +1,5 @@
 use crate::server::common::cookie_health;
+use crate::server::common::process_priority::background_std;
 use crate::server::common::recording_lease;
 use crate::server::common::route_health::{HealthUpdate, RouteHealthState, RouteSelection};
 use crate::server::common::segment_enrollment::{
@@ -672,7 +673,8 @@ fn merge_compatible_segments(
         events.iter().map(|event| event.prev_file_path.as_path()),
     )?;
     let started_at = Instant::now();
-    let copy_output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    let copy_output = background_std(&mut command)
         .args([
             "-hide_banner",
             "-loglevel",
@@ -763,7 +765,8 @@ fn remux_then_concat(
     let mut diagnostics = Vec::new();
     for (index, event) in events.iter().enumerate() {
         let path = parent.join(format!(".{stem}.{suffix}.{index}.normalized.mkv"));
-        let output = std::process::Command::new("ffmpeg")
+        let mut command = std::process::Command::new("ffmpeg");
+        let output = background_std(&mut command)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -813,7 +816,8 @@ fn remux_then_concat(
         normalized.iter().map(std::path::PathBuf::as_path),
     )?;
     let output_path = parent.join(format!("{stem}.{suffix}.recovered.mkv"));
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    let output = background_std(&mut command)
         .args([
             "-hide_banner",
             "-loglevel",

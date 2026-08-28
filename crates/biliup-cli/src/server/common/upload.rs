@@ -1616,6 +1616,15 @@ async fn upload_single_file_with_repair(
             reason: crate::server::common::audio_normalization::OriginalReason::NoAudio,
         }
     };
+    // 标准化的测量遍已经完整 demux 过原片并顺带做了时间戳诊断；原片干净时产物也干净，
+    // 不必再为它单独跑一遍整片扫描。诊断缺失或原片异常时照常走完整的检测/修复链路。
+    let source_timestamps_clean = matches!(
+        normalization,
+        NormalizationOutcome::Normalized {
+            source_timestamps_clean: true,
+            ..
+        }
+    );
     let normalization_artifact = match normalization {
         NormalizationOutcome::Normalized { artifact, .. } => Some(artifact),
         NormalizationOutcome::Original { reason } => {
@@ -1629,9 +1638,16 @@ async fn upload_single_file_with_repair(
         .as_ref()
         .map(TempArtifact::path)
         .unwrap_or(original_path);
-    let outcome = if repair_enabled {
+    let outcome = if repair_enabled && !source_timestamps_clean {
         normalize_timestamps(normalized_path, &SystemFfmpeg).await
     } else {
+        if repair_enabled {
+            info!(
+                timestamp_repair = "skipped",
+                file = %original_path.display(),
+                "timestamp scan skipped: source verified clean during loudness measurement"
+            );
+        }
         RepairOutcome::Clean
     };
     let upload_path = match &outcome {

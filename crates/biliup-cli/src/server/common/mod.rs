@@ -8,10 +8,12 @@ pub mod audio_normalization;
 pub mod cookie_health;
 pub mod cover_generator;
 pub mod download;
+pub mod ffmpeg_scan;
 pub mod lifecycle_backfill;
 pub mod missing_segment;
 /// 用户提供路径的安全解析（静态文件接口与后续的图片上传共用）
 pub mod path_safety;
+pub mod process_priority;
 /// 单直播间录制租约：持久状态机、到期扫描、录制准入与可靠通知。
 pub mod recording_lease;
 pub mod recovery_eligibility;

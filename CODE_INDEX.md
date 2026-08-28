@@ -66,6 +66,10 @@
 | `crates/biliup-cli/src/server/common/upload_session.rs` | 维护投稿会话恢复（场次键优先、时钟窗口兜底）、单调持久投稿意图与退避时间，并以生命周期账本检查完整性、确定性重建分 P 和原子 claim/finalize。 | `SessionCompleteness`、`request_session_submit`、`session_submit_readiness`、`schedule_submit_retry`、`select_recovery_candidate`、`reusable_streamer_info`、`touch_session_activity`、`claim_complete_session` |
 | `crates/biliup-cli/src/server/common/lifecycle_backfill.rs` | 把历史会话的 videos_json 与遗留 missing 行回填成 v2 生命周期账本，合并重复源、生成 legacy:// 基线并按会话断点续跑。 | `run_lifecycle_backfill`、`plan_session`、`BackfillPlan` |
 | `crates/biliup-cli/src/server/common/upload_line_health.rs` | 分类上传网络错误并持久维护单线路失败次数、冷却和到期单探测租约。 | `UploadFailureKind`、`acquire_line`、`record_failure`、`record_success` |
+| `crates/biliup-cli/src/server/common/audio_normalization.rs` | 上传前的双遍 `loudnorm` 响度标准化：探测、测量（顺带做时间戳诊断）、`-c copy` 视频 + 重编音频的转码、产物校验与孤儿临时件清理，全局单并发，任一步失败一律降级直传原片。 | `normalize_for_upload`、`NormalizationOutcome`、`AudioFfmpegRunner`、`MeasureScan`、`parse_loudnorm_measurement`、`NORMALIZE_SLOTS` |
+| `crates/biliup-cli/src/server/common/timestamp_repair.rs` | 上传前的时间戳异常检测与两级修复（copy 重封装 → 保画质重编码），每一步都以复检为准，进程层面失败一律降级直传。 | `normalize_timestamps`、`RepairOutcome`、`FfmpegRunner`、`SystemFfmpeg` |
+| `crates/biliup-cli/src/server/common/ffmpeg_scan.rs` | 全片扫描类 ffmpeg 调用的 stderr 流式消费：边读边匹配时间戳异常模式，只保留尾部窗口，避免把几百 MB 日志收进内存。 | `run_scanning_stderr`、`StderrScan`、`stderr_indicates_anomaly` |
+| `crates/biliup-cli/src/server/common/process_priority.rs` | 给上传前的 ffmpeg 预处理子进程设置后台 nice 与 IO 优先级，使其让路给网页请求；录制与用户 hook 不降级。 | `background`、`background_std` |
 | `crates/biliup-cli/src/server/router.rs` | 声明全部 v1 HTTP 路由与静态回退，是查「某个接口存不存在、挂在哪个 handler」的唯一入口。 | `router` |
 | `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失分段列表、独立待投稿会话五态、补传/重投/停止/按会话恢复、attempt 历史与上传健康查询。分段补传端点只 claim、不等上传；按会话恢复持久化人工投稿授权，并在无分段工作时异步唤醒统一投稿协调器。 | `get_missing_uploads`、`get_pending_submit_sessions`、`recover_missing_upload`、`stop_missing_upload`、`recover_session_uploads`、`get_missing_upload_attempts` |
 | `crates/biliup-cli/src/server/common/missing_segment.rs` | 缺失分段的补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与重试延迟。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment` |
@@ -112,4 +116,6 @@
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`start_recording_lease_tasks`）：Web 服务同级运行五秒到期扫描和可靠通知扫描，并在 shutdown 时中止二者。
 - `app/ui/StreamerActions/RecordingLeaseModal.tsx` → `crates/biliup-cli/src/server/api/recording_lease.rs`（租约 mutation）：弹窗提交明确 UTC 时间、当前租约 id 和客户备注，后端返回权威状态与服务器时间。
 - `crates/biliup/src/uploader/line.rs` → `crates/biliup/src/uploader/line/upos.rs`（`Upos::upload_stream`）：线路对象把实际分块传输委派给 upos 协议实现，观察者回调据此产生已确认字节进度。
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/audio_normalization.rs`、`timestamp_repair.rs`（`normalize_for_upload`、`normalize_timestamps`）：预处理顺序是先标准化、后时间戳检测，检测的对象是标准化产物而不是原片。标准化的测量遍已经完整 demux 过原片并顺带扫了时间戳，原片干净时 `upload_single_file_with_repair` 跳过对产物的整片扫描；诊断缺失或原片异常时照常走完整的检测/修复链路。
+- `crates/biliup-cli/src/server/common/audio_normalization.rs`、`timestamp_repair.rs`、`download.rs` → `crates/biliup-cli/src/server/common/process_priority.rs`（`background`）：预处理与分段恢复合并的 ffmpeg 一律降到后台优先级；`core/downloader` 的录制进程和用户自定义 hook 刻意不走这里。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/missing_segment.rs`（`missing_segment_health`）：健康接口按状态实时计数 + 识别尚未被 60 秒自愈周期收敛的 stale uploading 行，不必等后台任务打日志才能观测。

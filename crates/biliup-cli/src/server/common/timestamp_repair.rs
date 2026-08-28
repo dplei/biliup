@@ -1,3 +1,5 @@
+use crate::server::common::ffmpeg_scan::run_scanning_stderr;
+use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use error_stack::{ResultExt, bail};
@@ -96,25 +98,14 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
 
 pub struct SystemFfmpeg;
 
-/// stderr 中命中任一模式即判为时间戳异常（用具体模式，避免宽泛词误判）。
-fn stderr_indicates_anomaly(stderr: &str) -> bool {
-    const PATTERNS: &[&str] = &[
-        "Non-monotonic DTS",
-        "non monotonically increasing dts",
-        "timestamp discontinuity",
-        "Invalid timestamp",
-        "Application provided invalid",
-    ];
-    PATTERNS.iter().any(|p| stderr.contains(p))
-}
-
 #[async_trait]
 impl FfmpegRunner for SystemFfmpeg {
     async fn detect_anomaly(&self, path: &Path) -> AppResult<bool> {
         // 全片扫描：-c copy -f null，只读不重编码。
         // 使用 verbose 级别确保 "Invalid timestamp" / "Application provided invalid" 等
         // 低于 warning 的模式也能输出；-nostats 抑制进度行噪声。
-        let output = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        command
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -125,21 +116,18 @@ impl FfmpegRunner for SystemFfmpeg {
                 "-i",
             ])
             .arg(path)
-            .args(["-c", "copy", "-f", "null", "-"])
-            .kill_on_drop(true)
-            .output()
+            .args(["-c", "copy", "-f", "null", "-"]);
+        let (status, scan) = run_scanning_stderr(background(&mut command))
             .await
             .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
         // 模式命中优先：即使退出码非零也应尝试修复。
-        if stderr_indicates_anomaly(&stderr) {
+        if scan.timestamp_anomaly {
             return Ok(true);
         }
         // 无异常模式，但退出码非零 → 可能是路径错误等无关故障，向上报错。
-        if !output.status.success() {
+        if !status.success() {
             bail!(AppError::Custom(format!(
-                "ffmpeg detect exited non-zero ({}) for {}",
-                output.status,
+                "ffmpeg detect exited non-zero ({status}) for {}",
                 path.display()
             )));
         }
@@ -147,7 +135,8 @@ impl FfmpegRunner for SystemFfmpeg {
     }
 
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
-        let status = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        let status = background(&mut command)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -199,7 +188,8 @@ impl FfmpegRunner for SystemFfmpeg {
     }
 
     async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()> {
-        let status = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        let status = background(&mut command)
             .args([
                 "-hide_banner",
                 "-loglevel",

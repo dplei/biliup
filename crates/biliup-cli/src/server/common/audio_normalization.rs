@@ -1,3 +1,5 @@
+use crate::server::common::ffmpeg_scan::run_scanning_stderr;
+use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use error_stack::{ResultExt, bail};
@@ -42,10 +44,19 @@ pub struct LoudnessMeasurement {
     pub target_offset: f64,
 }
 
+/// 测量那一遍的产出。响度分析需要完整 demux 一遍原片，时间戳检测同样如此，
+/// 于是两件事合并到同一次 ffmpeg 调用里，省掉一整遍全片读。
+pub struct MeasureScan {
+    /// 含 loudnorm JSON 的 stderr 尾部窗口。
+    pub stderr: String,
+    /// 顺带扫出的原片时间戳诊断。`None` 表示这个 runner 不做检测。
+    pub timestamp_anomaly: Option<bool>,
+}
+
 #[async_trait]
 pub trait AudioFfmpegRunner: Send + Sync {
     async fn probe(&self, input: &Path) -> AppResult<AudioProbe>;
-    async fn measure(&self, input: &Path, target: LoudnessTarget) -> AppResult<String>;
+    async fn measure(&self, input: &Path, target: LoudnessTarget) -> AppResult<MeasureScan>;
     async fn transcode(
         &self,
         input: &Path,
@@ -104,6 +115,10 @@ pub enum NormalizationOutcome {
     Normalized {
         artifact: TempArtifact,
         measurement: LoudnessMeasurement,
+        /// 测量那一遍顺带扫出的原片时间戳诊断。`true` 表示原片干净，而标准化只是
+        /// `-c copy` 搬运视频流 + 重编音频，产物不会凭空长出时间戳异常，于是上传前
+        /// 可以跳过对产物的整片检测。拿不到诊断时保持 `false`，照常检测。
+        source_timestamps_clean: bool,
     },
 }
 
@@ -241,7 +256,7 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
         target_lufs,
         "audio normalization started"
     );
-    let stderr = match runner.measure(source, target).await {
+    let scan = match runner.measure(source, target).await {
         Ok(v) => v,
         Err(error) => {
             warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during measure");
@@ -250,7 +265,8 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
             };
         }
     };
-    let measurement = match parse_loudnorm_measurement(&stderr) {
+    let source_timestamps_clean = scan.timestamp_anomaly == Some(false);
+    let measurement = match parse_loudnorm_measurement(&scan.stderr) {
         Ok(v) => v,
         Err(error) => {
             warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed: invalid measurement");
@@ -300,6 +316,7 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     NormalizationOutcome::Normalized {
         artifact,
         measurement,
+        source_timestamps_clean,
     }
 }
 
@@ -369,7 +386,8 @@ fn stderr_text(bytes: &[u8]) -> String {
 #[async_trait]
 impl AudioFfmpegRunner for SystemAudioFfmpeg {
     async fn probe(&self, input: &Path) -> AppResult<AudioProbe> {
-        let output = Command::new("ffprobe")
+        let mut command = Command::new("ffprobe");
+        let output = background(&mut command)
             .args([
                 "-v",
                 "error",
@@ -408,28 +426,43 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
         })
     }
 
-    async fn measure(&self, input: &Path, target: LoudnessTarget) -> AppResult<String> {
+    async fn measure(&self, input: &Path, target: LoudnessTarget) -> AppResult<MeasureScan> {
         let filter = format!(
             "loudnorm=I={}:LRA={LRA}:TP={TRUE_PEAK}:print_format=json",
             target.0
         );
-        let output = Command::new("ffmpeg")
-            .args(["-hide_banner", "-nostats", "-i"])
+        // 两路输出共用一次 demux：第一路 `-c copy` 到 null 只为拿时间戳诊断（包直接丢弃，
+        // 几乎不额外耗 CPU），第二路才是响度分析。`-loglevel verbose` 是诊断所必需的，
+        // 低于 warning 的 "Invalid timestamp" 之类只有这一级才会输出。
+        let mut command = Command::new("ffmpeg");
+        command
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "verbose",
+                "-nostats",
+                "-fflags",
+                "+igndts",
+                "-i",
+            ])
             .arg(input)
-            .args(["-map", "0:a:0", "-af", &filter, "-f", "null", "-"])
-            .kill_on_drop(true)
-            .output()
+            .args(["-c", "copy", "-f", "null", "-"])
+            .args(["-map", "0:a:0", "-af", &filter, "-f", "null", "-"]);
+        let (status, scan) = run_scanning_stderr(background(&mut command))
             .await
             .change_context(AppError::Custom(
                 "failed to spawn ffmpeg (loudnorm measure)".into(),
             ))?;
-        if !output.status.success() {
+        if !status.success() {
             bail!(AppError::Custom(format!(
                 "ffmpeg loudnorm measure failed: {}",
-                stderr_text(&output.stderr)
+                scan.tail
             )));
         }
-        Ok(stderr_text(&output.stderr))
+        Ok(MeasureScan {
+            stderr: scan.tail,
+            timestamp_anomaly: Some(scan.timestamp_anomaly),
+        })
     }
 
     async fn transcode(
@@ -444,7 +477,7 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
             target.0, m.input_i, m.input_lra, m.input_tp, m.input_thresh, m.target_offset
         );
         let mut command = Command::new("ffmpeg");
-        command
+        background(&mut command)
             .args(["-hide_banner", "-nostats", "-y", "-i"])
             .arg(input)
             .args([
@@ -674,7 +707,8 @@ async fn create_reference_sample(
     let raw = store
         .root
         .join(format!("sample-raw-{:016x}.m4a", rand::random::<u64>()));
-    let result = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    let result = background(&mut command)
         .args([
             "-hide_banner",
             "-nostats",
@@ -740,6 +774,24 @@ mod tests {
 
     struct FakeRunner {
         measure_ok: bool,
+        timestamp_anomaly: Option<bool>,
+    }
+
+    impl FakeRunner {
+        /// 测量成功，且顺带扫出原片时间戳干净。
+        fn clean() -> Self {
+            Self {
+                measure_ok: true,
+                timestamp_anomaly: Some(false),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                measure_ok: false,
+                timestamp_anomaly: None,
+            }
+        }
     }
 
     #[async_trait]
@@ -752,9 +804,12 @@ mod tests {
             })
         }
 
-        async fn measure(&self, _input: &Path, _target: LoudnessTarget) -> AppResult<String> {
+        async fn measure(&self, _input: &Path, _target: LoudnessTarget) -> AppResult<MeasureScan> {
             if self.measure_ok {
-                Ok("{\"input_i\":\"-27.4\",\"input_tp\":\"-6.1\",\"input_lra\":\"3.2\",\"input_thresh\":\"-38\",\"target_offset\":\"0.1\"}".into())
+                Ok(MeasureScan {
+                    stderr: "{\"input_i\":\"-27.4\",\"input_tp\":\"-6.1\",\"input_lra\":\"3.2\",\"input_thresh\":\"-38\",\"target_offset\":\"0.1\"}".into(),
+                    timestamp_anomaly: self.timestamp_anomaly,
+                })
             } else {
                 Err(error_stack::Report::new(AppError::Custom(
                     "measure failed".into(),
@@ -801,13 +856,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("有 空格.flv");
         tokio::fs::write(&source, b"source").await.unwrap();
-        let outcome = normalize_for_upload(&source, -16.0, &FakeRunner { measure_ok: true }).await;
+        let outcome = normalize_for_upload(&source, -16.0, &FakeRunner::clean()).await;
         let output = match outcome {
             NormalizationOutcome::Normalized {
                 artifact,
                 measurement,
+                source_timestamps_clean,
             } => {
                 assert_eq!(measurement.input_i, -27.4);
+                assert!(source_timestamps_clean);
                 let path = artifact.path().to_path_buf();
                 assert!(tokio::fs::try_exists(&path).await.unwrap());
                 drop(artifact);
@@ -820,12 +877,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_timestamp_diagnosis_does_not_claim_a_clean_source() {
+        // runner 不提供诊断时必须保守：上传前照常跑整片时间戳扫描。
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, b"source").await.unwrap();
+        let runner = FakeRunner {
+            measure_ok: true,
+            timestamp_anomaly: None,
+        };
+        assert!(matches!(
+            normalize_for_upload(&source, -16.0, &runner).await,
+            NormalizationOutcome::Normalized {
+                source_timestamps_clean: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn anomalous_source_does_not_claim_a_clean_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, b"source").await.unwrap();
+        let runner = FakeRunner {
+            measure_ok: true,
+            timestamp_anomaly: Some(true),
+        };
+        assert!(matches!(
+            normalize_for_upload(&source, -16.0, &runner).await,
+            NormalizationOutcome::Normalized {
+                source_timestamps_clean: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn measurement_failure_falls_back_to_original() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, b"source").await.unwrap();
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &FakeRunner { measure_ok: false }).await,
+            normalize_for_upload(&source, -16.0, &FakeRunner::failing()).await,
             NormalizationOutcome::Original {
                 reason: OriginalReason::MeasureFailed
             }
