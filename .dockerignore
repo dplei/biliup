@@ -14,3 +14,7 @@ cookies.json
 data/
 # 本机 cargo 配置（含指向 Homebrew Python 的 PYO3_PYTHON，进了镜像会让 Linux 构建找错解释器）
 .cargo/
+# 本机 dev 录制产物（录像落在 cwd=仓库根目录，1 场直播就上 GB，绝不进构建上下文）
+*.flv
+*.flv.part
+*.part.flv
