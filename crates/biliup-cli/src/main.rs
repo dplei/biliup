@@ -132,7 +132,8 @@ async fn main() -> AppResult<()> {
             output,
             split_size,
             split_time,
-        } => download(&url, output, split_size, split_time).await?,
+            stall_timeout,
+        } => download(&url, output, split_size, split_time, stall_timeout).await?,
         Commands::Server {
             bind,
             port,

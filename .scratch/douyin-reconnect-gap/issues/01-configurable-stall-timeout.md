@@ -1,6 +1,6 @@
 # 01 — 码流停顿超时可配置并调低
 
-Status: ready-for-agent
+Status: implemented / 待生产验收（2026-08-29）
 
 ## 背景
 
@@ -56,3 +56,21 @@ HLS 路径（`hls.rs`）没有同类超时，不在本轮范围。
 - 生产验收第 8 条专门盯这个。
 
 若两场观察下来误判 > 0，把阈值上调到 10~12 秒再评估，不要直接回滚——10 秒仍比 30 秒省一半。
+
+## 实现记录（2026-08-29）
+
+代码已落地，单测全绿，**默认行为不变**（`Connection::new` 仍是 30 秒）。
+
+- `Connection::with_stall_timeout` + `DEFAULT_STALL_TIMEOUT`，`read_frame` 用 `self.stall_timeout`；
+- 配置项 `stream_stall_timeout_secs`（全局），per-streamer 覆写走既有的
+  `live_streamer.override_cfg` → `Context::get_config()` 链路，**不需要新增数据库列**；
+- 两个建连点都接上了：服务端 `stream_gears.rs` 走配置，CLI `biliup download` 新增
+  `--stall-timeout <秒>`（`05` 的对照实验可以直接用它）；
+- 超时日志补了 `stall_timeout_secs` 与 `connected_ms`。
+
+单测：`connection_new_keeps_the_thirty_second_default`、
+`read_frame_gives_up_after_the_configured_stall_timeout`、
+`stall_timeout_is_reset_by_every_chunk`（8×100ms 的稳定流在 300ms 阈值下不超时，
+证明计时按 chunk 重置）、`stall_timeout_can_be_lowered_per_streamer`。
+
+⚠️ **不配置就没有收益**：默认 30 秒是回滚安全，验收前必须把该房间设成 6~8 秒。

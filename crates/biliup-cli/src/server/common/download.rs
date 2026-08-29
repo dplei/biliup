@@ -61,6 +61,26 @@ impl OfflineRetryState {
     }
 }
 
+/// 一次断连缺口的三段式口径。
+///
+/// `silent` 是上游最后一个字节到连接判死；`detect_to_retry` 是判死到重新发起拉流。
+/// 旧口径只有后者，于是整场丢了近 5 分钟、日志里却只记了 30 秒量级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamGap {
+    silent: Duration,
+    detect_to_retry: Duration,
+    total: Duration,
+}
+
+fn compose_stream_gap(silent: Duration, check_elapsed: Duration, backoff: Duration) -> StreamGap {
+    let detect_to_retry = check_elapsed.saturating_add(backoff);
+    StreamGap {
+        silent,
+        detect_to_retry,
+        total: silent.saturating_add(detect_to_retry),
+    }
+}
+
 fn exponential_backoff(failure_count: u32) -> Duration {
     RETRY_BASE_DELAY
         .saturating_mul(2_u32.saturating_pow(failure_count.saturating_sub(1).min(5)))
@@ -71,6 +91,8 @@ struct DownloadAttempt {
     result: AppResult<DownloadStatus>,
     connected_for: Duration,
     completed_configured_segment: bool,
+    /// 上游最后一个字节到连接判死之间的静默时长；只有 FLV 自研解析路径测得到。
+    silent_for: Option<Duration>,
 }
 
 /// 分段事件处理器
@@ -919,14 +941,17 @@ impl DownloadTask {
         let mut can_download = true;
         let mut route_failure_count = 0_u32;
         let mut estimated_missing = Duration::ZERO;
+        let mut stream_gap_count = 0_u32;
         let mut result = Ok(DownloadStatus::StreamEnded);
         loop {
+            let mut silent_for = None;
             let attempt = if can_download {
                 route_health.begin_attempt(&stream);
                 let attempt = self
                     .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
                     .await;
                 result = attempt.result;
+                silent_for = attempt.silent_for;
                 info!("initialize_components completed: {url}");
                 Some((attempt.connected_for, attempt.completed_configured_segment))
             } else {
@@ -1115,9 +1140,27 @@ impl DownloadTask {
             };
 
             if confirmed_live && (interrupted || !can_download) {
-                estimated_missing = estimated_missing
-                    .saturating_add(check_elapsed)
-                    .saturating_add(backoff);
+                // 缺口三段式。旧口径只累加 check_elapsed + backoff，即「从报错之后」开始算，
+                // 结构上看不见上游停发到判死那一段静默——而那才是缺口的大头。
+                let gap = compose_stream_gap(
+                    silent_for.unwrap_or(Duration::ZERO),
+                    check_elapsed,
+                    backoff,
+                );
+                stream_gap_count = stream_gap_count.saturating_add(1);
+                estimated_missing = estimated_missing.saturating_add(gap.total);
+                info!(
+                    event = "stream_gap",
+                    url = url,
+                    // 口径如实命名：这是「最后一个字节到判死」，不等于全部丢失的内容，
+                    // 其中约一个关键帧间隔的数据其实已经收到、只是还压在缓存里。
+                    silent_ms = gap.silent.as_millis() as u64,
+                    silent_measured = silent_for.is_some(),
+                    detect_to_retry_ms = gap.detect_to_retry.as_millis() as u64,
+                    total_gap_ms = gap.total.as_millis() as u64,
+                    gap_index = stream_gap_count,
+                    "stream gap between two connections"
+                );
             }
 
             info!("Retrying download in {:?}...", backoff);
@@ -1150,6 +1193,7 @@ impl DownloadTask {
             successful_flv_to_hls_switches = health_metrics.successful_flv_to_hls_switches,
             flv_to_hls_connected_ms = health_metrics.flv_to_hls_connected_for.as_millis(),
             all_routes_backoffs = health_metrics.all_routes_backoffs,
+            stream_gap_count,
             estimated_missing_ms = estimated_missing.as_millis(),
             valid_segments = processor.stats.valid_segments,
             recoverable_short_segments = processor.stats.recoverable_short_segments,
@@ -1309,6 +1353,7 @@ impl DownloadTask {
             result,
             connected_for,
             completed_configured_segment,
+            silent_for: self.downloader.take_last_gap().map(|gap| gap.silent_for),
         }
     }
 
@@ -1479,13 +1524,41 @@ async fn remove_blocked_new_streamer_info(ctx: &Context) {
 
 #[cfg(test)]
 mod retry_state_tests {
-    use super::{OfflineRetryState, exponential_backoff, persist_closed_session_intents};
+    use super::{
+        OfflineRetryState, compose_stream_gap, exponential_backoff, persist_closed_session_intents,
+    };
     use crate::server::infrastructure::connection_pool::{
         ConnectionManager, test_support::migrated_pool,
     };
     use chrono::{TimeZone, Utc};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn stream_gap_sums_the_silent_and_reconnect_halves() {
+        let gap = compose_stream_gap(
+            Duration::from_millis(19_500),
+            Duration::from_millis(800),
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(gap.silent, Duration::from_millis(19_500));
+        assert_eq!(gap.detect_to_retry, Duration::from_millis(2_800));
+        assert_eq!(gap.total, Duration::from_millis(22_300));
+        // 旧口径只记 detect_to_retry，会把 22.3 秒的缺口报成 2.8 秒
+        assert!(gap.total > gap.detect_to_retry * 7);
+    }
+
+    #[test]
+    fn stream_gap_without_a_measured_silence_falls_back_to_the_old_scope() {
+        // 非 FLV 路径测不到静默时长，此时口径应与改动前完全一致。
+        let gap = compose_stream_gap(
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(gap.total, gap.detect_to_retry);
+        assert_eq!(gap.total, Duration::from_millis(2_800));
+    }
 
     #[test]
     fn backoff_is_two_four_eight_sixteen_then_capped_at_thirty() {

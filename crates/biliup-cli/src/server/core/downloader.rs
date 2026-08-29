@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
@@ -50,6 +51,11 @@ pub struct DownloadConfig {
     /// 脱敏的单次选流/下载关联 ID。
     pub attempt_id: Option<String>,
     pub quality: Option<String>,
+
+    /// 码流停顿看门狗阈值（秒）：连续这么久没收到任何字节就判连接已死。
+    /// `None` 表示沿用 `biliup` 侧的 30 秒默认值。
+    #[serde(default)]
+    pub stall_timeout_secs: Option<u64>,
 }
 
 impl DownloadConfig {
@@ -121,6 +127,17 @@ impl DownloaderRuntime {
         }
     }
 
+    /// 取走上一次 FLV 连接结束时记录的缺口线索。
+    ///
+    /// 只有 stream-gears 走 `httpflv` 自研解析、能测到静默时长；其余下载器交给外部进程，
+    /// 拿不到这个口径，返回 `None` 让上层退回旧的「报错之后」记账。
+    pub fn take_last_gap(&self) -> Option<StreamGapReport> {
+        match self {
+            Self::StreamGears(d) => d.take_last_gap(),
+            _ => None,
+        }
+    }
+
     pub async fn stop(&self) -> AppResult<()> {
         match self {
             Self::Ffmpeg(d) => d.stop().await,
@@ -129,6 +146,17 @@ impl DownloaderRuntime {
             Self::YtDlp(d) => d.stop().await,
         }
     }
+}
+
+/// 一次 FLV 连接结束时测到的缺口线索。
+///
+/// `silent_for` 是「上游最后一个字节 → 连接判死」，也就是原先完全看不见的那一段：
+/// 缺口的大头在这里，而不是在报错之后的重连里。
+#[derive(Debug, Clone, Copy)]
+pub struct StreamGapReport {
+    pub silent_for: Duration,
+    pub connected_for: Duration,
+    pub stall_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]

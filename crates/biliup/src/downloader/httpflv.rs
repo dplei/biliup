@@ -28,13 +28,44 @@ pub struct HttpFlvLogContext {
     pub quality: Option<String>,
 }
 
+/// 服务端录制走这条路径：调用方保留 `Connection` 的所有权，
+/// 以便在本函数返回后读取 `diagnostics()`（静默时长要传回重连循环做缺口记账）。
 pub async fn download_with_context(
-    mut connection: Connection,
+    connection: &mut Connection,
     file: LifecycleFile<'_>,
     segment: Segmentable,
     log_context: HttpFlvLogContext,
 ) -> crate::downloader::error::Result<()> {
-    download_inner(&mut connection, file, segment, Some(&log_context)).await
+    download_inner(connection, file, segment, Some(&log_context)).await
+}
+
+/// 一条连接内的分段与媒体时间戳进度。
+///
+/// 用途是把「连接死亡时距上一次分段过了多久」写进日志：抖音那批断连是否由分段动作触发，
+/// 只能靠这个字段在真实录制里归因（见 `.scratch/douyin-reconnect-gap/issues/05`）。
+/// 时间戳字段用的是 FLV 的流级绝对基准，跨连接可直接相减得到真实缺口。
+#[derive(Debug, Clone, Default)]
+pub struct FlvProgress {
+    /// 本连接内发生的分段次数
+    pub splits: u32,
+    /// 最后一次分段的本地时刻
+    pub last_split_at: Option<Instant>,
+    /// 本连接写入文件的第一个 tag 的媒体时间戳
+    pub first_timestamp_ms: Option<u64>,
+    /// 本连接写入文件的最后一个 tag 的媒体时间戳
+    pub last_timestamp_ms: Option<u64>,
+}
+
+impl FlvProgress {
+    fn since_last_split_ms(&self) -> i64 {
+        self.last_split_at
+            .map(|at| at.elapsed().as_millis() as i64)
+            .unwrap_or(-1)
+    }
+}
+
+fn optional_ms(value: Option<u64>) -> i64 {
+    value.map(|v| v as i64).unwrap_or(-1)
 }
 
 async fn download_inner(
@@ -44,25 +75,64 @@ async fn download_inner(
     log_context: Option<&HttpFlvLogContext>,
 ) -> crate::downloader::error::Result<()> {
     let file_name = file.file_name.clone();
-    match parse_flv(connection, file, segment).await {
+    let mut progress = FlvProgress::default();
+    let result = parse_flv(connection, file, segment, &mut progress).await;
+    let diagnostics = connection.diagnostics();
+    let attempt_id = log_context
+        .map(|context| context.attempt_id.as_str())
+        .unwrap_or("untracked");
+    let stream_host = log_context
+        .map(|context| context.stream_host.as_str())
+        .unwrap_or("unknown");
+    let protocol = log_context
+        .map(|context| context.protocol.as_str())
+        .unwrap_or("flv");
+    let quality = log_context
+        .and_then(|context| context.quality.as_deref())
+        .unwrap_or("unknown");
+    match result {
         Ok(_) => {
+            info!(
+                event = "httpflv_connection_closed",
+                outcome = "stream_ended",
+                received_bytes = diagnostics.received_bytes,
+                connected_ms = diagnostics.connected_for.as_millis() as u64,
+                silent_ms = diagnostics.silent_for.as_millis() as u64,
+                stall_timeout_secs = diagnostics.stall_timeout.as_secs(),
+                splits = progress.splits,
+                since_last_split_ms = progress.since_last_split_ms(),
+                first_timestamp_ms = optional_ms(progress.first_timestamp_ms),
+                last_timestamp_ms = optional_ms(progress.last_timestamp_ms),
+                attempt_id,
+                stream_host,
+                protocol,
+                quality,
+                "httpflv connection closed"
+            );
             info!("Done... {}", file_name);
             Ok(())
         }
         Err(e) => {
-            let diagnostics = connection.diagnostics();
             warn!(
+                event = "httpflv_connection_closed",
+                outcome = "transport_error",
                 error = ?e,
                 http_status = diagnostics.http_status,
                 content_encoding = diagnostics.content_encoding.as_deref().unwrap_or("none"),
                 transfer_encoding = diagnostics.transfer_encoding.as_deref().unwrap_or("none"),
                 received_bytes = diagnostics.received_bytes,
                 connected_ms = diagnostics.connected_for.as_millis() as u64,
+                silent_ms = diagnostics.silent_for.as_millis() as u64,
+                stall_timeout_secs = diagnostics.stall_timeout.as_secs(),
+                splits = progress.splits,
+                since_last_split_ms = progress.since_last_split_ms(),
+                first_timestamp_ms = optional_ms(progress.first_timestamp_ms),
+                last_timestamp_ms = optional_ms(progress.last_timestamp_ms),
                 buffered = diagnostics.buffered,
-                attempt_id = log_context.map(|context| context.attempt_id.as_str()).unwrap_or("untracked"),
-                stream_host = log_context.map(|context| context.stream_host.as_str()).unwrap_or("unknown"),
-                protocol = log_context.map(|context| context.protocol.as_str()).unwrap_or("flv"),
-                quality = log_context.and_then(|context| context.quality.as_deref()).unwrap_or("unknown"),
+                attempt_id,
+                stream_host,
+                protocol,
+                quality,
                 "httpflv download failed"
             );
             Err(e)
@@ -74,6 +144,7 @@ pub(crate) async fn parse_flv(
     connection: &mut Connection,
     file: LifecycleFile<'_>,
     mut segment: Segmentable,
+    progress: &mut FlvProgress,
 ) -> crate::downloader::error::Result<()> {
     let mut flv_tags_cache: Vec<(TagHeader, Bytes, Bytes)> = Vec::new();
     // println!("parse_flv Segment: {:?}", segment);
@@ -205,6 +276,10 @@ pub(crate) async fn parse_flv(
                     }
                     out.write_tag(tag_header, flv_tag_data, previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
+                    progress
+                        .first_timestamp_ms
+                        .get_or_insert(tag_header.timestamp as u64);
+                    progress.last_timestamp_ms = Some(tag_header.timestamp as u64);
                     // downloaded_size += (11 + tag_header.data_size + 4) as u64;
                     prev_timestamp = tag_header.timestamp
                     // println!("{downloaded_size}");
@@ -250,6 +325,8 @@ pub(crate) async fn parse_flv(
                         SegmentCloseReason::Unknown
                     };
                     out.create_new(reason)?;
+                    progress.splits = progress.splits.saturating_add(1);
+                    progress.last_split_at = Some(Instant::now());
                     create_new = false;
                 }
                 flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
@@ -297,6 +374,12 @@ pub fn map_parse_err<'a, T>(
     }
 }
 
+/// 码流停顿看门狗的默认阈值。
+///
+/// 语义是「连续多久一个字节都没收到」——每收到一个 chunk 就重置，不是连接总时长。
+/// 保持 30 秒是为了回滚安全：只对确认被上游掐断的房间通过配置下调。
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Connection {
     resp: Response,
     buffer: BytesMut,
@@ -305,6 +388,9 @@ pub struct Connection {
     transfer_encoding: Option<String>,
     received_bytes: u64,
     started_at: Instant,
+    /// 最后一次成功收到 chunk 的时刻；构造时等于 `started_at`
+    last_chunk_at: Instant,
+    stall_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -314,14 +400,23 @@ pub struct ConnectionDiagnostics {
     pub transfer_encoding: Option<String>,
     pub received_bytes: u64,
     pub connected_for: Duration,
+    /// 上游最后一个字节到现在的静默时长。缺口的大头在这一段里，
+    /// 而不是在报错之后的重连里。
+    pub silent_for: Duration,
+    pub stall_timeout: Duration,
     pub buffered: usize,
 }
 
 impl Connection {
     pub fn new(resp: Response) -> Connection {
+        Connection::with_stall_timeout(resp, DEFAULT_STALL_TIMEOUT)
+    }
+
+    pub fn with_stall_timeout(resp: Response, stall_timeout: Duration) -> Connection {
         let http_status = resp.status().as_u16();
         let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
         let transfer_encoding = header_value(&resp, reqwest::header::TRANSFER_ENCODING);
+        let started_at = Instant::now();
         Connection {
             resp,
             buffer: BytesMut::with_capacity(8 * 1024),
@@ -329,7 +424,9 @@ impl Connection {
             content_encoding,
             transfer_encoding,
             received_bytes: 0,
-            started_at: Instant::now(),
+            started_at,
+            last_chunk_at: started_at,
+            stall_timeout,
         }
     }
 
@@ -340,6 +437,8 @@ impl Connection {
             transfer_encoding: self.transfer_encoding.clone(),
             received_bytes: self.received_bytes,
             connected_for: self.started_at.elapsed(),
+            silent_for: self.last_chunk_at.elapsed(),
+            stall_timeout: self.stall_timeout,
             buffered: self.buffer.len(),
         }
     }
@@ -358,9 +457,10 @@ impl Connection {
             // BytesMut::with_capacity(0).deref_mut()
             // tokio::fs::File::open("").read()
             // self.resp.chunk()
-            match timeout(Duration::from_secs(30), self.resp.chunk()).await {
+            match timeout(self.stall_timeout, self.resp.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
                     self.received_bytes = self.received_bytes.saturating_add(chunk.len() as u64);
+                    self.last_chunk_at = Instant::now();
                     self.buffer.put(chunk);
                 }
                 Ok(Ok(None)) => {
@@ -383,7 +483,13 @@ impl Connection {
                 }
                 Err(err) => {
                     let buffered = self.buffer.len();
-                    warn!(error = %err, buffered, "httpflv chunk read timed out");
+                    warn!(
+                        error = %err,
+                        buffered,
+                        stall_timeout_secs = self.stall_timeout.as_secs(),
+                        connected_ms = self.started_at.elapsed().as_millis() as u64,
+                        "httpflv chunk read timed out"
+                    );
                     return Err(crate::downloader::error::Error::HttpFlvReadTimeout { buffered });
                 }
             }
@@ -410,7 +516,111 @@ fn header_value(resp: &Response, name: reqwest::header::HeaderName) -> Option<St
 
 #[cfg(test)]
 mod tests {
-    use bytes::{Buf, BufMut, BytesMut};
+    use super::{Connection, DEFAULT_STALL_TIMEOUT};
+    use bytes::{Buf, BufMut, Bytes, BytesMut};
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    /// 构造一个「先吐若干 chunk、之后永远不再产出」的响应。
+    /// 用来模拟上游停发但连接未关闭——本 effort 里真实发生的正是这种静默。
+    fn stalling_response(chunks: Vec<&'static [u8]>) -> reqwest::Response {
+        let stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from_static(chunk))),
+        )
+        .chain(futures::stream::pending());
+        reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    /// 构造一个持续按 `interval` 产出 chunk 的响应。
+    fn dripping_response(
+        chunk: &'static [u8],
+        count: usize,
+        interval: Duration,
+    ) -> reqwest::Response {
+        let stream = futures::stream::unfold(0usize, move |sent| async move {
+            if sent >= count {
+                return None;
+            }
+            tokio::time::sleep(interval).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from_static(chunk)), sent + 1))
+        });
+        reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    #[tokio::test]
+    async fn connection_new_keeps_the_thirty_second_default() {
+        let connection = Connection::new(stalling_response(vec![]));
+        let diagnostics = connection.diagnostics();
+        assert_eq!(diagnostics.stall_timeout, DEFAULT_STALL_TIMEOUT);
+        assert_eq!(diagnostics.stall_timeout, Duration::from_secs(30));
+        // 刚建连时静默时长应接近 0，而不是未初始化的大数
+        assert!(diagnostics.silent_for < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn read_frame_gives_up_after_the_configured_stall_timeout() {
+        let mut connection = Connection::with_stall_timeout(
+            stalling_response(vec![b"abcd"]),
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let error = connection
+            .read_frame(8)
+            .await
+            .expect_err("stalled upstream must be judged dead");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                error,
+                crate::downloader::error::Error::HttpFlvReadTimeout { buffered: 4 }
+            ),
+            "unexpected error: {error:?}"
+        );
+        // 按配置的阈值判死，而不是等满 30 秒
+        assert!(elapsed >= Duration::from_millis(300), "elapsed {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "elapsed {elapsed:?}");
+        // 静默口径覆盖「上游最后一个字节 → 判死」这一段
+        let silent = connection.diagnostics().silent_for;
+        assert!(silent >= Duration::from_millis(300), "silent {silent:?}");
+        assert!(silent < Duration::from_millis(1000), "silent {silent:?}");
+    }
+
+    #[tokio::test]
+    async fn stall_timeout_is_reset_by_every_chunk() {
+        // 8 × 100ms = 800ms 总时长，远超 300ms 阈值；只要计时按 chunk 重置就不该超时。
+        let mut connection = Connection::with_stall_timeout(
+            dripping_response(b"ab", 8, Duration::from_millis(100)),
+            Duration::from_millis(300),
+        );
+        let frame = connection
+            .read_frame(16)
+            .await
+            .expect("steady stream must not trip the stall watchdog");
+        assert_eq!(frame.len(), 16);
+        assert_eq!(connection.diagnostics().received_bytes, 16);
+    }
+
+    #[tokio::test]
+    async fn silent_for_tracks_the_time_since_the_last_byte() {
+        let mut connection = Connection::with_stall_timeout(
+            stalling_response(vec![b"abcd"]),
+            Duration::from_secs(30),
+        );
+        connection.read_frame(4).await.expect("first frame");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let diagnostics = connection.diagnostics();
+        let silent = diagnostics.silent_for;
+        assert!(
+            silent >= Duration::from_millis(250) && silent < Duration::from_millis(600),
+            "silent {silent:?}"
+        );
+        // 连接总时长与静默时长是两个口径，不能混用
+        assert!(diagnostics.connected_for >= silent);
+    }
 
     #[test]
     fn byte_it_works() -> Result<(), Box<dyn std::error::Error>> {

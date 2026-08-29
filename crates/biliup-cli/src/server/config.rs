@@ -55,6 +55,14 @@ pub struct Config {
     #[serde(default)]
     pub route_health_enabled: bool,
 
+    /// 码流停顿看门狗阈值（秒）：连续这么久一个字节都没收到就判连接已死并重连。
+    ///
+    /// 每收到一个 chunk 就重置，语义不是连接总时长。缺省沿用 30 秒——高码率源被上游掐断后
+    /// 这 30 秒是白等的，边界缺口的大头就在这里；确认被掐的房间可下调到 6~8 秒。
+    /// 代价是网络抖动超过阈值时会多一次重连（多一个分 P），所以默认保持 30 以便回滚。
+    #[serde(default)]
+    pub stream_stall_timeout_secs: Option<u64>,
+
     /// 文件名前缀
     #[serde(default)]
     pub filename_prefix: Option<String>,
@@ -799,6 +807,17 @@ mod route_health_config_tests {
         let enabled: Config = serde_yaml::from_str("route_health_enabled: true").expect("config");
         assert!(enabled.route_health_enabled);
     }
+
+    #[test]
+    fn stall_timeout_defaults_to_the_downloader_builtin() {
+        // 缺省不下发，由 biliup 侧沿用 30 秒——回滚安全。
+        let default: Config = serde_yaml::from_str("{}").expect("default config");
+        assert_eq!(default.stream_stall_timeout_secs, None);
+
+        let tuned: Config =
+            serde_yaml::from_str("stream_stall_timeout_secs: 8").expect("tuned config");
+        assert_eq!(tuned.stream_stall_timeout_secs, Some(8));
+    }
 }
 
 #[cfg(test)]
@@ -922,5 +941,21 @@ mod tests {
 
         assert!(!config.preserve_recoverable_short_segments);
         assert!(!config.route_health_enabled);
+    }
+
+    /// 只对确认被上游掐断的房间下调阈值，其余房间保持 30 秒——
+    /// per-streamer 覆写就是这个灰度的载体。
+    #[test]
+    fn stall_timeout_can_be_lowered_per_streamer() {
+        let mut config = Config::default();
+        assert_eq!(config.stream_stall_timeout_secs, None);
+
+        config.apply(serde_json::from_str::<ConfigPatch>(r#"{}"#).unwrap());
+        assert_eq!(config.stream_stall_timeout_secs, None);
+
+        config.apply(
+            serde_json::from_str::<ConfigPatch>(r#"{"stream_stall_timeout_secs": 8}"#).unwrap(),
+        );
+        assert_eq!(config.stream_stall_timeout_secs, Some(8));
     }
 }

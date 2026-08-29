@@ -1,6 +1,8 @@
 use crate::server::common::construct_headers;
 use crate::server::common::util::parse_time;
-use crate::server::core::downloader::{DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo};
+use crate::server::core::downloader::{
+    DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo, StreamGapReport,
+};
 use crate::server::errors::{AppError, AppResult};
 use biliup::client::StatelessClient;
 use biliup::downloader::error::Error as DownloadError;
@@ -13,7 +15,8 @@ use biliup::downloader::{hls, httpflv};
 use error_stack::ResultExt;
 use nom::Err;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +27,9 @@ pub struct StreamGears {
     proxy: Option<String>,
 
     token: RwLock<CancellationToken>,
+
+    /// 上一次 FLV 连接结束时测到的缺口线索，供重连循环记账。
+    last_gap: Mutex<Option<StreamGapReport>>,
 }
 
 impl StreamGears {
@@ -39,7 +45,21 @@ impl StreamGears {
         Self {
             proxy,
             token: RwLock::new(CancellationToken::new()),
+            last_gap: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn take_last_gap(&self) -> Option<StreamGapReport> {
+        self.last_gap.lock().unwrap().take()
+    }
+
+    fn record_gap(&self, connection: &Connection) {
+        let diagnostics = connection.diagnostics();
+        *self.last_gap.lock().unwrap() = Some(StreamGapReport {
+            silent_for: diagnostics.silent_for,
+            connected_for: diagnostics.connected_for,
+            stall_timeout: diagnostics.stall_timeout,
+        });
     }
 
     async fn start_download<'a>(
@@ -73,6 +93,12 @@ impl StreamGears {
             download_config.file_size,
         );
 
+        let stall_timeout = download_config
+            .stall_timeout_secs
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(httpflv::DEFAULT_STALL_TIMEOUT);
+
         // 创建HTTP客户端
         let client = StatelessClient::new(headers_in, proxy.as_deref());
         // 获取可重试的响应
@@ -93,12 +119,13 @@ impl StreamGears {
             }
         };
         // 创建连接
-        let mut connection = Connection::new(response);
+        let mut connection = Connection::with_stall_timeout(response, stall_timeout);
         // 读取帧头
         let bytes = match connection.read_frame(9).await {
             Ok(bytes) => bytes,
             Err(err) => {
                 let diagnostics = connection.diagnostics();
+                self.record_gap(&connection);
                 let status = classify_download_error(err);
                 warn!(
                     attempt_id,
@@ -108,6 +135,7 @@ impl StreamGears {
                     received_bytes = diagnostics.received_bytes,
                     connected_for = ?diagnostics.connected_for,
                     buffered = diagnostics.buffered,
+                    stall_timeout_secs = stall_timeout.as_secs(),
                     stream_host,
                     protocol = requested_protocol,
                     quality = download_config.quality.as_deref().unwrap_or("unknown"),
@@ -151,6 +179,7 @@ impl StreamGears {
                     protocol = "flv",
                     candidate_count,
                     quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                    stall_timeout_secs = stall_timeout.as_secs(),
                     "starting stream download"
                 );
                 // FLV流下载
@@ -166,9 +195,15 @@ impl StreamGears {
                     protocol: "flv".to_string(),
                     quality: download_config.quality.clone(),
                 };
-                match httpflv::download_with_context(connection, file, segment.clone(), log_context)
-                    .await
-                {
+                let download_result = httpflv::download_with_context(
+                    &mut connection,
+                    file,
+                    segment.clone(),
+                    log_context,
+                )
+                .await;
+                self.record_gap(&connection);
+                match download_result {
                     Ok(()) => Ok(DownloadStatus::StreamEnded),
                     Err(err) => {
                         let status = classify_download_error(err);

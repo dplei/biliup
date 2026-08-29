@@ -25,8 +25,13 @@ pub async fn download(
     output: String,
     split_size: Option<u64>,
     split_time: Option<humantime::Duration>,
+    stall_timeout: Option<u64>,
 ) -> AppResult<()> {
     let segmentable = Segmentable::new(split_time.map(|t| t.into()), split_size);
+    let stall_timeout = stall_timeout
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(httpflv::DEFAULT_STALL_TIMEOUT);
     let client = reqwest::Client::new();
     let request = LiveRequest {
         client,
@@ -61,6 +66,7 @@ pub async fn download(
                 &stream.title,
                 &output,
                 segmentable,
+                stall_timeout,
             )
             .await
         }
@@ -79,6 +85,7 @@ async fn download_stream(
     title: &str,
     output: &str,
     segmentable: Segmentable,
+    stall_timeout: std::time::Duration,
 ) -> AppResult<()> {
     let output = output.replace("{title}", title);
     let headers = construct_headers(headers).map_err(|err| Report::new(AppError::Custom(err)))?;
@@ -100,7 +107,7 @@ async fn download_stream(
                 .retryable(url)
                 .await
                 .change_context_lazy(|| AppError::Unknown)?;
-            let mut connection = Connection::new(response);
+            let mut connection = Connection::with_stall_timeout(response, stall_timeout);
             connection
                 .read_frame(9)
                 .await

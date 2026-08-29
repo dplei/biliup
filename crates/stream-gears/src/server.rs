@@ -279,7 +279,11 @@ pub(crate) async fn _main(args: &[String]) -> AppResult<()> {
             output,
             split_size,
             split_time,
-        } => biliup_cli::downloader::download(&url, output, split_size, split_time).await?,
+            stall_timeout,
+        } => {
+            biliup_cli::downloader::download(&url, output, split_size, split_time, stall_timeout)
+                .await?
+        }
         Commands::Server {
             bind,
             port,

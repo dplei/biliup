@@ -155,6 +155,10 @@ pub enum Commands {
         /// 按照时间分割视频
         #[arg(long)]
         split_time: Option<humantime::Duration>,
+
+        /// 码流停顿超时（秒）：连续这么久没收到任何字节就判连接已死。缺省 30
+        #[arg(long)]
+        stall_timeout: Option<u64>,
     },
     /// 启动web服务，默认端口19159
     Server {

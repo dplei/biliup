@@ -1,6 +1,6 @@
 # 03 — 缺口统计口径修正与可观测
 
-Status: ready-for-agent
+Status: implemented / 待生产验收（2026-08-29）
 
 ## 背景
 
@@ -68,3 +68,26 @@ total_gap_ms=    两者之和
 
 本 ticket 与 `01`/`02`/`04` 无代码依赖，但**应该先于它们上线**：
 没有可信的缺口口径，后面三个改动的收益无法量化验证。
+
+## 实现记录（2026-08-29）
+
+- `Connection` 增加 `last_chunk_at`，`ConnectionDiagnostics` 增加 `silent_for` 与 `stall_timeout`；
+- `StreamGapReport` 由 `StreamGears` 在连接结束时记录，`DownloaderRuntime::take_last_gap()`
+  交给重连循环。非 FLV 路径拿不到这个口径，返回 `None` 时退回旧算法，行为与改动前一致；
+- 三段式日志已落地：`event="stream_gap"`，字段 `silent_ms` / `detect_to_retry_ms` /
+  `total_gap_ms` / `silent_measured` / `gap_index`；`estimated_missing` 改为累加 `total_gap_ms`；
+- 会话汇总增加 `stream_gap_count`。
+
+口径按原文的诚实要求命名为 `silent_ms`（起点是最后一个字节，不是最后一个落盘 tag），
+另外补了一条更强的判据：`httpflv_connection_closed` 里带 `first_timestamp_ms` /
+`last_timestamp_ms`。因为抖音的 FLV 时间戳是**流级绝对基准**
+（见 [`findings-cdn-behavior.md`](../findings-cdn-behavior.md) 第 2 节），
+把本次连接的 `last_timestamp_ms` 与下一次连接的 `first_timestamp_ms` 相减，
+得到的就是**边界处真实丢失的媒体时长**，不再需要人工逐个分 P 比对。
+验收第 5 条（误差 < 10%）现在可以直接用日志算。
+
+### 未做
+
+第 3 条的「健康接口与补传页展示」没做。`stream_gap_count` 与新口径的
+`estimated_missing_ms` 已进结构化日志，页面挂载点等口径在生产上验准之后再说——
+先展示一个还没验过的数字没有意义。

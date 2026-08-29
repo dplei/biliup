@@ -156,6 +156,7 @@ impl Context {
             suffix,
             attempt_id: stream.attempt_id.clone(),
             quality: stream.recording_quality.clone(),
+            stall_timeout_secs: config.stream_stall_timeout_secs,
         }
     }
 }

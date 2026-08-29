@@ -1,6 +1,6 @@
 # 05 — 分段归因对照实验
 
-Status: ready-for-human
+Status: ready-for-human（2026-08-29 起改为在生产日志里被动取样）
 （2026-08-29 重写。原标题「上游连接寿命诊断实验」，原设计已失效，见下）
 
 ## 目的
@@ -68,3 +68,32 @@ Status: ready-for-human
 - 结论：**无效**，未能测到分段归因。已据此改写实验设计（见上方两个必须条件）。
 
 ### 待补：首轮有效样本
+
+### 2026-08-29 第二轮：改为在真实录制里被动取样
+
+放弃「专门开一场 curl / CLI 对照实验」，改成**把判据做进日志**，跟着正常录制取样。
+理由是前两轮失败的根因都是实验条件不可控（主播下播、分段点与自然寿命撞车），
+而这两个变量在真实录制里同样存在——与其控制它，不如把它记下来。
+
+`httpflv_connection_closed` 现在每条连接结束都打一条，字段：
+
+| 字段 | 含义 |
+|---|---|
+| `outcome` | `stream_ended`（正常 EOF）/ `transport_error`。**这一条就把「主播下播」和「连接被掐」分开了**，也就是前两轮栽的那个坑 |
+| `splits` | 本连接内发生过几次分段 |
+| `since_last_split_ms` | 连接死亡时距上一次分段多久；`-1` = 本连接内没分过段 |
+| `silent_ms` | 上游最后一个字节到判死 |
+| `connected_ms` | 连接总寿命 |
+| `first_timestamp_ms` / `last_timestamp_ms` | 本连接写入文件的首尾媒体时间戳（流级绝对基准） |
+
+### 判读（明天照这个读）
+
+设 `stop_after_split = since_last_split_ms - silent_ms`，即**上游停发**发生在分段之后多久。
+
+| 观察 | 结论 |
+|---|---|
+| `outcome=transport_error` 且 `splits>=1` 且 `stop_after_split` 稳定在几秒内 | **假设 B**：分段动作触发断连 |
+| `outcome=transport_error` 但 `since_last_split_ms=-1`，或 `stop_after_split` 与分段无相关性 | **假设 A**：上游寿命上限，`07` 立项 |
+| `outcome=stream_ended` | 主播下播，**不算样本**（前两轮就是把它当成断连了） |
+
+样本量要求不变：至少 2 场。
