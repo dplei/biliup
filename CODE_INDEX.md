@@ -22,6 +22,7 @@
 | --- | --- | --- |
 | `crates/biliup/src/lib.rs` | `biliup` 核心 crate 的公共门面，并提供带指数退避和抖动的通用异步重试。 | `retry`、`retry_with_config` |
 | `crates/biliup/src/downloader/httpflv.rs` | HTTP-FLV 拉流与逐 tag 解析：按关键帧刷盘并在关键帧边界切分段，维护 onMetaData/序列头缓存，用单次 chunk 读超时兜住码流停顿，断连时产出连接寿命与已收字节的诊断。 | `parse_flv`、`Connection`、`read_frame`、`ConnectionDiagnostics`、`download_with_context` |
+| `crates/biliup/src/downloader/live/douyin.rs` | 抖音选流：解析房间信息后枚举各档位候选（含每档 `bitrate` 元数据），按请求档位就近选档并下发 flv/hls 地址与鉴权头；档位仅按名称在 `QUALITY_CODES` 内上下查找，**不参考码率**。 | `Douyin`、`DouyinLive::check_stream`、`select_quality_code`、`QUALITY_CODES`、`build_stream_candidates` |
 | `crates/danmaku/src/lib.rs` | 弹幕录制 crate 的公共门面，组织客户端、协议、消息和 XML 输出模块并重导出稳定 API。 | `DanmakuRecorder`、`RecorderConfig`、`create_platform`、`XmlWriter` |
 
 ## Web 前端入口
@@ -115,7 +116,7 @@
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`、`Parcel::upload_with_observer`）：恢复与自动模式把冷却线路排除在实际探测请求之外；上传返回的 `Video` 标题由上传文件名兜底，而喂进去的是响度标准化/时间戳修复的中间件，因此 `upload_single_file_with_repair` 必须用原始录像名覆盖分P标题。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。
 - `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup/src/downloader/httpflv.rs`（`Connection::new`、`read_frame`）：服务端录制走这条拉流路径；`read_frame` 的单次 chunk 读超时是「上游停发数据」的唯一检测手段，超时长度直接决定断连后空等多久。
-- `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/util.rs`（`FileValidator::validate`）：分段关闭后按同一份判据分流——`Invalid` 直接删除，`RecoverableShort` 仅在`preserve_recoverable_short_segments` 开启时进入合并管线，否则同样删除。
+- `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/util.rs`（`FileValidator::validate`）：分段关闭后按同一份判据分流——`Invalid` 直接删除，`RecoverableShort` 仅在`preserve_recoverable_short_segments` 开启时进入合并管线，否则同样删除；进入管线后还要满足同组 `group.len() > 1` 才会 `merge_compatible_segments`，**单个短片段一律走 `defer_recovery_batch` 落库等待处理，不进成片**。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/download.rs`（`start_download_workflow`）：开播检测插入 `streamer_info` 后，以该行 id 作为本场 Context 身份进入录制与上传流水线。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`admit_detected_session`）：直播检测在写入新场次和启动下载前读取活动租约；到期后只允许可证明匹配的持久 grace 场次。
 - `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`complete_grace_session`）：确认下播并处理尾段后，先 CAS 到期暂停再决定是否把 Worker 放回轮询队列。

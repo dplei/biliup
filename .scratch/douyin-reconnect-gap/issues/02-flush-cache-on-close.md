@@ -25,6 +25,34 @@ Status: ready-for-agent
 让片段进入既有的合并管线（`merged_recovery_outputs` / `deferred_recovery_batches`）。
 这一条写进验收，不要漏。
 
+## ⚠️ 第二个前置条件：单个短片段进不了合并管线
+
+**仅开启 `preserve_recoverable_short_segments` 还不够。** 核对
+`SegmentEventProcessor::flush_pending_short_segments` 后确认：
+**只有 `group.len() > 1` 才走 `merge_compatible_segments`**，单个片段会 fall through 到
+`defer_recovery_batch`，写 manifest 落库、挂到 `/v1/recovery-batches` 等待处理，**不进成片**。
+
+而本场景每个分段边界只产出**一个** ~1.5 秒片段：
+
+```
+边界 N：短片段 → pending
+30 分钟后边界 N+1：正常大分段判 Valid → 先 flush_pending（组内仅 1 个）→ deferred
+```
+
+所以按现在的写法，`02` 刷出来的数据**落不进成片**，本 ticket 的收益不成立。
+要真正拿到收益，必须二选一：
+
+- **（推荐）扩展合并管线**，支持把短片段拼接到**相邻的下一个 Valid 片段**头部；
+  这是 `02` 原文完全没有覆盖的改动量，落地前要先评估。
+- 或者接受「片段留在 recovery-batches 里由人工处理」，那么本 ticket 应重新定位为
+  **只修「边界上多一个 13 字节空文件被删」的记账问题**，不再声称能补回 1.5 秒内容。
+
+## 收益的口径提醒
+
+`02` 保住的那 ~1.5 秒**本来就不在缺口里**——它是分段前已经收到的数据。
+它解决的是「空文件被判 `HeaderOnly` 删除」，对边界处的观感贡献接近零。
+`assessment` 收益表里若把它算进「实际丢失」的压缩，口径是虚的。
+
 ## 改动范围
 
 1. `parse_flv` 目前把 `flv_tags_cache` 声明在内层 `async` block 之外、循环之内使用。
@@ -59,8 +87,11 @@ Status: ready-for-agent
 生产验收（需与 `preserve_recoverable_short_segments: true` 同时生效）：
 
 5. 分段边界不再出现 `discarding invalid media segment ... reason=HeaderOnly`。
-6. 日志出现 `queueing recoverable short media segment`，且该片段最终进入合并输出
-   （`merged_recovery_outputs` 计数增加），不是被丢弃。
+6. 日志出现 `queueing recoverable short media segment`。
+   ⚠️ **原文写的「`merged_recovery_outputs` 计数增加」在单片段场景下不可能满足**——
+   见上方第二个前置条件，单个片段走的是 `deferred_recovery_batches`。
+   本条的实际判据取决于选了哪条路：扩展了合并管线则验片段进入相邻分段；
+   否则只验它出现在 recovery-batches 列表里、未被删除。
 7. 成片检查：合并后的分 P 在边界处比未修复前多出约 1.5 秒内容，且能正常播放。
 
 ## 风险
