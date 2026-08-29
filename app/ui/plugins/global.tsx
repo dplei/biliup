@@ -388,11 +388,11 @@ const Global: React.FC = () => {
         <AudioNormalizationControl />
         <Form.Input
           field="cookie_health_webhook"
-          label="Cookie 失效推送（cookie_health_webhook）"
-          placeholder="留空则只在网页顶部横幅提示"
+          label="通知推送地址（cookie_health_webhook）"
+          placeholder="留空则不推送任何通知"
           extraText={
             <div style={{ fontSize: '14px' }}>
-              检测到平台 cookie 可能失效（连续多次直播间检查失败，如抖音风控/sessionid 过期）时，向此地址推送一次提醒，恢复时再推一次。按 URL 自动识别格式：
+              全局通知出口，字段名里的 cookie 只是历史原因。以下事件都推送到这里：cookie 失效与恢复、抖音录制画质降级、上传线路熔断、投稿结果、录制到期暂停。留空则这些通知都不发送（cookie 问题仍会在网页顶部横幅提示）。按 URL 自动识别格式：
               <br />
               • <b>钉钉</b>（含 oapi.dingtalk.com）：自动发钉钉机器人格式。机器人「安全设置」请选「自定义关键词」并填 <code>biliup</code>（推送文案已带此前缀）。
               <br />

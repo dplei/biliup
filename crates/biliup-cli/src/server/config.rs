@@ -87,9 +87,12 @@ pub struct Config {
     #[serde(default)]
     pub audio_normalization_offset_db: i8,
 
-    /// cookie 健康提示 webhook（可选）。检测到平台 cookie 可能失效（连续直播间检查失败）时，
-    /// 以及恢复时各推送一次。URL 含 `{title}`/`{content}` 占位 → GET 替换（兼容 Bark/Server酱）；
-    /// 否则 POST JSON `{"title":..,"content":..}`（兼容企业微信/钉钉/自建）。留空则只在网页横幅提示。
+    /// 全局通知 webhook（可选）。字段名保留 `cookie_health` 只是历史原因——它早已是所有
+    /// 运维通知的统一出口：cookie 失效与恢复、抖音录制画质降级、上传线路熔断、投稿结果、
+    /// 录制租约到期暂停，全部走这一个地址，没有分事件的独立配置项。
+    /// URL 含 `{title}`/`{content}` 占位 → GET 替换（兼容 Bark/Server酱）；
+    /// 否则 POST JSON `{"title":..,"content":..}`（兼容企业微信/钉钉/自建）。
+    /// 留空则以上通知都不发送（cookie 问题仍在网页横幅提示，租约到期会停在 `not_configured`）。
     #[serde(default)]
     pub cookie_health_webhook: Option<String>,
 

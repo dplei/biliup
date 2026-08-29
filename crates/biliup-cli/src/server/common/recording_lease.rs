@@ -646,7 +646,6 @@ struct NotificationLease {
     #[sqlx(flatten)]
     lease: RecordingLease,
     remark: String,
-    url: String,
 }
 
 fn notification_retry_delay(attempts: i64) -> Duration {
@@ -686,10 +685,9 @@ fn notification_message(row: &NotificationLease) -> (String, String) {
         lease.customer_note.trim()
     };
     let content = format!(
-        "客户/需求：{}\n直播间：{}\n地址：{}\n约定到期：{} (Asia/Shanghai){}\n实际暂停：{}\n租约事件：#{}",
+        "客户/需求：{}\n主播：{}\n约定到期：{} (Asia/Shanghai){}\n实际暂停：{}\n租约事件：#{}",
         customer_note,
         row.remark,
-        row.url,
         format_shanghai(lease.expires_at),
         session_end,
         pause_time,
@@ -752,7 +750,7 @@ pub async fn scan_recording_lease_notifications(
             continue;
         }
         let row = sqlx::query_as::<_, NotificationLease>(
-            "SELECT r.*, l.remark, l.url FROM recording_lease r \
+            "SELECT r.*, l.remark FROM recording_lease r \
              JOIN livestreamers l ON l.id = r.live_streamer_id WHERE r.id = ?1",
         )
         .bind(id)
