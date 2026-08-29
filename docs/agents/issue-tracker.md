@@ -12,6 +12,24 @@
 - 每个 issue 文件顶部附近用一行 `Status:` 记录 triage 状态，取值为五个规范角色之一：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`
 - 评论与讨论记录追加到文件末尾的 `## Comments` 标题下
 
+## 完结后归档到 `.archive/`
+
+`.scratch/` 只放**还在推进**的 effort。一项工作彻底完结时，把整个
+`.scratch/<feature-slug>/` 目录用 `git mv` 原样移动到 `.archive/<feature-slug>/`，
+并在 [`.archive/README.md`](../../.archive/README.md) 的「已归档」表格补一行
+（目录、内容一句话、归档日期、完结依据）。归档只挪位置，不改内容。
+
+**同时满足才算完结**：
+
+- 目录里每个 issue 的 `Status:` 都是 `resolved` 或 `wontfix`；
+- spec / assessment 一类总览文件不再留有待办——`ready-for-human` 和 `needs-info`
+  都表示还有人要做的事，不归档；
+- 代码已落到 `dev`，验证结论已写进目录内的文件。
+
+只要还剩一条待真实环境验收、待补数据、待部署观察，就留在 `.scratch/`。
+
+收尾一项工作时顺手判断一次；不确定是否完结就留在 `.scratch/`，别抢在验收前归档。
+
 ## 当某个 skill 说「发布到 issue tracker」时
 
 在 `.scratch/<feature-slug>/` 下新建文件（目录不存在则创建）。

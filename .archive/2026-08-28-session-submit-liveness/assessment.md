@@ -1,6 +1,6 @@
 # 2026-08-28 投稿会话活性修复：总览与任务拆分
 
-Status: ready-for-human
+Status: implemented
 
 来源：[`dplei/biliup#1`](https://github.com/dplei/biliup/issues/1) 及
 [`2026-08-28 再次复现`](https://github.com/dplei/biliup/issues/1#issuecomment-5447934912)。
@@ -160,3 +160,14 @@ Status: ready-for-human
 - 不自动修复已经重复创建的远端稿件。
 - 不自动偷取无过期策略的 submit claim；不确定远端结果继续要求人工核对。
 - 不改变正常“整场只投稿一次”的产品语义。
+
+
+---
+
+## 收尾（2026-08-29）
+
+07 号 ticket 的生产验收已完成，01–07 全部 `resolved`：迁移全部应用、投稿意图路径在生产投出过
+多分段稿件、无卡住会话。详见 [`07`](issues/07-incident-regression-and-verification.md) 的
+Answer 段。本 effort 归档。
+
+会话重复创建的根因不在本轮范围内，见 [`dplei/biliup#3`](https://github.com/dplei/biliup/issues/3)。

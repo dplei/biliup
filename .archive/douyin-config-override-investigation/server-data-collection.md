@@ -1,6 +1,6 @@
 # 抖音主播配置覆写诊断数据采集
 
-Status: needs-info
+Status: wontfix（前提不成立，见文末结论）
 
 ## 目标
 
@@ -489,3 +489,59 @@ successful_flv_to_hls_switches：
 ## Comments
 
 - 用户截图确认主播配置覆写页面中三个开关均已打开。
+
+
+---
+
+## 结论（2026-08-29）：覆写没有失效，本调查的前提是误判
+
+生产只读采集 + 本地代码核对之后，「三个开关前端显示开启、运行结果为 false」这个前提不成立。
+按 issue tracker 的角色定义标 `wontfix`——不是「不修」，是「没有这个 bug」。
+
+### 采集结果
+
+- 全局 `configuration` 只有一行，三个开关都是真 JSON 布尔 `true`。
+- 有覆写的主播里，`json_type` 全部返回 `true`（布尔），API `/v1/streamers` 同样返回 `boolean`。
+  **怀疑过的「布尔被存成字符串 `"true"`」不存在。**
+- 有一个主播的两个开关是显式 JSON `null`（不是缺键），另外所有带覆写的主播都存着两个值为
+  `null` 的降级相关键。
+
+### 显式 null 是安全的
+
+`Config` 用 `struct_patch::Patch` 派生 `ConfigPatch`，`Option<T>` 字段的 patch 类型是
+`Option<Option<T>>`。JSON `null` 落到它上面时，serde 默认解析为**外层 `None`**，`apply` 时
+不覆盖，回退全局值。
+
+只有显式标注了 `deserialize_with = "deserialize_option_patch"` 的字段才会把 `null` 解析成
+`Some(None)`（强制置空）——全仓只有 `file_size` 一个字段这么标
+（[`config.rs:20`](../../crates/biliup-cli/src/server/config.rs#L20)，函数定义在
+[`config.rs:544`](../../crates/biliup-cli/src/server/config.rs#L544)）。
+三个抖音开关都没有这个标注，所以显式 `null` 只是回退全局，不会强制关闭。
+
+### 覆写链路是通的
+
+[`live.rs:21`](../../crates/biliup-cli/src/server/core/live.rs#L21) 的 `live_request` 取的是
+`worker.get_config()`，而 `get_config()`
+（[`context.rs:250`](../../crates/biliup-cli/src/server/infrastructure/context.rs#L250)）
+正是「全局配置 clone 后 `apply(override)`」的合并结果，不是 `get_global_config()`。
+下载路径读的也是 `ctx.config()`。
+
+### 生产日志反而证明覆写生效了
+
+候选启用条件在 [`douyin.rs:546/571`](../../crates/biliup/src/downloader/live/douyin.rs#L546)：
+
+```rust
+if route_failover && quality_fallback   // 才生成低一档画质候选
+let protocols = if route_failover && protocol_fallback  // 才保留同画质的 HLS 候选
+```
+
+生产日志里 `candidate_count=4 enabled_candidate_count=2`，启用的两个是同画质的 flv 与 hls，
+低一档画质的两个未启用。这**恰好**是 `route_failover=true` + `protocol_fallback=true` +
+`quality_fallback` 未开（生产覆写里它是 `null`，回退全局默认 `false`）的预期结果。
+若 `route_failover` 真是 `false`，候选模型根本不会建立。
+
+### 真正的问题在别处
+
+「开关开了却没看到降级行为」的观感，来自熔断打开后**从不切换到那个已启用的备用候选**，
+反复重试同一个 `selected` 候选——那是
+[`dplei/biliup#6`](https://github.com/dplei/biliup/issues/6)，与配置覆写无关。

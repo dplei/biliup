@@ -1,6 +1,6 @@
 # Spec：直播间录制到期与本场保活
 
-状态：设计完成，尚未实现  
+状态：已实现，待真实 dev 验收（见 [verification.md](verification.md)）  
 分支：`dev`  
 日期：2026-08-27
 

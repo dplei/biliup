@@ -1,6 +1,6 @@
 # 07 — 事故回归与端到端验证
 
-Status: ready-for-human
+Status: resolved
 Blocked by: 03, 04, 05, 06
 
 ## 背景
@@ -124,3 +124,24 @@ blocked 到自动投出间隔 80 秒，无人干预、不依赖下一场直播�
 
 **仍未完成、需要部署授权的部分**：备份生产 SQLite 后部署 migration 19+20，并在生产观察至少一场
 多分段直播。因此本任务继续保持 `ready-for-human`。
+
+
+## Answer（2026-08-29 生产只读核对）
+
+部署与生产观察均已完成，本 ticket 的验收条件满足。核对全程只读（`sqlite3 -readonly` +
+`PRAGMA query_only=ON`），未写库、未重启服务。
+
+- **migration 已全部应用**：迁移表内每一条 `success=1`，`submit_requested_at`、`submit_state`、
+  `submit_retry_attempts` 等投稿意图字段在生产 schema 中齐备。
+- **新路径确实在生产投出过多分段稿**：投稿意图非空的会话全部是新逻辑生效之后产生的，样本为
+  两场多分段直播，结局均为 `ok_with_aid` 并拿到稿件号。更早的会话投稿意图为空，符合
+  「新字段只对生效后的会话写入」的预期。
+- **没有卡住的会话**：按「无稿件号且未 finalized」筛选，结果为空——两次事故对应的活性缺陷在
+  生产上不再复现。
+
+### 一个不属于本轮的残留
+
+核对中发现一对同主播、创建时间相差约一秒的重复空会话，`blocked_count` 停在两位数、无分段、
+无稿件号，是**人工 finalize** 掉的，不是系统自愈的。会话被重复创建这个根因仍然存在，属于
+补扫为无可补分段的历史场次凭空建会话的问题，已由 [`dplei/biliup#3`](https://github.com/dplei/biliup/issues/3)
+单独跟踪，不在投稿活性的范围内。
