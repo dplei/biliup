@@ -28,6 +28,118 @@ static ACTIVE_NORMALIZATION_ARTIFACTS: LazyLock<Mutex<HashSet<PathBuf>>> =
 #[derive(Debug, Clone, Copy)]
 pub struct LoudnessTarget(pub f64);
 
+/// 转码期检查可用空间的间隔。GB 级分段的转码是分钟量级，10 秒的粒度足够，也不会把
+/// `statvfs` 调成热点。
+const DISK_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 产物大小相对原片的安全系数。视频 `-c copy`、音频重编到 192k，产物通常在原片 ±10%。
+/// 这是编码参数的推论，不是用户该判断的东西，所以不进配置。
+const OUTPUT_SIZE_FACTOR: f64 = 1.1;
+
+/// 一次上传的响度标准化配置。
+///
+/// 打包传递而不是一路加参数：上传编排的函数已经在 `too_many_arguments` 的边缘，每多一个
+/// 旋钮就多一处调用点要改，也更容易把某个参数传串。
+#[derive(Debug, Clone, Copy)]
+pub struct NormalizationSettings {
+    pub enabled: bool,
+    pub target_lufs: f64,
+    pub keep_original: bool,
+    pub budget: DiskBudget,
+}
+
+impl NormalizationSettings {
+    pub fn new(enabled: bool, target_lufs: f64, keep_original: bool, reserve_gib: u64) -> Self {
+        Self {
+            enabled,
+            target_lufs,
+            keep_original,
+            budget: DiskBudget::from_reserve_gib(reserve_gib),
+        }
+    }
+
+    /// 补传发现原片已被就地替换时，用它关掉标准化而保留其余设置。
+    pub fn with_enabled(self, enabled: bool) -> Self {
+        Self { enabled, ..self }
+    }
+}
+
+/// 标准化可以吃掉多少磁盘。
+///
+/// 两道水位都失败开放：探测不出可用空间时一律放行，宁可让标准化照常跑，也不要因为读不到
+/// 一个数字就静默停掉一个功能。
+#[derive(Clone, Copy)]
+pub struct DiskBudget {
+    /// 任何时候都要留给系统的字节数。
+    reserve_bytes: u64,
+    probe: fn(&Path) -> Option<u64>,
+    check_interval: Duration,
+}
+
+impl std::fmt::Debug for DiskBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskBudget")
+            .field("reserve_bytes", &self.reserve_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DiskBudget {
+    pub fn from_reserve_gib(reserve_gib: u64) -> Self {
+        Self {
+            reserve_bytes: reserve_gib.saturating_mul(1024 * 1024 * 1024),
+            probe: crate::server::common::disk_space::available_bytes,
+            check_interval: DISK_CHECK_INTERVAL,
+        }
+    }
+
+    /// 够不够开始转码。`Ok(())` 表示放行——包括探测不出可用空间的情况。
+    fn admits(&self, directory: &Path, input_bytes: u64) -> Result<(), (u64, u64)> {
+        let Some(available) = (self.probe)(directory) else {
+            return Ok(());
+        };
+        let required = (input_bytes as f64 * OUTPUT_SIZE_FACTOR) as u64 + self.reserve_bytes;
+        if available < required {
+            return Err((available, required));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_probe(reserve_bytes: u64, probe: fn(&Path) -> Option<u64>) -> Self {
+        Self {
+            reserve_bytes,
+            probe,
+            // 用例不该为了看一次水位触发而真的等十秒。
+            check_interval: Duration::from_millis(5),
+        }
+    }
+
+    /// 探测不出可用空间的 budget：两道水位都放行，用于关心其它行为的用例。
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self {
+            reserve_bytes: 0,
+            probe: |_| None,
+            check_interval: Duration::from_millis(5),
+        }
+    }
+
+    /// 在可用空间跌破保留线时返回。探测不出来就永远挂起，让转码自然跑完。
+    ///
+    /// 判据里不含安全系数：此刻产物已经在写，要守的是最后那道保留线。
+    async fn wait_for_pressure(&self, directory: &Path) -> u64 {
+        loop {
+            tokio::time::sleep(self.check_interval).await;
+            if let Some(available) = (self.probe)(directory)
+                && available < self.reserve_bytes
+            {
+                return available;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioProbe {
     pub duration_seconds: Option<f64>,
@@ -159,6 +271,10 @@ pub enum OriginalReason {
     InvalidMeasurement,
     TranscodeFailed,
     InvalidOutput,
+    /// 准入时可用空间就不够放下产物，没有启动 ffmpeg。
+    DiskAdmissionDenied,
+    /// 转码途中可用空间跌破保留线，ffmpeg 已被取消、半成品已删。
+    DiskPressureAborted,
 }
 
 /// 标准化成功后产物的去向。调用方只匹配这个枚举，不要靠配置项反推当前是哪种形态。
@@ -296,6 +412,7 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     target_lufs: f64,
     runner: &R,
     keep_original: bool,
+    budget: DiskBudget,
 ) -> NormalizationOutcome {
     let started = std::time::Instant::now();
     if let Some(directory) = source.parent() {
@@ -330,6 +447,22 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
         .acquire()
         .await
         .expect("normalization semaphore open");
+    // 准入判断放在拿到 permit 之后：排队期间可用空间会变，排队前算出来的结论到执行时
+    // 已经过期。
+    let directory = source.parent().unwrap_or_else(|| Path::new("."));
+    if let Err((available_bytes, required_bytes)) = budget.admits(directory, input_bytes) {
+        warn!(
+            audio_normalization = "skipped",
+            reason = "disk_admission_denied",
+            file = %source.display(),
+            available_bytes,
+            required_bytes,
+            "not enough free space for a normalization output; uploading the original"
+        );
+        return NormalizationOutcome::Original {
+            reason: OriginalReason::DiskAdmissionDenied,
+        };
+    }
     let target = LoudnessTarget(target_lufs);
     info!(
         audio_normalization = "started",
@@ -359,11 +492,29 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     // Construct the guard before starting ffmpeg: cancellation/drop then removes a partially
     // written .part file as well as a completed one.
     let artifact = TempArtifact::normalization_output(normalized_temp_path(source));
-    if let Err(error) = runner
-        .transcode(source, artifact.path(), target, &measurement)
-        .await
-    {
+    // 磁盘可能在转码途中被别的东西吃光。`select!` 落地即 drop 掉转码 future，
+    // `kill_on_drop(true)` 随之杀掉 ffmpeg，`.part` 由下面的 cleanup 删掉。
+    let transcoded = tokio::select! {
+        result = runner.transcode(source, artifact.path(), target, &measurement) => result.map_err(Some),
+        available_bytes = budget.wait_for_pressure(directory) => {
+            warn!(
+                audio_normalization = "aborted",
+                reason = "disk_pressure",
+                file = %source.display(),
+                available_bytes,
+                reserve_bytes = budget.reserve_bytes,
+                "free space fell below the reserve mid-transcode; cancelling and uploading the original"
+            );
+            Err(None)
+        }
+    };
+    if let Err(error) = transcoded {
         artifact.cleanup().await;
+        let Some(error) = error else {
+            return NormalizationOutcome::Original {
+                reason: OriginalReason::DiskPressureAborted,
+            };
+        };
         warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during transcode");
         return NormalizationOutcome::Original {
             reason: OriginalReason::TranscodeFailed,
@@ -805,7 +956,11 @@ async fn remove_if_exists(path: &Path) -> AppResult<()> {
     }
 }
 
-pub async fn maybe_capture_reference_sample(source: &Path, store: &AudioSampleStore) {
+pub async fn maybe_capture_reference_sample(
+    source: &Path,
+    store: &AudioSampleStore,
+    budget: DiskBudget,
+) {
     let claim = match store.try_claim_capture().await {
         Ok(Some(v)) => v,
         Ok(None) => return,
@@ -814,7 +969,7 @@ pub async fn maybe_capture_reference_sample(source: &Path, store: &AudioSampleSt
             return;
         }
     };
-    if let Err(error) = create_reference_sample(source, store, &claim).await {
+    if let Err(error) = create_reference_sample(source, store, &claim, budget).await {
         warn!(file=%source.display(), ?error, "sample capture failed; will retry next segment");
         let _ = store.retry_later(claim).await;
     }
@@ -824,6 +979,7 @@ async fn create_reference_sample(
     source: &Path,
     store: &AudioSampleStore,
     claim: &CaptureClaim,
+    budget: DiskBudget,
 ) -> AppResult<()> {
     let runner = SystemAudioFfmpeg::for_sample();
     let probe = runner.probe(source).await?;
@@ -871,7 +1027,7 @@ async fn create_reference_sample(
     let raw_artifact = TempArtifact::guard(raw);
     // 样片走 `keep_original`：这里要的是产物本身，截取出来的 raw 反而是要丢掉的中间件。
     let outcome =
-        normalize_for_upload(raw_artifact.path(), BASE_TARGET_LUFS, &runner, true).await;
+        normalize_for_upload(raw_artifact.path(), BASE_TARGET_LUFS, &runner, true, budget).await;
     match outcome {
         NormalizationOutcome::Normalized {
             form: NormalizedForm::Artifact(artifact),
@@ -929,6 +1085,9 @@ mod tests {
         /// 产物视频流构成；`None` 表示与原片一致。
         output_video_codecs: Option<Vec<String>>,
         output_has_audio: bool,
+        /// 转码永不结束，用来观察硬水位能不能把它掐掉。
+        transcode_hangs: bool,
+        measured: Arc<Mutex<bool>>,
     }
 
     impl Default for FakeRunner {
@@ -940,6 +1099,8 @@ mod tests {
                 output_duration: None,
                 output_video_codecs: None,
                 output_has_audio: true,
+                transcode_hangs: false,
+                measured: Arc::new(Mutex::new(false)),
             }
         }
     }
@@ -986,6 +1147,7 @@ mod tests {
         }
 
         async fn measure(&self, _input: &Path, _target: LoudnessTarget) -> AppResult<MeasureScan> {
+            *self.measured.lock().unwrap() = true;
             if self.measure_ok {
                 Ok(MeasureScan {
                     stderr: "{\"input_i\":\"-27.4\",\"input_tp\":\"-6.1\",\"input_lra\":\"3.2\",\"input_thresh\":\"-38\",\"target_offset\":\"0.1\"}".into(),
@@ -1006,6 +1168,9 @@ mod tests {
             _measured: &LoudnessMeasurement,
         ) -> AppResult<()> {
             tokio::fs::write(output, &self.output_bytes).await.unwrap();
+            if self.transcode_hangs {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
     }
@@ -1060,7 +1225,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("有 空格.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
-        let outcome = normalize_for_upload(&source, -16.0, &FakeRunner::clean(), true).await;
+        let outcome = normalize_for_upload(&source, -16.0, &FakeRunner::clean(), true, DiskBudget::unlimited()).await;
         let output = match outcome {
             NormalizationOutcome::Normalized {
                 form: NormalizedForm::Artifact(artifact),
@@ -1092,7 +1257,7 @@ mod tests {
             ..FakeRunner::default()
         };
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &runner, false).await,
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await,
             NormalizationOutcome::Normalized {
                 source_timestamps_clean: false,
                 ..
@@ -1110,7 +1275,7 @@ mod tests {
             ..FakeRunner::default()
         };
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &runner, false).await,
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await,
             NormalizationOutcome::Normalized {
                 source_timestamps_clean: false,
                 ..
@@ -1124,7 +1289,7 @@ mod tests {
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &FakeRunner::failing(), false).await,
+            normalize_for_upload(&source, -16.0, &FakeRunner::failing(), false, DiskBudget::unlimited()).await,
             NormalizationOutcome::Original {
                 reason: OriginalReason::MeasureFailed
             }
@@ -1139,7 +1304,7 @@ mod tests {
         let runner = FakeRunner::clean();
         let expected = runner.output_bytes.clone();
 
-        let outcome = normalize_for_upload(&source, -16.0, &runner, false).await;
+        let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
         assert!(matches!(
             outcome,
@@ -1193,7 +1358,7 @@ mod tests {
             let source = dir.path().join("segment.flv");
             tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
 
-            let outcome = normalize_for_upload(&source, -16.0, &runner, false).await;
+            let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
             assert!(
                 matches!(
@@ -1229,7 +1394,7 @@ mod tests {
         };
 
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &runner, false).await,
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await,
             NormalizationOutcome::Normalized {
                 form: NormalizedForm::ReplacedOriginal,
                 ..
@@ -1251,7 +1416,7 @@ mod tests {
             ..FakeRunner::default()
         };
 
-        let outcome = normalize_for_upload(&source, -16.0, &runner, false).await;
+        let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
         assert!(matches!(
             outcome,
@@ -1261,6 +1426,105 @@ mod tests {
         ));
         assert!(tokio::fs::try_exists(source.join("occupant")).await.unwrap());
         assert!(leftover_artifacts(dir.path()).await.is_empty());
+        assert_eq!(active_artifacts_under(dir.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_to_start_when_the_output_would_not_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner::clean();
+        let measured = runner.measured.clone();
+        // 原片 × 1.1 还差得远，更别说保留线。
+        let budget = DiskBudget::with_probe(1024 * 1024 * 1024, |_| Some(1024));
+
+        let outcome = normalize_for_upload(&source, -16.0, &runner, false, budget).await;
+
+        assert!(matches!(
+            outcome,
+            NormalizationOutcome::Original {
+                reason: OriginalReason::DiskAdmissionDenied
+            }
+        ));
+        assert!(
+            !*measured.lock().unwrap(),
+            "admission must run before the measure pass, not after paying for it"
+        );
+        assert_eq!(tokio::fs::read(&source).await.unwrap(), SOURCE_BYTES);
+        assert!(leftover_artifacts(dir.path()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_passes_when_space_is_plentiful() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let budget = DiskBudget::with_probe(1024, |_| Some(64 * 1024 * 1024 * 1024));
+
+        assert!(matches!(
+            normalize_for_upload(&source, -16.0, &FakeRunner::clean(), false, budget).await,
+            NormalizationOutcome::Normalized { .. }
+        ));
+    }
+
+    /// 探测不出可用空间时放行——平台能力缺失不该静默停掉一个功能。
+    #[tokio::test]
+    async fn an_unreadable_filesystem_does_not_block_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner::clean();
+        let measured = runner.measured.clone();
+        let budget = DiskBudget::with_probe(u64::MAX, |_| None);
+
+        let outcome = normalize_for_upload(&source, -16.0, &runner, false, budget).await;
+
+        assert!(matches!(
+            outcome,
+            NormalizationOutcome::Normalized { .. }
+        ));
+        assert!(*measured.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn disk_pressure_mid_transcode_cancels_and_falls_back_to_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner {
+            transcode_hangs: true,
+            ..FakeRunner::default()
+        };
+        // 准入那一次读到宽裕，转码开始后磁盘被别的东西吃光。函数指针存不下状态，用一个
+        // 只属于本用例的计数器区分这两个阶段。
+        static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn probe(_: &Path) -> Option<u64> {
+            if READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some(64 * 1024 * 1024 * 1024)
+            } else {
+                Some(1024)
+            }
+        }
+        let budget = DiskBudget::with_probe(4096, probe);
+
+        let outcome = normalize_for_upload(&source, -16.0, &runner, false, budget).await;
+
+        assert!(matches!(
+            outcome,
+            NormalizationOutcome::Original {
+                reason: OriginalReason::DiskPressureAborted
+            }
+        ));
+        assert_eq!(
+            tokio::fs::read(&source).await.unwrap(),
+            SOURCE_BYTES,
+            "an aborted transcode must not touch the original"
+        );
+        assert!(
+            leftover_artifacts(dir.path()).await.is_empty(),
+            "the cancelled transcode left its .part behind"
+        );
         assert_eq!(active_artifacts_under(dir.path()), 0);
     }
 

@@ -105,6 +105,19 @@ export default function AudioNormalizationControl() {
       />
 
       {enabled && (
+        <Form.InputNumber
+          field="audio_normalization_disk_reserve_gib"
+          label="磁盘保留线"
+          suffix="GiB"
+          min={1}
+          max={1024}
+          extraText="可用空间放不下一份处理结果时跳过本段的音量处理、直接上传原片；处理途中磁盘跌破这条线也会立即中止并回退。录制与上传不受影响。"
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0, marginTop: 12 }}
+        />
+      )}
+
+      {enabled && (
         <Form.Switch
           field="audio_normalization_keep_original"
           label="保留原始录像"

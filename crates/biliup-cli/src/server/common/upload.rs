@@ -1,8 +1,8 @@
 use crate::UploadLine;
 use crate::server::common::attempt_lease::{self, AttemptPhase, StaleReason, preprocess_deadline};
 use crate::server::common::audio_normalization::{
-    AudioSampleStore, NormalizationOutcome, NormalizedForm, SystemAudioFfmpeg, TempArtifact,
-    maybe_capture_reference_sample, normalize_for_upload,
+    AudioSampleStore, DiskBudget, NormalizationOutcome, NormalizationSettings, NormalizedForm,
+    SystemAudioFfmpeg, TempArtifact, maybe_capture_reference_sample, normalize_for_upload,
 };
 use crate::server::common::cookie_health::notify_alert;
 use crate::server::common::cover_generator::{
@@ -359,6 +359,7 @@ pub async fn process_with_upload(
                 &AudioSampleStore::for_working_directory(
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 ),
+                ctx.config().normalization_settings().budget,
             )
             .await;
             error!(
@@ -560,6 +561,7 @@ async fn defer_segments_after_upload_init_failure(
     reason: &str,
     segment_processors: &[HookStep],
     sample_store: &AudioSampleStore,
+    sample_budget: DiskBudget,
 ) -> DeferredSegmentSummary {
     // `process_with_upload` closes it before local session preparation. Close again so this helper
     // is safe in isolation and drains a finite snapshot even while producers still own senders.
@@ -592,7 +594,7 @@ async fn defer_segments_after_upload_init_failure(
 
         // 样片截取不依赖 B 站登录或上传线路。即使上传初始化失败，完整分段仍可满足
         // 用户已提交的“截取下一段”请求；失败开放，不影响待补传登记。
-        maybe_capture_reference_sample(&queued_path, sample_store).await;
+        maybe_capture_reference_sample(&queued_path, sample_store, sample_budget).await;
 
         let queued = if let Some(enrollment) = &event.enrollment {
             sqlx::query(
@@ -1498,7 +1500,12 @@ async fn pipeline_upload_videos(
         let sample_store = AudioSampleStore::for_working_directory(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         );
-        maybe_capture_reference_sample(&original_path, &sample_store).await;
+        maybe_capture_reference_sample(
+            &original_path,
+            &sample_store,
+            ctx.config().normalization_settings().budget,
+        )
+        .await;
 
         let AttemptClaim::Claimed(attempt_token) = claim_enrolled_attempt(
             ctx.pool(),
@@ -1523,9 +1530,7 @@ async fn pipeline_upload_videos(
             &original_path,
             upload_context,
             repair_enabled,
-            effective_config.audio_normalization_enabled,
-            effective_config.effective_audio_target_lufs(),
-            effective_config.audio_normalization_keep_original,
+            effective_config.normalization_settings(),
             ctx.pool(),
             enrollment.missing_id,
             &attempt_token,
@@ -1609,17 +1614,16 @@ async fn upload_single_file_with_repair(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
-    normalization_enabled: bool,
-    target_lufs: f64,
-    keep_original: bool,
+    settings: NormalizationSettings,
     activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
-    let normalization = if normalization_enabled {
+    let normalization = if settings.enabled {
         normalize_for_upload(
             original_path,
-            target_lufs,
+            settings.target_lufs,
             &SystemAudioFfmpeg::default(),
-            keep_original,
+            settings.keep_original,
+            settings.budget,
         )
         .await
     } else {
@@ -1655,7 +1659,7 @@ async fn upload_single_file_with_repair(
             None
         }
         NormalizationOutcome::Original { reason } => {
-            if normalization_enabled {
+            if settings.enabled {
                 info!(audio_normalization = "fallback", file = %original_path.display(), ?reason);
             }
             None
@@ -2133,9 +2137,7 @@ async fn upload_enrolled_with_watchdog(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
-    normalization_enabled: bool,
-    target_lufs: f64,
-    keep_original: bool,
+    settings: NormalizationSettings,
     pool: &ConnectionPool,
     missing_id: i64,
     attempt_token: &str,
@@ -2155,9 +2157,7 @@ async fn upload_enrolled_with_watchdog(
         original_path,
         context,
         repair_enabled,
-        normalization_enabled,
-        target_lufs,
-        keep_original,
+        settings,
         Some(activity_tx),
     );
     pin!(upload);
@@ -2611,31 +2611,25 @@ async fn recover_due_missing_segments(
         let path = PathBuf::from(&file_path);
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let normalization_enabled =
-            audio_normalization_needed(&row, effective_config.audio_normalization_enabled);
+        let normalization = effective_config
+            .normalization_settings()
+            .with_enabled(audio_normalization_needed(
+                &row,
+                effective_config.audio_normalization_enabled,
+            ));
         let result = if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
             upload_enrolled_with_watchdog(
                 &path,
                 &recovery_context,
                 repair_enabled,
-                normalization_enabled,
-                effective_config.effective_audio_target_lufs(),
-                effective_config.audio_normalization_keep_original,
+                normalization,
                 ctx.pool(),
                 enrollment.missing_id,
                 token,
             )
             .await
         } else {
-            upload_single_file_with_repair(
-                &path,
-                &recovery_context,
-                repair_enabled,
-                normalization_enabled,
-                effective_config.effective_audio_target_lufs(),
-                effective_config.audio_normalization_keep_original,
-                None,
-            )
+            upload_single_file_with_repair(&path, &recovery_context, repair_enabled, normalization, None)
             .await
             .map(|(video, outcome, artifact)| (video, outcome, artifact, None))
         };
@@ -3569,32 +3563,26 @@ pub async fn run_claimed_recovery(
         }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let normalization_enabled =
-            audio_normalization_needed(&row, effective_config.audio_normalization_enabled);
+        let normalization = effective_config
+            .normalization_settings()
+            .with_enabled(audio_normalization_needed(
+                &row,
+                effective_config.audio_normalization_enabled,
+            ));
         let (video, outcome, _normalization_artifact, _attempt_guard) =
             if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
                 upload_enrolled_with_watchdog(
                     &path,
                     &upload_context,
                     repair_enabled,
-                    normalization_enabled,
-                    effective_config.effective_audio_target_lufs(),
-                    effective_config.audio_normalization_keep_original,
+                    normalization,
                     pool,
                     enrollment.missing_id,
                     token,
                 )
                 .await?
             } else {
-                upload_single_file_with_repair(
-                    &path,
-                    &upload_context,
-                    repair_enabled,
-                    normalization_enabled,
-                    effective_config.effective_audio_target_lufs(),
-                    effective_config.audio_normalization_keep_original,
-                    None,
-                )
+                upload_single_file_with_repair(&path, &upload_context, repair_enabled, normalization, None)
                 .await
                 .map(|(video, outcome, artifact)| (video, outcome, artifact, None))?
             };
@@ -5114,6 +5102,7 @@ mod tests {
             "login unavailable",
             &[],
             &AudioSampleStore::for_working_directory(_dir.path()),
+            test_config().normalization_settings().budget,
         )
         .await;
 
@@ -5540,8 +5529,12 @@ impl UActor {
                                 );
                             }
                             // 仅录制模式同样会产出完整分段，样片截取不应依赖投稿模板。
-                            maybe_capture_reference_sample(&event.prev_file_path, &sample_store)
-                                .await;
+                            maybe_capture_reference_sample(
+                                &event.prev_file_path,
+                                &sample_store,
+                                ctx.config().normalization_settings().budget,
+                            )
+                            .await;
                         }
                         warn!(
                             url = ctx.live_streamer().url,
