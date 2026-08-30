@@ -1,7 +1,7 @@
 use crate::UploadLine;
 use crate::server::common::attempt_lease::{self, AttemptPhase, StaleReason, preprocess_deadline};
 use crate::server::common::audio_normalization::{
-    AudioSampleStore, NormalizationOutcome, SystemAudioFfmpeg, TempArtifact,
+    AudioSampleStore, NormalizationOutcome, NormalizedForm, SystemAudioFfmpeg, TempArtifact,
     maybe_capture_reference_sample, normalize_for_upload,
 };
 use crate::server::common::cookie_health::notify_alert;
@@ -1609,8 +1609,16 @@ async fn upload_single_file_with_repair(
     target_lufs: f64,
     activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
+    // TODO(03-keep-original-switch): 接上 `audio_normalization_keep_original` 配置。
+    let keep_original = false;
     let normalization = if normalization_enabled {
-        normalize_for_upload(original_path, target_lufs, &SystemAudioFfmpeg::default()).await
+        normalize_for_upload(
+            original_path,
+            target_lufs,
+            &SystemAudioFfmpeg::default(),
+            keep_original,
+        )
+        .await
     } else {
         NormalizationOutcome::Original {
             reason: crate::server::common::audio_normalization::OriginalReason::NoAudio,
@@ -1625,8 +1633,17 @@ async fn upload_single_file_with_repair(
             ..
         }
     );
+    // 就地替换的形态没有临时件要善后，上传路径就是原片路径；只有 `keep_original` 会
+    // 产出需要清理的临时件。
     let normalization_artifact = match normalization {
-        NormalizationOutcome::Normalized { artifact, .. } => Some(artifact),
+        NormalizationOutcome::Normalized {
+            form: NormalizedForm::Artifact(artifact),
+            ..
+        } => Some(artifact),
+        NormalizationOutcome::Normalized {
+            form: NormalizedForm::ReplacedOriginal,
+            ..
+        } => None,
         NormalizationOutcome::Original { reason } => {
             if normalization_enabled {
                 info!(audio_normalization = "fallback", file = %original_path.display(), ?reason);
