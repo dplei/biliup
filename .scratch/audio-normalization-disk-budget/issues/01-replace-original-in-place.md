@@ -1,6 +1,6 @@
 # 01 — 产物校验加严并原子替换原片
 
-Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
+Status: resolved（随 [#14](https://github.com/dplei/biliup/pull/14) 合入 `dev`；真实环境验收集中在 [`06`](./06-concurrency-acceptance.md)）
 
 ## 背景
 

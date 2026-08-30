@@ -1,6 +1,6 @@
 # Spec：响度标准化的磁盘预算——产物原地替换与两级水位
 
-Status: ready-for-agent
+Status: ready-for-human（01–05 已合入 `dev`，06 的真实环境验收待做）
 来源：[`dplei/biliup#8`](https://github.com/dplei/biliup/issues/8)（2026-08-30 设计讨论）
 分支：`dev`
 
@@ -168,7 +168,7 @@ pre-upload 请求体），把 ffmpeg stdout 直接接上传器不成立。
 
 ## 8. Ticket
 
-01–05 已实现，随本 PR 提交。06 的并发峰值断言已在本机用真实 ffmpeg 验过，其余项待真实录制环境。
+01–05 已随 [#14](https://github.com/dplei/biliup/pull/14) 合入 `dev`。06 的并发峰值断言已在本机用真实 ffmpeg 验过，其余项待真实录制环境——**在 06 收尾之前本目录不归档**。
 
 | # | 标题 | 依赖 | 状态 |
 | --- | --- | --- | --- |

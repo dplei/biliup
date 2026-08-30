@@ -1,6 +1,6 @@
 # 06 — 多路并发峰值验收
 
-Status: 部分完成 / 待真实录制验收（2026-08-30）
+Status: ready-for-human（本机断言已验，真实录制环境的四项待做）
 Blocked by: 01, 02, 03, 04, 05
 
 ## 背景
@@ -76,6 +76,9 @@ cargo test -p biliup-cli concurrent_normalization -- --ignored --nocapture
 写爆磁盘。是否改成「按 probe 出的音频码率推算」见下方待决项。
 
 ## 仍需真实环境的部分
+
+**这四条是本目录还留在 `.scratch/` 的唯一原因**；全部完成并把结论写回本文件后，整个目录
+就可以按 [`docs/agents/issue-tracker.md`](../../../docs/agents/issue-tracker.md) 归档。
 
 - 验收标准 2（流水线未退化）：要有真实录制 + 真实上传才能比端到端时长，本机测不了。
 - 验收标准 4、5（水位降级）：需要人为压低可用空间，在真实盘上做。
