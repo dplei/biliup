@@ -236,7 +236,7 @@ async fn enroll_in_database(
         return Ok(existing);
     }
 
-    let session_id = find_or_create_session(&mut tx, request).await?;
+    let (session_id, created_session) = find_or_create_session(&mut tx, request).await?;
     let baseline_count =
         sqlx::query_scalar::<_, String>("SELECT videos_json FROM upload_session WHERE id = ?")
             .bind(session_id)
@@ -305,6 +305,7 @@ async fn enroll_in_database(
     Ok(SegmentEnrollment {
         missing_id,
         upload_session_id: session_id,
+        created_session,
         segment_order,
         normalized_file_path: request.normalized_file_path.clone(),
         total_bytes: request.total_bytes,
@@ -328,6 +329,7 @@ async fn existing_enrollment(
     Ok(row.map(|row| SegmentEnrollment {
         missing_id: row.get("id"),
         upload_session_id: row.get::<i64, _>("upload_session_id"),
+        created_session: false,
         segment_order: row.get("segment_order"),
         normalized_file_path: request.normalized_file_path.clone(),
         total_bytes: row
@@ -382,7 +384,7 @@ fn reject_if_claimed(claim_token: Option<String>) -> Result<(), sqlx::Error> {
 async fn find_or_create_session(
     tx: &mut Transaction<'_, Sqlite>,
     request: &EnrollmentRequest,
-) -> Result<i64, sqlx::Error> {
+) -> Result<(i64, bool), sqlx::Error> {
     if let Some((id, claim_token, updated_at)) =
         sqlx::query_as::<_, (i64, Option<String>, DateTime<Utc>)>(
             "SELECT id, submit_claim_token, updated_at FROM upload_session \
@@ -405,7 +407,7 @@ async fn find_or_create_session(
                 .execute(&mut **tx)
                 .await?;
         }
-        return Ok(id);
+        return Ok((id, false));
     }
     let session_key = live_session_key_of(tx, request.streamer_info_id).await?;
     if let Some(session_key) = session_key.as_deref()
@@ -428,7 +430,7 @@ async fn find_or_create_session(
         .bind(id)
         .execute(&mut **tx)
         .await?;
-        return Ok(id);
+        return Ok((id, false));
     }
     let cutoff = request.now - chrono::Duration::minutes(request.recovery_window_minutes);
     if let Some((id, claim_token, existing_key)) =
@@ -463,7 +465,7 @@ async fn find_or_create_session(
             .bind(id)
             .execute(&mut **tx)
             .await?;
-            return Ok(id);
+            return Ok((id, false));
         }
     }
     // Keep the finalized boundary inside the enrollment transaction as well. The public
@@ -494,7 +496,7 @@ async fn find_or_create_session(
     .bind(session_key)
     .execute(&mut **tx)
     .await?;
-    Ok(result.last_insert_rowid())
+    Ok((result.last_insert_rowid(), true))
 }
 
 async fn ensure_filelist(

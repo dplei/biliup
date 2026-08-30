@@ -7,9 +7,12 @@ use biliup_cli::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     import_outbox_once, normalize_segment_path,
 };
-use biliup_cli::server::common::submission_scheduler::due_submission_session_ids;
+use biliup_cli::server::common::submission_scheduler::{
+    due_submission_session_ids, scan_due_submissions,
+};
 use biliup_cli::server::common::upload::{
-    AttemptClaim, claim_enrolled_attempt, fail_enrolled_attempt, persist_segment,
+    AttemptClaim, SubmissionTrigger, claim_enrolled_attempt, fail_enrolled_attempt,
+    persist_segment, rescan_local_valid_segments,
 };
 use biliup_cli::server::common::upload_line_health::{
     LineAvailability, UploadFailureKind, acquire_line, record_failure,
@@ -1152,6 +1155,84 @@ async fn submit_liveness_04_retry_deadline_and_uncertain_claim_are_safe() {
             .unwrap();
     assert_eq!(state.0.as_deref(), Some("ok_no_aid"));
     assert_eq!(state.1.as_deref(), Some(token.as_str()));
+}
+
+#[tokio::test]
+async fn target_09_empty_rescan_shell_never_blocks_or_revives() {
+    let working_directory = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+
+    let empty = rescan_local_valid_segments(
+        &Config::default(),
+        &db.pool,
+        INCIDENT_STREAMER_INFO_ID,
+        working_directory.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(empty.upload_session_id, None);
+    assert!(!empty.created_session);
+    assert_eq!(empty.queued, 0);
+    assert_eq!(db.counts().await, (0, 0));
+
+    // Recreate the pre-fix database shell, including migration-19-style durable submit intent.
+    db.insert_session("uploading", "[]").await;
+    let now = FakeClock::incident_start().now();
+    request_session_submit(&db.pool, INCIDENT_SESSION_ID, now)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE upload_session SET submit_state = 'blocked_missing_segments', blocked_count = 7 \
+         WHERE id = ?1",
+    )
+    .bind(INCIDENT_SESSION_ID)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let summary = scan_due_submissions(
+        &Config::default(),
+        &db.pool,
+        now,
+        SubmissionTrigger::StartupScan,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.candidates, 1);
+    assert_eq!(summary.skipped, vec![INCIDENT_SESSION_ID]);
+    let state: (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT status, submit_state, blocked_count FROM upload_session WHERE id = ?1",
+    )
+    .bind(INCIDENT_SESSION_ID)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        (
+            "finalized".to_string(),
+            Some("discarded_empty".to_string()),
+            7,
+        )
+    );
+    assert!(
+        due_submission_session_ids(&db.pool, now + Duration::days(1), true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let after_discard = rescan_local_valid_segments(
+        &Config::default(),
+        &db.pool,
+        INCIDENT_STREAMER_INFO_ID,
+        working_directory.path(),
+    )
+    .await
+    .unwrap();
+    assert!(after_discard.skipped_finalized);
+    assert_eq!(after_discard.upload_session_id, Some(INCIDENT_SESSION_ID));
+    assert_eq!(db.counts().await, (1, 0));
 }
 
 async fn lease_state(pool: &ConnectionPool, missing_id: i64) -> (String, Option<String>) {

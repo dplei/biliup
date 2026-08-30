@@ -160,6 +160,7 @@ pub enum SessionSubmissionOutcome {
         completeness: SessionCompleteness,
     },
     ClaimedElsewhere,
+    DiscardedEmpty,
     Finalized,
     Submitted {
         aid: u64,
@@ -796,6 +797,14 @@ pub async fn reconcile_session_submission(
                 "session submit already claimed; skipping duplicate finalize"
             );
             return Ok(SessionSubmissionOutcome::ClaimedElsewhere);
+        }
+        SubmitClaim::DiscardedEmpty => {
+            info!(
+                session = session_row_id,
+                trigger = trigger.as_str(),
+                "closed session had no lifecycle baseline; finalized without remote submission"
+            );
+            return Ok(SessionSubmissionOutcome::DiscardedEmpty);
         }
         SubmitClaim::Finalized => {
             info!(
@@ -2576,6 +2585,7 @@ async fn recover_due_missing_segments(
         let v2_enrollment = (row.lifecycle_version == 2).then(|| SegmentEnrollment {
             missing_id: row.id,
             upload_session_id: session_row_id,
+            created_session: false,
             segment_order: row.segment_order,
             normalized_file_path: PathBuf::from(
                 row.normalized_file_path
@@ -2992,12 +3002,13 @@ pub async fn upload(
 pub struct LocalSegmentRescanResult {
     pub live_streamer_id: i64,
     pub streamer_info_id: i64,
-    pub upload_session_id: i64,
+    pub upload_session_id: Option<i64>,
     /// True when this rescan had to create the session itself. Surfaced so a rescan that quietly
     /// forks a live stream into a second archive is visible instead of silent.
     #[serde(default)]
     pub created_session: bool,
     pub scanned: usize,
+    pub valid_candidates: usize,
     pub queued: usize,
     pub skipped_known: usize,
     pub skipped_invalid: usize,
@@ -3085,9 +3096,8 @@ pub async fn rescan_local_valid_segments(
             None => None,
         },
     };
-    let mut created_session = false;
     let session = match session {
-        Some(session) => session,
+        Some(session) => Some(session),
         None => {
             if let Some(session_id) =
                 finalized_session_for_streamer_info(pool, live_streamer.id, streamer_info_id)
@@ -3105,20 +3115,23 @@ pub async fn rescan_local_valid_segments(
                 return Ok(LocalSegmentRescanResult {
                     live_streamer_id: live_streamer.id,
                     streamer_info_id,
-                    upload_session_id: session_id,
+                    upload_session_id: Some(session_id),
                     created_session: false,
                     scanned: 0,
+                    valid_candidates: 0,
                     queued: 0,
                     skipped_known: 0,
                     skipped_invalid: 0,
                     skipped_finalized: true,
                 });
             }
-            created_session = true;
-            insert_uploading_session(pool, live_streamer.id, streamer_info_id, &[]).await?
+            None
         }
     };
-    let videos = parse_videos(&session.videos_json);
+    let videos = session
+        .as_ref()
+        .map(|session| parse_videos(&session.videos_json))
+        .unwrap_or_default();
     let uploaded_stems: HashSet<String> = videos
         .iter()
         .flat_map(|video| {
@@ -3202,9 +3215,10 @@ pub async fn rescan_local_valid_segments(
     let mut result = LocalSegmentRescanResult {
         live_streamer_id: live_streamer.id,
         streamer_info_id,
-        upload_session_id: session.id,
-        created_session,
+        upload_session_id: session.as_ref().map(|session| session.id),
+        created_session: false,
         scanned: 0,
+        valid_candidates: 0,
         queued: 0,
         skipped_known: 0,
         skipped_invalid: 0,
@@ -3225,6 +3239,7 @@ pub async fn rescan_local_valid_segments(
             result.skipped_invalid += 1;
             continue;
         }
+        result.valid_candidates += 1;
         let danmaku_path = path.with_extension("xml");
         let request = EnrollmentRequest {
             live_streamer_id: live_streamer.id,
@@ -3241,9 +3256,12 @@ pub async fn rescan_local_valid_segments(
         match enroll_validated_segment(&EnrollmentStore::production(pool.clone()), &request).await?
         {
             EnrollmentOutcome::Enrolled(enrollment) if enrollment.duplicate => {
+                result.upload_session_id = Some(enrollment.upload_session_id);
                 result.skipped_known += 1;
             }
             EnrollmentOutcome::Enrolled(enrollment) => {
+                result.upload_session_id = Some(enrollment.upload_session_id);
+                result.created_session |= enrollment.created_session;
                 info!(
                     file = %path.display(), session = enrollment.upload_session_id,
                     segment_order = enrollment.segment_order,
@@ -3256,6 +3274,18 @@ pub async fn rescan_local_valid_segments(
             EnrollmentOutcome::Outboxed(_) => {}
         }
     }
+    info!(
+        live_streamer_id = result.live_streamer_id,
+        streamer_info_id = result.streamer_info_id,
+        upload_session_id = result.upload_session_id,
+        scanned = result.scanned,
+        valid_candidates = result.valid_candidates,
+        queued = result.queued,
+        skipped_known = result.skipped_known,
+        skipped_invalid = result.skipped_invalid,
+        created_session = result.created_session,
+        "本地补扫完成"
+    );
     Ok(result)
 }
 
@@ -3411,6 +3441,7 @@ pub async fn claim_manual_recovery(
         Some(SegmentEnrollment {
             missing_id: row.id,
             upload_session_id: session_id,
+            created_session: false,
             segment_order: row.segment_order,
             normalized_file_path: PathBuf::from(
                 row.normalized_file_path
@@ -5228,7 +5259,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.upload_session_id, 30);
+        assert_eq!(result.upload_session_id, Some(30));
         assert_eq!(result.scanned, 1);
         assert_eq!(result.queued, 0);
         assert_eq!(result.skipped_invalid, 1);
@@ -5237,6 +5268,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_count, 0, "空片段不得出现在缺失补传");
+    }
+
+    #[tokio::test]
+    async fn local_rescan_without_valid_candidate_has_no_session_side_effect() {
+        let (dir, pool) = deferred_test_pool().await;
+        sqlx::query("DELETE FROM upload_session WHERE id = 30")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO livestreamers (id, url, remark) \
+             VALUES (10, 'https://example.com/live', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let empty = rescan_local_valid_segments(&Config::default(), &pool, 20, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(empty.upload_session_id, None);
+        assert!(!empty.created_session);
+        assert_eq!(empty.valid_candidates, 0);
+        assert_eq!(empty.queued, 0);
+
+        sqlx::query(
+            "INSERT INTO filelist (file, streamer_info_id) VALUES ('already-removed.flv', 20)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let vanished = rescan_local_valid_segments(&Config::default(), &pool, 20, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(vanished.upload_session_id, None);
+        assert!(!vanished.created_session);
+        assert_eq!(vanished.queued, 0);
+
+        let invalid = dir.path().join("test invalid-rescan.flv");
+        std::fs::write(&invalid, b"thirteen-byte").unwrap();
+        let invalid = rescan_local_valid_segments(&Config::default(), &pool, 20, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(invalid.upload_session_id, None);
+        assert!(!invalid.created_session);
+        assert_eq!(invalid.valid_candidates, 0);
+        assert_eq!(invalid.skipped_invalid, 1);
+
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let missing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_missing_segment")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((sessions, missing), (0, 0));
+    }
+
+    fn valid_test_flv(timestamp_ms: u32) -> Vec<u8> {
+        let payload_size = 6_usize;
+        let mut bytes = vec![
+            b'F',
+            b'L',
+            b'V',
+            1,
+            5,
+            0,
+            0,
+            0,
+            9, // header
+            0,
+            0,
+            0,
+            0, // PreviousTagSize0
+            9, // video tag
+            0,
+            0,
+            payload_size as u8,
+            ((timestamp_ms >> 16) & 0xff) as u8,
+            ((timestamp_ms >> 8) & 0xff) as u8,
+            (timestamp_ms & 0xff) as u8,
+            ((timestamp_ms >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+            0x17,
+            1,
+            0,
+            0,
+            0,
+            0x65,
+        ];
+        bytes.extend_from_slice(&((11 + payload_size) as u32).to_be_bytes());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn local_rescan_creates_session_with_first_valid_candidate_and_is_idempotent() {
+        let (dir, pool) = deferred_test_pool().await;
+        sqlx::query("DELETE FROM upload_session WHERE id = 30")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO livestreamers (id, url, remark) \
+             VALUES (10, 'https://example.com/live', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let recording = dir.path().join("test valid-rescan.flv");
+        std::fs::write(&recording, valid_test_flv(1_000)).unwrap();
+        let config = Config {
+            filtering_threshold: 0,
+            ..Config::default()
+        };
+
+        let first = rescan_local_valid_segments(&config, &pool, 20, dir.path())
+            .await
+            .unwrap();
+        assert!(first.upload_session_id.is_some());
+        assert!(first.created_session);
+        assert_eq!(first.valid_candidates, 1);
+        assert_eq!(first.queued, 1);
+
+        let second = rescan_local_valid_segments(&config, &pool, 20, dir.path())
+            .await
+            .unwrap();
+        assert_eq!(second.upload_session_id, first.upload_session_id);
+        assert!(!second.created_session);
+        assert_eq!(second.queued, 0);
+        assert!(second.skipped_known >= 1);
+
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_session")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let missing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_missing_segment")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((sessions, missing), (1, 1));
     }
 
     #[tokio::test]
@@ -5256,7 +5430,7 @@ mod tests {
             .unwrap();
 
         assert!(result.skipped_finalized);
-        assert_eq!(result.upload_session_id, 30);
+        assert_eq!(result.upload_session_id, Some(30));
         let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upload_session")
             .fetch_one(&pool)
             .await

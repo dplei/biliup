@@ -204,7 +204,39 @@ pub enum SubmitClaim {
         blocked_count: i64,
     },
     AlreadyClaimed,
+    DiscardedEmpty,
     Finalized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmptySessionDiscardRejection {
+    SubmitNotRequested,
+    HasLifecycleRows(i64),
+    HasVideos,
+    HasRemoteIdentity,
+    Claimed,
+    ManualInspection,
+}
+
+impl EmptySessionDiscardRejection {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::SubmitNotRequested => "会话尚未关闭，不能丢弃仍可能开始录制的空会话",
+            Self::HasLifecycleRows(_) => "会话已有分段账本，请先处理具体分段",
+            Self::HasVideos => "会话已保存远端视频信息，不能作为空会话丢弃",
+            Self::HasRemoteIdentity => "会话已有 aid 或 bvid，不能覆盖远端投稿结果",
+            Self::Claimed => "会话已有投稿 claim，请先核对远端投稿状态",
+            Self::ManualInspection => "会话处于远端结果不确定状态，必须人工核对",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmptySessionDiscardResult {
+    Discarded { previous_status: String },
+    AlreadyFinalized { submit_state: Option<String> },
+    NotFound,
+    Rejected(EmptySessionDiscardRejection),
 }
 
 #[derive(Debug)]
@@ -373,6 +405,105 @@ pub async fn session_completeness(
     Ok(result)
 }
 
+async fn discard_empty_session_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_row_id: i64,
+) -> AppResult<EmptySessionDiscardResult> {
+    let row = sqlx::query(
+        "SELECT status, submit_state, submit_requested_at, submit_claim_token, \
+                videos_json, aid, bvid \
+         FROM upload_session WHERE id = ?1",
+    )
+    .bind(session_row_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    let Some(row) = row else {
+        return Ok(EmptySessionDiscardResult::NotFound);
+    };
+    let status = row.get::<String, _>("status");
+    let submit_state = row.get::<Option<String>, _>("submit_state");
+    if status == "finalized" {
+        return Ok(EmptySessionDiscardResult::AlreadyFinalized { submit_state });
+    }
+    if row.get::<Option<String>, _>("submit_claim_token").is_some() {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::Claimed,
+        ));
+    }
+    if matches!(submit_state.as_deref(), Some("ok_no_aid" | "submitting")) {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::ManualInspection,
+        ));
+    }
+    if row
+        .get::<Option<DateTime<Utc>>, _>("submit_requested_at")
+        .is_none()
+    {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::SubmitNotRequested,
+        ));
+    }
+    if row.get::<Option<i64>, _>("aid").is_some() || row.get::<Option<String>, _>("bvid").is_some()
+    {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::HasRemoteIdentity,
+        ));
+    }
+    let videos_json = row.get::<String, _>("videos_json");
+    if !matches!(serde_json::from_str::<Vec<serde_json::Value>>(&videos_json), Ok(videos) if videos.is_empty())
+    {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::HasVideos,
+        ));
+    }
+    let lifecycle_rows = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM upload_missing_segment WHERE upload_session_id = ?1",
+    )
+    .bind(session_row_id)
+    .fetch_one(&mut **tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    if lifecycle_rows != 0 {
+        return Ok(EmptySessionDiscardResult::Rejected(
+            EmptySessionDiscardRejection::HasLifecycleRows(lifecycle_rows),
+        ));
+    }
+
+    let now = Utc::now();
+    sqlx::query(
+        "UPDATE upload_session SET status = 'finalized', submit_state = 'discarded_empty', \
+                last_submit_error = NULL, blocked_signature = NULL, next_submit_at = NULL, \
+                submit_claim_token = NULL, submit_claimed_at = NULL, updated_at = ?1 \
+         WHERE id = ?2",
+    )
+    .bind(now)
+    .bind(session_row_id)
+    .execute(&mut **tx)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(EmptySessionDiscardResult::Discarded {
+        previous_status: status,
+    })
+}
+
+/// Logically finalize a closed session which never acquired a lifecycle baseline.
+///
+/// The session identity is retained so a later local rescan sees the finalized boundary and cannot
+/// recreate the same historical shell.
+pub async fn discard_empty_session(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+) -> AppResult<EmptySessionDiscardResult> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .change_context(AppError::Unknown)?;
+    let result = discard_empty_session_in_transaction(&mut tx, session_row_id).await?;
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(result)
+}
+
 /// Atomically validate the permanent lifecycle ledger, rebuild videos_json and acquire submit
 /// ownership. No network-facing studio construction may happen before this succeeds.
 pub async fn claim_complete_session(
@@ -383,6 +514,24 @@ pub async fn claim_complete_session(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .change_context(AppError::Unknown)?;
+    match discard_empty_session_in_transaction(&mut tx, session_row_id).await? {
+        EmptySessionDiscardResult::Discarded { .. } => {
+            tx.commit().await.change_context(AppError::Unknown)?;
+            return Ok(SubmitClaim::DiscardedEmpty);
+        }
+        EmptySessionDiscardResult::AlreadyFinalized { .. } => {
+            return Ok(SubmitClaim::Finalized);
+        }
+        EmptySessionDiscardResult::NotFound => {
+            return Err(error_stack::Report::new(AppError::Custom(format!(
+                "upload session {session_row_id} does not exist"
+            ))));
+        }
+        EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::Claimed) => {
+            return Ok(SubmitClaim::AlreadyClaimed);
+        }
+        EmptySessionDiscardResult::Rejected(_) => {}
+    }
     let session =
         sqlx::query("SELECT status, submit_claim_token FROM upload_session WHERE id = ?1")
             .bind(session_row_id)
@@ -1184,6 +1333,147 @@ mod tests {
 
     fn now_fixed() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn closed_zero_baseline_session_is_discarded_without_blocking() {
+        let (_directory, pool) = completeness_pool().await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+        sqlx::query(
+            "UPDATE upload_session SET submit_state = 'blocked_missing_segments', \
+             last_submit_error = 'old blocker', blocked_signature = 'old-signature', \
+             blocked_count = 4, next_submit_at = ?1 WHERE id = 70",
+        )
+        .bind(Utc::now() + chrono::Duration::minutes(10))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            claim_complete_session(&pool, 70).await.unwrap(),
+            SubmitClaim::DiscardedEmpty
+        ));
+        let state: (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT status, submit_state, last_submit_error, blocked_signature, next_submit_at, \
+                    blocked_count FROM upload_session WHERE id = 70",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "finalized");
+        assert_eq!(state.1.as_deref(), Some("discarded_empty"));
+        assert_eq!((state.2, state.3, state.4), (None, None, None));
+        assert_eq!(state.5, 4, "cumulative audit count is retained");
+        assert_eq!(
+            session_submit_readiness(&pool, 70, Utc::now())
+                .await
+                .unwrap(),
+            SessionSubmitReadiness::Finalized
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_session_discard_enforces_closed_and_truly_empty_guards() {
+        let (_directory, pool) = completeness_pool().await;
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::SubmitNotRequested)
+        );
+
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+        insert_ledger(&pool, 1, 0, "pending", "/pending.flv", None).await;
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasLifecycleRows(1))
+        );
+        sqlx::query("DELETE FROM upload_missing_segment WHERE upload_session_id = 70")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upload_session SET aid = 123 WHERE id = 70")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasRemoteIdentity)
+        );
+        sqlx::query(
+            "UPDATE upload_session SET aid = NULL, submit_claim_token = 'held' WHERE id = 70",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::Claimed)
+        );
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = NULL, bvid = 'BV1test' WHERE id = 70",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasRemoteIdentity)
+        );
+        sqlx::query(
+            "UPDATE upload_session SET bvid = NULL, videos_json = '[{}]' WHERE id = 70",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasVideos)
+        );
+        sqlx::query(
+            "UPDATE upload_session SET videos_json = '[]', submit_state = 'ok_no_aid' WHERE id = 70",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::ManualInspection)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_empty_discard_is_idempotent() {
+        let (_directory, pool) = completeness_pool().await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+
+        let (left, right) = tokio::join!(
+            discard_empty_session(&pool, 70),
+            discard_empty_session(&pool, 70)
+        );
+        let results = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, EmptySessionDiscardResult::Discarded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    EmptySessionDiscardResult::AlreadyFinalized { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
