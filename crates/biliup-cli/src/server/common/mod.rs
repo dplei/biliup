@@ -7,6 +7,8 @@ pub mod audio_normalization;
 /// 平台 cookie 健康监测（检测失效并经横幅/webhook 提示）
 pub mod cookie_health;
 pub mod cover_generator;
+/// 文件系统可用空间探测（标准化的准入与硬水位共用）
+pub mod disk_space;
 pub mod download;
 pub mod ffmpeg_scan;
 pub mod lifecycle_backfill;
