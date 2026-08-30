@@ -441,6 +441,7 @@ async fn enqueue_segment(
         last_chunk_index: None,
         last_chunk_started_at: None,
         last_chunk_error: None,
+        audio_normalized_at: None,
     };
 
     let sql = r#"
@@ -571,6 +572,7 @@ mod tests {
             last_chunk_index: None,
             last_chunk_started_at: None,
             last_chunk_error: None,
+            audio_normalized_at: None,
         }
     }
 
