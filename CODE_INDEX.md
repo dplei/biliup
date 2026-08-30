@@ -22,6 +22,8 @@
 | --- | --- | --- |
 | `crates/biliup/src/lib.rs` | `biliup` 核心 crate 的公共门面，并提供带指数退避和抖动的通用异步重试。 | `retry`、`retry_with_config` |
 | `crates/biliup/src/downloader/httpflv.rs` | HTTP-FLV 拉流与逐 tag 解析：按关键帧刷盘并在关键帧边界切分段，维护 onMetaData/序列头缓存，用可配置的单次 chunk 读超时（停顿看门狗，默认 30s）兜住码流停顿，断连时产出连接寿命、静默时长、分段进度与媒体时间戳的诊断。 | `parse_flv`、`Connection`、`Connection::with_stall_timeout`、`DEFAULT_STALL_TIMEOUT`、`read_frame`、`ConnectionDiagnostics`、`FlvProgress`、`download_with_context` |
+| `crates/biliup/src/downloader/flv_writer.rs` | 录制落盘的 FLV 写入器：写 FLV 头、按 tag 原样写回时间戳（**不做任何偏移重基**，CDN 给什么就写什么），分段时刷盘换文件并交给 `LifecycleFile` 收尾。 | `FlvFile`、`FlvFile::write_tag`、`FlvFile::write_tag_header`、`FlvFile::create_new`、`FLV_HEADER` |
+| `crates/biliup/src/downloader/util.rs` | 分段判据 `Segmentable`（时间/大小任一超限即切）与录制文件生命周期 `LifecycleFile`；时间判据用媒体时间戳做 `current - start` 的**饱和减法**，时间戳倒退时 elapsed 归零。 | `Segmentable`、`Segmentable::needed`、`elapsed_time`、`set_time_position`、`set_start_time`、`LifecycleFile`、`SegmentCloseReason` |
 | `crates/biliup/src/downloader/live/douyin.rs` | 抖音选流：解析房间信息后枚举各档位候选（含每档 `bitrate` 元数据），按请求档位就近选档并下发 flv/hls 地址与鉴权头；档位仅按名称在 `QUALITY_CODES` 内上下查找，**不参考码率**。 | `Douyin`、`DouyinLive::check_stream`、`select_quality_code`、`QUALITY_CODES`、`build_stream_candidates` |
 | `crates/danmaku/src/lib.rs` | 弹幕录制 crate 的公共门面，组织客户端、协议、消息和 XML 输出模块并重导出稳定 API。 | `DanmakuRecorder`、`RecorderConfig`、`create_platform`、`XmlWriter` |
 
@@ -45,6 +47,7 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/core/monitor.rs` | 轮询各房间开播状态，命中开播时按平台场次键复用或新建本场 `streamer_info`，并在下载许可下拉起录制流程；单次检查抽成共用实现，供轮询与「主动检查」按钮各调一次。 | `start_monitor`、`check_room_once`、`check_now`、`CheckOutcome` |
 | `crates/biliup-cli/src/server/common/download.rs` | 录制主流程与分段事件处理：拉流、断线重试、切片校验，把有效分段登记后交给上传管道，并在尾段 durable enrollment 后持久关闭会话投稿意图。 | `start_download_workflow`、`DownloadTask`、`SegmentEventProcessor`、`persist_closed_session_intents` |
+| `crates/biliup-cli/src/server/core/downloader.rs` | 下载器类型分发与下载配置定义：`DownloaderType` 到具体实现的映射，**只有显式选 `Ffmpeg` 才走 `FfmpegDownloader`，其余一律回落到自研 FLV 解析的 `StreamGears`**——判断某个能力是否依赖 ffmpeg 录制路径时先看这里。 | `DownloaderType`、`DownloaderRuntime`、`DownloadConfig`、`parse_duration` |
 | `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` | 服务端拉流的具体执行器：按下载配置建 HTTP 客户端与 `Connection`，按后缀分流 FLV/HLS，读帧头失败即分类为可重试的传输错误，并给每次尝试打上 `attempt_id`/`stream_host` 便于串联断连诊断。 | `StreamGears`、`start_download`、`classify_download_error`、`classify_reqwest_error` |
 | `crates/biliup-cli/src/server/common/util.rs` | 录像分段落盘后的有效性判据：容器探测、`HeaderOnly`（FLV ≤13 字节）与小于阈值的可恢复短分段分类，决定丢弃、入队合并还是登记上传。 | `FileValidator`、`MediaValidation`、`InvalidMediaReason`、`probe_flv` |
 | `crates/biliup-cli/src/server/core/download_manager.rs` | 单平台下载编排的持有者：建 `Monitor` 与上传 Actor 池，并把房间增删、暂停入队/出队、主动检查转发给监控 Actor。 | `DownloadManager`、`add_room`、`make_waker`、`check_room_now` |
