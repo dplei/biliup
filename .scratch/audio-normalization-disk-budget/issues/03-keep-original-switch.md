@@ -37,8 +37,8 @@ audio_normalization_keep_original: false
 - `public/config.yaml`：加字段与注释，注释里点明「关闭后原片会被标准化结果覆盖，
   postprocessor 收到的是标准化文件」。
 - `CHANGELOG.md`：作为**行为变更**记录，不是普通 feature 条目。
-  （一度按「避免 upstream 冲突」跳过，主人明确表示以 `dev` 开发为先、不必迁就主仓库同步，
-  已按原计划补上。）
+  （一度按「避免 upstream 冲突」跳过，后来判定这个 fork 的重心就在自己的 `dev` 分支上，
+  不必为假想的未来冲突牺牲说明，已按原计划补上。）
 - 前端全局设置的响度区块加一行开关与说明文案。
 
 ## 验收标准

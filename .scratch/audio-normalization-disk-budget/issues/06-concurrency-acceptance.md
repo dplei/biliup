@@ -47,7 +47,7 @@ python3 scripts/normalization-disk-sample.py <录像目录> --csv keep-original.
 
 ## 本机落地结果（2026-08-30）
 
-验收标准 1 的核心断言已在 `dev` 上用真实 ffmpeg 验过，固化为 `#[ignore]` 测试：
+验收标准 1 的核心断言已在本机用真实 ffmpeg 验过，固化为 `#[ignore]` 测试：
 
 ```bash
 cargo test -p biliup-cli concurrent_normalization -- --ignored --nocapture
