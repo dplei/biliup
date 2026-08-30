@@ -177,6 +177,9 @@ pub struct UploadMissingSegment {
     pub last_chunk_index: Option<i64>,
     pub last_chunk_started_at: Option<DateTime<Utc>>,
     pub last_chunk_error: Option<String>,
+    /// 原片已被响度标准化产物就地替换的时刻；补传据此跳过重复编码。
+    /// 与上面的 `normalized_file_path`（路径规范化）无关。
+    pub audio_normalized_at: Option<DateTime<Utc>>,
 }
 
 /// 一次 attempt 一行的追加式历史，供补传页展示「先后用过哪些线路、各自为何结束」。

@@ -1,3 +1,4 @@
+use crate::server::common::audio_normalization::NormalizationSettings;
 use crate::server::core::downloader::DownloaderType;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::hook_step::HookStep;
@@ -94,6 +95,24 @@ pub struct Config {
     #[builder(default)]
     #[serde(default)]
     pub audio_normalization_offset_db: i8,
+
+    /// 响度标准化的磁盘保留线（GiB）。
+    ///
+    /// 准入时要求「原片大小 × 安全系数 + 本值」的可用空间，否则跳过标准化直传原片；
+    /// 转码途中可用空间跌破本值则取消 ffmpeg、删掉半成品并降级。安全系数由编码参数
+    /// 决定，是代码常量，不在这里暴露。
+    #[builder(default = default_audio_normalization_disk_reserve_gib())]
+    #[serde(default = "default_audio_normalization_disk_reserve_gib")]
+    pub audio_normalization_disk_reserve_gib: u64,
+
+    /// 标准化成功后是否保留原始录像。
+    ///
+    /// 默认 `false`：产物校验通过后原子替换原片，额外磁盘占用只存在于转码窗口内。
+    /// 代价是 postprocessor 与补传此后拿到的都是标准化后的文件，原始音轨不再保留。
+    /// `true` 退回旧行为——原片不动、产物是独立临时件，磁盘峰值也退回每段两份。
+    #[builder(default)]
+    #[serde(default)]
+    pub audio_normalization_keep_original: bool,
 
     /// 全局通知 webhook（可选）。字段名保留 `cookie_health` 只是历史原因——它早已是所有
     /// 运维通知的统一出口：cookie 失效与恢复、抖音录制画质降级、上传线路熔断、投稿结果、
@@ -574,6 +593,10 @@ fn default_recoverable_short_segment_mode() -> String {
     "merge_or_defer".to_string()
 }
 
+fn default_audio_normalization_disk_reserve_gib() -> u64 {
+    5
+}
+
 fn default_recoverable_short_batch_max_files() -> usize {
     60
 }
@@ -647,12 +670,28 @@ impl Config {
                 self.audio_normalization_offset_db
             )));
         }
+        if !(1..=1024).contains(&self.audio_normalization_disk_reserve_gib) {
+            bail!(AppError::Custom(format!(
+                "audio_normalization_disk_reserve_gib must be between 1 and 1024, got {}",
+                self.audio_normalization_disk_reserve_gib
+            )));
+        }
         Ok(())
     }
 
     /// 实际响度目标。配置保存时会拒绝越界值；这里仍 clamp，保护旧数据库或手工构造值。
     pub fn effective_audio_target_lufs(&self) -> f64 {
         -16.0 + f64::from(self.audio_normalization_offset_db.clamp(-6, 4))
+    }
+
+    /// 本次上传的响度标准化配置。调用方拿到后按需 `with_enabled` 覆写开关。
+    pub fn normalization_settings(&self) -> NormalizationSettings {
+        NormalizationSettings::new(
+            self.audio_normalization_enabled,
+            self.effective_audio_target_lufs(),
+            self.audio_normalization_keep_original,
+            self.audio_normalization_disk_reserve_gib.clamp(1, 1024),
+        )
     }
 
     pub fn normalize_segment_limits(&mut self) {
@@ -725,6 +764,43 @@ mod audio_normalization_config_tests {
         assert!(!config.audio_normalization_enabled);
         assert_eq!(config.audio_normalization_offset_db, 0);
         assert_eq!(config.effective_audio_target_lufs(), -16.0);
+        // 默认就地替换：标准化本身默认关闭，所以这只影响主动开启的人，而默认保留原片
+        // 就等于不省磁盘。
+        assert!(!config.audio_normalization_keep_original);
+    }
+
+    #[test]
+    fn disk_reserve_defaults_to_five_gib_and_rejects_out_of_range() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.audio_normalization_disk_reserve_gib, 5);
+        assert!(config.validate_segment_limits().is_ok());
+
+        for value in [0u64, 2048] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "audio_normalization_disk_reserve_gib: {value}"
+            ))
+            .unwrap();
+            assert!(config.validate_segment_limits().is_err());
+        }
+
+        let mut config = Config::default();
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"audio_normalization_disk_reserve_gib":20}"#).unwrap();
+        config.apply(patch);
+        assert_eq!(config.audio_normalization_disk_reserve_gib, 20);
+    }
+
+    #[test]
+    fn keep_original_is_readable_from_both_config_sources() {
+        let from_yaml: Config =
+            serde_yaml::from_str("audio_normalization_keep_original: true").unwrap();
+        assert!(from_yaml.audio_normalization_keep_original);
+
+        let mut config = Config::default();
+        let patch: ConfigPatch =
+            serde_json::from_str(r#"{"audio_normalization_keep_original":true}"#).unwrap();
+        config.apply(patch);
+        assert!(config.audio_normalization_keep_original);
     }
 
     #[test]

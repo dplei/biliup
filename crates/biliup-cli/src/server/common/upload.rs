@@ -1,8 +1,8 @@
 use crate::UploadLine;
 use crate::server::common::attempt_lease::{self, AttemptPhase, StaleReason, preprocess_deadline};
 use crate::server::common::audio_normalization::{
-    AudioSampleStore, NormalizationOutcome, SystemAudioFfmpeg, TempArtifact,
-    maybe_capture_reference_sample, normalize_for_upload,
+    AudioSampleStore, DiskBudget, NormalizationOutcome, NormalizationSettings, NormalizedForm,
+    SystemAudioFfmpeg, TempArtifact, maybe_capture_reference_sample, normalize_for_upload,
 };
 use crate::server::common::cookie_health::notify_alert;
 use crate::server::common::cover_generator::{
@@ -359,6 +359,7 @@ pub async fn process_with_upload(
                 &AudioSampleStore::for_working_directory(
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 ),
+                ctx.config().normalization_settings().budget,
             )
             .await;
             error!(
@@ -560,6 +561,7 @@ async fn defer_segments_after_upload_init_failure(
     reason: &str,
     segment_processors: &[HookStep],
     sample_store: &AudioSampleStore,
+    sample_budget: DiskBudget,
 ) -> DeferredSegmentSummary {
     // `process_with_upload` closes it before local session preparation. Close again so this helper
     // is safe in isolation and drains a finite snapshot even while producers still own senders.
@@ -592,7 +594,7 @@ async fn defer_segments_after_upload_init_failure(
 
         // 样片截取不依赖 B 站登录或上传线路。即使上传初始化失败，完整分段仍可满足
         // 用户已提交的“截取下一段”请求；失败开放，不影响待补传登记。
-        maybe_capture_reference_sample(&queued_path, sample_store).await;
+        maybe_capture_reference_sample(&queued_path, sample_store, sample_budget).await;
 
         let queued = if let Some(enrollment) = &event.enrollment {
             sqlx::query(
@@ -1498,7 +1500,12 @@ async fn pipeline_upload_videos(
         let sample_store = AudioSampleStore::for_working_directory(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         );
-        maybe_capture_reference_sample(&original_path, &sample_store).await;
+        maybe_capture_reference_sample(
+            &original_path,
+            &sample_store,
+            ctx.config().normalization_settings().budget,
+        )
+        .await;
 
         let AttemptClaim::Claimed(attempt_token) = claim_enrolled_attempt(
             ctx.pool(),
@@ -1517,12 +1524,13 @@ async fn pipeline_upload_videos(
 
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        // 首次上传不必查 `audio_normalized_at`：这一行是刚 enroll 出来的，标记必然为空。
+        // 只有失败后进补传的分段才可能已被就地替换过，那两条路径各自查。
         match upload_enrolled_with_watchdog(
             &original_path,
             upload_context,
             repair_enabled,
-            effective_config.audio_normalization_enabled,
-            effective_config.effective_audio_target_lufs(),
+            effective_config.normalization_settings(),
             ctx.pool(),
             enrollment.missing_id,
             &attempt_token,
@@ -1601,16 +1609,23 @@ async fn pipeline_upload_videos(
 
 /// 上传前时间戳检测/修复 + 上传。返回 (Video, RepairOutcome) 供调用方决定本地文件清理与告警。
 /// repair_enabled=false 时跳过 ffmpeg，等价 Clean。上传失败时会清理自身产生的临时修复件。
+#[allow(clippy::too_many_arguments)]
 async fn upload_single_file_with_repair(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
-    normalization_enabled: bool,
-    target_lufs: f64,
+    settings: NormalizationSettings,
     activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
-    let normalization = if normalization_enabled {
-        normalize_for_upload(original_path, target_lufs, &SystemAudioFfmpeg::default()).await
+    let normalization = if settings.enabled {
+        normalize_for_upload(
+            original_path,
+            settings.target_lufs,
+            &SystemAudioFfmpeg::default(),
+            settings.keep_original,
+            settings.budget,
+        )
+        .await
     } else {
         NormalizationOutcome::Original {
             reason: crate::server::common::audio_normalization::OriginalReason::NoAudio,
@@ -1625,10 +1640,26 @@ async fn upload_single_file_with_repair(
             ..
         }
     );
+    // 就地替换的形态没有临时件要善后，上传路径就是原片路径；只有 `keep_original` 会
+    // 产出需要清理的临时件。
     let normalization_artifact = match normalization {
-        NormalizationOutcome::Normalized { artifact, .. } => Some(artifact),
+        NormalizationOutcome::Normalized {
+            form: NormalizedForm::Artifact(artifact),
+            ..
+        } => Some(artifact),
+        NormalizationOutcome::Normalized {
+            form: NormalizedForm::ReplacedOriginal,
+            ..
+        } => {
+            // 立刻通知，不等上传结束：上传可能跑一小时，那么长的窗口里崩溃就会让补传
+            // 白白重编码一次。没有 activity 通道的是 legacy v1 路径，它没有可落标记的行。
+            if let Some(tx) = &activity_tx {
+                let _ = tx.send(UploadActivity::NormalizedInPlace);
+            }
+            None
+        }
         NormalizationOutcome::Original { reason } => {
-            if normalization_enabled {
+            if settings.enabled {
                 info!(audio_normalization = "fallback", file = %original_path.display(), ?reason);
             }
             None
@@ -1980,6 +2011,56 @@ enum UploadActivity {
         total_bytes: u64,
     },
     Progress(UploadProgress),
+    /// 原片刚被标准化产物就地替换。收到即落标记，让崩溃窗口只有一次 rename 加一条 UPDATE。
+    NormalizedInPlace,
+}
+
+/// 记下「原片已被标准化产物覆盖」，让这段的补传直接传它而不是再编码一遍。
+///
+/// 顺序上先 rename 后落标记：两步之间崩溃时，「补传多做一次有损编码」比「静默漏掉一段的
+/// 标准化」更可接受，也更容易从日志发现。落库失败不回滚替换、也不失败上传——标准化是可选
+/// 增强，代价只是那一次多余的重编码。
+///
+/// 只更新这一列：`updated_at` 参与到期扫描的排序，不该被一次预处理事件推着走。
+async fn mark_audio_normalized(pool: &ConnectionPool, missing_id: i64) {
+    let result = sqlx::query(
+        "UPDATE upload_missing_segment SET audio_normalized_at = ?1 \
+         WHERE id = ?2 AND lifecycle_version = 2",
+    )
+    .bind(chrono::Utc::now())
+    .bind(missing_id)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(_) => info!(
+            missing_id,
+            audio_normalization = "replaced_original",
+            "original recording replaced by its normalized output"
+        ),
+        Err(error) => warn!(
+            ?error,
+            missing_id, "记录响度标准化标记失败；该分段补传时会多做一次重编码"
+        ),
+    }
+}
+
+/// 补传前判断还要不要标准化。原片已被产物覆盖时直接传它，避免在已是 -16 LUFS 的音频上
+/// 叠加第二次有损编码——补传会重试多次，损失会累积。
+fn audio_normalization_needed(row: &UploadMissingSegment, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    if row.audio_normalized_at.is_some() {
+        info!(
+            audio_normalization = "skipped",
+            reason = "already_normalized",
+            missing_id = row.id,
+            file = %row.file_path,
+            "recovery upload reuses the normalized recording as-is"
+        );
+        return false;
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2056,8 +2137,7 @@ async fn upload_enrolled_with_watchdog(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
-    normalization_enabled: bool,
-    target_lufs: f64,
+    settings: NormalizationSettings,
     pool: &ConnectionPool,
     missing_id: i64,
     attempt_token: &str,
@@ -2077,8 +2157,7 @@ async fn upload_enrolled_with_watchdog(
         original_path,
         context,
         repair_enabled,
-        normalization_enabled,
-        target_lufs,
+        settings,
         Some(activity_tx),
     );
     pin!(upload);
@@ -2228,6 +2307,9 @@ async fn upload_enrolled_with_watchdog(
                 ))));
             }
             AttemptEvent::ActivityClosed => activity_open = false,
+            AttemptEvent::Activity(UploadActivity::NormalizedInPlace) => {
+                mark_audio_normalized(pool, missing_id).await;
+            }
             AttemptEvent::Activity(UploadActivity::QueueWaitStarted) => {
                 enter_phase(
                     pool,
@@ -2529,27 +2611,25 @@ async fn recover_due_missing_segments(
         let path = PathBuf::from(&file_path);
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        let normalization = effective_config
+            .normalization_settings()
+            .with_enabled(audio_normalization_needed(
+                &row,
+                effective_config.audio_normalization_enabled,
+            ));
         let result = if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
             upload_enrolled_with_watchdog(
                 &path,
                 &recovery_context,
                 repair_enabled,
-                effective_config.audio_normalization_enabled,
-                effective_config.effective_audio_target_lufs(),
+                normalization,
                 ctx.pool(),
                 enrollment.missing_id,
                 token,
             )
             .await
         } else {
-            upload_single_file_with_repair(
-                &path,
-                &recovery_context,
-                repair_enabled,
-                effective_config.audio_normalization_enabled,
-                effective_config.effective_audio_target_lufs(),
-                None,
-            )
+            upload_single_file_with_repair(&path, &recovery_context, repair_enabled, normalization, None)
             .await
             .map(|(video, outcome, artifact)| (video, outcome, artifact, None))
         };
@@ -3483,28 +3563,26 @@ pub async fn run_claimed_recovery(
         }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        let normalization = effective_config
+            .normalization_settings()
+            .with_enabled(audio_normalization_needed(
+                &row,
+                effective_config.audio_normalization_enabled,
+            ));
         let (video, outcome, _normalization_artifact, _attempt_guard) =
             if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
                 upload_enrolled_with_watchdog(
                     &path,
                     &upload_context,
                     repair_enabled,
-                    effective_config.audio_normalization_enabled,
-                    effective_config.effective_audio_target_lufs(),
+                    normalization,
                     pool,
                     enrollment.missing_id,
                     token,
                 )
                 .await?
             } else {
-                upload_single_file_with_repair(
-                    &path,
-                    &upload_context,
-                    repair_enabled,
-                    effective_config.audio_normalization_enabled,
-                    effective_config.effective_audio_target_lufs(),
-                    None,
-                )
+                upload_single_file_with_repair(&path, &upload_context, repair_enabled, normalization, None)
                 .await
                 .map(|(video, outcome, artifact)| (video, outcome, artifact, None))?
             };
@@ -3804,7 +3882,7 @@ mod tests {
         normalize_segment_path,
     };
     use crate::server::infrastructure::connection_pool::ConnectionManager;
-    use chrono::TimeZone;
+    use chrono::{DateTime, TimeZone, Utc};
 
     fn test_config() -> Config {
         serde_yaml::from_str("{}").expect("default test config")
@@ -3879,6 +3957,141 @@ mod tests {
         .await
         .unwrap();
         (dir, pool)
+    }
+
+    fn normalized_row(audio_normalized_at: Option<DateTime<Utc>>) -> UploadMissingSegment {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        UploadMissingSegment {
+            id: 40,
+            live_streamer_id: 10,
+            streamer_info_id: 20,
+            upload_session_id: Some(30),
+            aid: None,
+            file_path: "/recordings/segment.flv".into(),
+            danmaku_file_path: None,
+            segment_order: 0,
+            status: "pending".into(),
+            attempts: 0,
+            line_index: 0,
+            next_retry_at: now,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            normalized_file_path: Some("/recordings/segment.flv".into()),
+            lifecycle_version: 2,
+            video_json: None,
+            total_bytes: None,
+            uploaded_bytes: 0,
+            current_line: None,
+            upload_started_at: None,
+            last_progress_at: None,
+            attempt_token: None,
+            attempt_phase: None,
+            phase_started_at: None,
+            last_heartbeat_at: None,
+            line_source: None,
+            last_chunk_index: None,
+            last_chunk_started_at: None,
+            last_chunk_error: None,
+            audio_normalized_at,
+        }
+    }
+
+    /// 原片已被产物覆盖的分段，补传直接传它——否则每次重试都在已是 -16 LUFS 的音频上
+    /// 再叠一次有损编码。
+    #[test]
+    fn recovery_skips_normalization_for_an_already_replaced_recording() {
+        let marked = normalized_row(Some(chrono::Utc::now()));
+        assert!(!audio_normalization_needed(&marked, true));
+
+        let unmarked = normalized_row(None);
+        assert!(audio_normalization_needed(&unmarked, true));
+
+        // 开关关着时无论标记如何都不标准化。
+        assert!(!audio_normalization_needed(&marked, false));
+        assert!(!audio_normalization_needed(&unmarked, false));
+    }
+
+    #[tokio::test]
+    async fn replacing_the_original_marks_only_the_v2_row() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let now = chrono::Utc::now();
+        for (id, version) in [(40, 2), (41, 1)] {
+            sqlx::query(
+                "INSERT INTO upload_missing_segment \
+                 (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+                  segment_order, status, next_retry_at, created_at, updated_at, lifecycle_version) \
+                 VALUES (?1, 10, 20, 30, ?2, 0, 'pending', ?3, ?3, ?3, ?4)",
+            )
+            .bind(id)
+            .bind(format!("/segment-{id}.flv"))
+            .bind(now)
+            .bind(version)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        mark_audio_normalized(&pool, 40).await;
+        mark_audio_normalized(&pool, 41).await;
+
+        let marks: Vec<(i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT id, audio_normalized_at FROM upload_missing_segment ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(marks[0].1.is_some(), "v2 row should carry the marker");
+        assert!(
+            marks[1].1.is_none(),
+            "v1 rows stay untouched; they never go through in-place replacement"
+        );
+    }
+
+    /// 标记落库是尽力而为：目标行不存在也不能 panic 或让上传失败。
+    #[tokio::test]
+    async fn marking_a_missing_row_is_a_no_op() {
+        let (_directory, pool) = deferred_test_pool().await;
+        mark_audio_normalized(&pool, 9999).await;
+    }
+
+    #[tokio::test]
+    async fn audio_normalized_marker_migration_leaves_existing_rows_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marker.db");
+        let pool = ConnectionManager::new_pool(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (20, 'test', 'https://example.com/live', 'test stream', ?1, '')",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, file_path, segment_order, status, \
+              next_retry_at, created_at, updated_at, lifecycle_version) \
+             VALUES (40, 10, 20, '/legacy.flv', 0, 'pending', ?1, ?1, ?1, 2)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let existing: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT audio_normalized_at FROM upload_missing_segment WHERE id = 40",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            existing, None,
+            "migration must not invent a normalization time for rows recorded before it"
+        );
     }
 
     #[tokio::test]
@@ -4889,6 +5102,7 @@ mod tests {
             "login unavailable",
             &[],
             &AudioSampleStore::for_working_directory(_dir.path()),
+            test_config().normalization_settings().budget,
         )
         .await;
 
@@ -5315,8 +5529,12 @@ impl UActor {
                                 );
                             }
                             // 仅录制模式同样会产出完整分段，样片截取不应依赖投稿模板。
-                            maybe_capture_reference_sample(&event.prev_file_path, &sample_store)
-                                .await;
+                            maybe_capture_reference_sample(
+                                &event.prev_file_path,
+                                &sample_store,
+                                ctx.config().normalization_settings().budget,
+                            )
+                            .await;
                         }
                         warn!(
                             url = ctx.live_streamer().url,

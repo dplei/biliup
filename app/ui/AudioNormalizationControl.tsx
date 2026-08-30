@@ -105,6 +105,28 @@ export default function AudioNormalizationControl() {
       />
 
       {enabled && (
+        <Form.InputNumber
+          field="audio_normalization_disk_reserve_gib"
+          label="磁盘保留线"
+          suffix="GiB"
+          min={1}
+          max={1024}
+          extraText="可用空间放不下一份处理结果时跳过本段的音量处理、直接上传原片；处理途中磁盘跌破这条线也会立即中止并回退。录制与上传不受影响。"
+          style={{ width: '100%' }}
+          fieldStyle={{ alignSelf: 'stretch', padding: 0, marginTop: 12 }}
+        />
+      )}
+
+      {enabled && (
+        <Form.Switch
+          field="audio_normalization_keep_original"
+          label="保留原始录像"
+          extraText="默认关闭：标准化结果直接替换原片，磁盘上每段只留一份。开启后额外保留一份未处理的原片，磁盘占用翻倍；后处理脚本收到的也会变回原片。"
+          fieldStyle={{ alignSelf: 'stretch', padding: 0, marginTop: 12 }}
+        />
+      )}
+
+      {enabled && (
         <div style={{ display: 'flex', gap: 28, alignItems: 'center', flexWrap: 'wrap', marginTop: 16 }}>
           <div style={{ minWidth: 130, textAlign: 'center' }}>
             <div style={{ fontSize: 13, marginBottom: 8 }}>更响</div>
