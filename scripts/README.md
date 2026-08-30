@@ -5,6 +5,7 @@
 | [`dev.sh`](dev.sh) | 起本机开发环境：按需构建前端与后端，绑 `127.0.0.1:19159` | 本地跑服务、手工验收 |
 | [`check_code_index.py`](check_code_index.py) | 校验 `CODE_INDEX.md` 的路径、重复条目和悬空关系 | 改完 `CODE_INDEX.md` 之后 |
 | [`consistency-audit.sh`](consistency-audit.sh) | 只读巡检：找出投稿与本地账本之间的错位 | 怀疑稿件重复/缺分P、或想确认某类问题是孤例还是系统性 |
+| [`normalization-disk-sample.py`](normalization-disk-sample.py) | 采样响度标准化中间件的数量与字节峰值，并判定是否超过上限 | 验收「就地替换」是否真的把磁盘峰值压到一份，或排查 `.part` 残留 |
 
 ---
 
@@ -68,3 +69,18 @@ DB=<数据库路径> bash scripts/consistency-audit.sh > audit-$(date +%F).txt  
 `last_error` 目前同时承载「当前失败原因」「历史失败残留」「成功路径的状态说明」三种语义，
 重试成功后不清空，**不能**用「`last_error` 非空」判健康——见
 [dplei/biliup#7](https://github.com/dplei/biliup/issues/7)，第 5 节量化了它的影响面。
+
+## `normalization-disk-sample.py`
+
+```bash
+python3 scripts/normalization-disk-sample.py <录像目录> --csv in-place.csv
+```
+
+盯住录像目录，按间隔记录标准化中间件（`*.audio-normalized-*.part.*`）的数量与字节总和，
+Ctrl-C 结束后给出峰值摘要和一句判定。只读，不碰录像也不连数据库，正在直播时可以跑。
+
+默认断言「任何时刻最多一份中间件」——这正是就地替换要成立的条件，不满足就以退出码 1 结束。
+跑对照组（`audio_normalization_keep_original: true`）时加 `--max-parts 99` 让它只采样不判定，
+两份 CSV 对比就能看出峰值差距。
+
+用途与验收标准见 [`.scratch/audio-normalization-disk-budget/issues/06-concurrency-acceptance.md`](../.scratch/audio-normalization-disk-budget/issues/06-concurrency-acceptance.md)。

@@ -36,9 +36,9 @@ audio_normalization_keep_original: false
 
 - `public/config.yaml`：加字段与注释，注释里点明「关闭后原片会被标准化结果覆盖，
   postprocessor 收到的是标准化文件」。
-- ~~`CHANGELOG.md`~~：**不改**。该文件是上游文件，最后一次改动来自上游 commit，本
-  fork 从未在其中记录过自己的变更；往里加条目只会在同步 upstream 时制造冲突。行为变更
-  改由 `public/config.yaml` 注释与前端开关的说明文案承担——那也是用户实际会看到的两处。
+- `CHANGELOG.md`：作为**行为变更**记录，不是普通 feature 条目。
+  （一度按「避免 upstream 冲突」跳过，主人明确表示以 `dev` 开发为先、不必迁就主仓库同步，
+  已按原计划补上。）
 - 前端全局设置的响度区块加一行开关与说明文案。
 
 ## 验收标准
@@ -47,8 +47,8 @@ audio_normalization_keep_original: false
 2. 单测：`keep_original = true` 时走旧路径——产出临时件、上传临时件、上传后临时件被删、
    原片未被修改。
 3. 单测：`keep_original = false` 时走 [`01`](./01-replace-original-in-place.md) 的替换路径。
-4. `public/config.yaml` 注释与前端说明文案已写明「原片会被覆盖、postprocessor 收到的是
-   标准化文件」。
+4. `public/config.yaml` 注释、前端说明文案与 `CHANGELOG.md` 都写明「原片会被覆盖、
+   postprocessor 收到的是标准化文件」。
 5. `cargo test -p biliup-cli` 全绿，前端 `npm run build` 通过。
 
 ## 风险
@@ -62,4 +62,5 @@ audio_normalization_keep_original: false
 配置项落地，默认 `false`。前端在响度区块内新增「保留原始录像」开关，文案写明原片会被
 覆盖、后处理脚本收到的是标准化文件。
 
-CHANGELOG.md 按上文所述未改，理由已写在「改动范围 / 文档」一节。
+`CHANGELOG.md` 在「未发布」段记了一条 ⚠️ 行为变更与两条 💡。**发版时把段标题改成实际
+版本号**（按 `CLAUDE.md` 的约定，发版前会先 bump `Cargo.toml` 的 PATCH）。

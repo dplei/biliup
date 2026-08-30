@@ -11,12 +11,18 @@ Blocked by: 01, 02, 03, 04, 05
 ## 做法
 
 本机起多条并发管道（用短分段配置压缩单轮时长，不必等真实的 30 分钟分段），
-在整个过程中按秒采样两个量：
+用 [`scripts/normalization-disk-sample.py`](../../../scripts/normalization-disk-sample.py)
+在整个过程中采样中间件的数量、字节总和与目录总占用：
 
-- 录像目录下 `.audio-normalized-*.part.*` 的**文件数与字节总和**；
-- 目录总占用。
+```bash
+# 实验组：默认配置，脚本默认断言「任何时刻最多一份中间件」
+python3 scripts/normalization-disk-sample.py <录像目录> --csv in-place.csv
 
-对照组是打开 `audio_normalization_keep_original: true` 的同一场景。
+# 对照组：audio_normalization_keep_original: true，只采样不判定
+python3 scripts/normalization-disk-sample.py <录像目录> --csv keep-original.csv --max-parts 99
+```
+
+实验组退出码为 0 即验收标准 1 的前半；对照组用来确认测量方法本身有效——它应当能采到多份并存。
 
 ## 验收标准
 
