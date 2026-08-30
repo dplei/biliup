@@ -80,6 +80,7 @@ impl SubmissionScanSummary {
             }
             SessionSubmissionOutcome::NotRequested
             | SessionSubmissionOutcome::NotDue { .. }
+            | SessionSubmissionOutcome::DiscardedEmpty
             | SessionSubmissionOutcome::Finalized => self.skipped.push(session_id),
         }
     }
@@ -340,5 +341,59 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state.as_deref(), Some("blocked_missing_segments"));
+    }
+
+    #[tokio::test]
+    async fn startup_scan_terminalizes_historical_empty_shell_once() {
+        let (_directory, pool) = test_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
+        insert_session(
+            &pool,
+            11,
+            "uploading",
+            Some(now),
+            None,
+            Some("blocked_missing_segments"),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE upload_session SET blocked_count = 9, last_submit_error = 'historical empty' \
+             WHERE id = 11",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let summary = scan_due_submissions(
+            &Config::default(),
+            &pool,
+            now,
+            SubmissionTrigger::StartupScan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.candidates, 1);
+        assert_eq!(summary.skipped, vec![11]);
+        let state: (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, submit_state, blocked_count FROM upload_session WHERE id = 11",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            (
+                "finalized".to_string(),
+                Some("discarded_empty".to_string()),
+                9
+            )
+        );
+        assert!(
+            due_submission_session_ids(&pool, now + chrono::Duration::hours(1), true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

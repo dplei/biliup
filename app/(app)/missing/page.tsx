@@ -148,8 +148,9 @@ interface StreamerInfo {
 }
 
 interface RescanResult {
-  upload_session_id: number
+  upload_session_id: number | null
   scanned: number
+  valid_candidates: number
   queued: number
   skipped_known: number
   skipped_invalid: number
@@ -249,6 +250,7 @@ export default function MissingRecovery() {
   const [stoppingId, setStoppingId] = useState<number | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [recoveringSessionId, setRecoveringSessionId] = useState<number | null>(null)
+  const [discardingSessionId, setDiscardingSessionId] = useState<number | null>(null)
   // 每行各自的线路选择；空串（或缺省）表示「跟随配置」。
   const [lineChoice, setLineChoice] = useState<Record<number, string>>({})
   const [rescanStreamerInfoId, setRescanStreamerInfoId] = useState<number | null>(null)
@@ -286,13 +288,19 @@ export default function MissingRecovery() {
       const result = (await sendRequest('/v1/uploads/missing/rescan', {
         arg: { streamer_info_id: rescanStreamerInfoId },
       })) as RescanResult
-      Toast.success(
-        result.skipped_finalized
-          ? `会话 #${result.upload_session_id} 已投稿完成，补扫未创建新的补传任务`
-          : `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
+      if (result.skipped_finalized && result.upload_session_id != null) {
+        Toast.success(`会话 #${result.upload_session_id} 已终结，补扫未创建新的补传任务`)
+      } else if (result.upload_session_id == null) {
+        Toast.info(
+          `补扫完成：未发现可登记分段；${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
+        )
+      } else {
+        Toast.success(
+          `补扫完成：${result.queued} 段已加入会话 #${result.upload_session_id}，` +
             `${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
-      )
-      if (result.created_session) {
+        )
+      }
+      if (result.created_session && result.upload_session_id != null) {
         // 本场没有可挂接的会话时补扫才会新建。发生在录制中就意味着一场直播被拆成了两个稿件。
         Toast.warning(`会话 #${result.upload_session_id} 是本次补扫新建的，请确认它不该并入本场已有会话`)
       }
@@ -417,6 +425,19 @@ export default function MissingRecovery() {
       Toast.error(`恢复会话失败：${e?.message ?? e}`)
     } finally {
       setRecoveringSessionId(null)
+    }
+  }
+
+  const handleDiscardEmptySession = async (id: number) => {
+    setDiscardingSessionId(id)
+    try {
+      await requestDelete('/v1/uploads/sessions', { arg: id })
+      Toast.success(`空会话 #${id} 已终结；历史身份已保留，不会再自动投稿`)
+      await Promise.all([mutate(), mutatePendingSessions()])
+    } catch (e: any) {
+      Toast.error(`丢弃空会话失败：${e?.message ?? e}`)
+    } finally {
+      setDiscardingSessionId(null)
     }
   }
 
@@ -808,7 +829,13 @@ export default function MissingRecovery() {
             {(pendingSessions ?? []).map((session) => {
               const meta = SUBMIT_ACTION_META[session.action]
               const completeness = session.completeness
-              const canRecover = !['submitting', 'manual_inspection'].includes(session.action)
+              const canDiscardEmpty = completeness.total_expected === 0
+                && session.aid == null
+                && session.bvid == null
+                && !session.submit_claimed
+                && session.action !== 'manual_inspection'
+              const canRecover = completeness.total_expected > 0
+                && !['submitting', 'manual_inspection'].includes(session.action)
               return (
                 <div
                   key={session.id}
@@ -852,6 +879,24 @@ export default function MissingRecovery() {
                       >
                         恢复会话
                       </Button>
+                    )}
+                    {canDiscardEmpty && (
+                      <Popconfirm
+                        title="确认终结这个空会话？"
+                        content="只保留历史身份，不删除录像文件；终结后该会话不再自动投稿，也不会被补扫复活。"
+                        okText="终结空会话"
+                        cancelText="取消"
+                        onConfirm={() => handleDiscardEmptySession(session.id)}
+                      >
+                        <Button
+                          size="small"
+                          type="danger"
+                          icon={<IconDeleteStroked />}
+                          loading={discardingSessionId === session.id}
+                        >
+                          丢弃空会话
+                        </Button>
+                      </Popconfirm>
                     )}
                     {session.action === 'manual_inspection' && (
                       <Text type="danger" size="small">为避免重复稿件，此状态不提供普通重试按钮</Text>

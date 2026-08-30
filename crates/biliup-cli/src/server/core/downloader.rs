@@ -184,6 +184,8 @@ pub struct SegmentInfo {
 pub struct SegmentEnrollment {
     pub missing_id: i64,
     pub upload_session_id: i64,
+    /// The enrollment transaction created the destination upload session together with this row.
+    pub created_session: bool,
     pub segment_order: i64,
     pub normalized_file_path: PathBuf,
     pub total_bytes: u64,
