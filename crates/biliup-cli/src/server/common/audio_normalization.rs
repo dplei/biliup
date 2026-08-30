@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub const BASE_TARGET_LUFS: f64 = -16.0;
 const LRA: f64 = 11.0;
@@ -142,7 +142,17 @@ impl DiskBudget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioProbe {
+    /// **内容跨度**，即 `format.duration - format.start_time`，判据只看这一个。
+    ///
+    /// 直录 FLV 的 `format.duration` 不是时长：`flvdec` 拿不到可信的
+    /// `onMetaData.duration` 时会 seek 到文件尾读最后一个 tag 的时间戳当 duration，
+    /// 而分段录像的时间轴沿用整场 session，非首段的 `start_time` 远大于 0。
+    /// 产物那侧 ffmpeg 会把时间轴归零，两边不同口径相减，差的正好是 `start_time`。
     pub duration_seconds: Option<f64>,
+    /// 容器自报的 `format.duration` 原值，只供日志——判据一律用跨度。
+    pub container_duration: Option<f64>,
+    /// `format.start_time` 原值，只供日志。
+    pub start_seconds: Option<f64>,
     pub primary_audio_stream: Option<usize>,
     /// 视频流的 codec 名，按流顺序排列。转码用 `-c copy` 搬运视频，所以产物这一项
     /// 必须与原片逐项相等；不等即说明 ffmpeg 走了意料之外的路径。
@@ -153,6 +163,17 @@ impl AudioProbe {
     pub fn has_video(&self) -> bool {
         !self.video_codecs.is_empty()
     }
+}
+
+/// 由容器自报的两个原值算出内容跨度。原片与产物共用这一个函数，口径才谈得上一致。
+///
+/// `start_time` 缺失、非有限或为负都按 0（负值来自音频提前量，认下来只会让跨度虚增）。
+/// 跨度算不出正数时返回 `None`：那是「探不到时长」，由调用方跳过时长判据，不当失败。
+fn content_span(duration: Option<f64>, start: Option<f64>) -> Option<f64> {
+    let duration = duration.filter(|v| v.is_finite())?;
+    let start = start.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+    let span = duration - start;
+    (span > 0.0).then_some(span)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +296,69 @@ pub enum OriginalReason {
     DiskAdmissionDenied,
     /// 转码途中可用空间跌破保留线，ffmpeg 已被取消、半成品已删。
     DiskPressureAborted,
+    /// 一致性判据连续以同一理由挡下产物，熔断已跳闸，本进程不再发起标准化。
+    NormalizationDisabled,
+}
+
+/// 连续以**同一理由**被判据挡下多少次就跳闸。
+///
+/// 先写死不进配置：还没有证据说明它需要按环境调，等真有案例再提配置项。
+const REJECTION_TRIP_THRESHOLD: u32 = 3;
+
+static REJECTION_STREAK: Mutex<RejectionStreak> = Mutex::new(RejectionStreak::new());
+
+/// 一致性判据的连续失败熔断。
+///
+/// 判据失败本身是安全的（丢产物、传原片、不动数据），但不是免费的：每段两遍 loudnorm
+/// 满核数分钟，还与录制抢 CPU。一个确定性的判据 bug 会让这笔开销无限重复，而外部看不出
+/// 任何异常——上传照常成功。
+///
+/// 只对「连续同一 `reason`」跳闸：偶发坏分段（真断流、真截断）会打出不同 reason，那是
+/// 判据在正常工作，不该因此关掉功能；只有同一条判据连续挡住每一段，才是系统性问题的信号。
+///
+/// 跳闸后**不因后续成功而复位**——跳闸即停止发起标准化，本来也不会再有成功。复位手段是
+/// 重启进程，配置不受影响。
+#[derive(Debug, Default, PartialEq)]
+struct RejectionStreak {
+    reason: Option<&'static str>,
+    count: u32,
+    tripped: bool,
+}
+
+impl RejectionStreak {
+    const fn new() -> Self {
+        Self {
+            reason: None,
+            count: 0,
+            tripped: false,
+        }
+    }
+
+    /// 记一次判据失败，返回这一次是否让熔断跳闸（只在跳闸那一刻返回 `true`）。
+    fn record_rejection(&mut self, reason: &'static str) -> bool {
+        if self.reason == Some(reason) {
+            self.count += 1;
+        } else {
+            self.reason = Some(reason);
+            self.count = 1;
+        }
+        if self.count >= REJECTION_TRIP_THRESHOLD && !self.tripped {
+            self.tripped = true;
+            return true;
+        }
+        false
+    }
+
+    fn record_success(&mut self) {
+        self.reason = None;
+        self.count = 0;
+    }
+}
+
+fn rejection_streak() -> std::sync::MutexGuard<'static, RejectionStreak> {
+    REJECTION_STREAK
+        .lock()
+        .expect("rejection streak mutex poisoned")
 }
 
 /// 标准化成功后产物的去向。调用方只匹配这个枚举，不要靠配置项反推当前是哪种形态。
@@ -418,6 +502,15 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     if let Some(directory) = source.parent() {
         cleanup_orphaned_normalization_artifacts(directory).await;
     }
+    // 熔断已跳闸就不要再烧 CPU 了。放在探测之前：跳闸的前提就是「每一段都会被挡下」，
+    // 多探一次没有信息量。
+    if rejection_streak().tripped {
+        info!(audio_normalization = "skipped", file = %source.display(),
+            "audio normalization skipped: consistency checks tripped the breaker earlier in this process");
+        return NormalizationOutcome::Original {
+            reason: OriginalReason::NormalizationDisabled,
+        };
+    }
     let Ok(input_bytes) = tokio::fs::metadata(source).await.map(|m| m.len()) else {
         return NormalizationOutcome::Original {
             reason: OriginalReason::MissingOrEmpty,
@@ -529,14 +622,26 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     } else {
         None
     };
-    if let Err(reason) = output_is_faithful(&input, output_probe.as_ref(), input_bytes, output_bytes)
+    if let Err(rejection) =
+        output_is_faithful(&input, output_probe.as_ref(), input_bytes, output_bytes)
     {
         artifact.cleanup().await;
-        warn!(audio_normalization = "failed", file=%source.display(), reason, "audio normalization produced invalid output");
+        rejection.warn(source);
+        if rejection_streak().record_rejection(rejection.reason()) {
+            error!(
+                audio_normalization = "disabled",
+                reason = rejection.reason(),
+                consecutive = REJECTION_TRIP_THRESHOLD,
+                "the same consistency check rejected every normalization attempt in a row; \
+                 disabling normalization for this process so it stops burning CPU. \
+                 Uploads continue with the original files; restart to re-enable."
+            );
+        }
         return NormalizationOutcome::Original {
             reason: OriginalReason::InvalidOutput,
         };
     }
+    rejection_streak().record_success();
     let form = if keep_original {
         NormalizedForm::Artifact(artifact)
     } else {
@@ -570,34 +675,132 @@ fn output_is_faithful(
     output: Option<&AudioProbe>,
     input_bytes: u64,
     output_bytes: u64,
-) -> Result<(), &'static str> {
+) -> Result<(), OutputRejection> {
     let Some(output) = output else {
-        return Err("output_unreadable");
+        return Err(OutputRejection::Unreadable { output_bytes });
     };
     if output.primary_audio_stream.is_none() {
-        return Err("output_has_no_audio");
+        return Err(OutputRejection::NoAudio { output_bytes });
     }
     if output.duration_seconds.unwrap_or(0.0) <= 0.0 {
-        return Err("output_has_no_duration");
+        return Err(OutputRejection::NoDuration { output_bytes });
     }
     if input.video_codecs != output.video_codecs {
-        return Err("video_streams_differ");
+        return Err(OutputRejection::VideoStreamsDiffer {
+            source: input.video_codecs.join(","),
+            output: output.video_codecs.join(","),
+        });
     }
     // 视频 `-c copy`、音频重编到 192k，产物应当接近原片。掉到一半以下说明视频流没被搬
     // 过来，这是「明显异常」阈值，不是精确预算。
     if output_bytes.saturating_mul(2) < input_bytes {
-        return Err("output_too_small");
+        return Err(OutputRejection::TooSmall {
+            input_bytes,
+            output_bytes,
+        });
     }
-    // loudnorm 不改时长，正常偏差只来自容器时间基取整。原片时长探不到时跳过这一项，
-    // 不拿缺失当失败。
-    if let Some(source_duration) = input.duration_seconds.filter(|v| *v > 0.0) {
-        let tolerance = (source_duration * 0.005).max(1.0);
-        let drift = (output.duration_seconds.unwrap_or(0.0) - source_duration).abs();
-        if drift > tolerance {
-            return Err("duration_drift");
+    // loudnorm 不改时长，正常偏差只来自容器时间基取整。两侧都是 `content_span` 算出的
+    // 内容跨度，口径一致。原片跨度探不到时跳过这一项，不拿缺失当失败。
+    if let Some(source_span) = input.duration_seconds {
+        let tolerance = (source_span * 0.005).max(1.0);
+        let output_span = output.duration_seconds.unwrap_or(0.0);
+        if (output_span - source_span).abs() > tolerance {
+            return Err(OutputRejection::DurationDrift {
+                source_span,
+                output_span,
+                tolerance,
+                // 两个原值只为让这条 WARN 自足：`source_start_time` 一眼就能区分
+                // 「真的截断了」与「口径又错了」，不必回现场 ffprobe——那时分段
+                // 很可能已经上传完被清掉了。
+                source_start_time: input.start_seconds.unwrap_or(0.0),
+                source_container_duration: input.container_duration.unwrap_or(0.0),
+            });
         }
     }
     Ok(())
+}
+
+/// 判据失败的理由，连同它自己用到的实测值一起带出来。
+///
+/// `reason()` 的取值集合与结构化日志字段名保持稳定：既有的日志检索按 `reason=` 过滤，
+/// 熔断（`RejectionStreak`）也按它判断「是不是同一条判据在连续挡」。
+#[derive(Debug, Clone, PartialEq)]
+enum OutputRejection {
+    Unreadable {
+        output_bytes: u64,
+    },
+    NoAudio {
+        output_bytes: u64,
+    },
+    NoDuration {
+        output_bytes: u64,
+    },
+    VideoStreamsDiffer {
+        source: String,
+        output: String,
+    },
+    TooSmall {
+        input_bytes: u64,
+        output_bytes: u64,
+    },
+    DurationDrift {
+        source_span: f64,
+        output_span: f64,
+        tolerance: f64,
+        source_start_time: f64,
+        source_container_duration: f64,
+    },
+}
+
+impl OutputRejection {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Unreadable { .. } => "output_unreadable",
+            Self::NoAudio { .. } => "output_has_no_audio",
+            Self::NoDuration { .. } => "output_has_no_duration",
+            Self::VideoStreamsDiffer { .. } => "video_streams_differ",
+            Self::TooSmall { .. } => "output_too_small",
+            Self::DurationDrift { .. } => "duration_drift",
+        }
+    }
+
+    fn warn(&self, source: &Path) {
+        let reason = self.reason();
+        let file = source.display();
+        match self {
+            Self::Unreadable { output_bytes }
+            | Self::NoAudio { output_bytes }
+            | Self::NoDuration { output_bytes } => {
+                warn!(audio_normalization = "failed", %file, reason, output_bytes,
+                    "audio normalization produced invalid output");
+            }
+            Self::VideoStreamsDiffer { source, output } => {
+                warn!(audio_normalization = "failed", %file, reason,
+                    source_video_codecs = %source, output_video_codecs = %output,
+                    "audio normalization produced invalid output");
+            }
+            Self::TooSmall {
+                input_bytes,
+                output_bytes,
+            } => {
+                warn!(audio_normalization = "failed", %file, reason, input_bytes, output_bytes,
+                    "audio normalization produced invalid output");
+            }
+            Self::DurationDrift {
+                source_span,
+                output_span,
+                tolerance,
+                source_start_time,
+                source_container_duration,
+            } => {
+                warn!(audio_normalization = "failed", %file, reason,
+                    source_span, output_span, tolerance,
+                    drift = (output_span - source_span).abs(),
+                    source_start_time, source_container_duration,
+                    "audio normalization produced invalid output");
+            }
+        }
+    }
 }
 
 /// 仅扫描当前录像目录的一层。当前进程未登记的 `.part` 都来自上次失败或重启，立即清理；
@@ -657,6 +860,37 @@ struct ProbeStream {
 #[derive(Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
+    /// `-show_format` 本来就返回它，不需要额外探测。取不到时是 `"N/A"`，`parse` 自然失败。
+    start_time: Option<String>,
+}
+
+/// 把 `ffprobe -show_streams -show_format -of json` 的输出解析成 `AudioProbe`。
+///
+/// 单独成函数是为了能直接喂 JSON 做单测——本模块最贵的一次事故就出在这一层的口径上，
+/// 而通过 `SystemAudioFfmpeg::probe` 测它需要真的有 ffprobe 和素材。
+fn parse_probe_output(stdout: &[u8]) -> AppResult<AudioProbe> {
+    let parsed: ProbeOutput = serde_json::from_slice(stdout)
+        .change_context(AppError::Custom("invalid ffprobe JSON".into()))?;
+    let format = parsed.format;
+    let number = |raw: Option<&str>| raw.and_then(|v| v.parse::<f64>().ok());
+    let container_duration = number(format.as_ref().and_then(|v| v.duration.as_deref()));
+    let start_seconds = number(format.as_ref().and_then(|v| v.start_time.as_deref()));
+    Ok(AudioProbe {
+        duration_seconds: content_span(container_duration, start_seconds),
+        container_duration,
+        start_seconds,
+        primary_audio_stream: parsed
+            .streams
+            .iter()
+            .find(|v| v.codec_type.as_deref() == Some("audio"))
+            .map(|v| v.index),
+        video_codecs: parsed
+            .streams
+            .iter()
+            .filter(|v| v.codec_type.as_deref() == Some("video"))
+            .map(|v| v.codec_name.clone().unwrap_or_default())
+            .collect(),
+    })
 }
 
 fn stderr_text(bytes: &[u8]) -> String {
@@ -688,25 +922,7 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
                 stderr_text(&output.stderr)
             )));
         }
-        let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)
-            .change_context(AppError::Custom("invalid ffprobe JSON".into()))?;
-        Ok(AudioProbe {
-            duration_seconds: parsed
-                .format
-                .and_then(|v| v.duration)
-                .and_then(|v| v.parse().ok()),
-            primary_audio_stream: parsed
-                .streams
-                .iter()
-                .find(|v| v.codec_type.as_deref() == Some("audio"))
-                .map(|v| v.index),
-            video_codecs: parsed
-                .streams
-                .iter()
-                .filter(|v| v.codec_type.as_deref() == Some("video"))
-                .map(|v| v.codec_name.clone().unwrap_or_default())
-                .collect(),
-        })
+        parse_probe_output(&output.stdout)
     }
 
     async fn measure(&self, input: &Path, target: LoudnessTarget) -> AppResult<MeasureScan> {
@@ -986,12 +1202,15 @@ async fn create_reference_sample(
     if probe.primary_audio_stream.is_none() {
         bail!(AppError::Custom("segment has no audio".into()));
     }
-    let duration = probe
+    // `duration_seconds` 是内容跨度，不是容器自报的 duration——直录 FLV 上后者是末尾
+    // 时间戳。而 ffmpeg 的输入 `-ss` 恰好也以文件起点为原点（它自己会叠加
+    // `ic->start_time`），两者口径一致，这里不要再手工加 `start_time`。
+    let span = probe
         .duration_seconds
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(30.0);
-    let length = duration.clamp(0.1, 30.0);
-    let start = ((duration - length) / 2.0).max(0.0);
+    let length = span.clamp(0.1, 30.0);
+    let start = ((span - length) / 2.0).max(0.0);
     let raw = store
         .root
         .join(format!("sample-raw-{:016x}.m4a", rand::random::<u64>()));
@@ -1021,6 +1240,16 @@ async fn create_reference_sample(
         bail!(AppError::Custom(format!(
             "sample extraction failed: {}",
             stderr_text(&result.stderr)
+        )));
+    }
+    // 退出码不够：`-ss` 落到文件尾之外时 ffmpeg 照样退 0，只是产出一个几百字节的空容器。
+    // 空样片一路带到后面只会变成难懂的测量失败，在这里就挡住。
+    let raw_bytes = tokio::fs::metadata(&raw).await.map(|m| m.len()).unwrap_or(0);
+    if raw_bytes == 0 || runner.probe(&raw).await.ok().and_then(|v| v.duration_seconds).is_none() {
+        let _ = remove_if_exists(&raw).await;
+        bail!(AppError::Custom(format!(
+            "sample extraction produced an empty clip ({raw_bytes} bytes); \
+             requested {length:.3}s at {start:.3}s"
         )));
     }
     // 从此处开始任何 `?` 提前返回都会由 guard 清掉截取临时件。
@@ -1075,6 +1304,17 @@ mod tests {
     const SOURCE_BYTES: &[u8] = b"source-recording";
     const SOURCE_DURATION: f64 = 600.0;
 
+    /// `normalize_for_upload` 靠若干进程级状态工作：转码槽位、活动产物表、判据熔断。
+    /// 测试并行跑会互相干扰（尤其熔断一旦跳闸会让后续用例整段跳过），凡是调用它的用例
+    /// 都先拿这把锁，顺带把熔断复位到出厂状态。
+    static NORMALIZATION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn exclusive_normalization() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = NORMALIZATION_TEST_LOCK.lock().await;
+        *rejection_streak() = RejectionStreak::new();
+        guard
+    }
+
     struct FakeRunner {
         measure_ok: bool,
         timestamp_anomaly: Option<bool>,
@@ -1084,6 +1324,9 @@ mod tests {
         output_duration: Option<f64>,
         /// 产物视频流构成；`None` 表示与原片一致。
         output_video_codecs: Option<Vec<String>>,
+        /// 原片时间轴的起点。非零即模拟分段录像——容器自报的 duration 是末尾时间戳，
+        /// 内容跨度仍是 `SOURCE_DURATION`。
+        source_start_time: f64,
         output_has_audio: bool,
         /// 转码永不结束，用来观察硬水位能不能把它掐掉。
         transcode_hangs: bool,
@@ -1098,6 +1341,7 @@ mod tests {
                 output_bytes: b"normalized-output".to_vec(),
                 output_duration: None,
                 output_video_codecs: None,
+                source_start_time: 0.0,
                 output_has_audio: true,
                 transcode_hangs: false,
                 measured: Arc::new(Mutex::new(false)),
@@ -1132,12 +1376,18 @@ mod tests {
             if !Self::is_artifact(input) {
                 return Ok(AudioProbe {
                     duration_seconds: Some(SOURCE_DURATION),
+                    container_duration: Some(SOURCE_DURATION + self.source_start_time),
+                    start_seconds: Some(self.source_start_time),
                     primary_audio_stream: Some(1),
                     video_codecs: vec!["h264".into()],
                 });
             }
+            let output_span = self.output_duration.unwrap_or(SOURCE_DURATION);
             Ok(AudioProbe {
-                duration_seconds: Some(self.output_duration.unwrap_or(SOURCE_DURATION)),
+                duration_seconds: Some(output_span),
+                // ffmpeg 把产物时间轴归零，这是判据两侧口径不一致的根源。
+                container_duration: Some(output_span),
+                start_seconds: Some(0.0),
                 primary_audio_stream: self.output_has_audio.then_some(1),
                 video_codecs: self
                     .output_video_codecs
@@ -1222,6 +1472,7 @@ mod tests {
 
     #[tokio::test]
     async fn keep_original_returns_temporary_artifact_and_drop_cleans_it() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("有 空格.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1248,6 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_timestamp_diagnosis_does_not_claim_a_clean_source() {
+        let _guard = exclusive_normalization().await;
         // runner 不提供诊断时必须保守：上传前照常跑整片时间戳扫描。
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
@@ -1267,6 +1519,7 @@ mod tests {
 
     #[tokio::test]
     async fn anomalous_source_does_not_claim_a_clean_source() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1285,6 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn measurement_failure_falls_back_to_original() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1298,6 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn successful_normalization_replaces_the_original_in_place() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("有 空格.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1323,6 +1578,7 @@ mod tests {
     /// 时长、体积、视频流三项判据各自都要能挡住坏产物，且一律不动原片。
     #[tokio::test]
     async fn unfaithful_output_is_discarded_and_the_original_survives() {
+        let _guard = exclusive_normalization().await;
         let cases: [(&str, FakeRunner); 4] = [
             (
                 "duration_drift",
@@ -1385,6 +1641,7 @@ mod tests {
     /// 时长偏差在容差内（0.5% 或 1 秒，取大者）不算失败。
     #[tokio::test]
     async fn duration_drift_within_tolerance_is_accepted() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1402,8 +1659,209 @@ mod tests {
         ));
     }
 
+    /// 直录 FLV 的 ffprobe 输出：`format.duration` 是末尾时间戳，`start_time` 才是起点，
+    /// 而逐流的 `duration` 是 `N/A`——所以只能靠 `format` 这两个数相减。
+    ///
+    /// 这段 JSON 抄自本机复现出来的素材（`-output_ts_offset 3600`
+    /// + `-flvflags no_duration_filesize`），与线上分段同构。
+    const OFFSET_SOURCE_JSON: &[u8] = br#"{
+        "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "3600.000000", "duration": "N/A"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "3599.977000", "duration": "N/A"}
+        ],
+        "format": {"duration": "3605.900000", "start_time": "3599.977000"}
+    }"#;
+
+    /// 产物那侧 ffmpeg 把时间轴归零。
+    const ZERO_BASED_OUTPUT_JSON: &[u8] = br#"{
+        "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": "0.034000"},
+            {"index": 1, "codec_type": "audio", "codec_name": "aac", "start_time": "0.000000"}
+        ],
+        "format": {"duration": "6.111000", "start_time": "0.000000"}
+    }"#;
+
+    #[test]
+    fn probe_reports_the_content_span_not_the_end_timestamp() {
+        let probe = parse_probe_output(OFFSET_SOURCE_JSON).unwrap();
+        assert!(
+            (probe.duration_seconds.unwrap() - 5.923).abs() < 1e-6,
+            "跨度应当是 duration - start_time，实际 {:?}",
+            probe.duration_seconds
+        );
+        // 两个原值原样留着，判据失败时的 WARN 要靠它们自证。
+        assert_eq!(probe.container_duration, Some(3605.9));
+        assert_eq!(probe.start_seconds, Some(3599.977));
+        assert_eq!(probe.primary_audio_stream, Some(1));
+        assert_eq!(probe.video_codecs, vec!["h264".to_string()]);
+    }
+
+    /// 本次回归的核心护栏：非零时间轴的原片 + 归零的产物必须判为一致。
+    #[test]
+    fn an_offset_source_and_its_zero_based_output_are_consistent() {
+        let input = parse_probe_output(OFFSET_SOURCE_JSON).unwrap();
+        let output = parse_probe_output(ZERO_BASED_OUTPUT_JSON).unwrap();
+        assert_eq!(
+            output_is_faithful(&input, Some(&output), 1_000, 1_000),
+            Ok(())
+        );
+    }
+
+    /// `start_time` 的三种「没有可用值」写法都退化成按 0 算，且不 panic。
+    #[test]
+    fn a_missing_or_negative_start_time_degrades_to_zero() {
+        for raw in [
+            br#"{"streams": [], "format": {"duration": "12.0", "start_time": "N/A"}}"#.as_slice(),
+            br#"{"streams": [], "format": {"duration": "12.0"}}"#.as_slice(),
+            br#"{"streams": [], "format": {"duration": "12.0", "start_time": "-0.5"}}"#.as_slice(),
+        ] {
+            let probe = parse_probe_output(raw).unwrap();
+            assert_eq!(
+                probe.duration_seconds,
+                Some(12.0),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    /// 跨度算不出正数时按「探不到时长」处理：跳过时长判据，不当失败。其余三条判据照常。
+    #[test]
+    fn a_non_positive_span_skips_the_duration_check_instead_of_failing() {
+        let input = parse_probe_output(
+            br#"{"streams": [{"index": 0, "codec_type": "audio"}],
+                 "format": {"duration": "10.0", "start_time": "10.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.duration_seconds, None);
+
+        let output = parse_probe_output(ZERO_BASED_OUTPUT_JSON).unwrap();
+        // 视频流构成不同才是真失败；时长这一条不该抢在它前面报。
+        assert_eq!(
+            output_is_faithful(&input, Some(&output), 1_000, 1_000)
+                .unwrap_err()
+                .reason(),
+            "video_streams_differ"
+        );
+    }
+
+    /// 判据失败必须自带实测值：这次事故里，没有这几个数就只能回现场 ffprobe，
+    /// 而那时分段很可能已经传完被清掉了。
+    #[test]
+    fn a_rejection_carries_the_numbers_it_judged_on() {
+        let input = parse_probe_output(OFFSET_SOURCE_JSON).unwrap();
+        let truncated = parse_probe_output(
+            br#"{"streams": [
+                    {"index": 0, "codec_type": "video", "codec_name": "h264"},
+                    {"index": 1, "codec_type": "audio", "codec_name": "aac"}
+                ],
+                "format": {"duration": "1.000000", "start_time": "0.000000"}}"#,
+        )
+        .unwrap();
+
+        let rejection = output_is_faithful(&input, Some(&truncated), 1_000, 1_000).unwrap_err();
+        assert_eq!(rejection.reason(), "duration_drift");
+        let OutputRejection::DurationDrift {
+            source_span,
+            output_span,
+            tolerance,
+            source_start_time,
+            source_container_duration,
+        } = rejection
+        else {
+            panic!("expected duration_drift, got {rejection:?}");
+        };
+        assert!((source_span - 5.923).abs() < 1e-6);
+        assert_eq!(output_span, 1.0);
+        assert_eq!(tolerance, 1.0, "0.5% 不足 1 秒时取 1 秒下限");
+        assert_eq!(source_start_time, 3599.977);
+        assert_eq!(source_container_duration, 3605.9);
+
+        let too_small = output_is_faithful(&input, Some(&truncated), 1_000, 100).unwrap_err();
+        assert_eq!(
+            too_small,
+            OutputRejection::TooSmall {
+                input_bytes: 1_000,
+                output_bytes: 100
+            }
+        );
+    }
+
+    /// 熔断只认「连续同一 reason」。
+    #[test]
+    fn the_breaker_trips_only_on_a_run_of_the_same_reason() {
+        let mut streak = RejectionStreak::new();
+        assert!(!streak.record_rejection("duration_drift"));
+        assert!(!streak.record_rejection("duration_drift"));
+        assert!(
+            streak.record_rejection("duration_drift"),
+            "第三次同 reason 应当跳闸"
+        );
+        assert!(streak.tripped);
+        // 跳闸只报告一次，之后不再重复。
+        assert!(!streak.record_rejection("duration_drift"));
+    }
+
+    #[test]
+    fn a_success_in_between_clears_the_streak() {
+        let mut streak = RejectionStreak::new();
+        streak.record_rejection("duration_drift");
+        streak.record_rejection("duration_drift");
+        streak.record_success();
+        streak.record_rejection("duration_drift");
+        streak.record_rejection("duration_drift");
+        assert!(!streak.tripped, "中间成功过就不该跳闸");
+    }
+
+    /// 偶发坏分段会打出不同 reason，那是判据在正常工作，不该关掉功能。
+    #[test]
+    fn alternating_reasons_never_trip_the_breaker() {
+        let mut streak = RejectionStreak::new();
+        for _ in 0..3 {
+            streak.record_rejection("duration_drift");
+            streak.record_rejection("output_too_small");
+        }
+        assert!(!streak.tripped);
+    }
+
+    /// 跳闸之后连 ffmpeg 都不该再起——省下的正是这次事故里白烧掉的那部分 CPU。
+    #[tokio::test]
+    async fn a_tripped_breaker_skips_ffmpeg_entirely() {
+        let _guard = exclusive_normalization().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner {
+            output_duration: Some(SOURCE_DURATION / 2.0),
+            ..FakeRunner::default()
+        };
+
+        for _ in 0..REJECTION_TRIP_THRESHOLD {
+            assert!(matches!(
+                normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await,
+                NormalizationOutcome::Original {
+                    reason: OriginalReason::InvalidOutput
+                }
+            ));
+        }
+        *runner.measured.lock().unwrap() = false;
+
+        assert!(matches!(
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await,
+            NormalizationOutcome::Original {
+                reason: OriginalReason::NormalizationDisabled
+            }
+        ));
+        assert!(
+            !*runner.measured.lock().unwrap(),
+            "跳闸后不该再调用 measure/transcode"
+        );
+        assert_eq!(tokio::fs::read(&source).await.unwrap(), SOURCE_BYTES);
+    }
+
     #[tokio::test]
     async fn failed_replacement_leaves_the_original_intact() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         // 用一个非空目录冒充原片：`rename` 到非空目录必然失败，这是本机上唯一稳定可复现
         // 的替换失败方式（只读目录在以 root 运行的容器里挡不住）。
@@ -1431,6 +1889,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_refuses_to_start_when_the_output_would_not_fit() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1457,6 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn admission_passes_when_space_is_plentiful() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1471,6 +1931,7 @@ mod tests {
     /// 探测不出可用空间时放行——平台能力缺失不该静默停掉一个功能。
     #[tokio::test]
     async fn an_unreadable_filesystem_does_not_block_normalization() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1489,6 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn disk_pressure_mid_transcode_cancels_and_falls_back_to_the_original() {
+        let _guard = exclusive_normalization().await;
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
@@ -1537,6 +1999,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn system_ffmpeg_replaces_the_original_with_a_normalized_recording() {
+        let _guard = exclusive_normalization().await;
         // FLV 才是服务端录制的默认容器（`StreamGears` 自研解析逐 tag 写 FLV），MP4 只是
         // 其它下载器的路径。两个都测，否则就是拿一条没人走的路当验收。
         for container in ["flv", "mp4"] {
@@ -1643,6 +2106,166 @@ mod tests {
 
     /// 06 号验收里本机可跑的那一半：多路并发下，标准化带来的额外磁盘占用任何时刻不超过
     /// 一份分段。这条是跨管道的整体性质，`NORMALIZE_SLOTS` 与就地替换缺一不可，单测证明
+    /// 造一段与生产同构的 FLV：非零时间轴 + 没有可信的 `onMetaData.duration`。
+    ///
+    /// 两个开关缺一不可。`-output_ts_offset` 制造非零 `start_time`（分段录像沿用整场
+    /// session 的时间轴），`-flvflags no_duration_filesize` 阻止 `flvenc` 在 trailer 里
+    /// 回填正确的 duration——少了它，`flvdec` 就不会走「seek 到文件尾读最后一个 tag 的
+    /// 时间戳」那条路，素材会退化成一个普通 FLV，用例随之静默失效。
+    async fn write_offset_timeline_flv(path: &Path, seconds: u32) {
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={seconds}:size=320x240:rate=10"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={seconds}"),
+                "-filter:a",
+                "volume=-24dB",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                "-ar",
+                "44100",
+                "-shortest",
+                "-output_ts_offset",
+                "3600",
+                "-flvflags",
+                "no_duration_filesize",
+            ])
+            .arg(path)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(status.success(), "fixture generation failed");
+    }
+
+    /// 样片截取踩的是同一个口径：`-ss` 以文件起点为原点（ffmpeg 自己叠加
+    /// `ic->start_time`），拿末尾时间戳去算窗口就会 seek 到文件尾之外。那时 ffmpeg
+    /// **退出码仍是 0**，只是产出一个几百字节的空容器。
+    ///
+    /// 需要本地 ffmpeg；手动运行：
+    /// `cargo test -p biliup-cli sample_capture -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn sample_capture_reads_real_audio_from_an_offset_timeline() {
+        let _guard = exclusive_normalization().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("offset-segment.flv");
+        // 40 秒才够让截取窗口落在文件中段（`length` 上限 30 秒）。
+        write_offset_timeline_flv(&source, 40).await;
+
+        let store = AudioSampleStore::for_working_directory(dir.path());
+        store.arm_capture().await.unwrap();
+        maybe_capture_reference_sample(&source, &store, DiskBudget::from_reserve_gib(1)).await;
+
+        let sample = store.sample_path();
+        let bytes = tokio::fs::metadata(&sample)
+            .await
+            .expect("sample was not produced")
+            .len();
+        let probe = SystemAudioFfmpeg::for_sample().probe(&sample).await.unwrap();
+        println!(
+            "sample: {bytes} bytes, span={:?}s",
+            probe.duration_seconds
+        );
+        assert!(probe.primary_audio_stream.is_some());
+        // 空容器只有几百字节、探不到时长；真样片是 30 秒 96k AAC，几百 KB 起。
+        assert!(
+            bytes > 100_000,
+            "sample looks like an empty container: {bytes} bytes"
+        );
+        assert!(
+            (probe.duration_seconds.unwrap_or(0.0) - 30.0).abs() < 2.0,
+            "sample should cover the requested 30s window, got {:?}",
+            probe.duration_seconds
+        );
+    }
+
+    /// 与生产同构的素材：非零时间轴 + 没有可信的 `onMetaData.duration`。
+    ///
+    /// 两个开关缺一不可。`-output_ts_offset` 制造非零 `start_time`（分段录像沿用整场
+    /// session 的时间轴），`-flvflags no_duration_filesize` 阻止 `flvenc` 在 trailer 里
+    /// 回填正确的 duration——少了它，`flvdec` 就不会走「seek 到文件尾读最后一个 tag 的
+    /// 时间戳」那条路，素材会退化成一个普通 FLV，用例随之静默失效。
+    ///
+    /// 需要本地 ffmpeg；手动运行：
+    /// `cargo test -p biliup-cli offset_timeline -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_normalizes_a_segment_recorded_on_an_offset_timeline() {
+        let _guard = exclusive_normalization().await;
+        const OFFSET_SECS: f64 = 3600.0;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("offset-segment.flv");
+        write_offset_timeline_flv(&source, 6).await;
+
+        // 素材自检：先确认它真的复现了现象，再谈链路。少了这一步，素材一旦退化成正常
+        // FLV，下面的断言会因为「本来就不会失败」而通过。
+        let fixture = SystemAudioFfmpeg::default().probe(&source).await.unwrap();
+        println!(
+            "offset fixture: container_duration={:?} start={:?} span={:?}",
+            fixture.container_duration, fixture.start_seconds, fixture.duration_seconds
+        );
+        assert!(
+            fixture.start_seconds.unwrap_or(0.0) >= OFFSET_SECS - 1.0,
+            "fixture does not carry an offset timeline: {:?}",
+            fixture.start_seconds
+        );
+        assert!(
+            fixture.container_duration.unwrap_or(0.0) >= OFFSET_SECS,
+            "fixture still reports a real duration, so it cannot reproduce the bug: {:?}",
+            fixture.container_duration
+        );
+        assert!(
+            (fixture.duration_seconds.unwrap() - 6.0).abs() < 1.0,
+            "content span should be the real length, got {:?}",
+            fixture.duration_seconds
+        );
+
+        let outcome = normalize_for_upload(
+            &source,
+            BASE_TARGET_LUFS,
+            &SystemAudioFfmpeg::default(),
+            false,
+            DiskBudget::from_reserve_gib(1),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                NormalizationOutcome::Normalized {
+                    form: NormalizedForm::ReplacedOriginal,
+                    ..
+                }
+            ),
+            "an offset timeline must not be mistaken for duration drift: {outcome:?}"
+        );
+        assert!(leftover_artifacts(dir.path()).await.is_empty());
+
+        let scan = SystemAudioFfmpeg::default()
+            .measure(&source, LoudnessTarget(BASE_TARGET_LUFS))
+            .await
+            .unwrap();
+        let after = parse_loudnorm_measurement(&scan.stderr).unwrap();
+        println!("offset segment measured {} LUFS", after.input_i);
+        assert!(
+            (after.input_i - BASE_TARGET_LUFS).abs() <= 1.5,
+            "normalized loudness {} is not near {BASE_TARGET_LUFS}",
+            after.input_i
+        );
+    }
+
     /// 不了——必须真的并发跑起来盯着目录。
     ///
     /// 需要本地 ffmpeg；手动运行：
@@ -1650,6 +2273,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn concurrent_normalization_never_keeps_more_than_one_artifact() {
+        let _guard = exclusive_normalization().await;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let dir = tempfile::tempdir().unwrap();
