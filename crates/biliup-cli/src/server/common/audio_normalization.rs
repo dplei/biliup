@@ -1537,8 +1537,16 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn system_ffmpeg_replaces_the_original_with_a_normalized_recording() {
+        // FLV 才是服务端录制的默认容器（`StreamGears` 自研解析逐 tag 写 FLV），MP4 只是
+        // 其它下载器的路径。两个都测，否则就是拿一条没人走的路当验收。
+        for container in ["flv", "mp4"] {
+            smoke_one_container(container).await;
+        }
+    }
+
+    async fn smoke_one_container(container: &str) {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("smoke.mp4");
+        let source = dir.path().join(format!("smoke.{container}"));
         let status = tokio::process::Command::new("ffmpeg")
             .args([
                 "-y",
@@ -1553,6 +1561,8 @@ mod tests {
                 "-filter:a",
                 // 明显偏小的输入，好看出标准化确实抬了响度。
                 "volume=-24dB",
+                "-c:v",
+                "libx264",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -1565,7 +1575,7 @@ mod tests {
             .status()
             .await
             .expect("spawn ffmpeg");
-        assert!(status.success());
+        assert!(status.success(), "{container}: fixture generation failed");
         let original_bytes = tokio::fs::metadata(&source).await.unwrap().len();
 
         let outcome = normalize_for_upload(
@@ -1585,11 +1595,11 @@ mod tests {
                     ..
                 }
             ),
-            "unexpected outcome: {outcome:?}"
+            "{container}: unexpected outcome: {outcome:?}"
         );
         assert!(
             leftover_artifacts(dir.path()).await.is_empty(),
-            "a .part survived the replacement"
+            "{container}: a .part survived the replacement"
         );
 
         let probe = tokio::process::Command::new("ffprobe")
@@ -1610,7 +1620,7 @@ mod tests {
         let audio = String::from_utf8_lossy(&probe.stdout);
         assert!(
             audio.contains("aac") && audio.contains("48000"),
-            "replaced file should carry the normalized audio, got {audio:?}"
+            "{container}: replaced file should carry the normalized audio, got {audio:?}"
         );
 
         // 复测替换后的文件，确认整段响度已经收敛到目标附近。
@@ -1620,13 +1630,13 @@ mod tests {
             .unwrap();
         let after = parse_loudnorm_measurement(&scan.stderr).unwrap();
         println!(
-            "smoke: {original_bytes} bytes -> {} bytes, measured {} LUFS",
+            "smoke[{container}]: {original_bytes} bytes -> {} bytes, measured {} LUFS",
             tokio::fs::metadata(&source).await.unwrap().len(),
             after.input_i
         );
         assert!(
             (after.input_i - BASE_TARGET_LUFS).abs() <= 1.5,
-            "normalized loudness {} is not near {BASE_TARGET_LUFS}",
+            "{container}: normalized loudness {} is not near {BASE_TARGET_LUFS}",
             after.input_i
         );
     }
