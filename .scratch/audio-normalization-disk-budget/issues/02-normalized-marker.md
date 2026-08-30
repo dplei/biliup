@@ -1,6 +1,6 @@
 # 02 — `audio_normalized_at` 标记与补传跳过
 
-Status: ready-for-agent
+Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
 Blocked by: 01
 
 ## 背景
@@ -71,3 +71,16 @@ v2 下每个通过校验的分段在 enrollment 时就建行（见
 
 rename 与落标记之间崩溃 → 该段补传时多一次有损编码。窗口是一次 `rename` 加一条 UPDATE，
 代价有界且不是数据丢失，接受，不引入两阶段提交。
+
+## 实现记录（2026-08-30）
+
+标记走既有的 activity 通道（新增 `UploadActivity::NormalizedInPlace`）在替换完成的那一刻
+发出，由 `upload_enrolled_with_watchdog` 落库——比等 `upload_single_file_with_repair` 返回
+早了整个上传时长。legacy v1 路径不传 activity 通道，天然不落标记，与「v1 一律留 NULL」
+一致，不需要额外分支。
+
+`mark_audio_normalized` 只更新 `audio_normalized_at` 一列：`updated_at` 参与到期扫描排序，
+不该被一次预处理事件推着走。
+
+验收 3 用 `audio_normalization_needed` 的纯函数单测覆盖——它就是「读取跳过」的全部逻辑，
+比拉起一次真实上传更直接。

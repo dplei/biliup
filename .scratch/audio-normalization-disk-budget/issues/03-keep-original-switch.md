@@ -1,6 +1,6 @@
 # 03 — `keep_original` 开关与行为变更说明
 
-Status: ready-for-agent
+Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
 Blocked by: 01
 
 ## 背景
@@ -56,3 +56,10 @@ audio_normalization_keep_original: false
 两条路径并存意味着 `NormalizationOutcome` 要同时表达「已就地替换」与「产出了临时件」两种
 形态。实现时保持一个枚举两个分支，不要让调用方靠配置项自己猜当前是哪种——把形态编码进
 返回值，调用方只匹配。
+
+## 实现记录（2026-08-30）
+
+配置项落地，默认 `false`。前端在响度区块内新增「保留原始录像」开关，文案写明原片会被
+覆盖、后处理脚本收到的是标准化文件。
+
+CHANGELOG.md 按上文所述未改，理由已写在「改动范围 / 文档」一节。

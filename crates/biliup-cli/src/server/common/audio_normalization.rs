@@ -1528,6 +1528,109 @@ mod tests {
         assert_eq!(active_artifacts_under(dir.path()), 0);
     }
 
+    /// 需要本地 ffmpeg；手动运行：
+    /// `cargo test -p biliup-cli system_ffmpeg_replaces -- --ignored --nocapture`
+    ///
+    /// 单测都用 `FakeRunner`，证明不了真实 ffmpeg 的产物能过校验、能被替换上去。这条用
+    /// 一段合成的低响度素材跑完整条链路，并核对替换后的原片路径确实是 48 kHz AAC、整段
+    /// 响度落在目标附近。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_replaces_the_original_with_a_normalized_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("smoke.mp4");
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=6:size=320x240:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-filter:a",
+                // 明显偏小的输入，好看出标准化确实抬了响度。
+                "volume=-24dB",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                "-ar",
+                "44100",
+                "-shortest",
+            ])
+            .arg(&source)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+        let original_bytes = tokio::fs::metadata(&source).await.unwrap().len();
+
+        let outcome = normalize_for_upload(
+            &source,
+            BASE_TARGET_LUFS,
+            &SystemAudioFfmpeg::default(),
+            false,
+            DiskBudget::from_reserve_gib(1),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                NormalizationOutcome::Normalized {
+                    form: NormalizedForm::ReplacedOriginal,
+                    ..
+                }
+            ),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert!(
+            leftover_artifacts(dir.path()).await.is_empty(),
+            "a .part survived the replacement"
+        );
+
+        let probe = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_name,sample_rate",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&source)
+            .output()
+            .await
+            .unwrap();
+        let audio = String::from_utf8_lossy(&probe.stdout);
+        assert!(
+            audio.contains("aac") && audio.contains("48000"),
+            "replaced file should carry the normalized audio, got {audio:?}"
+        );
+
+        // 复测替换后的文件，确认整段响度已经收敛到目标附近。
+        let scan = SystemAudioFfmpeg::default()
+            .measure(&source, LoudnessTarget(BASE_TARGET_LUFS))
+            .await
+            .unwrap();
+        let after = parse_loudnorm_measurement(&scan.stderr).unwrap();
+        println!(
+            "smoke: {original_bytes} bytes -> {} bytes, measured {} LUFS",
+            tokio::fs::metadata(&source).await.unwrap().len(),
+            after.input_i
+        );
+        assert!(
+            (after.input_i - BASE_TARGET_LUFS).abs() <= 1.5,
+            "normalized loudness {} is not near {BASE_TARGET_LUFS}",
+            after.input_i
+        );
+    }
+
     #[tokio::test]
     async fn orphaned_partial_artifacts_are_removed_without_touching_active_artifacts() {
         let dir = tempfile::tempdir().unwrap();

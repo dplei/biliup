@@ -1,6 +1,6 @@
 # 05 — 准入水位与转码期硬水位取消
 
-Status: ready-for-agent
+Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
 Blocked by: 04
 
 ## 背景
@@ -81,3 +81,18 @@ tokio::select! {
 阈值定得太保守会让标准化在磁盘偏紧的机器上长期静默不生效。因此两条降级都必须留下带
 `available_bytes`/`required_bytes` 的日志，且 `reserve_gib` 可调——不要只记一句
 「skipped」就完事。
+
+## 实现记录（2026-08-30）
+
+一处计划外的重构：`enabled` / `target_lufs` / `keep_original` / `budget` 打包成
+`NormalizationSettings`，由 `Config::normalization_settings()` 构造，补传路径用
+`with_enabled` 覆写开关。上传编排的函数本来就挂着 `too_many_arguments`，本 ticket 要加的
+是第四个旋钮，再往下传只会让五个调用点更容易把参数传串。
+
+`DiskBudget` 持有探测函数指针与检查间隔，测试据此注入固定/分阶段读数，不必真的填满磁盘；
+硬水位用例把间隔调到 5 ms，不需要 tokio 的 `test-util` feature。
+
+⚠️ `OUTPUT_SIZE_FACTOR = 1.1` 在音频占比高的素材上会低估产物大小（见
+[`01` 的实现记录](./01-replace-original-in-place.md)）。后果由硬水位兜住——准入放行、
+转码途中跌破保留线即中止降级——所以本轮不调这个系数，留给 [`06`](./06-concurrency-acceptance.md)
+用真实录像观察后再定。

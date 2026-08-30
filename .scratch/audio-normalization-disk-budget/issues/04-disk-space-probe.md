@@ -1,6 +1,6 @@
 # 04 — 跨平台可用空间探测模块
 
-Status: ready-for-agent
+Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
 
 ## 背景
 
@@ -45,3 +45,8 @@ pub fn available_bytes(path: &Path) -> Option<u64>;
 
 容器里 `statvfs` 报的是挂载点的空间，overlay 或 bind mount 下可能与宿主感知不一致。
 这对本用途无害：我们要限制的正是**产物实际写入的那个文件系统**，`statvfs` 报的就是它。
+
+## 实现记录（2026-08-30）
+
+按计划落地，无偏离。`f_frsize` 为 0 时退回 `f_bsize`；`f_bavail`/`f_frsize` 的宽度随平台
+而异，一律走 `try_from`，并对 clippy 的平台相关假阳性加了带注释的 `allow`。

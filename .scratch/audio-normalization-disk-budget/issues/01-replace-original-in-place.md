@@ -1,6 +1,6 @@
 # 01 — 产物校验加严并原子替换原片
 
-Status: ready-for-agent
+Status: implemented / 待验收（见 [`06`](./06-concurrency-acceptance.md)）
 
 ## 背景
 
@@ -85,3 +85,27 @@ fsync(.part)  →  rename(.part → 原片路径)  →  fsync(父目录)
 
 时长容差取 0.5% 是因为 loudnorm 不改时长，正常偏差只来自容器时间基取整；若冒烟中发现
 FLV → FLV 场景稳定偏差超过该值，先查是不是 `-c copy` 之外的路径被触发，不要直接放宽阈值。
+
+## 实现记录（2026-08-30）
+
+`normalize_for_upload` 增加 `keep_original` 参数，录像路径传 `false`、样片生成传 `true`
+（样片要的是产物本身，截出来的 raw 才是中间件）。`NormalizedForm` 编码产物去向，
+`ReplacedOriginal` 分支下 `upload_single_file_with_repair` 的第三元返回 `None`，于是三个
+元组解构点一处未动。
+
+两处与计划不同：
+
+1. **`segment_part_title` 的补丁保留**，没有按计划删除。就地替换下路径不变、标题天然
+   正确，但 `keep_original = true` 时上传的仍是临时件，那条补丁还有用。回归测试原样保留。
+2. **体积判据只做下界，不做上界。** 冒烟里 64k/44.1kHz 的合成音频重编到 192k/48kHz 后，
+   产物是原片的 1.88 倍。真实录像里视频占绝大部分，音频码率变化会被稀释，但这说明
+   [`05`](./05-disk-watermarks.md) 的 `OUTPUT_SIZE_FACTOR = 1.1` 在音频占比高的素材上会
+   低估。后果可控：准入放行后由硬水位兜住，中止并降级，不会写爆磁盘。
+
+本机冒烟（验收 8）已通过：合成的 -24 dB 素材跑完整条链路，替换后的原片路径是 48 kHz
+AAC，复测整段 -16.0 LUFS，目录无 `.part` 残留。证据固化为 `#[ignore]` 测试
+`system_ffmpeg_replaces_the_original_with_a_normalized_recording`，需要本地 ffmpeg：
+
+```bash
+cargo test -p biliup-cli system_ffmpeg_replaces -- --ignored --nocapture
+```

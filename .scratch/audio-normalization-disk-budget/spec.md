@@ -168,14 +168,16 @@ pre-upload 请求体），把 ffmpeg stdout 直接接上传器不成立。
 
 ## 8. Ticket
 
-| # | 标题 | 依赖 |
-| --- | --- | --- |
-| [01](./issues/01-replace-original-in-place.md) | 产物校验加严并原子替换原片 | — |
-| [02](./issues/02-normalized-marker.md) | `audio_normalized_at` 标记与补传跳过 | 01 |
-| [03](./issues/03-keep-original-switch.md) | `keep_original` 开关与行为变更说明 | 01 |
-| [04](./issues/04-disk-space-probe.md) | 跨平台可用空间探测模块 | — |
-| [05](./issues/05-disk-watermarks.md) | 准入水位与转码期硬水位取消 | 04 |
-| [06](./issues/06-concurrency-acceptance.md) | 多路并发峰值验收 | 01–05 |
+01–05 已实现（`dev` 之外的 `feat/audio-normalization-disk-budget` 分支），06 待人工验收。
+
+| # | 标题 | 依赖 | 状态 |
+| --- | --- | --- | --- |
+| [01](./issues/01-replace-original-in-place.md) | 产物校验加严并原子替换原片 | — | implemented |
+| [02](./issues/02-normalized-marker.md) | `audio_normalized_at` 标记与补传跳过 | 01 | implemented |
+| [03](./issues/03-keep-original-switch.md) | `keep_original` 开关与行为变更说明 | 01 | implemented |
+| [04](./issues/04-disk-space-probe.md) | 跨平台可用空间探测模块 | — | implemented |
+| [05](./issues/05-disk-watermarks.md) | 准入水位与转码期硬水位取消 | 04 | implemented |
+| [06](./issues/06-concurrency-acceptance.md) | 多路并发峰值验收 | 01–05 | ready-for-human |
 
 ## 9. 验收总纲
 
