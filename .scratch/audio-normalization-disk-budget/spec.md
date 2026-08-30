@@ -168,7 +168,7 @@ pre-upload 请求体），把 ffmpeg stdout 直接接上传器不成立。
 
 ## 8. Ticket
 
-01–05 已实现（`dev` 之外的 `feat/audio-normalization-disk-budget` 分支），06 待人工验收。
+01–05 已实现并合入 `dev`。06 的并发峰值断言已在本机用真实 ffmpeg 验过，其余项待真实录制环境。
 
 | # | 标题 | 依赖 | 状态 |
 | --- | --- | --- | --- |
@@ -177,7 +177,7 @@ pre-upload 请求体），把 ffmpeg stdout 直接接上传器不成立。
 | [03](./issues/03-keep-original-switch.md) | `keep_original` 开关与行为变更说明 | 01 | implemented |
 | [04](./issues/04-disk-space-probe.md) | 跨平台可用空间探测模块 | — | implemented |
 | [05](./issues/05-disk-watermarks.md) | 准入水位与转码期硬水位取消 | 04 | implemented |
-| [06](./issues/06-concurrency-acceptance.md) | 多路并发峰值验收 | 01–05 | ready-for-human |
+| [06](./issues/06-concurrency-acceptance.md) | 多路并发峰值验收 | 01–05 | 部分完成 / 待真实录制 |
 
 ## 9. 验收总纲
 

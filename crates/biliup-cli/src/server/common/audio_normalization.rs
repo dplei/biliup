@@ -1631,6 +1631,121 @@ mod tests {
         );
     }
 
+    /// 06 号验收里本机可跑的那一半：多路并发下，标准化带来的额外磁盘占用任何时刻不超过
+    /// 一份分段。这条是跨管道的整体性质，`NORMALIZE_SLOTS` 与就地替换缺一不可，单测证明
+    /// 不了——必须真的并发跑起来盯着目录。
+    ///
+    /// 需要本地 ffmpeg；手动运行：
+    /// `cargo test -p biliup-cli concurrent_normalization -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn concurrent_normalization_never_keeps_more_than_one_artifact() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        // 四种音频配置，用来看产物/原片比值随音频码率怎么变——准入水位的
+        // `OUTPUT_SIZE_FACTOR` 就是按这个比值定的。
+        let variants = [("64k", "44100"), ("128k", "48000"), ("192k", "48000"), ("320k", "48000")];
+        let mut sources = Vec::new();
+        for (index, (bitrate, rate)) in variants.iter().enumerate() {
+            let source = dir.path().join(format!("segment-{index}.mp4"));
+            let status = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-y", "-f", "lavfi", "-i",
+                    "testsrc=duration=15:size=640x480:rate=15",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=15",
+                    "-filter:a", "volume=-24dB",
+                    "-c:a", "aac", "-b:a", bitrate, "-ar", rate, "-shortest",
+                ])
+                .arg(&source)
+                .status()
+                .await
+                .expect("spawn ffmpeg");
+            assert!(status.success());
+            let bytes = tokio::fs::metadata(&source).await.unwrap().len();
+            sources.push((source, bytes, *bitrate));
+        }
+
+        // 采样器：并发跑起来之后，目录里同时存在的 `.part` 最多有几份。
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak, stop, directory) = (peak.clone(), stop.clone(), dir.path().to_path_buf());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let count = leftover_artifacts(&directory).await.len();
+                    peak.fetch_max(count, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let mut running = Vec::new();
+        for (source, _, _) in &sources {
+            let source = source.clone();
+            running.push(tokio::spawn(async move {
+                normalize_for_upload(
+                    &source,
+                    BASE_TARGET_LUFS,
+                    &SystemAudioFfmpeg::default(),
+                    false,
+                    DiskBudget::from_reserve_gib(1),
+                )
+                .await
+            }));
+        }
+        let outcomes = futures::future::join_all(running).await;
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        sampler.await.unwrap();
+
+        for (outcome, (source, _, _)) in outcomes.into_iter().zip(&sources) {
+            let outcome = outcome.unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    NormalizationOutcome::Normalized {
+                        form: NormalizedForm::ReplacedOriginal,
+                        ..
+                    }
+                ),
+                "{} got {outcome:?}",
+                source.display()
+            );
+        }
+
+        println!("\n并发 {} 段，历时 {:.1}s", sources.len(), elapsed.as_secs_f64());
+        println!("{:<8} {:>12} {:>12} {:>8}", "音频", "原片", "产物", "倍率");
+        let mut worst_ratio = 0.0_f64;
+        for (source, before, bitrate) in &sources {
+            let after = tokio::fs::metadata(source).await.unwrap().len();
+            let ratio = after as f64 / *before as f64;
+            worst_ratio = worst_ratio.max(ratio);
+            println!("{bitrate:<8} {before:>12} {after:>12} {ratio:>8.2}");
+        }
+        println!(
+            "最大倍率 {worst_ratio:.2}，准入用的 OUTPUT_SIZE_FACTOR = {OUTPUT_SIZE_FACTOR}"
+        );
+        println!(
+            "⚠️ 这组倍率不能外推到真实录像：合成素材的视频只有几十 kbps，音频占了大头，\n\
+             而真实直播录像是 Mbps 级视频 + 192k 音频，音频占比 <2%，重编再怎么变都动不了\n\
+             总大小几个百分点。这里能看的是趋势——音频占比越高，固定系数越会低估。"
+        );
+
+        let peak = peak.load(Ordering::Relaxed);
+        println!("并发期间同时存在的中间件峰值：{peak} 份");
+        assert!(
+            peak <= 1,
+            "额外磁盘占用超过一份分段：峰值 {peak} 份中间件同时存在"
+        );
+        assert!(
+            leftover_artifacts(dir.path()).await.is_empty(),
+            "跑完之后还有 .part 残留"
+        );
+        assert_eq!(active_artifacts_under(dir.path()), 0);
+    }
+
     #[tokio::test]
     async fn orphaned_partial_artifacts_are_removed_without_touching_active_artifacts() {
         let dir = tempfile::tempdir().unwrap();
