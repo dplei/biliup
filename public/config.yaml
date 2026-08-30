@@ -33,6 +33,11 @@ filtering_threshold: 20
 #audio_normalization_enabled: true
 ### 相对推荐音量的偏移，网页音量推子会自动维护；范围 -6 到 +4
 #audio_normalization_offset_db: 0
+### 标准化成功后是否保留原始录像；默认 false
+### false：产物直接替换原片，磁盘上每段只有一份。注意后处理脚本与补传拿到的都是
+###        标准化后的文件，原始音轨不再保留
+### true：保留原片，标准化产物是独立临时件，磁盘峰值为每段两份
+#audio_normalization_keep_original: false
 ### 全进程预上传节流与 B 站 601 冷却；默认开启
 #upload_rate_gate_enabled: true
 #upload_min_request_interval_secs: 2

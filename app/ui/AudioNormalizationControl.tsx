@@ -105,6 +105,15 @@ export default function AudioNormalizationControl() {
       />
 
       {enabled && (
+        <Form.Switch
+          field="audio_normalization_keep_original"
+          label="保留原始录像"
+          extraText="默认关闭：标准化结果直接替换原片，磁盘上每段只留一份。开启后额外保留一份未处理的原片，磁盘占用翻倍；后处理脚本收到的也会变回原片。"
+          fieldStyle={{ alignSelf: 'stretch', padding: 0, marginTop: 12 }}
+        />
+      )}
+
+      {enabled && (
         <div style={{ display: 'flex', gap: 28, alignItems: 'center', flexWrap: 'wrap', marginTop: 16 }}>
           <div style={{ minWidth: 130, textAlign: 'center' }}>
             <div style={{ fontSize: 13, marginBottom: 8 }}>更响</div>

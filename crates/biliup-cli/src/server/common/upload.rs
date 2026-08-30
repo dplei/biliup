@@ -1525,6 +1525,7 @@ async fn pipeline_upload_videos(
             repair_enabled,
             effective_config.audio_normalization_enabled,
             effective_config.effective_audio_target_lufs(),
+            effective_config.audio_normalization_keep_original,
             ctx.pool(),
             enrollment.missing_id,
             &attempt_token,
@@ -1603,16 +1604,16 @@ async fn pipeline_upload_videos(
 
 /// 上传前时间戳检测/修复 + 上传。返回 (Video, RepairOutcome) 供调用方决定本地文件清理与告警。
 /// repair_enabled=false 时跳过 ffmpeg，等价 Clean。上传失败时会清理自身产生的临时修复件。
+#[allow(clippy::too_many_arguments)]
 async fn upload_single_file_with_repair(
     original_path: &Path,
     context: &UploadContext,
     repair_enabled: bool,
     normalization_enabled: bool,
     target_lufs: f64,
+    keep_original: bool,
     activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
-    // TODO(03-keep-original-switch): 接上 `audio_normalization_keep_original` 配置。
-    let keep_original = false;
     let normalization = if normalization_enabled {
         normalize_for_upload(
             original_path,
@@ -2134,6 +2135,7 @@ async fn upload_enrolled_with_watchdog(
     repair_enabled: bool,
     normalization_enabled: bool,
     target_lufs: f64,
+    keep_original: bool,
     pool: &ConnectionPool,
     missing_id: i64,
     attempt_token: &str,
@@ -2155,6 +2157,7 @@ async fn upload_enrolled_with_watchdog(
         repair_enabled,
         normalization_enabled,
         target_lufs,
+        keep_original,
         Some(activity_tx),
     );
     pin!(upload);
@@ -2617,6 +2620,7 @@ async fn recover_due_missing_segments(
                 repair_enabled,
                 normalization_enabled,
                 effective_config.effective_audio_target_lufs(),
+                effective_config.audio_normalization_keep_original,
                 ctx.pool(),
                 enrollment.missing_id,
                 token,
@@ -2629,6 +2633,7 @@ async fn recover_due_missing_segments(
                 repair_enabled,
                 normalization_enabled,
                 effective_config.effective_audio_target_lufs(),
+                effective_config.audio_normalization_keep_original,
                 None,
             )
             .await
@@ -3574,6 +3579,7 @@ pub async fn run_claimed_recovery(
                     repair_enabled,
                     normalization_enabled,
                     effective_config.effective_audio_target_lufs(),
+                    effective_config.audio_normalization_keep_original,
                     pool,
                     enrollment.missing_id,
                     token,
@@ -3586,6 +3592,7 @@ pub async fn run_claimed_recovery(
                     repair_enabled,
                     normalization_enabled,
                     effective_config.effective_audio_target_lufs(),
+                    effective_config.audio_normalization_keep_original,
                     None,
                 )
                 .await
