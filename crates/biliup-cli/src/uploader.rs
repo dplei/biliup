@@ -1,4 +1,5 @@
 use crate::UploadLine;
+use crate::observe::{self, standalone::UploadTask};
 use crate::server::errors::{AppError, AppResult};
 use crate::upload_lock::UploadLock;
 use biliup::client::StatelessClient;
@@ -126,13 +127,18 @@ pub async fn upload_by_command(
     submit: SubmitOption,
     proxy: Option<&str>,
 ) -> AppResult<()> {
+    let task = UploadTask::default();
     if video_path.is_empty() {
+        observe::submission_decided(&task.submission, "failed", "no_input", 0);
         return Err(AppError::Custom(
             "No video files specified. Please provide at least one video file path.".to_string(),
         )
         .into());
     }
-    let bili = login_by_cookies(user_cookie, proxy).await?;
+    let bili = task.check(
+        login_by_cookies(user_cookie, proxy).await,
+        "authentication_failed",
+    )?;
     if studio.title.is_empty() {
         studio.title = video_path[0]
             .file_stem()
@@ -140,23 +146,29 @@ pub async fn upload_by_command(
             .map(|s| s.to_string())
             .unwrap();
     }
-    cover_up(&mut studio, &bili).await?;
-    studio.videos = upload(&video_path, &bili, line, limit).await?;
+    task.check(cover_up(&mut studio, &bili).await, "cover_failed")?;
+    studio.videos = task.check(
+        upload_with_task(&video_path, &bili, line, limit, &task).await,
+        "upload_failed",
+    )?;
 
-    match submit {
-        SubmitOption::BCutAndroid => bili
-            .submit_by_bcut_android(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-        SubmitOption::Web => bili
-            .submit_by_web(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-        _ => bili
-            .submit_by_app(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-    };
+    task.submit(async {
+        Ok(match submit {
+            SubmitOption::BCutAndroid => bili
+                .submit_by_bcut_android(&studio, proxy)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?,
+            SubmitOption::Web => bili
+                .submit_by_web(&studio, proxy)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?,
+            _ => bili
+                .submit_by_app(&studio, proxy)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?,
+        })
+    })
+    .await?;
 
     Ok(())
 }
@@ -168,48 +180,68 @@ pub async fn upload_by_config(
     proxy: Option<&str>,
 ) -> AppResult<()> {
     // println!("number of concurrent futures: {limit}");
-    let bilibili = login_by_cookies(user_cookie, proxy).await?;
-    let config = load_config(&config).change_context_lazy(|| AppError::Unknown)?;
+    let setup = UploadTask::default();
+    let bilibili = setup.check(
+        login_by_cookies(user_cookie, proxy).await,
+        "authentication_failed",
+    )?;
+    let config = setup.check(
+        load_config(&config).change_context_lazy(|| AppError::Unknown),
+        "config_failed",
+    )?;
+    observe::submission_decided(&setup.submission, "skipped", "config_dispatch", 0);
     for (filename_patterns, mut studio) in config.streamers {
+        let task = UploadTask::default();
         let mut paths = Vec::new();
-        for entry in glob::glob(&filename_patterns)
-            .change_context_lazy(|| AppError::Unknown)?
+        for entry in task
+            .check(
+                glob::glob(&filename_patterns).change_context_lazy(|| AppError::Unknown),
+                "config_failed",
+            )?
             .filter_map(Result::ok)
         {
             paths.push(entry);
         }
         if paths.is_empty() {
             warn!("未搜索到匹配的视频文件：{filename_patterns}");
+            observe::submission_decided(&task.submission, "skipped", "no_input", 0);
             continue;
         }
-        cover_up(&mut studio, &bilibili).await?;
+        task.check(cover_up(&mut studio, &bilibili).await, "cover_failed")?;
 
-        studio.videos = upload(
-            &paths,
-            &bilibili,
-            config
-                .line
-                .as_ref()
-                .and_then(|l| UploadLine::from_str(l, true).ok()),
-            config.limit,
-        )
-        .await?;
+        studio.videos = task.check(
+            upload_with_task(
+                &paths,
+                &bilibili,
+                config
+                    .line
+                    .as_ref()
+                    .and_then(|l| UploadLine::from_str(l, true).ok()),
+                config.limit,
+                &task,
+            )
+            .await,
+            "upload_failed",
+        )?;
         // 命令行参数优先，如果没有提供则使用配置文件中的设置
         let submit_option = submit_override.clone().unwrap_or(config.submit.clone());
-        match submit_option {
-            SubmitOption::BCutAndroid => bilibili
-                .submit_by_bcut_android(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-            SubmitOption::Web => bilibili
-                .submit_by_web(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-            _ => bilibili
-                .submit_by_app(&studio, proxy)
-                .await
-                .change_context_lazy(|| AppError::Unknown)?,
-        };
+        task.submit(async {
+            Ok(match submit_option {
+                SubmitOption::BCutAndroid => bilibili
+                    .submit_by_bcut_android(&studio, proxy)
+                    .await
+                    .change_context_lazy(|| AppError::Unknown)?,
+                SubmitOption::Web => bilibili
+                    .submit_by_web(&studio, proxy)
+                    .await
+                    .change_context_lazy(|| AppError::Unknown)?,
+                _ => bilibili
+                    .submit_by_app(&studio, proxy)
+                    .await
+                    .change_context_lazy(|| AppError::Unknown)?,
+            })
+        })
+        .await?;
     }
     Ok(())
 }
@@ -223,29 +255,58 @@ pub async fn append(
     submit: SubmitOption,
     proxy: Option<&str>,
 ) -> AppResult<()> {
+    let task = UploadTask::default();
     if video_path.is_empty() {
+        observe::submission_decided(&task.submission, "failed", "no_input", 0);
         return Err(AppError::Custom(
             "No video files specified. Please provide at least one video file path.".to_string(),
         )
         .into());
     }
-    let bilibili = login_by_cookies(user_cookie, proxy).await?;
-    let mut uploaded_videos = upload(&video_path, &bilibili, line, limit).await?;
-    let mut studio = bilibili
-        .studio_data(&vid, proxy)
-        .await
-        .change_context_lazy(|| AppError::Unknown)?;
+    let bilibili = task.check(
+        login_by_cookies(user_cookie, proxy).await,
+        "authentication_failed",
+    )?;
+    let mut uploaded_videos = task.check(
+        upload_with_task(&video_path, &bilibili, line, limit, &task).await,
+        "upload_failed",
+    )?;
+    let mut studio = task.check(
+        bilibili
+            .studio_data(&vid, proxy)
+            .await
+            .change_context_lazy(|| AppError::Unknown),
+        "target_lookup_failed",
+    )?;
     studio.videos.append(&mut uploaded_videos);
-    match submit {
-        SubmitOption::App => bilibili
-            .edit_by_app(&studio, proxy)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-        _ => bilibili
-            .edit_by_web(&studio)
-            .await
-            .change_context_lazy(|| AppError::Unknown)?,
-    };
+    observe::submission_started(&task.submission, "append_ready");
+    let result = async {
+        Ok::<_, error_stack::Report<AppError>>(match submit {
+            SubmitOption::App => bilibili
+                .edit_by_app(&studio, proxy)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?,
+            _ => bilibili
+                .edit_by_web(&studio)
+                .await
+                .change_context_lazy(|| AppError::Unknown)?,
+        })
+    }
+    .await;
+    observe::submission_completed(
+        &task.submission,
+        if result.is_ok() {
+            "succeeded"
+        } else {
+            "unknown"
+        },
+        if result.is_ok() {
+            "appended"
+        } else {
+            "request_failed"
+        },
+    );
+    result?;
     // studio.edit(&login_info).await?;
     Ok(())
 }
@@ -390,6 +451,20 @@ pub async fn upload(
     line: Option<UploadLine>,
     limit: usize,
 ) -> AppResult<Vec<Video>> {
+    let task = UploadTask::default();
+    task.check(
+        upload_with_task(video_path, bili, line, limit, &task).await,
+        "upload_failed",
+    )
+}
+
+async fn upload_with_task(
+    video_path: &[PathBuf],
+    bili: &BiliBili,
+    line: Option<UploadLine>,
+    limit: usize,
+    task: &UploadTask,
+) -> AppResult<Vec<Video>> {
     info!("number of concurrent futures: {limit}");
 
     // 生成断点续传文件路径（基于视频列表的哈希）
@@ -427,6 +502,11 @@ pub async fn upload(
 
     let mut videos = checkpoint.videos.clone();
     let client = StatelessClient::default();
+    let line_reason = if line.is_some() {
+        "configured"
+    } else {
+        "automatic"
+    };
     let line = match line {
         Some(UploadLine::Bldsa) => line::bldsa(),
         Some(UploadLine::Cnbldsa) => line::cnbldsa(),
@@ -448,17 +528,23 @@ pub async fn upload(
             .change_context(AppError::Unknown)?,
     };
     // let line = line::kodo();
-    for video_path in video_path {
+    for (index, video_path) in video_path.iter().enumerate() {
+        let identity = task.file(video_path, index + 1);
         // 检查文件是否已经上传
         if checkpoint.is_uploaded(video_path) {
             info!("Skipping already uploaded file: {}", video_path.display());
+            observe::recovery_decided(&identity, "skipped", "checkpoint_reused");
             continue;
         }
 
+        observe::upload_queued(&identity, "awaiting_pre_upload");
+        let identity = identity.with_attempt(&uuid::Uuid::new_v4().to_string());
         info!("{line:?}");
-        let video_file = VideoFile::new(video_path).change_context_lazy(|| {
-            AppError::Custom(format!("file {}", video_path.to_string_lossy()))
-        })?;
+        let video_file = VideoFile::new(video_path)
+            .inspect_err(|_| observe::upload_failed(&identity, "source_io", "无法读取上传文件"))
+            .change_context_lazy(|| {
+                AppError::Custom(format!("file {}", video_path.to_string_lossy()))
+            })?;
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
 
@@ -467,6 +553,7 @@ pub async fn upload(
         let credential_id = format!("{}", bili.login_info.token_info.mid);
         let upload_lock = Arc::new(Mutex::new(
             UploadLock::new(&credential_id)
+                .inspect_err(|_| observe::upload_failed(&identity, "lock_failed", "无法创建上传锁"))
                 .map_err(|e| AppError::Custom(format!("Failed to create upload lock: {}", e)))?,
         ));
 
@@ -474,6 +561,7 @@ pub async fn upload(
         {
             let lock = upload_lock.lock().unwrap();
             if lock.is_locked() {
+                observe::upload_failed(&identity, "cooldown", "其他上传任务正在等待限流恢复");
                 return Err(AppError::Custom(format!(
                     "另一个使用该账号 ({}) 的上传进程正在等待限流恢复，请稍后重试",
                     credential_id
@@ -486,16 +574,37 @@ pub async fn upload(
         let lock_acquired = Arc::new(Mutex::new(false));
 
         // 执行上传，遇到限流错误时自动重试
-        let uploader = {
+        let (uploader, identity) = {
             let upload_lock_clone = Arc::clone(&upload_lock);
             let lock_acquired_clone = Arc::clone(&lock_acquired);
 
             biliup::retry_with_config(
-                || async {
-                    let video_file_clone = VideoFile::new(video_path).map_err(|e| {
-                        Kind::Custom(format!("file {}: {}", video_path.to_string_lossy(), e))
-                    })?;
-                    line.pre_upload(bili, video_file_clone).await
+                || {
+                    let identity = identity.with_attempt(&uuid::Uuid::new_v4().to_string());
+                    let line = &line;
+                    async move {
+                        observe::upload_line_decided(
+                            &identity,
+                            line.key(),
+                            "executed",
+                            line_reason,
+                        );
+                        let video_file_clone = VideoFile::new(video_path)
+                            .inspect_err(|_| {
+                                observe::upload_failed(&identity, "source_io", "无法读取上传文件")
+                            })
+                            .map_err(|e| {
+                                Kind::Custom(format!(
+                                    "file {}: {}",
+                                    video_path.to_string_lossy(),
+                                    e
+                                ))
+                            })?;
+                        let result = line.pre_upload(bili, video_file_clone).await;
+                        result
+                            .inspect_err(|error| observe::standalone::failed(&identity, error))
+                            .map(|uploader| (uploader, identity))
+                    }
                 },
                 5,
                 Some(move |e: &Kind| {
@@ -546,6 +655,7 @@ pub async fn upload(
 
         let instant = Instant::now();
 
+        observe::upload_started(&identity, line.key(), total_size);
         let video = uploader
             .upload(client.clone(), limit, |vs| {
                 vs.map(|chunk| {
@@ -556,9 +666,11 @@ pub async fn upload(
                 })
             })
             .await
+            .inspect_err(|error| observe::standalone::failed(&identity, error))
             .change_context_lazy(|| AppError::Unknown)?;
         pb.finish_and_clear();
         let t = instant.elapsed().as_millis();
+        observe::upload_completed(&identity, "transferred", t as u64);
         info!(
             "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
             t as f64 / 1000.,

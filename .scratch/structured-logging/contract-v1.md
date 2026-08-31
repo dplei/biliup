@@ -23,6 +23,11 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   business ID 查询同时传 instance_id。P1 不为业务分配 segment_id，不新增业务字段。
   P3 起 segment_id 在文件创建时分配（`LifecycleFile::create`），随关闭回调与登记账本持久化；
   空字符串 ID 表示「调用方没有这个身份」，既不入库也不计 rejected，与格式非法的 ID 区分。
+- 独立上传既有文件时没有录制账本，不按路径补造 segment_id / upload_session_id。
+  P3/14 的上传事件采用另一种完整形态：task_id + original_file + segment_order +
+  upload_attempt_id；segment_order 是本次输入列表从 1 起的序号，用于区分脱敏后同 basename
+  的不同输入，不能跨 task 当作持久身份。排队/断点复用时 attempt 可空；每次预上传重试
+  分配新 attempt。checkpoint 只证明既有记录被复用，不重新宣称本次完成了远端传输。
 - streamer_name 为脱敏显示快照（≤256 字节）；original_file/artifact_file 只保留脱敏 basename
   （≤256 字节），转码不覆盖 segment_id。file/line 仅辅助来源，不作身份。
 - fields 是受控扁平标量集合，未知键、嵌套 JSON、负的非负量丢弃并计数；数值以

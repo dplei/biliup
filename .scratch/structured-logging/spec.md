@@ -104,6 +104,9 @@ P0–P1 已按 [契约v1](contract-v1.md) / [预算v1](baseline-budget.md) 落�
    作为 artifact 关联，不覆盖原分段身份。
 3. 单条服务端任务事件应能回答「哪个主播、哪一场、哪个分段」。启动阶段或尚未创建文件时，
    允许相关字段为空，但必须有阶段/尝试身份；独立 CLI 用 `task_id`，不伪造主播和场次。
+   独立上传的既有文件没有录制账本身份时，采用 `task_id + original_file + segment_order +
+   upload_attempt_id` 形态（[契约 v1](contract-v1.md)）；输入序号只在当前任务内有效，
+   不从路径推断原录制分段，也不把 checkpoint 复用写成新的传输成功。
 4. ID 不通过跨库外键级联删除；主播/文件删除后历史事件仍有必要的展示快照。不同实例的
    自增业务 ID 必须与 `instance_id` 一起使用。
 5. 稳定事件名如 `recording.dts_backward`、`processing.timestamp_repair_decided`；数值用

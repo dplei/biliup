@@ -3111,7 +3111,44 @@ pub async fn upload(
     config: &Config,
     pool: &ConnectionPool,
 ) -> AppResult<(BiliBili, Vec<Video>)> {
-    let bilibili = login_by_cookies(&cookie_file, proxy).await;
+    upload_with_task(
+        cookie_file,
+        proxy,
+        line,
+        video_paths,
+        limit,
+        config,
+        pool,
+        None,
+    )
+    .await
+}
+
+/// The embedded uploader supplies its invocation context; legacy page callers keep their
+/// current behavior until that entry is migrated as a separate coverage batch.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_with_task(
+    cookie_file: impl AsRef<Path>,
+    proxy: Option<&str>,
+    line: Option<UploadLine>,
+    video_paths: &[PathBuf],
+    limit: usize,
+    config: &Config,
+    pool: &ConnectionPool,
+    task: Option<&crate::observe::standalone::UploadTask>,
+) -> AppResult<(BiliBili, Vec<Video>)> {
+    let bilibili = login_by_cookies(&cookie_file, proxy)
+        .await
+        .inspect_err(|_| {
+            if let Some(task) = task {
+                crate::observe::submission_decided(
+                    &task.submission,
+                    "failed",
+                    "authentication_failed",
+                    0,
+                );
+            }
+        });
     let bilibili = match bilibili {
         Err(Kind::IO(_)) => bilibili.change_context_lazy(|| {
             AppError::Custom(format!(
@@ -3133,79 +3170,145 @@ pub async fn upload(
         config.cookie_health_webhook.as_deref(),
         "page_upload",
     )
-    .await?;
+    .await
+    .inspect_err(|_| {
+        if let Some(task) = task {
+            crate::observe::submission_decided(
+                &task.submission,
+                "failed",
+                "line_selection_failed",
+                0,
+            );
+        }
+    })?;
+    let line_outcome = if selected.source == LineSource::Fallback {
+        "fallback"
+    } else {
+        "executed"
+    };
+    let line_reason = selected.source.as_str();
     let line = selected.line;
     let line_key = selected.key;
-    for video_path in video_paths {
-        println!(
-            "{:?}",
-            video_path
+    for (index, video_path) in video_paths.iter().enumerate() {
+        let identity = task.map(|task| {
+            task.file(video_path, index + 1)
+                .with_attempt(&uuid::Uuid::new_v4().to_string())
+        });
+        if let Some(identity) = &identity {
+            crate::observe::upload_queued(identity, "awaiting_pre_upload");
+            crate::observe::upload_line_decided(identity, &line_key, line_outcome, line_reason);
+        }
+        let file_result = async {
+            let canonical_path = video_path
                 .canonicalize()
-                .change_context_lazy(|| AppError::Unknown)?
-                .to_str()
-        );
-        info!("{line:?}");
-        let video_file = VideoFile::new(video_path).change_context_lazy(|| AppError::Unknown)?;
-        let total_size = video_file.total_size;
-        let file_name = video_file.file_name.clone();
-        let settings = UploadRateGateSettings::from(config);
-        upload_rate_gate::before_pre_upload(settings, pool).await?;
-        let uploader = match line.pre_upload(&bilibili, video_file).await {
-            Ok(uploader) => {
-                upload_rate_gate::record_success(settings, pool).await;
-                uploader
-            }
-            Err(Kind::RateLimit { code: 601, message }) => {
-                let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
-                return Err(error_stack::Report::new(AppError::Custom(format!(
-                    "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
-                ))));
-            }
-            Err(error) => {
-                upload_rate_gate::record_non_rate_limit_failure(settings).await;
-                record_line_kind_failure(
-                    pool,
-                    &line_key,
-                    config.cookie_health_webhook.as_deref(),
-                    &error,
-                )
-                .await;
-                return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
-            }
-        };
-
-        let instant = Instant::now();
-
-        let video = match uploader
-            .upload(client.clone(), limit, |vs| {
-                vs.map(|vs| {
-                    let chunk = vs?;
-                    let len = chunk.len();
-                    Ok((chunk, len))
+                .inspect_err(|_| {
+                    if let Some(identity) = &identity {
+                        crate::observe::upload_failed(identity, "source_io", "无法读取上传文件");
+                    }
                 })
-            })
-            .await
-        {
-            Ok(video) => video,
-            Err(error) => {
-                record_line_kind_failure(
-                    pool,
-                    &line_key,
-                    config.cookie_health_webhook.as_deref(),
-                    &error,
-                )
-                .await;
-                return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+                .change_context_lazy(|| AppError::Unknown)?;
+            println!("{:?}", canonical_path.to_str());
+            info!("{line:?}");
+            let video_file = VideoFile::new(video_path)
+                .inspect_err(|_| {
+                    if let Some(identity) = &identity {
+                        crate::observe::upload_failed(identity, "source_io", "无法读取上传文件");
+                    }
+                })
+                .change_context_lazy(|| AppError::Unknown)?;
+            let total_size = video_file.total_size;
+            let file_name = video_file.file_name.clone();
+            let settings = UploadRateGateSettings::from(config);
+            upload_rate_gate::before_pre_upload(settings, pool)
+                .await
+                .inspect_err(|_| {
+                    if let Some(identity) = &identity {
+                        crate::observe::upload_failed(identity, "rate_gate_unavailable", "无法读取上传准入状态");
+                    }
+                })?;
+            let uploader = match line.pre_upload(&bilibili, video_file).await {
+                Ok(uploader) => {
+                    upload_rate_gate::record_success(settings, pool).await;
+                    uploader
+                }
+                Err(Kind::RateLimit { code: 601, message }) => {
+                    if let Some(identity) = &identity {
+                        crate::observe::upload_failed(identity, "rate_limited", "预上传被限流");
+                    }
+                    let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
+                    return Err(error_stack::Report::new(AppError::Custom(format!(
+                        "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
+                    ))));
+                }
+                Err(error) => {
+                    if let Some(identity) = &identity {
+                        crate::observe::standalone::failed(identity, &error);
+                    }
+                    upload_rate_gate::record_non_rate_limit_failure(settings).await;
+                    record_line_kind_failure(
+                        pool,
+                        &line_key,
+                        config.cookie_health_webhook.as_deref(),
+                        &error,
+                    )
+                    .await;
+                    return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+                }
+            };
+
+            let instant = Instant::now();
+            if let Some(identity) = &identity {
+                crate::observe::upload_started(identity, &line_key, total_size);
             }
+
+            let video = match uploader
+                .upload(client.clone(), limit, |vs| {
+                    vs.map(|vs| {
+                        let chunk = vs?;
+                        let len = chunk.len();
+                        Ok((chunk, len))
+                    })
+                })
+                .await
+            {
+                Ok(video) => video,
+                Err(error) => {
+                    if let Some(identity) = &identity {
+                        crate::observe::standalone::failed(identity, &error);
+                    }
+                    record_line_kind_failure(
+                        pool,
+                        &line_key,
+                        config.cookie_health_webhook.as_deref(),
+                        &error,
+                    )
+                    .await;
+                    return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
+                }
+            };
+            if let Some(identity) = &identity {
+                crate::observe::upload_completed(
+                    identity,
+                    "transferred",
+                    instant.elapsed().as_millis() as u64,
+                );
+            }
+            upload_line_health::record_success(pool, &line_key).await?;
+            let t = instant.elapsed().as_millis();
+            info!(
+                line = &line_key,
+                "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
+                t as f64 / 1000.,
+                total_size as f64 / 1000. / t as f64
+            );
+            Ok::<_, error_stack::Report<AppError>>(video)
+        }
+        .await;
+        let video = if let Some(task) = task {
+            task.check(file_result, "upload_failed")?
+        } else {
+            file_result?
         };
-        upload_line_health::record_success(pool, &line_key).await?;
-        let t = instant.elapsed().as_millis();
-        info!(
-            line = &line_key,
-            "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
-            t as f64 / 1000.,
-            total_size as f64 / 1000. / t as f64
-        );
         videos.push(video);
     }
 
