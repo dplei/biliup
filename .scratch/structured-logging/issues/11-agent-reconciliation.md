@@ -42,5 +42,7 @@ Implementation: complete
 当前状态见 [P2 回执](../receipts/P2.md)：三份提示词与输入契约、视图隔离（互不含对方来源与
 匿名映射）、未引用/跨源引用报告被拒、12 项合成故障回归、桥接传输核对均已实跑。真实入口上
 新增一条比较边界：重复旧行与脱敏行无法按文本判定，工具判 insufficient 而非 passed。
-**未完成**：两份互不可见的独立还原报告与 `cross` 交叉复核尚未执行，因此本任务验收记 partial，
-P2 阶段判 awaiting-validation。所有输出仍固定 `native_coverage=not-started`。
+两份互不可见的独立还原与 `cross` 交叉复核已实跑完成：两份初始报告都判 insufficient 并把
+业务六问保持 unknown，没有把桥接文本或导出管道健康当作业务结论；交叉复核 `bridge_transport=passed`、
+`native_coverage=not-started`。真实证据上跑通一次完整闭环——导出器把声明的时区按路径脱敏导致
+两源时间无法对齐，改为受控标识符并补回归后重新采包复核通过，旧包结论保留。本任务验收 passed。

@@ -3,8 +3,8 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P1 已完成并通过本地受控验收，代码在当前工作区未提交。P2 的 09–11 实现与确定性验证完成，
-等两份独立还原报告与交叉复核后才判通过；P3–P6 未开始，旧日志/页面保留。
+P0–P2 已完成并通过本地受控验收，代码已提交在任务分支（未 push）。原生业务覆盖仍为
+not-started，桥接不计覆盖分；P3–P6 未开始，旧日志/页面保留。
 
 ## 状态约定
 
@@ -29,7 +29,7 @@ P0–P1 已完成并通过本地受控验收，代码在当前工作区未提交
 | --- | --- | --- | --- | --- | --- | --- |
 | P0 | 06 | complete | passed | not-required | passed | [P0](receipts/P0.md) |
 | P1 | 07、08 | complete | passed | not-required | passed | [P1](receipts/P1.md) |
-| P2 | 09、10、11 | complete | partial | not-required | awaiting-validation | [P2](receipts/P2.md) |
+| P2 | 09、10、11 | complete | passed | not-required | passed | [P2](receipts/P2.md) |
 | P3 | 12、13、14、15、16 | not-started | pending | pending | not-started | — |
 | P4 | 17 | not-started | pending | pending | not-started | — |
 | P5 | 18 | not-started | pending | pending | not-started | — |
@@ -50,7 +50,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [08 独立 SQLite](issues/08-sqlite-writer.md) | P1 | complete | passed | [P1](receipts/P1.md)：幂等/只读/附件/维护/备份/强杀与量化负载 |
 | [09 入口旁路](issues/09-shadow-integration.md) | P2 | complete | passed | [P2](receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
 | [10 证据导出](issues/10-evidence-export.md) | P2 | complete | passed | [P2](receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
-| [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | partial | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对已跑；独立还原 × 2 与交叉复核待执行 |
+| [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | not-started | pending | 待实现 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | not-started | pending | 待实现 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
@@ -62,18 +62,20 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近已验收阶段：P1；P2 实现完成、确定性验证通过，判 `awaiting-validation`。
-- 当前实施阶段/任务：P2 的 11 仅剩独立还原与交叉复核；09、10 已完成验收。
+- 最近已验收阶段：P2（09、10、11 全部 passed）。
+- 当前实施阶段/任务：无进行中阶段；下一阶段是 P3 的 12–16，尚未开始。
 - 本轮已做：复核 P2 实现并复跑全部测试；补跑 5 个入口证据包的桥接传输核对；新增本地
-  dev server 三态（开启/关闭/新库不可用）真实服务演练及其证据包；回写回执与本表。
-- 源码交付状态：基于 3fa218f，当前 refactor/issue2-260831-153007 工作区未提交；含新 crate
-  与 `shadow.rs`、三处入口初始化改造、`scripts/structured_logging/`、effort 文档与代码索引。
+  dev server 三态（开启/关闭/新库不可用）真实服务演练及其证据包；完成两份互不可见的独立
+  还原与交叉复核；据此修复导出器时区脱敏并新增回归、重新采包复核；回写回执与本表。
+- 源码交付状态：refactor/issue2-260831-153007 上的 542a8fa（新 crate、`shadow.rs`、三处入口
+  初始化改造、`scripts/structured_logging/`）、a791971（effort 文档与代码索引），以及其后
+  一次「导出器时区修复与 P2 收尾回写」提交，未 push。
 - 运行/观察记录：受控入口矩阵、本地 dev server 真实 HTTP/WebSocket 演练、20,000 条双路
   负载、合成故障回归；没有真实录制/上传/投稿，没有生产双写，没有长观察。
 - 已知边界：原生业务覆盖 `not-started`，桥接不计任何覆盖项；纯文本桥接在重复旧行与脱敏行
   上不可判定（工具判 insufficient）；Rust CLI/Rust server 无持久旧文件 sink，受控演练显式
   使用 wrapper stdout；仅 macOS 本机验证，Windows 未验证。
-- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 继续 P2`。
+- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 实现 P3`。
 
 ## 每次回写的检查清单
 

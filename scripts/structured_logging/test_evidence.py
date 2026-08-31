@@ -69,6 +69,20 @@ class EvidenceTest(unittest.TestCase):
         self.assertIn('legacy_line_limit',m['completeness']['reasons'])
         self.assertLess((out/'legacy.jsonl').stat().st_size,8192)
 
+    def test_declared_timezone_survives_and_bogus_zone_is_unknown(self):
+        # Regression: a path-shaped scrub used to turn "Asia/Shanghai" into "Asia[PATH]",
+        # leaving analysts unable to align the two sources' timestamps.
+        self.event()
+        out, m = self.export()
+        self.assertEqual(m['legacy'][0]['timezone'], 'Asia/Shanghai')
+        self.request['legacy'][0]['timezone'] = '/etc/passwd Authorization: Bearer synthetic-secret'
+        self.request['display_timezone'] = 'Asia/Shanghai'
+        out2, m2 = self.export('bogus-zone')
+        self.assertEqual(m2['legacy'][0]['timezone'], 'unknown')
+        self.assertIn('legacy_timezone_unknown', m2['completeness']['reasons'])
+        self.assertEqual(m2['scope']['display_timezone'], 'Asia/Shanghai')
+        self.assertNotIn('synthetic-secret', (out2 / 'manifest.json').read_text())
+
     def test_rotation_during_read_retains_failed_manifest(self):
         original = e.Bundle.write
         def rotate(bundle, name, obj):
