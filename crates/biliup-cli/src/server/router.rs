@@ -17,10 +17,14 @@ use crate::server::api::endpoints::{
     recover_missing_upload, recover_session_uploads, rescan_missing_uploads, retry_missing_upload,
     stop_missing_upload,
 };
+use crate::server::api::log_events::{
+    export_log_events, get_log_event_diagnostic, list_log_events, stream_log_events,
+};
 use crate::server::api::recording_lease::{
     delete_recording_lease, put_recording_lease, put_recording_state, toggle_recording_state,
 };
 use crate::server::api::stream_check::check_stream_now;
+use crate::server::api::ws::ws_logs;
 use crate::server::common::path_safety::{PathRejection, resolve_within};
 use crate::server::common::upload::BACKGROUND_DIR;
 use crate::server::infrastructure::service_register::ServiceRegister;
@@ -44,6 +48,15 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
                 .put(put_streamers_endpoint), // 更新主播
         )
         .route("/v1/streamers/{id}", delete(delete_streamers_endpoint)) // 删除主播
+        // 独立事件库的只读入口。放在这里而不是 app.rs 的守卫之后，未登录一律拿不到数据；
+        // 旧的 /v1/ws/logs 仍读真实旧文件，作为对照来源保持不变。
+        .route("/v1/log-events", get(list_log_events))
+        .route("/v1/log-events/stream", get(stream_log_events))
+        .route("/v1/log-events/export", get(export_log_events))
+        .route(
+            "/v1/log-events/{event_uid}/diagnostic",
+            get(get_log_event_diagnostic),
+        )
         .route("/v1/streamers/{id}/pause", put(toggle_recording_state))
         // 主动检查直播流：不等轮询轮到这个房间，立刻检查一次并在开播时接上录制。
         .route("/v1/streamers/{id}/check", post(check_stream_now))
@@ -130,6 +143,9 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
             delete(discard_empty_upload_session),
         )
         .route("/v1/uploads", post(post_uploads))
+        // 旧的文件日志流从 app.rs 的守卫之后挪进来：它读的是真实旧日志文件，未登录不该拿到。
+        // 部署显式关闭登录守卫时行为不变（整个 router 都不设防）。
+        .route("/v1/ws/logs", get(ws_logs))
         .with_state(service_register) // 注入服务注册器状态
         .merge(static_file_router(default_static_root()))
         .merge(cover_background_router(PathBuf::from(BACKGROUND_DIR)))
