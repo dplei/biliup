@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 11
 Phase: P3
-Implementation: not-started
+Implementation: complete
 
 来源：[覆盖清单 C02–C05](../coverage-ledger.md)、[实施计划](../rollout-plan.md)。
 
@@ -36,3 +36,10 @@ migration。此任务不把日志身份变成新的业务状态机，不迁移�
 ## Comments
 
 先拿一条完整业务链证明关联有效，再扩展其他路径。
+
+- 交付完成，验收 partial，结论见 [P3 回执](../receipts/P3.md)。分段身份在文件创建时分配，
+  经关闭回调与登记事务（加法迁移，可空）持久化；受控演练覆盖两次完整过程、双路交错、
+  连续切片、传输失败断连与人工构造的 DTS 异常，证据包 complete 且 7 条预期事实全部确认。
+- 顺带修掉一处既有缺陷：切片关闭原因在计数复位之后才取值，导致配置切片恒为 `Unknown`。
+  修复有业务可见副作用（线路健康的「完成配置分段」信号此前一直为假），已加回归测试。
+- 未完成：服务端整场循环缺真实开播样本；外部下载器与 HLS 路径保留待接入标记，归入任务 14。

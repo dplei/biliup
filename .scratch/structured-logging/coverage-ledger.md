@@ -2,8 +2,9 @@
 
 Status: needs-triage
 来源：[实施计划](rollout-plan.md)、[对比流程](reconciliation.md)。
-P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。以下业务原生事件仍均为
-**未接入、未通过业务运行验证**，不能把 P1 合成载体验证当作业务覆盖。
+P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12 起 **C02–C05 的录制域**已有
+原生事件并通过受控演练（见下方变更记录）；**C01、C06–C14 仍未接入**，只有桥接文本，
+不能把 P1 合成载体验证或桥接采集当作业务覆盖。
 
 ## 关键事实
 
@@ -67,7 +68,7 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Rust CLI | 全局subscriber；仅stdout，--rust-log缺省tower_http=debug,info，秒级本地时间，Web可reload，无文件guard | P2实测：旁路三态通过；无持久旧文件，受控对照用wrapper stdout |
 | Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：多次调用共享run、不覆盖宿主subscriber；旧文件照常 |
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P2实测：缺凭据早退路径通过，多次调用不重复消费；旧文件照常 |
-| HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python读头失败回落HLS；server StreamGears同样探测。稳定segment_id尚缺 | 源码核对；P3验流/回调 |
+| HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python读头失败回落HLS；server StreamGears同样探测 | P3/12实测：FLV路径稳定segment_id与原生事件通过（Python入口真实演练 + 服务端执行器集成测试）；HLS共用同一文件层但未实跑 |
 | 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | 不冒称可用；P3/14须复核实际可达性 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
 
@@ -84,7 +85,7 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
 
 每批接入后追加 `覆盖项 / 入口 / 契约版本 / 接入任务 / 对比批次别名 / 结论 / 未解决差异`。
 真实映射和运行细节不写入本文件；公开结论只引用脱敏场景与匿名报告编号。
-业务原生覆盖目前没有通过记录。新增路径、新事件或必填字段变更后，相关条目回到待验证。
+业务原生覆盖自 P3/12 起有第一条通过记录（录制域）。新增路径、新事件或必填字段变更后，相关条目回到待验证。
 
 - C01–C14 / 合成调用者 / v1 / 06–08 / synthetic-v1：P0来源映射和P1载体/存储能力通过，
   [P0](receipts/P0.md)、[P1](receipts/P1.md)；不计为业务迁移覆盖，所有实际入口仍待P2/P3。
@@ -102,3 +103,17 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
 - 证据包元数据 / 导出器 / evidence-v1 / 10–11 / shadow-v1：独立还原与交叉复核发现声明时区被
   按路径规则脱敏、两源时间无法对齐（差异 D04）。已改为受控时区标识符（合法值保留、非法值判
   unknown 并计入不完整原因）、补回归用例并重新采包复核通过；修复前的包保留原结论。
+- C02–C05 / Python 下载函数 + 服务端拉流执行器 / v1 / 12 / recording-native-v1：**原生**通过。
+  分段身份在 `LifecycleFile::create` 分配，经关闭回调、`SegmentInfo` 与登记事务（加法迁移、
+  可空列）持久化；受控演练覆盖两次完整过程、双路交错、连续切片、传输失败断连与人工构造的
+  DTS 异常，证据包 complete、校验 passed、7 条预期事实全部 confirmed，见 [P3](receipts/P3.md)。
+  **未解决差异**：服务端整场循环（`recording.started/stopped/retry_scheduled`）缺真实开播样本，
+  只有编译与集成测试证据；外部下载器与 HLS 路径未接入身份（保留待接入标记，归任务 14）；
+  C01、C06–C13 不因本行计任何原生分。
+- 切片关闭原因 / 原生 FLV 路径 / v1 / 12 / recording-native-v1：既有缺陷——原因在计数复位之后
+  才取值，配置切片的关闭原因恒为 `Unknown`。已改为复位前取值并加回归。**业务可见副作用**：
+  线路健康的 `completed_configured_segment` 此前恒为假，修复后完成配置分段才计为稳定尝试。
+- 契约细化 / Fields / contract-v1 / 12 / recording-native-v1：空字符串 ID 表示「调用方没有该身份」，
+  既不入库也不计 rejected；格式非法的 ID 仍计 rejected。已加双向回归。
+- 导出目录形态 / 导出器 / evidence-v1 / 12 / recording-native-v1：目录改为「多种合法形态取其一」，
+  `recording.dts_backward` 的 1:1 与汇总形态都合法，半个形态仍判缺字段；已加回归。

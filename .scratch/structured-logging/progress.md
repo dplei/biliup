@@ -3,8 +3,8 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收，代码已提交在任务分支（未 push）。原生业务覆盖仍为
-not-started，桥接不计覆盖分；P3–P6 未开始，旧日志/页面保留。
+P0–P2 已完成并通过本地受控验收；P3 进行中：任务 12 交付完成、验收 partial，13–16 未开始。
+录制域已有原生事件，其余域仍只有桥接；P4–P6 未开始，旧日志/页面保留。
 
 ## 状态约定
 
@@ -30,7 +30,7 @@ not-started，桥接不计覆盖分；P3–P6 未开始，旧日志/页面保留
 | P0 | 06 | complete | passed | not-required | passed | [P0](receipts/P0.md) |
 | P1 | 07、08 | complete | passed | not-required | passed | [P1](receipts/P1.md) |
 | P2 | 09、10、11 | complete | passed | not-required | passed | [P2](receipts/P2.md) |
-| P3 | 12、13、14、15、16 | not-started | pending | pending | not-started | — |
+| P3 | 12、13、14、15、16 | in-progress | pending | pending | in-progress | [P3](receipts/P3.md) |
 | P4 | 17 | not-started | pending | pending | not-started | — |
 | P5 | 18 | not-started | pending | pending | not-started | — |
 | P6 | 19 | not-started | pending | not-required | not-started | — |
@@ -51,7 +51,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [09 入口旁路](issues/09-shadow-integration.md) | P2 | complete | passed | [P2](receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
 | [10 证据导出](issues/10-evidence-export.md) | P2 | complete | passed | [P2](receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
-| [12 录制试点](issues/12-recording-pilot.md) | P3 | not-started | pending | 待实现 |
+| [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通与受控演练通过；缺真实开播整场样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | not-started | pending | 待实现 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
 | [15 查询 API](issues/15-query-api.md) | P3 | not-started | pending | 待实现 |
@@ -63,19 +63,19 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 ## 当前交接位置
 
 - 最近已验收阶段：P2（09、10、11 全部 passed）。
-- 当前实施阶段/任务：无进行中阶段；下一阶段是 P3 的 12–16，尚未开始。
-- 本轮已做：复核 P2 实现并复跑全部测试；补跑 5 个入口证据包的桥接传输核对；新增本地
-  dev server 三态（开启/关闭/新库不可用）真实服务演练及其证据包；完成两份互不可见的独立
-  还原与交叉复核；据此修复导出器时区脱敏并新增回归、重新采包复核；回写回执与本表。
-- 源码交付状态：refactor/issue2-260831-153007 上的 542a8fa（新 crate、`shadow.rs`、三处入口
-  初始化改造、`scripts/structured_logging/`）、a791971（effort 文档与代码索引），以及其后
-  一次「导出器时区修复与 P2 收尾回写」提交，未 push。
-- 运行/观察记录：受控入口矩阵、本地 dev server 真实 HTTP/WebSocket 演练、20,000 条双路
-  负载、合成故障回归；没有真实录制/上传/投稿，没有生产双写，没有长观察。
-- 已知边界：原生业务覆盖 `not-started`，桥接不计任何覆盖项；纯文本桥接在重复旧行与脱敏行
-  上不可判定（工具判 insufficient）；Rust CLI/Rust server 无持久旧文件 sink，受控演练显式
-  使用 wrapper stdout；仅 macOS 本机验证，Windows 未验证。
-- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 实现 P3`。
+- 当前实施阶段/任务：P3 进行中；任务 12 完成（验收 partial），下一项是任务 13。
+- 本轮已做：核验 P2 证据后进入 P3；实现分段稳定身份与录制域原生事件（创建/关闭/登记/
+  DTS/断连/重连/开始/结束），加法迁移持久化身份；补 5 项测试；跑通受控录制演练并导出
+  证据包，7 条预期事实全部确认；闭环 3 处差异（切片原因恒 Unknown、导出目录不认汇总形态、
+  期望事实引用被匿名化的 ID）；回写回执与本表。
+- 源码交付状态：refactor/issue2-260831-153007 上的 542a8fa、a791971 与其后一次「导出器时区
+  修复与 P2 收尾回写」提交已入库；**本轮 P3/12 的全部改动仍在工作区未提交**。
+- 运行/观察记录：受控录制演练（合成媒体、本地回环、无账号）、受控入口矩阵、本地 dev server
+  三态演练、20,000 条双路负载；没有真实平台开播录制，没有上传/投稿原生样本，没有长观察。
+- 已知边界：原生覆盖目前只到录制域（C02–C05 的受控部分），C06–C13 仍只有桥接；服务端整场
+  循环缺真实开播样本；外部下载器与 HLS 路径未接入身份；纯文本桥接在重复旧行与脱敏行上
+  不可判定；仅 macOS 本机验证，Windows 未验证。
+- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 继续 P3，从上次未完成处接着做`。
 
 ## 每次回写的检查清单
 
