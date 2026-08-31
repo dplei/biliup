@@ -2,6 +2,7 @@ pub mod cli;
 /// 本地封面预览（挑背景图与试参数用，不参与线上渲染）
 pub mod cover_preview;
 pub mod downloader;
+pub mod observe;
 pub mod server;
 pub mod upload_lock;
 pub mod uploader;

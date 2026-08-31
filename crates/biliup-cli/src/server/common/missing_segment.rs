@@ -427,6 +427,8 @@ async fn enqueue_segment(
         updated_at: now,
         normalized_file_path: None,
         lifecycle_version: 1,
+        // Legacy v1 rows predate the stable identity and must not be given a fabricated one.
+        segment_id: None,
         video_json: None,
         total_bytes: None,
         uploaded_bytes: 0,
@@ -573,6 +575,7 @@ mod tests {
             last_chunk_started_at: None,
             last_chunk_error: None,
             audio_normalized_at: None,
+            segment_id: None,
         }
     }
 

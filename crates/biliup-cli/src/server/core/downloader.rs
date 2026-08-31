@@ -23,6 +23,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// 一次重连所继承的缺口线索。`silent_measured` 区分实测与估算，估算不冒充测量。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ReconnectContext {
+    pub gap_ms: u64,
+    pub silent_ms: u64,
+    pub silent_measured: bool,
+}
+
 /// 下载器配置
 /// 包含下载过程中需要的各种参数和设置
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -47,6 +55,14 @@ pub struct DownloadConfig {
     pub output_dir: PathBuf,
 
     pub suffix: String,
+
+    /// 录制身份：房间与场次由调用方给出，事件层不从文件名反推。
+    #[serde(default)]
+    pub owner: crate::observe::RecordingIdentity,
+
+    /// 上一次连接的缺口；有值表示本次是重连，连接真正建立时才据此记录恢复。
+    #[serde(default)]
+    pub reconnect: Option<ReconnectContext>,
 
     /// 脱敏的单次选流/下载关联 ID。
     pub attempt_id: Option<String>,
@@ -169,6 +185,9 @@ pub struct SegmentInfo {
     pub segment_index: usize,
     pub close_reason: SegmentCloseReason,
     pub attempt_id: Option<String>,
+    /// Stable identity assigned when the file was created, carried through close, enrollment and
+    /// upload. Empty only for segments produced by a path that predates the identity.
+    pub segment_id: Option<String>,
     /// 合并成功后保留的原始短片；上传 durable 后才允许交给后处理清理。
     pub recovery_source_paths: Vec<PathBuf>,
     /// Durable v2 lifecycle identity. Upload code must consume this identity instead of
@@ -190,6 +209,8 @@ pub struct SegmentEnrollment {
     pub normalized_file_path: PathBuf,
     pub total_bytes: u64,
     pub duplicate: bool,
+    /// Identity carried from file creation, or the one already stored for a duplicate row.
+    pub segment_id: Option<String>,
 }
 
 impl SegmentInfo {
@@ -206,6 +227,7 @@ impl SegmentInfo {
             segment_index,
             close_reason: SegmentCloseReason::Unknown,
             attempt_id: None,
+            segment_id: None,
             recovery_source_paths: Vec::new(),
             enrollment: None,
         }

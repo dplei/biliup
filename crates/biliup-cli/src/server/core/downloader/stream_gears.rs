@@ -145,13 +145,23 @@ impl StreamGears {
                 return Ok(status);
             }
         };
+        // 帧头读通即连接已建立，这里才是「恢复」的真实执行点，不在退避决定时提前宣布。
+        if let Some(reconnect) = download_config.reconnect {
+            crate::observe::reconnected(
+                &download_config.owner,
+                reconnect.gap_ms,
+                reconnect.silent_ms,
+                reconnect.silent_measured,
+                Some(&attempt_id),
+            );
+        }
         // let mut i = 0;
         // let mut prev_file_path = None;
         // 创建分段回调钩子
         let hook = {
             let mut i = 0;
             let attempt_id = attempt_id.clone();
-            move |s: &str, close_reason| {
+            move |s: &str, close_reason, identity: biliup::downloader::util::SegmentIdentity| {
                 let file_path = PathBuf::from(s);
 
                 let event = SegmentInfo {
@@ -161,6 +171,7 @@ impl StreamGears {
                     segment_index: i,
                     close_reason,
                     attempt_id: Some(attempt_id.clone()),
+                    segment_id: Some(identity.segment_id),
                     recovery_source_paths: Vec::new(),
                     enrollment: None,
                 };
@@ -188,7 +199,8 @@ impl StreamGears {
                     "flv",
                     close_handle,
                     hook,
-                );
+                )
+                .with_owner(download_config.owner.owner(Some(&attempt_id)));
                 let log_context = httpflv::HttpFlvLogContext {
                     attempt_id: attempt_id.clone(),
                     stream_host: stream_host.clone(),
@@ -237,7 +249,8 @@ impl StreamGears {
                     "starting stream download"
                 );
                 let file =
-                    LifecycleFile::with_hook_and_close_handle(&file_name, "ts", close_handle, hook);
+                    LifecycleFile::with_hook_and_close_handle(&file_name, "ts", close_handle, hook)
+                        .with_owner(download_config.owner.owner(Some(&attempt_id)));
                 hls::download(&url, &client, file, segment.clone())
                     .await
                     .change_context(AppError::Unknown)?;
@@ -299,5 +312,213 @@ impl StreamGears {
         // 如果底层下载函数不支持取消，这里不能真正中断正在进行的下载
         self.token.read().unwrap().cancel();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observe::RecordingIdentity;
+    use crate::server::common::util::Recorder;
+    use crate::server::core::downloader::ReconnectContext;
+    use crate::server::infrastructure::models::StreamerInfo;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct Collector<'a>(&'a mut BTreeMap<String, String>);
+    impl Visit for Collector<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != crate::observe::EVENT_TARGET {
+                return;
+            }
+            let mut fields = BTreeMap::new();
+            event.record(&mut Collector(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    impl Captured {
+        fn named(&self, name: &str) -> Vec<BTreeMap<String, String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|fields| fields.get("event_name").map(String::as_str) == Some(name))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn append_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
+        bytes.push(tag_type);
+        bytes.extend_from_slice(&[
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+            ((timestamp >> 16) & 0xff) as u8,
+            ((timestamp >> 8) & 0xff) as u8,
+            (timestamp & 0xff) as u8,
+            ((timestamp >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+        ]);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    fn splittable_flv(keyframes: usize, payload: usize) -> Vec<u8> {
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..keyframes {
+            let mut frame = vec![0x17, 0x01, 0, 0, 0];
+            frame.resize(5 + payload, 0x41);
+            append_tag(&mut bytes, 9, &frame, (index as u32 + 1) * 1_000);
+        }
+        bytes
+    }
+
+    async fn serve_once(body: Vec<u8>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&body).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        port
+    }
+
+    /// The server recording path must carry the room and session identity onto every native
+    /// event, and prove a reconnect only when the connection is actually established.
+    #[tokio::test]
+    async fn server_recording_events_carry_room_session_and_attempt_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let port = serve_once(splittable_flv(6, 2_000)).await;
+
+        let streamer_info = StreamerInfo::new(
+            "受控主播",
+            "http://127.0.0.1/controlled",
+            "受控标题",
+            chrono::Utc::now(),
+            "",
+        );
+        let template = directory
+            .path()
+            .join("segment-%H%M%S")
+            .display()
+            .to_string();
+        let config = DownloadConfig {
+            url: format!("http://127.0.0.1:{port}/stream.flv"),
+            stream_candidates: Vec::new(),
+            segment_time: None,
+            file_size: Some(4_000),
+            headers: Default::default(),
+            recorder: Recorder::new(Some(template), streamer_info),
+            output_dir: directory.path().to_path_buf(),
+            suffix: "flv".to_string(),
+            owner: RecordingIdentity::server(7, 42, "受控主播"),
+            reconnect: Some(ReconnectContext {
+                gap_ms: 8_000,
+                silent_ms: 3_000,
+                silent_measured: true,
+            }),
+            attempt_id: Some("attempt-controlled".to_string()),
+            quality: None,
+            stall_timeout_secs: Some(5),
+        };
+
+        let segments: Arc<Mutex<Vec<SegmentInfo>>> = Arc::default();
+        let collected = segments.clone();
+        let downloader = StreamGears::new(None);
+        let status = downloader
+            .download(
+                Box::new(move |event| {
+                    if let SegmentEvent::Segment(info) = event {
+                        collected.lock().unwrap().push(info);
+                    }
+                }),
+                config,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(status, DownloadStatus::StreamEnded));
+
+        let reconnected = captured.named("recording.reconnected");
+        assert_eq!(
+            reconnected.len(),
+            1,
+            "one reconnect per established connection"
+        );
+        assert_eq!(reconnected[0]["gap_ms"], "8000");
+        assert_eq!(reconnected[0]["reason_code"], "measured_gap");
+        assert_eq!(reconnected[0]["download_attempt_id"], "attempt-controlled");
+        assert_eq!(reconnected[0]["live_streamer_id"], "7");
+        assert_eq!(reconnected[0]["streamer_info_id"], "42");
+
+        let created = captured.named("recording.segment_created");
+        assert!(created.len() >= 2, "the fixture must split");
+        for event in &created {
+            assert_eq!(event["live_streamer_id"], "7");
+            assert_eq!(event["streamer_info_id"], "42");
+            assert_eq!(event["download_attempt_id"], "attempt-controlled");
+        }
+
+        // The identity the hook hands to the upload pipeline is the one the events reported.
+        let reported: Vec<String> = created
+            .iter()
+            .map(|event| event["segment_id"].clone())
+            .collect();
+        let delivered = segments.lock().unwrap();
+        assert!(!delivered.is_empty());
+        for info in delivered.iter() {
+            let segment_id = info.segment_id.clone().expect("segment identity");
+            assert!(
+                reported.contains(&segment_id),
+                "{segment_id} was never created"
+            );
+        }
     }
 }

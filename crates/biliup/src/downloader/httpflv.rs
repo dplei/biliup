@@ -3,7 +3,7 @@ use crate::downloader::flv_parser::{
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
-use crate::downloader::util::{LifecycleFile, SegmentCloseReason, Segmentable};
+use crate::downloader::util::{EVENT_TARGET, LifecycleFile, SegmentCloseReason, Segmentable};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
 use reqwest::Response;
@@ -68,6 +68,149 @@ fn optional_ms(value: Option<u64>) -> i64 {
     value.map(|v| v as i64).unwrap_or(-1)
 }
 
+/// Source-side rollup for the DTS warning: the first backward jump of a segment is reported one
+/// to one, the rest are counted and flushed as one summary. A summary never replaces the old
+/// per-tag warning line, and a segment change always starts a new record.
+#[derive(Default)]
+struct DtsBackwardRollup {
+    segment_id: String,
+    original_file: String,
+    count: u64,
+    first_ms: u64,
+    last_ms: u64,
+    max_backward_ms: u64,
+}
+
+impl DtsBackwardRollup {
+    fn record(&mut self, file: &LifecycleFile<'_>, previous_ms: u64, current_ms: u64) {
+        let segment_id = file
+            .identity()
+            .map(|identity| identity.segment_id.clone())
+            .unwrap_or_default();
+        if segment_id != self.segment_id {
+            self.flush(file);
+            self.segment_id = segment_id;
+            self.original_file = original_file(file).to_owned();
+        }
+        let backward = previous_ms.saturating_sub(current_ms);
+        self.count += 1;
+        if self.count == 1 {
+            self.first_ms = current_ms;
+            self.max_backward_ms = backward;
+            emit_dts_first(file, previous_ms, current_ms);
+        } else {
+            self.max_backward_ms = self.max_backward_ms.max(backward);
+        }
+        self.last_ms = current_ms;
+    }
+
+    fn flush(&mut self, file: &LifecycleFile<'_>) {
+        if self.count > 1 {
+            emit_dts_summary(file, self);
+        }
+        self.count = 0;
+        self.first_ms = 0;
+        self.last_ms = 0;
+        self.max_backward_ms = 0;
+    }
+}
+
+fn emit_dts_first(file: &LifecycleFile<'_>, previous_ms: u64, current_ms: u64) {
+    let owner = file.owner();
+    warn!(
+        target: EVENT_TARGET,
+        event_name = "recording.dts_backward",
+        outcome = "executed",
+        reason_code = "timestamp_backward",
+        segment_id = segment_id(file),
+        original_file = original_file(file),
+        previous_ms,
+        current_ms,
+        live_streamer_id = owner.live_streamer_id(),
+        streamer_info_id = owner.streamer_info_id(),
+        task_id = owner.task_id(),
+        download_attempt_id = owner.download_attempt_id(),
+        "检测到时间戳倒退，继续录制并标记待检查"
+    );
+}
+
+fn emit_dts_summary(file: &LifecycleFile<'_>, rollup: &DtsBackwardRollup) {
+    let owner = file.owner();
+    warn!(
+        target: EVENT_TARGET,
+        event_name = "recording.dts_backward",
+        outcome = "executed",
+        reason_code = "timestamp_backward",
+        segment_id = rollup.segment_id,
+        original_file = rollup.original_file,
+        count = rollup.count,
+        first_ms = rollup.first_ms,
+        last_ms = rollup.last_ms,
+        max_backward_ms = rollup.max_backward_ms,
+        live_streamer_id = owner.live_streamer_id(),
+        streamer_info_id = owner.streamer_info_id(),
+        task_id = owner.task_id(),
+        download_attempt_id = owner.download_attempt_id(),
+        "本分段时间戳倒退汇总"
+    );
+}
+
+/// Connection outcome for the recording chain. The gap that follows is measured by the reconnect
+/// loop, so this event only reports what this connection itself observed.
+fn emit_disconnected(
+    owner: &crate::downloader::util::RecordingOwner,
+    outcome: &'static str,
+    reason_code: &'static str,
+    diagnostics: &ConnectionDiagnostics,
+    error: Option<String>,
+) {
+    let silent_ms = diagnostics.silent_for.as_millis().min(u64::MAX as u128) as u64;
+    let duration_ms = diagnostics.connected_for.as_millis().min(u64::MAX as u128) as u64;
+    let error = error.unwrap_or_default();
+    if outcome == "failed" {
+        warn!(
+            target: EVENT_TARGET,
+            event_name = "recording.disconnected",
+            outcome,
+            reason_code,
+            silent_ms,
+            duration_ms,
+            error,
+            live_streamer_id = owner.live_streamer_id(),
+            streamer_info_id = owner.streamer_info_id(),
+            task_id = owner.task_id(),
+            download_attempt_id = owner.download_attempt_id(),
+            "拉流连接异常结束"
+        );
+    } else {
+        info!(
+            target: EVENT_TARGET,
+            event_name = "recording.disconnected",
+            outcome,
+            reason_code,
+            silent_ms,
+            duration_ms,
+            live_streamer_id = owner.live_streamer_id(),
+            streamer_info_id = owner.streamer_info_id(),
+            task_id = owner.task_id(),
+            download_attempt_id = owner.download_attempt_id(),
+            "拉流连接正常结束"
+        );
+    }
+}
+
+fn segment_id<'b>(file: &'b LifecycleFile<'_>) -> &'b str {
+    file.identity()
+        .map(|identity| identity.segment_id.as_str())
+        .unwrap_or("")
+}
+
+fn original_file<'b>(file: &'b LifecycleFile<'_>) -> &'b str {
+    file.identity()
+        .map(|identity| identity.original_file.as_str())
+        .unwrap_or("")
+}
+
 async fn download_inner(
     connection: &mut Connection,
     file: LifecycleFile<'_>,
@@ -75,6 +218,9 @@ async fn download_inner(
     log_context: Option<&HttpFlvLogContext>,
 ) -> crate::downloader::error::Result<()> {
     let file_name = file.file_name.clone();
+    // Identity travels with the file; copy it out before the writer takes ownership so the
+    // connection events can still say who was recording.
+    let owner = file.owner().clone();
     let mut progress = FlvProgress::default();
     let result = parse_flv(connection, file, segment, &mut progress).await;
     let diagnostics = connection.diagnostics();
@@ -110,6 +256,7 @@ async fn download_inner(
                 "httpflv connection closed"
             );
             info!("Done... {}", file_name);
+            emit_disconnected(&owner, "succeeded", "stream_end", &diagnostics, None);
             Ok(())
         }
         Err(e) => {
@@ -135,6 +282,15 @@ async fn download_inner(
                 quality,
                 "httpflv download failed"
             );
+            let reason = if matches!(
+                e,
+                crate::downloader::error::Error::HttpFlvReadTimeout { .. }
+            ) {
+                "read_timeout"
+            } else {
+                "transport_error"
+            };
+            emit_disconnected(&owner, "failed", reason, &diagnostics, Some(format!("{e}")));
             Err(e)
         }
     }
@@ -151,6 +307,7 @@ pub(crate) async fn parse_flv(
     let _previous_tag_size = connection.read_frame(4).await?;
 
     let mut out = FlvFile::new(file)?;
+    let mut dts_rollup = DtsBackwardRollup::default();
     let result: crate::downloader::error::Result<()> = async {
     segment.set_size_position(9 + 4);
     // let mut downloaded_size = 9 + 4;
@@ -273,6 +430,11 @@ pub(crate) async fn parse_flv(
                             "Non-monotonous DTS in output stream; previous: {prev_timestamp}, current: {};",
                             tag_header.timestamp
                         );
+                        dts_rollup.record(
+                            &out.file,
+                            prev_timestamp as u64,
+                            tag_header.timestamp as u64,
+                        );
                     }
                     out.write_tag(tag_header, flv_tag_data, previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
@@ -287,6 +449,16 @@ pub(crate) async fn parse_flv(
                 flv_tags_cache.clear();
 
                 if segment.needed() || create_new {
+                    // The reason must be read before the counters are reset: reading it after
+                    // `set_size_position`/`set_start_time` always saw a fresh segment and
+                    // reported every configured split as `Unknown`.
+                    let reason = if segment.size_needed() {
+                        SegmentCloseReason::SizeSplit
+                    } else if segment.time_needed() {
+                        SegmentCloseReason::TimedSplit
+                    } else {
+                        SegmentCloseReason::Unknown
+                    };
                     segment.set_start_time(Duration::from_millis(timestamp));
                     segment.set_size_position(9 + 4);
 
@@ -317,13 +489,8 @@ pub(crate) async fn parse_flv(
                         );
                     }
                     info!("{} splitting.{segment:?}", out.file.file_name);
-                    let reason = if segment.size_needed() {
-                        SegmentCloseReason::SizeSplit
-                    } else if segment.time_needed() {
-                        SegmentCloseReason::TimedSplit
-                    } else {
-                        SegmentCloseReason::Unknown
-                    };
+                    // Flush before the split so the summary still names the segment it counted.
+                    dts_rollup.flush(&out.file);
                     out.create_new(reason)?;
                     progress.splits = progress.splits.saturating_add(1);
                     progress.last_split_at = Some(Instant::now());
@@ -339,6 +506,7 @@ pub(crate) async fn parse_flv(
     Ok(())
     }
     .await;
+    dts_rollup.flush(&out.file);
     let close_reason = if result.is_ok() {
         SegmentCloseReason::StreamEnded
     } else {
@@ -516,10 +684,191 @@ fn header_value(resp: &Response, name: reqwest::header::HeaderName) -> Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::{Connection, DEFAULT_STALL_TIMEOUT};
+    use super::{Connection, DEFAULT_STALL_TIMEOUT, DtsBackwardRollup};
+    use crate::downloader::util::LifecycleFile;
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use futures::StreamExt;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct Collector<'a>(&'a mut BTreeMap<String, String>);
+    impl Visit for Collector<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != super::EVENT_TARGET {
+                return;
+            }
+            let mut fields = BTreeMap::new();
+            event.record(&mut Collector(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    fn append_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
+        bytes.push(tag_type);
+        bytes.extend_from_slice(&[
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+            ((timestamp >> 16) & 0xff) as u8,
+            ((timestamp >> 8) & 0xff) as u8,
+            (timestamp & 0xff) as u8,
+            ((timestamp >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+        ]);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    /// A complete stream: metadata, both sequence headers, then keyframes carrying real payload.
+    fn splittable_flv(keyframes: usize, payload: usize) -> Vec<u8> {
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05); // AMF null: enough to be a valid onMetaData tag
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..keyframes {
+            let mut frame = vec![0x17, 0x01, 0, 0, 0];
+            frame.resize(5 + payload, 0x41);
+            append_tag(&mut bytes, 9, &frame, (index as u32 + 1) * 1_000);
+        }
+        bytes
+    }
+
+    fn complete_response(body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(http::Response::new(reqwest::Body::from(body)))
+    }
+
+    /// The close reason used to be read after the counters had already been reset, so every
+    /// configured split reported `Unknown`. The recorded reason must name the limit that fired.
+    #[tokio::test]
+    async fn a_size_split_closes_the_segment_with_split_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("split").display().to_string();
+        let captured = Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let mut connection = Connection::new(complete_response(splittable_flv(6, 2_000)));
+        // The caller consumes the 9 byte FLV header before handing the stream to the parser.
+        connection.read_frame(9).await.unwrap();
+        let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
+        let segment = crate::downloader::util::Segmentable::new(None, Some(4_000));
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut connection, file, segment, &mut progress)
+            .await
+            .unwrap();
+
+        let events = captured.0.lock().unwrap().clone();
+        let closes: Vec<_> = events
+            .iter()
+            .filter(|fields| {
+                fields.get("event_name").map(String::as_str) == Some("recording.segment_closed")
+            })
+            .collect();
+        assert!(
+            progress.splits >= 2,
+            "the fixture must split more than once"
+        );
+        assert_eq!(
+            closes.len() as u32,
+            progress.splits + 1,
+            "one close per file"
+        );
+        let reasons: Vec<_> = closes
+            .iter()
+            .map(|fields| fields["reason_code"].as_str())
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .filter(|reason| **reason == "split_limit")
+                .count()
+                >= 2,
+            "configured splits must be reported as split_limit: {reasons:?}"
+        );
+        assert_eq!(reasons.last(), Some(&"stream_end"));
+    }
+
+    /// The old per-tag DTS warning stays one to one; the native stream reports the first jump of
+    /// a segment and then one rollup, and a new segment always starts its own record.
+    #[test]
+    fn dts_rollup_reports_the_first_jump_then_one_summary_per_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("dts-%Y%m%d").display().to_string();
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let (first_id, second_id) = tracing::subscriber::with_default(subscriber, || {
+            let mut file = LifecycleFile::new(&template, "flv");
+            let mut rollup = DtsBackwardRollup::default();
+
+            file.create().unwrap();
+            let first_id = file.identity().unwrap().segment_id.clone();
+            rollup.record(&file, 1_000, 400);
+            rollup.record(&file, 1_200, 900);
+            rollup.record(&file, 1_500, 100);
+
+            // A split allocates a new identity; the counts must not leak across it.
+            file.create().unwrap();
+            let second_id = file.identity().unwrap().segment_id.clone();
+            rollup.record(&file, 2_000, 1_900);
+            rollup.flush(&file);
+            (first_id, second_id)
+        });
+
+        let events = captured.0.lock().unwrap().clone();
+        let names: Vec<_> = events
+            .iter()
+            .filter(|fields| {
+                fields.get("event_name").map(String::as_str) == Some("recording.dts_backward")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(names.len(), 3, "first jump, first summary, second jump");
+
+        assert_eq!(names[0]["segment_id"], first_id);
+        assert_eq!(names[0]["previous_ms"], "1000");
+        assert_eq!(names[0]["current_ms"], "400");
+        assert!(!names[0].contains_key("count"));
+
+        assert_eq!(names[1]["segment_id"], first_id);
+        assert_eq!(names[1]["count"], "3", "count includes the first jump");
+        assert_eq!(names[1]["first_ms"], "400");
+        assert_eq!(names[1]["last_ms"], "100");
+        assert_eq!(names[1]["max_backward_ms"], "1400");
+
+        assert_eq!(names[2]["segment_id"], second_id);
+        assert_eq!(names[2]["previous_ms"], "2000");
+        // A single jump in the new segment produces no summary of its own.
+        assert!(!names[2].contains_key("count"));
+    }
 
     /// 构造一个「先吐若干 chunk、之后永远不再产出」的响应。
     /// 用来模拟上游停发但连接未关闭——本 effort 里真实发生的正是这种静默。
