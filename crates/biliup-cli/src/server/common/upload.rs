@@ -3124,8 +3124,8 @@ pub async fn upload(
     .await
 }
 
-/// The embedded uploader supplies its invocation context; legacy page callers keep their
-/// current behavior until that entry is migrated as a separate coverage batch.
+/// Page and embedded uploaders supply the same invocation context through transfer and
+/// submission. The compatibility wrapper above remains available without observation context.
 #[allow(clippy::too_many_arguments)]
 pub async fn upload_with_task(
     cookie_file: impl AsRef<Path>,

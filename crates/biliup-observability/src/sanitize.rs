@@ -26,6 +26,9 @@ pub(crate) fn clean(value: &str, limit: usize) -> (String, bool, bool) {
         "://",
         "access_key",
         "api_key",
+        // Legacy upload callers debug-print the entire remote response, including account
+        // archive identifiers. Retain neither that body nor its numeric Debug wrappers.
+        "responsedata",
     ]
     .iter()
     .any(|s| lower.contains(s));

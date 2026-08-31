@@ -18,7 +18,7 @@ MAX_BYTES = 16 * 1024 * 1024
 MAX_ROWS = 20000
 MAX_SECONDS = 10
 IDS = {"instance_id", "process_run_id", "event_uid", "live_streamer_id", "streamer_info_id", "upload_session_id", "segment_id", "missing_id", "download_attempt_id", "upload_attempt_id", "task_id", "streamer_name", "original_file", "artifact_file", "history_row_id"}
-SENSITIVE = re.compile(r"cookie|authorization|token|secret|password|credential|bearer|signature|sign=|https?:|://|access_key|api_key|sessdata|bili_jct", re.I)
+SENSITIVE = re.compile(r"cookie|authorization|token|secret|password|credential|bearer|signature|sign=|https?:|://|access_key|api_key|sessdata|bili_jct|responsedata", re.I)
 CATEGORIES = {"system", "recording", "processing", "upload", "submission", "auth", "audit"}
 # Zone names are controlled identifiers, not free text: keep them readable, reject anything else.
 ZONE = re.compile(r"^(?:UTC|Z|[+-]\d{2}:\d{2}|[A-Za-z][A-Za-z_+-]{0,20}(?:/[A-Za-z][A-Za-z0-9_+-]{0,20}){0,2})$")

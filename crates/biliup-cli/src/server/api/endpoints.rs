@@ -1,3 +1,4 @@
+use crate::observe::{self, standalone::UploadTask};
 use crate::server::common::missing_segment::{
     MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
 };
@@ -7,7 +8,7 @@ use crate::server::common::recovery_scheduler::{recover_due_segments, spawn_clai
 use crate::server::common::upload::{
     RecoveryClaim, StopAttemptOutcome, SubmissionTrigger, build_studio, claim_manual_recovery,
     claim_retry_recovery, rescan_local_valid_segments, spawn_session_submission,
-    stop_missing_segment_attempt, submit_to_bilibili, upload,
+    stop_missing_segment_attempt, submit_to_bilibili, upload_with_task,
 };
 use crate::server::common::upload_line_health;
 use crate::server::common::upload_line_selection::{cooling_lines, plan_upload_line};
@@ -52,6 +53,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing::instrument::WithSubscriber;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -668,6 +670,10 @@ pub async fn post_uploads(
     State(pool): State<ConnectionPool>,
     Json(json_data): Json<PostUploads>,
 ) -> Result<Json<serde_json::Value>, Response> {
+    // A page request may mix files from different recordings. The first-file lookup below
+    // is only for template rendering; it cannot establish lineage for the whole upload.
+    let task = UploadTask::default();
+    let task_id = task.submission.task_id.clone();
     let upload_config = json_data.params;
     let files = json_data.files;
     let (line, limit, submit_api) = {
@@ -719,38 +725,54 @@ pub async fn post_uploads(
 
     info!(matched, ?streamer_name, "通过页面开始上传");
     let runtime_config = config.read().unwrap().clone();
-    tokio::spawn(async move {
-        let (bilibili, videos) = upload(
-            upload_config
-                .user_cookie
-                .as_deref()
-                .unwrap_or("cookies.json"),
-            None,
-            line,
-            &files,
-            limit as usize,
-            &runtime_config,
-            &pool,
-        )
-        .await?;
-        if !videos.is_empty() {
-            let recorder = Recorder::new(upload_config.title.clone(), streamer_info);
-            let studio = build_studio(
-                &upload_config,
-                streamer_background.as_deref(),
-                &bilibili,
-                videos,
-                &recorder,
+    tokio::spawn(
+        async move {
+            let (bilibili, videos) = upload_with_task(
+                upload_config
+                    .user_cookie
+                    .as_deref()
+                    .unwrap_or("cookies.json"),
+                None,
+                line,
+                &files,
+                limit as usize,
+                &runtime_config,
+                &pool,
+                Some(&task),
             )
             .await?;
-            let response_data =
-                submit_to_bilibili(&bilibili, &studio, submit_api.as_deref()).await?;
-            info!("通过页面上传成功 {:?}", response_data);
+            if !videos.is_empty() {
+                let recorder = Recorder::new(upload_config.title.clone(), streamer_info);
+                let studio = task.check(
+                    build_studio(
+                        &upload_config,
+                        streamer_background.as_deref(),
+                        &bilibili,
+                        videos,
+                        &recorder,
+                    )
+                    .await,
+                    "studio_build_failed",
+                )?;
+                let response_data = task
+                    .submit(submit_to_bilibili(
+                        &bilibili,
+                        &studio,
+                        submit_api.as_deref(),
+                    ))
+                    .await?;
+                info!("通过页面上传成功 {:?}", response_data);
+            } else {
+                observe::submission_decided(&task.submission, "skipped", "no_videos", 0);
+            }
+            Ok::<_, Report<AppError>>(())
         }
-        Ok::<_, Report<AppError>>(())
-    });
+        .with_current_subscriber(),
+    );
 
     Ok(Json(serde_json::json!({
+        // This is an observation correlation key, not a durable job or a success receipt.
+        "task_id": task_id,
         "matched": matched,
         "streamer_name": streamer_name,
     })))

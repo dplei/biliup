@@ -18,7 +18,7 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   reason_code 为 ≤64 字节 ASCII 小写下划线代码，域枚举见覆盖清单。未知不得写成功。
 - Context 是显式可克隆字段载体；live_streamer_id=房间配置，streamer_info_id=录制场次，
   upload_session_id=投稿会话，segment_id=文件创建时分配的稳定身份，missing_id=登记账本，
-  download_attempt_id/upload_attempt_id=各自尝试，task_id=独立 CLI/嵌入调用。
+  download_attempt_id/upload_attempt_id=各自尝试，task_id=独立 CLI/嵌入调用或页面上传请求。
   ID ≤128 字节，仅 ASCII 字母/数字/下划线/短横/点/冒号；ID 可未知，绝不互相代用。
   business ID 查询同时传 instance_id。P1 不为业务分配 segment_id，不新增业务字段。
   P3 起 segment_id 在文件创建时分配（`LifecycleFile::create`），随关闭回调与登记账本持久化；
@@ -28,6 +28,11 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   upload_attempt_id；segment_order 是本次输入列表从 1 起的序号，用于区分脱敏后同 basename
   的不同输入，不能跨 task 当作持久身份。排队/断点复用时 attempt 可空；每次预上传重试
   分配新 attempt。checkpoint 只证明既有记录被复用，不重新宣称本次完成了远端传输。
+- 页面 `POST /v1/uploads` 返回新增 `task_id`，仅用于事件关联；HTTP 成功表示接受请求，
+  不表示上传/投稿成功，也不是可恢复的持久任务凭证。首文件的主播反查只供模板渲染，
+  不给同批文件推断录制身份。后台显式传 task 与 subscriber；被强杀没有结束事件时保持未知。
+  空视频结果记 `submission.decided skipped/no_videos`，模板构建返回错误记
+  `failed/studio_build_failed`；仅真正发起投稿才记 started/completed。
 - streamer_name 为脱敏显示快照（≤256 字节）；original_file/artifact_file 只保留脱敏 basename
   （≤256 字节），转码不覆盖 segment_id。file/line 仅辅助来源，不作身份。
 - fields 是受控扁平标量集合，未知键、嵌套 JSON、负的非负量丢弃并计数；数值以
@@ -40,6 +45,8 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 任意请求/响应。消息/错误/诊断遇到 cookie、authorization、token、secret、password、
 credential、签名/URL 等敏感线索时整值替换；控制字符变空格。没有标签的任意秘密无法自动识别，
 调用方仍禁止把原始请求/响应或凭据当摘要。字段丢弃、脱敏、截断分别可见。
+旧上传链的 `ResponseData` 调试文本按原始响应整值脱敏，不能因其中 `aid` 是
+`Number(...)` 而绕过账号清理；旧 sink 不改，桥接采集与离线导出均执行此规则。
 错误字段≤1024 字节；诊断流按≤1024 字节行检查，过长整行省略，避免分块边界泄露；
 保留首个 error/fatal 行和≤8192 字节脱敏尾部、原始总字节、exit_code、truncated。
 列表不加载诊断正文。JSONL 通过 JSON serializer 生成，换行无歧义。

@@ -107,6 +107,8 @@ P0–P1 已按 [契约v1](contract-v1.md) / [预算v1](baseline-budget.md) 落�
    独立上传的既有文件没有录制账本身份时，采用 `task_id + original_file + segment_order +
    upload_attempt_id` 形态（[契约 v1](contract-v1.md)）；输入序号只在当前任务内有效，
    不从路径推断原录制分段，也不把 checkpoint 复用写成新的传输成功。
+   页面整场上传同样使用独立 task：接口返回 task 仅方便查询，后台跨 spawn 显式传递；
+   首文件反查主播仅用于模板，不代表其余文件的录制归属，也不凭 HTTP 接受响应推断成功。
 4. ID 不通过跨库外键级联删除；主播/文件删除后历史事件仍有必要的展示快照。不同实例的
    自增业务 ID 必须与 `instance_id` 一起使用。
 5. 稳定事件名如 `recording.dts_backward`、`processing.timestamp_repair_decided`；数值用

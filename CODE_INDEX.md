@@ -54,7 +54,7 @@
 | `crates/biliup-observability/src/lib.rs` | 独立结构化日志 crate 门面，不依赖 Web 服务或业务数据库；目前以默认关闭的旁路接入各入口，旧文件与旧页面仍是权威来源。 | `Runtime`、`Emitter`、`CaptureLayer` |
 | `crates/biliup-observability/src/model.rs` | 定义 v1 不可变事件、稳定/运行身份、显式上下文与扁平字段允许列表，区分原生与桥接来源。 | `Event`、`EventData`、`Fields`、`Context`、`Draft` |
 | `crates/biliup-observability/src/capture.rs` | 从父子 span、延迟 record 和事件字段构建快照，以独立层过滤控制原生/桥接采集并排除内部 SQL。 | `CaptureLayer`、`legacy_output` |
-| `crates/biliup-observability/src/sanitize.rs` | 对允许字段执行有界格式化、敏感线索整值脱敏和控制字符处理，不序列化未知 Debug 对象。 | `clean`、`Bounded`、`debug` |
+| `crates/biliup-observability/src/sanitize.rs` | 对允许字段执行有界格式化、敏感线索与旧链完整 ResponseData 整值脱敏和控制字符处理，不序列化未知 Debug 对象。 | `clean`、`Bounded`、`debug` |
 | `crates/biliup-observability/src/diagnostic.rs` | 流式捕获外部诊断：跨 chunk 按有界行脱敏，保留首致命摘要、有限尾部和原始字节/截断信息。 | `DiagnosticCapture`、`Diagnostic` |
 | `crates/biliup-observability/src/runtime.rs` | 提供条数/字节双限队列、重要级别预留、可替换后台消费者、提交后高水位、独立健康与限时关闭。 | `Runtime`、`Emitter`、`Consumer`、`Health`、`Options` |
 | `crates/biliup-observability/src/sqlite.rs` | 独立 SQLite migrations 与单写入器、事件/附件幂等事务、只读游标查询、保留/WAL/低盘保护和一致性备份。查询支持级别/分类的精确集合与 `newest_first` 倒序，集合大小在 `push_filters` 里统一设界，`count` 与分页受同一约束。 | `SqliteStore`、`StoreOptions`、`Repository`、`Query`、`MIGRATOR`、`push_filters` |
@@ -117,7 +117,7 @@
 | `crates/biliup-cli/src/server/common/disk_space.rs` | 文件系统可用空间探测（unix `statvfs`，取非特权可用的 `f_bavail`）：响度标准化的准入与硬水位共用，探测不出一律返回 `None` 让调用方放行。 | `available_bytes` |
 | `crates/biliup-cli/src/server/common/process_priority.rs` | 给上传前的 ffmpeg 预处理子进程设置后台 nice 与 IO 优先级，使其让路给网页请求；录制与用户 hook 不降级。 | `background`、`background_std` |
 | `crates/biliup-cli/src/server/router.rs` | 组装主要 v1 业务 HTTP 路由和静态文件服务；认证与日志 WebSocket 另由应用启动层挂载。 | `router`、`static_file_router` |
-| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失分段列表、独立待投稿会话五态、补传/重投/停止/按会话恢复、严格空会话逻辑终结、attempt 历史与上传健康查询。分段补传端点只 claim、不等上传；按会话恢复持久化人工投稿授权，并在无分段工作时异步唤醒统一投稿协调器。 | `get_missing_uploads`、`get_pending_submit_sessions`、`recover_missing_upload`、`stop_missing_upload`、`recover_session_uploads`、`discard_empty_upload_session`、`get_missing_upload_attempts` |
+| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失补传/待投稿五态与人工恢复、上传健康和页面整场上传；页面响应返回观测 task，跨后台上传/投稿传递，首文件主播反查只用于模板。分段补传只 claim，按会话恢复持久化授权后异步唤醒投稿协调器。 | `post_uploads`、`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`get_missing_upload_attempts` |
 | `crates/biliup-cli/src/server/common/missing_segment.rs` | 缺失分段的补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与重试延迟。⚠️ `upload_missing_segment` 是**补救账本**而非全量分段账本——走正常上传路径的会话在表中没有任何行，「无行」是健康状态；查询前先读 [`scripts/README.md`](./scripts/README.md#consistency-auditsh)。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment` |
 
 ## 上传核心
@@ -138,6 +138,7 @@
 | `scripts/structured_logging/recording_pilot.py` | P3/12 的受控录制演练：本地回环发合成 FLV（含人工注入的 DTS 倒退与中途截断），跑真实 Python 下载入口，核对身份链与分段/断连事件，并生成证据包请求与预期事实清单。 | `inject_dts_backward`、`serve`、`check`、`expectations` |
 | `scripts/structured_logging/reconcile.py` | 按证据包生成互不可见的双源分析视图、校验报告引用合法性，并单列桥接文本传输结论（永不为原生覆盖计分）。 | `prepare`、`cross`、`check_report`、`bridge_transport` |
 | `scripts/structured_logging/upload_entries.py` | 独立上传入口的无账号演练：缺凭据的命令/配置/追加与 Python 调用、三态、重复调用、关闭回退及双源证据导出，不冒充成功远端运行。 | `main`、`run`、`embedded` |
+| `scripts/structured_logging/page_upload_entries.py` | 页面上传的隔离 Rust/wheel HTTP 演练：缺失/损坏凭据、并发请求 task 查询、采集三态与关闭回退，导出双源和分离视图，不执行远端上传。 | `main`、`run`、`call` |
 | `scripts/structured_logging/smoke_entries.py` | 手工触发的入口冒烟：5 个支持入口 × 采集关闭/开启/新库不可用三态加一次关闭回退，全程合成媒体与空业务库，不做账号或网络动作。 | `main`、`child` |
 | `scripts/consistency-audit.sh` | 只读巡检：比对每个已投稿会话的 `videos_json` 与本地分段账本，按投稿意图是否为空切成 legacy/current 两组，找出重复进稿、上传未进稿和序号不连续三类错位。 | — |
 
@@ -196,5 +197,6 @@
 
 - `crates/biliup-cli/src/main.rs`、`crates/stream-gears/src/server.rs` → `crates/biliup-cli/src/uploader.rs`（`upload_by_command`、`upload_by_config`、`append`）：Rust/wheel CLI 复用同一独立上传链，task 在调用层分配并传至每次尝试。
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/uploader.rs`（`upload`）：Python 函数在局部 subscriber/runtime 内执行上传编排，每次调用持有独立 task。
-- `crates/stream-gears/src/uploader.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`upload_with_task`）：Python 传入 task 关联底层传输与后续投稿，页面旧 `upload` 包装仍不传 task。
+- `crates/stream-gears/src/uploader.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`upload_with_task`）：Python 传入 task 关联底层传输与后续投稿。
+- `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload.rs`、`crates/biliup-cli/src/observe/standalone.rs`（`post_uploads`、`upload_with_task`、`UploadTask::submit`）：页面请求同一 task 进入后台传输与投稿，显式继承请求 subscriber；关联回归入口是 `page_upload_events` 集成测试。
 - `crates/biliup-cli/src/uploader.rs`、`crates/stream-gears/src/uploader.rs` → `crates/biliup-cli/src/observe/standalone.rs`（`UploadTask`）：早退记录投稿未开始的原因，远端请求返回后单独区分成功、失败与不确定结果。
