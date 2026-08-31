@@ -3,8 +3,9 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收；P3 进行中：12、13 交付完成（验收 partial），15 通过，14/16 未开始。
-录制域已有原生事件，其余域仍只有桥接；P4–P6 未开始，旧日志/页面保留。
+P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 未开始**。
+录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统/认证/审计仍只有桥接；
+P4–P6 未开始，旧日志与旧页面保留，新页只是试用入口。
 
 ## 状态约定
 
@@ -30,7 +31,7 @@ P0–P2 已完成并通过本地受控验收；P3 进行中：12、13 交付完�
 | P0 | 06 | complete | passed | not-required | passed | [P0](receipts/P0.md) |
 | P1 | 07、08 | complete | passed | not-required | passed | [P1](receipts/P1.md) |
 | P2 | 09、10、11 | complete | passed | not-required | passed | [P2](receipts/P2.md) |
-| P3 | 12、13、14、15、16 | in-progress | pending | pending | in-progress | [P3](receipts/P3.md) |
+| P3 | 12、13、14、15、16 | in-progress | partial | pending | in-progress | [P3](receipts/P3.md) |
 | P4 | 17 | not-started | pending | pending | not-started | — |
 | P5 | 18 | not-started | pending | pending | not-started | — |
 | P6 | 19 | not-started | pending | not-required | not-started | — |
@@ -51,11 +52,11 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [09 入口旁路](issues/09-shadow-integration.md) | P2 | complete | passed | [P2](receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
 | [10 证据导出](issues/10-evidence-export.md) | P2 | complete | passed | [P2](receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
-| [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通与受控演练通过；缺真实开播整场样本 |
-| [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：决定链受控实跑通过；远端上传/投稿待 dev 实跑 |
+| [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
+| [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
-| [16 试用页面](issues/16-preview-ui.md) | P3 | not-started | pending | 待实现 |
+| [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收全部通过；默认入口开关初值仍是旧页 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
 | [18 停旧写入](issues/18-stop-legacy-writes.md) | P5 | not-started | pending | 待前置通过后无文件观察及回退验证 |
 | [19 移除旧实现](issues/19-remove-legacy.md) | P6 | not-started | pending | 待前置通过后移除与兼容收尾 |
@@ -63,22 +64,24 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 ## 当前交接位置
 
 - 最近已验收阶段：P2（09、10、11 全部 passed）。
-- 当前实施阶段/任务：P3 进行中；12、13、15 已完成，剩 16（试用页面）与 14（全范围覆盖），各自单独一轮 session 做。
-- 本轮已做：核验 P2 证据后进入 P3；实现分段稳定身份与录制域原生事件（创建/关闭/登记/
-  DTS/断连/重连/开始/结束），加法迁移持久化身份；补 5 项测试；跑通受控录制演练并导出
-  证据包，7 条预期事实全部确认；闭环 3 处差异（切片原因恒 Unknown、导出目录不认汇总形态、
-  期望事实引用被匿名化的 ID）；回写回执与本表。
-- 源码交付状态：refactor/issue2-260831-153007 上的 542a8fa、a791971 与其后一次「导出器时区
-  修复与 P2 收尾回写」提交已入库；**本轮 P3/12 的全部改动仍在工作区未提交**。
-- 运行/观察记录：受控录制演练（合成媒体、本地回环、无账号）、受控入口矩阵、本地 dev server
-  三态演练、20,000 条双路负载；没有真实平台开播录制，没有上传/投稿原生样本，没有长观察。
-- 已知边界：原生覆盖目前只到录制域（C02–C05 的受控部分），C06–C13 仍只有桥接；服务端整场
-  循环缺真实开播样本；外部下载器与 HLS 路径未接入身份；纯文本桥接在重复旧行与脱敏行上
+- 当前实施阶段/任务：P3 进行中；12、13、15、16 已完成，**只剩 14（全范围覆盖）**，单独一轮 session 做。
+- 本轮已做（第二轮，任务 16）：新增「日志与事件（试用）」页与两个固定地址（新页 `/log-events`、
+  旧页 `/logviewer/legacy`），`/logviewer` 由一个常量决定渲染哪一个、初值仍是旧页；页面接
+  `/v1/log-events` 的筛选、命中计数、行内详情、场次范围、实时接续与导出，另有独立的运行进度视图；
+  为满足「最新在前」和「分别看信息/警告/错误」给查询接口加了三个加法参数（`levels`、
+  `categories`、`order=desc`）并补测试；用一场**真实开播录制**在本机 dev 环境跑通录制→预处理→
+  上传→补传→投稿全链，顺带补上 12/13 缺的真实运行样本；回写回执、覆盖清单、代码索引与本表。
+- 源码交付状态：`refactor/issue2-260831-153007`；第一轮（12/13/15）与第二轮（16）的改动都已提交。
+- 运行/观察记录：受控录制演练、受控入口矩阵、本地 dev server 三态演练、20,000 条双路负载，
+  以及本轮**一场真实开播录制到投稿成功**（207 条原生事件，采集健康无丢弃无写入失败）；
+  仍**没有长观察窗口**，也没有真实断连样本。
+- 已知边界：原生覆盖到 C02–C10（录制域与后处理域），C01、C11–C13 仍只有桥接；断连/重连、
+  外部下载器、HLS 与页面/CLI 整场 `upload()` 未有真实样本或未接入；真实 601 限流的
+  `reason_code` 落在 `transport`，事件层面分辨不出限流；纯文本桥接在重复旧行与脱敏行上
   不可判定；仅 macOS 本机验证，Windows 未验证。
-- 下一次可直接输入（**一轮只做一个任务**，做完回写并停下）：
-  - 先做页面：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 16`
-  - 再做覆盖：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`
-  - 两个任务各自的范围与验收边界见 [P3 回执](receipts/P3.md) 的「后续拆分」一节。
+- 下一次可直接输入（**一轮只做一个任务**，做完回写并提交，然后停下）：
+  - `@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`
+  - 范围与验收边界见 [P3 回执](receipts/P3.md) 的「后续拆分」一节；14 体量最大，可再按四个批次分轮。
 
 ## 每次回写的检查清单
 
