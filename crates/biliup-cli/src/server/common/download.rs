@@ -98,6 +98,7 @@ struct DownloadAttempt {
 /// 分段事件处理器
 pub struct SegmentEventProcessor {
     channel: Option<Sender<SegmentInfo>>,
+    identity: crate::observe::RecordingIdentity,
     uploader: Sender<UploaderMessage>,
     ctx: Context,
     file_validator: FileValidator,
@@ -153,6 +154,11 @@ impl SegmentEventProcessor {
         let config = ctx.config();
         Self {
             channel: None,
+            identity: crate::observe::RecordingIdentity::server(
+                ctx.worker_id(),
+                ctx.id(),
+                &ctx.live_stream().name,
+            ),
             uploader,
             file_validator: FileValidator::new(config.filtering_threshold * 1000 * 1000, true),
             preserve_recoverable_short_segments: config.preserve_recoverable_short_segments,
@@ -331,6 +337,7 @@ impl SegmentEventProcessor {
                 now: chrono::Utc::now(),
                 recovery_window_minutes: self.ctx.config().recovery_window_minutes.unwrap_or(30)
                     as i64,
+                segment_id: event.segment_id.clone(),
             };
             let store = EnrollmentStore::production(self.ctx.pool().clone());
             match enroll_validated_segment(&store, &request).await? {
@@ -347,6 +354,20 @@ impl SegmentEventProcessor {
                         attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
                         "validated and enrolled media segment"
                     );
+                    crate::observe::segment_enrolled(
+                        &self.identity,
+                        enrollment.segment_id.as_deref().unwrap_or(""),
+                        &event.prev_file_path.display().to_string(),
+                        "executed",
+                        if enrollment.duplicate {
+                            "already_enrolled"
+                        } else {
+                            "enrolled"
+                        },
+                        Some(enrollment.upload_session_id),
+                        Some(enrollment.missing_id),
+                        Some(enrollment.segment_order),
+                    );
                     if enrollment.duplicate {
                         return Ok(());
                     }
@@ -358,6 +379,16 @@ impl SegmentEventProcessor {
                         manifest = %manifest.display(),
                         "validated media segment durably outboxed; upload deferred until database import"
                     );
+                    crate::observe::segment_enrolled(
+                        &self.identity,
+                        event.segment_id.as_deref().unwrap_or(""),
+                        &event.prev_file_path.display().to_string(),
+                        "waiting",
+                        "outboxed",
+                        None,
+                        None,
+                        None,
+                    );
                     return Ok(());
                 }
                 EnrollmentOutcome::FinalizedRejected { session_id } => {
@@ -366,12 +397,32 @@ impl SegmentEventProcessor {
                         session_id,
                         "late validated segment belongs to a finalized session; retained locally without reopening upload work"
                     );
+                    crate::observe::segment_enrolled(
+                        &self.identity,
+                        event.segment_id.as_deref().unwrap_or(""),
+                        &event.prev_file_path.display().to_string(),
+                        "skipped",
+                        "session_finalized",
+                        Some(session_id),
+                        None,
+                        None,
+                    );
                     return Ok(());
                 }
                 EnrollmentOutcome::SourceMissing => {
                     warn!(
                         file = %event.prev_file_path.display(),
                         "validated segment disappeared before enrollment; no retry row was created"
+                    );
+                    crate::observe::segment_enrolled(
+                        &self.identity,
+                        event.segment_id.as_deref().unwrap_or(""),
+                        &event.prev_file_path.display().to_string(),
+                        "failed",
+                        "source_missing",
+                        None,
+                        None,
+                        None,
                     );
                     return Ok(());
                 }
@@ -754,6 +805,9 @@ fn merge_compatible_segments(
         segment_index: first.segment_index,
         close_reason: last.close_reason,
         attempt_id: first.attempt_id.clone(),
+        // The merged file is a new original entering the ledger, so it gets its own identity;
+        // the segments it was built from keep theirs and stay listed as recovery sources.
+        segment_id: Some(biliup::downloader::util::allocate_segment_id()),
         recovery_source_paths: events
             .iter()
             .map(|event| event.prev_file_path.clone())
@@ -933,6 +987,17 @@ impl DownloadTask {
             client.download().await?;
         }
 
+        // 录制身份显式构造一次，回调、channel 与阻塞任务都从这里克隆，不依赖环境上下文。
+        let identity = crate::observe::RecordingIdentity::server(
+            ctx.worker_id(),
+            ctx.id(),
+            &ctx.live_stream().name,
+        );
+        // 结束原因取自真正执行到的分支，不从日志文案反推；未走到任何分支时保持 unknown。
+        let stop_outcome: &str;
+        let stop_reason: &str;
+        let mut pending_reconnect: Option<crate::server::core::downloader::ReconnectContext> = None;
+
         // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
         let failover_enabled = platform == "douyin"
@@ -943,12 +1008,19 @@ impl DownloadTask {
         let mut estimated_missing = Duration::ZERO;
         let mut stream_gap_count = 0_u32;
         let mut result = Ok(DownloadStatus::StreamEnded);
+        crate::observe::recording_started(&identity, "live_detected", None);
         loop {
             let mut silent_for = None;
             let attempt = if can_download {
                 route_health.begin_attempt(&stream);
                 let attempt = self
-                    .download(&mut processor, ctx.clone(), danmaku_client.clone(), &stream)
+                    .download(
+                        &mut processor,
+                        ctx.clone(),
+                        danmaku_client.clone(),
+                        &stream,
+                        pending_reconnect.take(),
+                    )
                     .await;
                 result = attempt.result;
                 silent_for = attempt.silent_for;
@@ -964,6 +1036,8 @@ impl DownloadTask {
 
             if self.token.is_cancelled() {
                 info!(url = url, "task is cancelled");
+                stop_outcome = "cancelled";
+                stop_reason = "user_cancel";
                 break;
             }
             // 检查流状态
@@ -1097,6 +1171,8 @@ impl DownloadTask {
                             check_elapsed = ?check_elapsed,
                             "连续离线超过宽限期 {:?}，确认下播，结束本场", grace
                         );
+                        stop_outcome = "executed";
+                        stop_reason = "offline";
                         break;
                     }
                     let since = offline_retry.offline_since.expect("offline timestamp set");
@@ -1124,6 +1200,8 @@ impl DownloadTask {
                             check_elapsed = ?check_elapsed,
                             "检查直播间持续失败超过宽限期 {:?}，结束本场: {}", grace, sanitized_error
                         );
+                        stop_outcome = "failed";
+                        stop_reason = "check_failed";
                         break;
                     }
                     let since = offline_retry.offline_since.expect("offline timestamp set");
@@ -1161,19 +1239,40 @@ impl DownloadTask {
                     gap_index = stream_gap_count,
                     "stream gap between two connections"
                 );
+                // 恢复只能由下一次连接真正建立来证明，这里只把缺口交给下一次尝试。
+                pending_reconnect = Some(crate::server::core::downloader::ReconnectContext {
+                    gap_ms: gap.total.as_millis().min(u64::MAX as u128) as u64,
+                    silent_ms: gap.silent.as_millis().min(u64::MAX as u128) as u64,
+                    silent_measured: silent_for.is_some(),
+                });
             }
 
             info!("Retrying download in {:?}...", backoff);
             if !backoff.is_zero() {
+                crate::observe::retry_scheduled(
+                    &identity,
+                    if confirmed_live {
+                        "transport_error"
+                    } else {
+                        "offline"
+                    },
+                    backoff.as_millis().min(u64::MAX as u128) as u64,
+                    None,
+                );
+            }
+            if !backoff.is_zero() {
                 tokio::select! {
                     _ = self.token.cancelled() => {
                         info!(url = url, "task was cancelled during retry backoff");
+                        stop_outcome = "cancelled";
+                        stop_reason = "user_cancel";
                         break;
                     }
                     _ = tokio::time::sleep(backoff) => {}
                 }
             }
         }
+        crate::observe::recording_stopped(&identity, stop_outcome, stop_reason);
         if let Err(error) = processor.finish().await {
             error!(
                 error = ?error,
@@ -1270,6 +1369,7 @@ impl DownloadTask {
         ctx: Context,
         danmaku_client: Option<Arc<dyn DanmakuClient + Send + Sync>>,
         stream: &LiveStream,
+        reconnect: Option<crate::server::core::downloader::ReconnectContext>,
     ) -> DownloadAttempt {
         // 获取配置和主播信息
         let streamer = ctx.live_streamer();
@@ -1313,9 +1413,9 @@ impl DownloadTask {
         };
 
         let started_at = Instant::now();
-        let download = self
-            .downloader
-            .download(Box::new(hook), ctx.download_config(stream));
+        let mut download_config = ctx.download_config(stream);
+        download_config.reconnect = reconnect;
+        let download = self.downloader.download(Box::new(hook), download_config);
         tokio::pin!(download);
         let mut receive_segments = true;
         let result = loop {
@@ -1673,6 +1773,7 @@ mod short_segment_group_tests {
             next_file_path: None,
             segment_index: index,
             close_reason: SegmentCloseReason::TransportError,
+            segment_id: None,
             attempt_id: Some(format!("attempt-{index}")),
             recovery_source_paths: Vec::new(),
             enrollment: None,

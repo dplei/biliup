@@ -291,6 +291,47 @@ async fn target_02_validated_segments_are_durable_before_actor_consumption() {
     assert_eq!(db.counts().await, (1, 3));
 }
 
+/// Task 12: the identity assigned when the recording file was created is what the ledger stores,
+/// and a later rescan or restart that offers a different id must not relabel the segment.
+#[tokio::test]
+async fn target_12_segment_identity_is_stored_and_never_relabelled() {
+    let media = tempfile::tempdir().unwrap();
+    let outbox = tempfile::tempdir().unwrap();
+    let db = IncidentDb::new().await;
+    let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
+    let source = media.path().join("identity-segment.flv");
+    write_synthetic_valid_flv(&source);
+
+    let mut request = enrollment_request(&source);
+    request.segment_id = Some("seg-fixture-created".to_string());
+    let EnrollmentOutcome::Enrolled(first) =
+        enroll_validated_segment(&store, &request).await.unwrap()
+    else {
+        panic!("a valid segment must enroll");
+    };
+    assert_eq!(first.segment_id.as_deref(), Some("seg-fixture-created"));
+    let stored = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT segment_id FROM upload_missing_segment WHERE id = ?",
+    )
+    .bind(first.missing_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some("seg-fixture-created"));
+
+    // A restarted process rescans the same file and has no idea which id it once carried.
+    request.segment_id = Some("seg-fixture-rescanned".to_string());
+    let EnrollmentOutcome::Enrolled(second) =
+        enroll_validated_segment(&store, &request).await.unwrap()
+    else {
+        panic!("a known segment must resolve to the existing enrollment");
+    };
+    assert!(second.duplicate);
+    assert_eq!(second.missing_id, first.missing_id);
+    assert_eq!(second.segment_id.as_deref(), Some("seg-fixture-created"));
+    assert_eq!(db.counts().await, (1, 1));
+}
+
 /// Scenario 1 from task 08's fault matrix: the process is killed the instant a segment becomes
 /// validated, before any actor or watchdog touches it. Restart must find the row exactly where
 /// enrollment left it — `pending`, unclaimed — not lost, not stuck `uploading` forever.
@@ -652,6 +693,7 @@ async fn target_06_source_missing_stops_retries_and_finalized_stays_closed() {
         total_bytes: 0,
         now: FakeClock::incident_start().now(),
         recovery_window_minutes: 30,
+        segment_id: None,
     };
     let store = EnrollmentStore::new(db.pool.clone(), outbox.path().to_path_buf());
 
@@ -1322,5 +1364,6 @@ fn enrollment_request(path: &Path) -> EnrollmentRequest {
         total_bytes: std::fs::metadata(path).unwrap().len(),
         now: FakeClock::incident_start().now(),
         recovery_window_minutes: 30,
+        segment_id: None,
     }
 }

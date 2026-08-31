@@ -198,6 +198,20 @@ fn safety_unknown_debug_bounded_error_and_chunked_diagnostic() {
         .with("task_id", "task-a");
     assert!(f.get("gap_ms").is_none());
     assert_eq!(f.get("original_file").unwrap(), "segment.flv");
+    // An id the call site does not have is unknown, not a dropped field: nothing is stored and
+    // the quality counters stay clean, so a standalone command is not reported as lossy.
+    let unknown = Fields::new()
+        .with("live_streamer_id", "")
+        .with("task_id", "task-a")
+        .with("segment_id", "seg with space");
+    assert!(unknown.get("live_streamer_id").is_none());
+    assert_eq!(unknown.get("task_id").unwrap(), "task-a");
+    assert!(unknown.get("segment_id").is_none());
+    assert_eq!(
+        unknown.quality().rejected,
+        1,
+        "only the malformed id counts"
+    );
 }
 
 #[test]

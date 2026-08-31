@@ -87,6 +87,38 @@ async fn download_stream(
     segmentable: Segmentable,
     stall_timeout: std::time::Duration,
 ) -> AppResult<()> {
+    // A standalone command has no room or session row: it identifies itself by task id and never
+    // borrows a streamer identity it does not have.
+    let identity =
+        crate::observe::RecordingIdentity::task(&biliup::downloader::util::allocate_id("task"));
+    let owner = identity.owner(None);
+    crate::observe::recording_started(&identity, "live_detected", None);
+    let result = download_stream_inner(
+        url,
+        headers,
+        title,
+        output,
+        segmentable,
+        stall_timeout,
+        owner,
+    )
+    .await;
+    match &result {
+        Ok(()) => crate::observe::recording_stopped(&identity, "executed", "stream_end"),
+        Err(_) => crate::observe::recording_stopped(&identity, "failed", "transport_error"),
+    }
+    result
+}
+
+async fn download_stream_inner(
+    url: &str,
+    headers: &std::collections::HashMap<String, String>,
+    title: &str,
+    output: &str,
+    segmentable: Segmentable,
+    stall_timeout: std::time::Duration,
+    owner: biliup::downloader::util::RecordingOwner,
+) -> AppResult<()> {
     let output = output.replace("{title}", title);
     let headers = construct_headers(headers).map_err(|err| Report::new(AppError::Custom(err)))?;
     let mut client = StatelessClient::new(headers.clone(), None);
@@ -94,7 +126,7 @@ async fn download_stream(
 
     match live::media_ext_from_url(url).as_deref() {
         Some("m3u8" | "ts") => {
-            let file = LifecycleFile::new(&output, "ts");
+            let file = LifecycleFile::new(&output, "ts").with_owner(owner);
             hls::download(url, &client, file, segmentable)
                 .await
                 .change_context_lazy(|| AppError::Unknown)
@@ -112,7 +144,7 @@ async fn download_stream(
                 .read_frame(9)
                 .await
                 .change_context_lazy(|| AppError::Unknown)?;
-            let file = LifecycleFile::new(&output, "flv");
+            let file = LifecycleFile::new(&output, "flv").with_owner(owner);
             httpflv::download(connection, file, segmentable)
                 .await
                 .change_context_lazy(|| AppError::Unknown)?;

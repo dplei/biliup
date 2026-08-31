@@ -2597,6 +2597,7 @@ async fn recover_due_missing_segments(
                 .and_then(|value| u64::try_from(value).ok())
                 .unwrap_or(0),
             duplicate: false,
+            segment_id: row.segment_id.clone(),
         });
         let attempt_token = if let Some(enrollment) = &v2_enrollment {
             let AttemptClaim::Claimed(token) =
@@ -3252,6 +3253,9 @@ pub async fn rescan_local_valid_segments(
                 .len(),
             now: chrono::Utc::now(),
             recovery_window_minutes: config.recovery_window_minutes.unwrap_or(30) as i64,
+            // A local rescan finds files that were recorded before this process started, so it
+            // has no identity to offer; enrollment keeps whatever the ledger already stored.
+            segment_id: None,
         };
         match enroll_validated_segment(&EnrollmentStore::production(pool.clone()), &request).await?
         {
@@ -3453,6 +3457,7 @@ pub async fn claim_manual_recovery(
                 .and_then(|value| u64::try_from(value).ok())
                 .unwrap_or(0),
             duplicate: false,
+            segment_id: row.segment_id.clone(),
         })
     } else {
         None
@@ -4025,6 +4030,7 @@ mod tests {
             last_chunk_started_at: None,
             last_chunk_error: None,
             audio_normalized_at,
+            segment_id: None,
         }
     }
 
@@ -4358,6 +4364,7 @@ mod tests {
             total_bytes: std::fs::metadata(&path).unwrap().len(),
             now: chrono::Utc.with_ymd_and_hms(2026, 8, 23, 12, 5, 0).unwrap(),
             recovery_window_minutes: 30,
+            segment_id: None,
         };
         let store = EnrollmentStore::new(pool.clone(), directory.join("outbox"));
         let EnrollmentOutcome::Enrolled(enrollment) =
@@ -5498,6 +5505,7 @@ mod tests {
             total_bytes: std::fs::metadata(&path).unwrap().len(),
             now: chrono::Utc::now(),
             recovery_window_minutes: 30,
+            segment_id: None,
         };
         let outcome = enroll_validated_segment(
             &EnrollmentStore::new(pool.clone(), directory.path().join("outbox")),

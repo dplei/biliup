@@ -220,6 +220,9 @@ impl FfmpegDownloader {
             next_file_path: None,
             close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
             attempt_id: download_config.attempt_id.clone(),
+            // External downloaders create their own files, so no stable identity is assigned
+            // here yet; that path is migrated in task 14.
+            segment_id: None,
             recovery_source_paths: Vec::new(),
             enrollment: None,
         }));
@@ -289,6 +292,9 @@ impl FfmpegDownloader {
                 segment_index,
                 close_reason: biliup::downloader::util::SegmentCloseReason::TimedSplit,
                 attempt_id: download_config.attempt_id.clone(),
+                // External downloaders create their own files, so no stable identity is assigned
+                // here yet; that path is migrated in task 14.
+                segment_id: None,
                 recovery_source_paths: Vec::new(),
                 enrollment: None,
                 // start_time: std::time::SystemTime::now(),
@@ -313,6 +319,9 @@ impl FfmpegDownloader {
                 segment_index,
                 close_reason: biliup::downloader::util::SegmentCloseReason::StreamEnded,
                 attempt_id: download_config.attempt_id.clone(),
+                // External downloaders create their own files, so no stable identity is assigned
+                // here yet; that path is migrated in task 14.
+                segment_id: None,
                 recovery_source_paths: Vec::new(),
                 enrollment: None,
                 // start_time: std::time::SystemTime::now(),

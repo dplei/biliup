@@ -125,6 +125,12 @@ impl Fields {
             self.quality.rejected += 1;
             return;
         };
+        // A call site that has no business id says so with an empty string. That is "unknown",
+        // which the contract allows, so it stores nothing and is not counted as a rejection —
+        // otherwise every standalone command would look like a stream of dropped fields.
+        if kind == "id" && value.as_str().is_some_and(str::is_empty) {
+            return;
+        }
         let valid = match (&value, kind) {
             (Value::Number(n), "number") => n.as_u64().is_some_and(|n| n <= i64::MAX as u64),
             (Value::Number(n), "signed") => n.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),

@@ -36,6 +36,7 @@ pub fn download_with_hook(
     segment: Segmentable,
     file_name_hook: CallbackFn,
     proxy: Option<&str>,
+    owner: biliup::downloader::util::RecordingOwner,
 ) -> PyResult<()> {
     shadow::block_on_inherited(
         tracing::dispatcher::get_default(Clone::clone),
@@ -56,7 +57,8 @@ pub fn download_with_hook(
                 Ok((_i, header)) => {
                     debug!("header: {header:#?}");
                     info!("Downloading {}...", url);
-                    let file = LifecycleFile::with_hook(file_name, "flv", file_name_hook);
+                    let file = LifecycleFile::with_hook(file_name, "flv", file_name_hook)
+                        .with_owner(owner);
                     httpflv::download(connection, file, segment)
                         .await
                         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
@@ -66,7 +68,8 @@ pub fn download_with_hook(
                 }
                 Err(e) => {
                     error!("{e}");
-                    let file = LifecycleFile::with_hook(file_name, "ts", file_name_hook);
+                    let file =
+                        LifecycleFile::with_hook(file_name, "ts", file_name_hook).with_owner(owner);
                     hls::download(url, &client, file, segment).await.unwrap();
                 }
             }
@@ -157,7 +160,7 @@ fn download_with_callback(
         };
 
         let file_name_hook = file_name_callback_fn.map(|callback_fn| -> CallbackFn {
-            Box::new(move |fmt_file_name, _close_reason| {
+            Box::new(move |fmt_file_name, _close_reason, _identity| {
                 Python::attach(|py| match callback_fn.call1(py, (fmt_file_name,)) {
                     Ok(_) => {}
                     Err(_) => {
@@ -177,14 +180,29 @@ fn download_with_callback(
             )
             .with(_shadow.layer().map(|layer| layer.filtered()));
         tracing::subscriber::with_default(collector, || -> PyResult<()> {
-            match download_with_hook(
+            // An embedded call owns no room or session row: it identifies itself by task id.
+            let identity = biliup_cli::observe::RecordingIdentity::task(
+                &biliup::downloader::util::allocate_id("task"),
+            );
+            biliup_cli::observe::recording_started(&identity, "live_detected", None);
+            let outcome = download_with_hook(
                 url,
                 map,
                 file_name,
                 segmentable,
-                file_name_hook.unwrap_or(Box::new(|_, _| {})),
+                file_name_hook.unwrap_or(Box::new(|_, _, _| {})),
                 proxy.as_deref(),
-            ) {
+                identity.owner(None),
+            );
+            match &outcome {
+                Ok(()) => {
+                    biliup_cli::observe::recording_stopped(&identity, "executed", "stream_end")
+                }
+                Err(_) => {
+                    biliup_cli::observe::recording_stopped(&identity, "failed", "transport_error")
+                }
+            }
+            match outcome {
                 Ok(res) => Ok(res),
                 Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "{}",

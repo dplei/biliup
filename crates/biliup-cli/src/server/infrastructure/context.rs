@@ -151,9 +151,15 @@ impl Context {
             file_size: config.file_size,
             headers: stream.stream_headers.clone(),
             recorder: self.recorder(stream_info),
+            owner: crate::observe::RecordingIdentity::server(
+                self.worker_id(),
+                self.id(),
+                &self.stream.name,
+            ),
             // output_dir: PathBuf::from("./downloads")
             output_dir: PathBuf::from("."),
             suffix,
+            reconnect: None,
             attempt_id: stream.attempt_id.clone(),
             quality: stream.recording_quality.clone(),
             stall_timeout_secs: config.stream_stall_timeout_secs,

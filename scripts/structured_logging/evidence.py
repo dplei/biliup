@@ -30,8 +30,11 @@ def zone(value):
 
 OUTCOMES = {"executed", "skipped", "fallback", "failed", "waiting", "succeeded", "unknown", "recovered", "cancelled"}
 # Catalog requirements used only for native evidence. No parsing text into business identity.
+# A value may list alternative shapes; an event satisfies the catalog by matching any one of them
+# (a source-side rollup carries counts instead of one pair, and is not a missing field).
 REQUIRED = {
- "recording.dts_backward": ["segment_id", "previous_ms", "current_ms"],
+ "recording.dts_backward": [["segment_id", "previous_ms", "current_ms"],
+                            ["segment_id", "count", "first_ms", "last_ms", "max_backward_ms"]],
  "recording.segment_created": ["segment_id", "original_file"],
  "recording.segment_closed": ["segment_id", "original_file", "size_bytes", "reason_code"],
  "recording.segment_enrolled": ["segment_id", "original_file"],
@@ -454,8 +457,12 @@ def validate(out, expectations=None):
                 for ambiguous in ("duration", "size", "delay", "gap", "previous", "current"):
                     if ambiguous in fields:
                         errors.append({"ref": ref, "code": "unit_missing:" + ambiguous})
-                for key in REQUIRED.get(e["event_name"], []):
-                    if key not in fields:
+                options = REQUIRED.get(e["event_name"], [])
+                options = options if options and isinstance(options[0], list) else [options]
+                if options and not any(all(key in fields for key in option) for option in options):
+                    for key in sorted({key for option in options for key in option}):
+                        if not any(key in option and key not in fields for option in options):
+                            continue
                         errors.append({"ref": ref, "code": "missing_field:" + key})
     # Stable identities cannot change owners across stages. Missing owners stay unknown.
     owners = {}

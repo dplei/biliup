@@ -29,6 +29,10 @@ pub struct EnrollmentRequest {
     pub total_bytes: u64,
     pub now: DateTime<Utc>,
     pub recovery_window_minutes: i64,
+    /// Identity allocated at file creation. Absent for paths that do not assign one yet and for
+    /// outbox manifests written before this field existed; never invented here.
+    #[serde(default)]
+    pub segment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,10 +268,10 @@ async fn enroll_in_database(
           danmaku_file_path, segment_order, status, attempts, line_index, next_retry_at, \
           last_error, created_at, updated_at, normalized_file_path, lifecycle_version, \
           video_json, total_bytes, uploaded_bytes, current_line, upload_started_at, \
-          last_progress_at, attempt_token) \
+          last_progress_at, attempt_token, segment_id) \
          VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'pending', 0, 0, ?7, \
                  'validated segment accepted; awaiting upload', ?7, ?7, ?8, 2, \
-                 NULL, ?9, 0, NULL, NULL, NULL, NULL)",
+                 NULL, ?9, 0, NULL, NULL, NULL, NULL, ?10)",
     )
     .bind(request.live_streamer_id)
     .bind(request.streamer_info_id)
@@ -283,6 +287,7 @@ async fn enroll_in_database(
     .bind(request.now)
     .bind(request.normalized_file_path.display().to_string())
     .bind(total_bytes)
+    .bind(request.segment_id.clone())
     .execute(&mut *tx)
     .await;
 
@@ -310,6 +315,7 @@ async fn enroll_in_database(
         normalized_file_path: request.normalized_file_path.clone(),
         total_bytes: request.total_bytes,
         duplicate: false,
+        segment_id: request.segment_id.clone(),
     })
 }
 
@@ -318,7 +324,7 @@ async fn existing_enrollment(
     request: &EnrollmentRequest,
 ) -> Result<Option<SegmentEnrollment>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, upload_session_id, segment_order, total_bytes \
+        "SELECT id, upload_session_id, segment_order, total_bytes, segment_id \
          FROM upload_missing_segment \
          WHERE live_streamer_id = ? AND normalized_file_path = ? AND lifecycle_version = 2",
     )
@@ -337,6 +343,11 @@ async fn existing_enrollment(
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or(request.total_bytes),
         duplicate: true,
+        // The stored identity wins: a restart or rescan must find the original segment back,
+        // not relabel it with whatever this caller happens to hold.
+        segment_id: row
+            .get::<Option<String>, _>("segment_id")
+            .or_else(|| request.segment_id.clone()),
     }))
 }
 

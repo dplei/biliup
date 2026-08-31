@@ -180,6 +180,9 @@ pub struct UploadMissingSegment {
     /// 原片已被响度标准化产物就地替换的时刻；补传据此跳过重复编码。
     /// 与上面的 `normalized_file_path`（路径规范化）无关。
     pub audio_normalized_at: Option<DateTime<Utc>>,
+    /// 文件创建时分配的稳定分段身份；重启、补扫与补传据此找回同一分段。
+    /// 本迁移之前的行与尚未接入的下载路径为 None，不按文件名倒推。
+    pub segment_id: Option<String>,
 }
 
 /// 一次 attempt 一行的追加式历史，供补传页展示「先后用过哪些线路、各自为何结束」。
