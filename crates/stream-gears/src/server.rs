@@ -204,164 +204,173 @@ pub(crate) fn _main(args: &[String]) -> AppResult<()> {
 
     // One scoped subscriber per invocation, including spawned and blocking workers.
     // Repeated wheel calls never replace or duplicate an embedding host's subscriber.
+    let command = biliup_cli::observe::lifecycle::command_name(&cli.command);
     shadow::block_on(tracing::Dispatch::new(subscriber), false, async move {
         info!("Tracing initialized with daily rotation");
 
-        match cli.command {
-            Commands::Login => login(cli.user_cookie, cli.proxy.as_deref()).await?,
-            Commands::Renew => {
-                renew(cli.user_cookie, cli.proxy.as_deref()).await?;
-            }
-            Commands::Upload {
-                video_path,
-                config: None,
-                line,
-                limit,
-                studio,
-                submit,
-            } => {
-                upload_by_command(
+        let work = async {
+            match cli.command {
+                Commands::Login => login(cli.user_cookie, cli.proxy.as_deref()).await?,
+                Commands::Renew => {
+                    renew(cli.user_cookie, cli.proxy.as_deref()).await?;
+                }
+                Commands::Upload {
+                    video_path,
+                    config: None,
+                    line,
+                    limit,
                     studio,
-                    cli.user_cookie,
+                    submit,
+                } => {
+                    upload_by_command(
+                        studio,
+                        cli.user_cookie,
+                        video_path,
+                        line,
+                        limit,
+                        submit.unwrap_or(SubmitOption::App),
+                        cli.proxy.as_deref(),
+                    )
+                    .await?
+                }
+                Commands::Upload {
+                    video_path: _,
+                    config: Some(config),
+                    submit,
+                    ..
+                } => {
+                    upload_by_config(config, cli.user_cookie, submit, cli.proxy.as_deref()).await?;
+                }
+                Commands::Append {
                     video_path,
-                    line,
-                    limit,
-                    submit.unwrap_or(SubmitOption::App),
-                    cli.proxy.as_deref(),
-                )
-                .await?
-            }
-            Commands::Upload {
-                video_path: _,
-                config: Some(config),
-                submit,
-                ..
-            } => {
-                upload_by_config(config, cli.user_cookie, submit, cli.proxy.as_deref()).await?;
-            }
-            Commands::Append {
-                video_path,
-                vid,
-                line,
-                limit,
-                studio: _,
-                submit,
-            } => {
-                append(
-                    cli.user_cookie,
                     vid,
-                    video_path,
                     line,
                     limit,
-                    submit.unwrap_or(SubmitOption::App),
-                    cli.proxy.as_deref(),
-                )
-                .await?
-            }
-            Commands::Show { vid } => show(cli.user_cookie, vid, cli.proxy.as_deref()).await?,
-            Commands::Comments { vid, sort, pn, ps } => {
-                comments(cli.user_cookie, vid, sort, pn, ps, cli.proxy.as_deref()).await?
-            }
-            Commands::Reply {
-                vid,
-                rpid,
-                message,
-                execute,
-            } => {
-                reply(
-                    cli.user_cookie,
+                    studio: _,
+                    submit,
+                } => {
+                    append(
+                        cli.user_cookie,
+                        vid,
+                        video_path,
+                        line,
+                        limit,
+                        submit.unwrap_or(SubmitOption::App),
+                        cli.proxy.as_deref(),
+                    )
+                    .await?
+                }
+                Commands::Show { vid } => show(cli.user_cookie, vid, cli.proxy.as_deref()).await?,
+                Commands::Comments { vid, sort, pn, ps } => {
+                    comments(cli.user_cookie, vid, sort, pn, ps, cli.proxy.as_deref()).await?
+                }
+                Commands::Reply {
                     vid,
                     rpid,
                     message,
                     execute,
-                    cli.proxy.as_deref(),
-                )
-                .await?
-            }
-            Commands::DumpFlv { file_name } => generate_json(file_name)?,
-            Commands::Download {
-                url,
-                output,
-                split_size,
-                split_time,
-                stall_timeout,
-            } => {
-                biliup_cli::downloader::download(
-                    &url,
+                } => {
+                    reply(
+                        cli.user_cookie,
+                        vid,
+                        rpid,
+                        message,
+                        execute,
+                        cli.proxy.as_deref(),
+                    )
+                    .await?
+                }
+                Commands::DumpFlv { file_name } => generate_json(file_name)?,
+                Commands::Download {
+                    url,
                     output,
                     split_size,
                     split_time,
                     stall_timeout,
-                )
-                .await?
-            }
-            Commands::Server {
-                bind,
-                port,
-                auth,
-                config,
-            } => {
-                biliup_cli::run((&bind, port), auth, reload_handle, config).await?;
-            }
-            // 与 biliup-cli 的 main.rs 保持一致。生产走的是 python wheel → stream_gears
-            // 这条链路（不是 main.rs），子命令只加在那边的话，这里就编不过——
-            // 而 `cargo check -p biliup-cli` 看不到本 crate，问题会一直藏到 Docker 构建才炸。
-            Commands::CoverPreview {
-                text,
-                background,
-                output,
-                dim,
-                blur,
-                background_only,
-            } => {
-                biliup_cli::cover_preview::cover_preview(
-                    &text,
+                } => {
+                    biliup_cli::downloader::download(
+                        &url,
+                        output,
+                        split_size,
+                        split_time,
+                        stall_timeout,
+                    )
+                    .await?
+                }
+                Commands::Server {
+                    bind,
+                    port,
+                    auth,
+                    config,
+                } => {
+                    biliup_cli::run((&bind, port), auth, reload_handle, config).await?;
+                }
+                // 与 biliup-cli 的 main.rs 保持一致。生产走的是 python wheel → stream_gears
+                // 这条链路（不是 main.rs），子命令只加在那边的话，这里就编不过——
+                // 而 `cargo check -p biliup-cli` 看不到本 crate，问题会一直藏到 Docker 构建才炸。
+                Commands::CoverPreview {
+                    text,
                     background,
-                    &output,
+                    output,
                     dim,
                     blur,
                     background_only,
-                )?;
-                let what = if background_only {
-                    "背景图"
-                } else {
-                    "封面预览"
-                };
-                println!("已生成{what}：{}", output.display());
-            }
-            Commands::List {
-                is_pubing,
-                pubed,
-                not_pubed,
-                from_page,
-                max_pages,
-            } => {
-                list(
-                    cli.user_cookie,
+                } => {
+                    biliup_cli::cover_preview::cover_preview(
+                        &text,
+                        background,
+                        &output,
+                        dim,
+                        blur,
+                        background_only,
+                    )?;
+                    let what = if background_only {
+                        "背景图"
+                    } else {
+                        "封面预览"
+                    };
+                    println!("已生成{what}：{}", output.display());
+                }
+                Commands::List {
                     is_pubing,
                     pubed,
                     not_pubed,
-                    cli.proxy.as_deref(),
                     from_page,
                     max_pages,
-                )
-                .await?
-            }
-            Commands::BackfillLifecycle { database, dry_run } => {
-                let pool = ConnectionManager::new_pool(&database).await?;
-                let summary = run_lifecycle_backfill(&pool, dry_run).await?;
-                info!(
-                    processed_sessions = summary.processed_sessions,
-                    migrated_rows = summary.migrated_rows,
-                    synthetic_rows = summary.synthetic_rows,
-                    conflict_rows = summary.conflict_rows,
-                    dry_run,
-                    "lifecycle backfill finished"
-                );
-            }
-        };
+                } => {
+                    list(
+                        cli.user_cookie,
+                        is_pubing,
+                        pubed,
+                        not_pubed,
+                        cli.proxy.as_deref(),
+                        from_page,
+                        max_pages,
+                    )
+                    .await?
+                }
+                Commands::BackfillLifecycle { database, dry_run } => {
+                    let pool = ConnectionManager::new_pool(&database).await?;
+                    let summary = run_lifecycle_backfill(&pool, dry_run).await?;
+                    info!(
+                        processed_sessions = summary.processed_sessions,
+                        migrated_rows = summary.migrated_rows,
+                        synthetic_rows = summary.synthetic_rows,
+                        conflict_rows = summary.conflict_rows,
+                        dry_run,
+                        "lifecycle backfill finished"
+                    );
+                }
+            };
 
-        Ok(())
+            Ok(())
+        };
+        biliup_cli::observe::lifecycle::run(
+            biliup_cli::observe::lifecycle::WHEEL_CLI,
+            command,
+            work,
+        )
+        .await
     })
     .map_err(|_| {
         biliup_cli::server::errors::AppError::Custom("runtime initialization failed".into())

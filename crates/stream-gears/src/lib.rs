@@ -199,6 +199,12 @@ fn download_with_callback(
             )
             .with(_shadow.layer().map(|layer| layer.filtered()));
         tracing::subscriber::with_default(collector, || -> PyResult<()> {
+            // One embedded call is one run of this entry; the recording it performs keeps its
+            // own task id, which is never borrowed from the run.
+            let mut invocation = biliup_cli::observe::lifecycle::Invocation::start(
+                biliup_cli::observe::lifecycle::PYTHON_DOWNLOAD,
+                "download",
+            );
             // An embedded call owns no room or session row: it identifies itself by task id.
             let identity = biliup_cli::observe::RecordingIdentity::task(
                 &biliup::downloader::util::allocate_id("task"),
@@ -222,6 +228,7 @@ fn download_with_callback(
                     biliup_cli::observe::recording_stopped(&identity, "failed", "transport_error")
                 }
             }
+            invocation.finish(&outcome);
             match outcome {
                 Ok(res) => Ok(res),
                 Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -238,7 +245,11 @@ fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::login_by_cookies(&file, proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "login_by_cookies",
+            login::login_by_cookies(&file, proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(_) => Ok(true),
@@ -254,7 +265,11 @@ fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<St
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::send_sms(country_code, phone, proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "send_sms",
+            login::send_sms(country_code, phone, proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(res) => Ok(res.to_string()),
@@ -270,7 +285,11 @@ fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool>
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::login_by_sms(code, serde_json::from_str(&ret).unwrap(), proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "login_by_sms",
+            login::login_by_sms(code, serde_json::from_str(&ret).unwrap(), proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(_) => Ok(true),
@@ -283,7 +302,11 @@ fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::get_qrcode(proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "get_qrcode",
+            login::get_qrcode(proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(res) => Ok(res.to_string()),
@@ -299,11 +322,15 @@ fn login_by_qrcode(ret: String, proxy: Option<String>) -> PyResult<String> {
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     shadow::block_on_inherited(dispatch, false, async {
-        let info = Credential::new(proxy.as_deref())
-            .login_by_qrcode(serde_json::from_str(&ret).unwrap())
-            .await?;
-        let res = serde_json::to_string_pretty(&info).unwrap();
-        Ok::<_, biliup::error::Kind>(res)
+        let result = async {
+            let info = Credential::new(proxy.as_deref())
+                .login_by_qrcode(serde_json::from_str(&ret).unwrap())
+                .await?;
+            let res = serde_json::to_string_pretty(&info).unwrap();
+            Ok::<_, biliup::error::Kind>(res)
+        }
+        .await;
+        biliup_cli::observe::auth::observe("bilibili", "login_by_qrcode", result)
     })?
     .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#?}", err)))
 }
@@ -317,7 +344,11 @@ fn login_by_web_cookies(
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "login_by_web_cookies",
+            login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(_) => Ok(true),
@@ -337,7 +368,11 @@ fn login_by_web_qrcode(
     let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
     let dispatch = _shadow.inherited_dispatch();
     let result = shadow::block_on_inherited(dispatch, false, async {
-        login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await
+        biliup_cli::observe::auth::observe(
+            "bilibili",
+            "login_by_web_qrcode",
+            login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await,
+        )
     })?;
     match result {
         Ok(_) => Ok(true),
@@ -439,11 +474,17 @@ fn upload(
             //     None => SubmitOption::App,
             // };
 
-            match shadow::block_on_inherited(
+            let mut invocation = biliup_cli::observe::lifecycle::Invocation::start(
+                biliup_cli::observe::lifecycle::PYTHON_UPLOAD,
+                "upload",
+            );
+            let outcome = shadow::block_on_inherited(
                 tracing::dispatcher::get_default(Clone::clone),
                 true,
                 uploader::upload(studio_pre, submit.as_deref(), proxy.as_deref()),
-            )? {
+            )?;
+            invocation.finish(&outcome);
+            match outcome {
                 Ok(_) => Ok(()),
                 // Ok(_) => {  },
                 Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(

@@ -5,7 +5,9 @@ Status: needs-triage
 P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12–13 起 **C02–C05 的录制域**与
 **C06–C10 的后处理域**已有原生事件；P3/16 那一轮在本机 dev 环境用**一场真实开播录制**跑通了
 从开播到投稿成功的整条链路，两域的**决定链与执行结果都已有真实样本**（见下方变更记录）。
-**C01、C11–C13 仍未接入**，只有桥接文本，不能把 P1 合成载体验证或桥接采集当作业务覆盖。
+P3/14 第五批起 **C01 入口启停**与 **C11 凭据健康**已有原生事件（Rust CLI 真实进程实跑；
+wheel/Python 入口共用同一包装但未起进程实跑）。**C12 与 C13 的剩余部分仍未接入**，
+只有桥接文本，不能把 P1 合成载体验证或桥接采集当作业务覆盖。
 
 ## 关键事实
 
@@ -66,9 +68,9 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 
 | 入口/路径 | 必查边界 | 当前状态 |
 | --- | --- | --- |
-| wheel CLI 主循环 | 全局subscriber；stdout + ds_update日期.log，daily最多7个，RUST_LOG（缺省info）总过滤，秒级本地时间；guard退出flush，Web可reload总过滤 | P2实测：旁路三态通过，旧输出不变；桥接文本重复行不可判定 |
-| Rust CLI | 全局subscriber；仅stdout，--rust-log缺省tower_http=debug,info，秒级本地时间，Web可reload，无文件guard | P2实测：旁路三态通过；无持久旧文件，受控对照用wrapper stdout |
-| Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：重叠调用共享run、不覆盖宿主subscriber；顺序调用排空后新建run，旧文件照常 |
+| wheel CLI 主循环 | 全局subscriber；stdout + ds_update日期.log，daily最多7个，RUST_LOG（缺省info）总过滤，秒级本地时间；guard退出flush，Web可reload总过滤 | P2实测：旁路三态通过，旧输出不变；桥接文本重复行不可判定。P3/14第五批：入口启停已接入，与 Rust CLI 共用包装，未起 Python 进程实跑 |
+| Rust CLI | 全局subscriber；仅stdout，--rust-log缺省tower_http=debug,info，秒级本地时间，Web可reload，无文件guard | P2实测：旁路三态通过；无持久旧文件，受控对照用wrapper stdout。P3/14第五批：真实二进制两次实跑，成功/失败两种结束事件与进程标识、版本均已回查 |
+| Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：重叠调用共享run、不覆盖宿主subscriber；顺序调用排空后新建run，旧文件照常。P3/14第五批：每次调用记一次运行启停，运行 id 与录制 task 分开 |
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python/server 的已知m3u8/ts直接HLS，其余保留FLV探测回落 | P3/14第三批：HLS复用S，新增序列缺口/不连续与失败事件；三下载入口受控三态/回退通过，CLI提取结果为fixture；服务执行器的媒体后重连与取消通过，真实平台HLS及服务整链待验 |
@@ -228,3 +230,25 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   未做新的三次隔离还原。HLS 真平台/服务整链/真实断连恢复、双路并发和量化负载待补；
   C04 不因 TS 事件算 DTS 验证，C01/C11–C13 和外部下载器不计覆盖，见
   [P3 第三批](receipts/P3.md#任务-14-第三批hls-下载)。
+- C01/C11 / Rust CLI、wheel CLI、Python 下载/上传/登录、服务端健康状态机 / contract-v1 /
+  14 第五批 / entry-auth-v1：**原生已接入，验收 partial**。一次运行 = 一个 `Invocation`，
+  正常/错误/被取消分别记 executed`shutdown`、failed`entry_failed`、unknown`entry_interrupted`；
+  强杀不执行析构，没有结束事件即缺失，不补造。新增允许键 `command`（解析后的子命令固定词），
+  进程标识与版本由既有 `process_run_id`/`app_version` 承载。**运行 task 与业务 task 是两个身份，
+  不互相代用**：CLI 上靠 process_run_id 关联，重叠的嵌入调用没有关联手段，这是有意的。
+  `auth.health_changed` 只由 `cookie_health` 状态机的两次跃迁发出（带 platform 与当次 count），
+  单次失败不改变健康状态；`auth.operation_failed` 覆盖每次被计数的失败，原因由既有
+  `classify_error` 定型为 authentication_failed/transport_error/server_error/invalid_response，
+  **错误文本只用于分类、随即丢弃**。去抖窗口内的重复失败不计数因而不发事件，事件条数等于
+  被计数的失败数而非重试风暴次数。登录成功不发原生事件（成功不是健康跃迁）。
+  **必要前置修复**：`record_error` 抽出接受时钟参数的 `record_error_at`，让去抖窗口与阈值
+  可在不等待真实时间的前提下验证（生产始终传真实时钟）；包装 CLI 结果时改按 `Debug` 而非
+  `Display` 渲染错误再分类——`error_stack::Report` 的 Display 只有顶层 context，实测会把
+  代理被拒的连接失败错判成 `invalid_response`。
+  证据：真实 `biliup` 二进制两次实跑（成功与失败）后只读回查到 4 条 system 事件；入口三态、
+  重叠运行、子命令词表、健康两次跃迁、去抖、三类失败定型与脱敏共 8 项测试通过；全部离线，
+  无账号、无外部网络。见 [P3 第五批](receipts/P3.md#任务-14-第五批入口生命周期与凭据健康c01--c11)。
+  **未解决差异**：wheel CLI、Python 下载/上传与 7 个登录辅助函数只做编译核对，**没有起
+  Python 进程实跑**，共用代码不代计这些入口的运行证据；服务端监控循环里的真实鉴权失败与
+  恢复（需真实平台）未验；webhook 告警与新事件同时发生的表现未验。C12、C13 剩余部分
+  （`ffmpeg_scan`、danmaku/封面/hook 诊断）不因本行计任何原生分。

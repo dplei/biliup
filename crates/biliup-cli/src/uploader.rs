@@ -86,15 +86,19 @@ pub async fn login(user_cookie: PathBuf, proxy: Option<&str>) -> AppResult<()> {
         .item("网页Cookie登录2")
         .interact()
         .change_context_lazy(|| AppError::Unknown)?;
-    let info = match selection {
-        0 => login_by_password(client).await?,
-        1 => login_by_sms(client).await?,
-        2 => login_by_qrcode(client).await?,
-        3 => login_by_browser(client).await?,
-        4 => login_by_web_cookies(client).await?,
-        5 => login_by_webqr_cookies(client).await?,
-        _ => panic!(),
-    };
+    let info = observe::auth::observe(
+        "bilibili",
+        "login",
+        match selection {
+            0 => login_by_password(client).await,
+            1 => login_by_sms(client).await,
+            2 => login_by_qrcode(client).await,
+            3 => login_by_browser(client).await,
+            4 => login_by_web_cookies(client).await,
+            5 => login_by_webqr_cookies(client).await,
+            _ => panic!(),
+        },
+    )?;
     let file = std::fs::File::create(user_cookie).change_context_lazy(|| AppError::Unknown)?;
     serde_json::to_writer_pretty(&file, &info).change_context_lazy(|| AppError::Unknown)?;
     info!("登录成功，数据保存在{:?}", file);
@@ -106,10 +110,14 @@ pub async fn renew(user_cookie: PathBuf, proxy: Option<&str>) -> AppResult<()> {
     let mut file = fopen_rw(user_cookie)?;
     let login_info: LoginInfo =
         serde_json::from_reader(&file).change_context_lazy(|| AppError::Unknown)?;
-    let new_info = client
-        .renew_tokens(login_info)
-        .await
-        .change_context_lazy(|| AppError::Unknown)?;
+    let new_info = observe::auth::observe(
+        "bilibili",
+        "renew",
+        client
+            .renew_tokens(login_info)
+            .await
+            .change_context_lazy(|| AppError::Unknown),
+    )?;
     file.rewind().change_context_lazy(|| AppError::Unknown)?;
     file.set_len(0).change_context_lazy(|| AppError::Unknown)?;
     serde_json::to_writer_pretty(std::io::BufWriter::new(&file), &new_info)

@@ -80,6 +80,31 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - 该事件经本次调用的采集器直接写出（附件无法走 tracing 字段），只取当前 dispatch 上的
   采集器，不搜索全局运行，也不从业务回调里初始化存储。
 
+### P3/14 入口生命周期与凭据健康增量
+
+- `system.started` / `system.stopped` 描述**一次运行**：两个 CLI 是一个进程，Python 绑定是一次
+  嵌入调用。运行自带 task_id，**与其中的录制/上传业务 task 是两个身份，互不代用**；同一进程内
+  两者只能靠 process_run_id 关联，重叠的嵌入调用可能共享 run，运行 id 才是区分它们的依据。
+- 字段：`stage` 为入口（`rust_cli`/`wheel_cli`/`python_download`/`python_upload`），`command`
+  为**解析后的子命令固定词**（新增允许键，text），不是原始参数文本；进程标识与版本由
+  `process_run_id`/`app_version` 承载，不重复写入 fields。参数值、cookie 路径、账号一律不带。
+- 结果三态：正常返回 executed/`shutdown`；返回错误 failed/`entry_failed`；**被取消或 panic 展开
+  记 unknown/`entry_interrupted`**，不推断成功也不算作失败。**进程被强杀不执行任何析构，
+  因此没有结束事件——缺失就是缺失，不补造。**
+- `auth.health_changed` 只由 `cookie_health` 的状态机在两次跃迁时发出：连续鉴权失败达阈值记
+  WARN failed/`authentication_failed`，恢复记 INFO recovered/`authentication_recovered`，带
+  `platform` 与 `count`（当次连续失败数）。**单次操作失败不改变健康状态，也不得声称凭据失效。**
+- `auth.operation_failed`：WARN、failed，带 `platform` 与 `stage`。`stage=live_check` 来自直播间
+  检查（监控轮询与录制断流复查同一口径），登录类入口的 stage 是各自的操作名。原因由
+  `classify_error` 定型：`authentication_failed`/`transport_error`/`server_error`/`invalid_response`。
+  **错误文本只用于分类，随即丢弃**，不进字段也不进摘要。
+- 去抖窗口内的重复鉴权失败只更新记录、不累加计数，因此**也不发事件**：事件条数等于被计数的
+  失败数，而不是重试风暴的次数。非鉴权类失败不进入去抖，与旧的每次告警行 1:1。
+- 包装 CLI 结果时按 `Debug` 而非 `Display` 渲染错误再分类：`error_stack::Report` 的 Display
+  只有顶层 context，按它分类会把所有被包裹的失败都定型成 `invalid_response`。
+- 登录成功不发原生事件：`auth.health_changed` 的 recovered 属于状态机，一次成功的登录不等于
+  平台健康跃迁；「这次登录跑完了且正常结束」由该入口的 `system.stopped` 回答。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify
