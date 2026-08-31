@@ -54,13 +54,24 @@
 | `crates/biliup-observability/src/sanitize.rs` | 对允许字段执行有界格式化、敏感线索整值脱敏和控制字符处理，不序列化未知 Debug 对象。 | `clean`、`Bounded`、`debug` |
 | `crates/biliup-observability/src/diagnostic.rs` | 流式捕获外部诊断：跨 chunk 按有界行脱敏，保留首致命摘要、有限尾部和原始字节/截断信息。 | `DiagnosticCapture`、`Diagnostic` |
 | `crates/biliup-observability/src/runtime.rs` | 提供条数/字节双限队列、重要级别预留、可替换后台消费者、提交后高水位、独立健康与限时关闭。 | `Runtime`、`Emitter`、`Consumer`、`Health`、`Options` |
-| `crates/biliup-observability/src/sqlite.rs` | 独立 SQLite migrations 与单写入器、事件/附件幂等事务、只读游标查询、保留/WAL/低盘保护和一致性备份。 | `SqliteStore`、`StoreOptions`、`Repository`、`Query`、`MIGRATOR` |
+| `crates/biliup-observability/src/sqlite.rs` | 独立 SQLite migrations 与单写入器、事件/附件幂等事务、只读游标查询、保留/WAL/低盘保护和一致性备份。查询支持级别/分类的精确集合与 `newest_first` 倒序，集合大小在 `push_filters` 里统一设界，`count` 与分页受同一约束。 | `SqliteStore`、`StoreOptions`、`Repository`、`Query`、`MIGRATOR`、`push_filters` |
 | `crates/biliup-observability/src/shadow.rs` | 把独立采集以可关闭旁路接进各入口：启动时读环境开关、同库多次调用共享一个 run、把 runtime worker 绑定到同一 dispatch，并保留嵌入宿主已有 subscriber。 | `Shadow`、`Config::from_env`、`block_on_inherited`、`health_snapshot`、`Inherited` |
 | `crates/biliup-observability/examples/shadow_acceptance.rs` | 新旧双路同时开启的合成负载入口：同时测量发射延迟、排空、两侧丢弃与新旧合计磁盘占用，并产出可导出的证据请求。 | `main`、`ticks` |
 | `crates/biliup-observability/examples/acceptance.rs` | 隔离的日志预算验收入口：以合成双路事件测量发射、调度延迟、排空、分页和磁盘占用，不启动业务服务。 | `main`、`workload` |
-| `crates/biliup-cli/src/server/api/log_events.rs` | 独立事件库的只读入口：按级别/分类/时间/关键词/关联 ID/采集种类分页查询（**默认只回原生事件**，桥接须显式请求），附件详情、SSE 实时接续（只发已提交事件，与列表共用入库序号游标）与 JSONL/CSV 流式导出；采集关闭或库不可用时回 `availability` 而不是空列表。 | `list_log_events`、`stream_log_events`、`export_log_events`、`get_log_event_diagnostic`、`Availability`、`ListParams` |
+| `crates/biliup-cli/src/server/api/log_events.rs` | 独立事件库的只读入口：按级别/分类/时间/关键词/关联 ID/采集种类分页查询（**默认只回原生事件**，桥接须显式请求），附件详情、SSE 实时接续（只发已提交事件，与列表共用入库序号游标）与 JSONL/CSV 流式导出；采集关闭或库不可用时回 `availability` 而不是空列表。`levels`/`categories` 是精确集合（`min_level` 之外另给一条路），`order=desc` 让页面从最新一条开始读、用 `next_until_id` 往回翻，实时与导出恒为正序。 | `list_log_events`、`stream_log_events`、`export_log_events`、`get_log_event_diagnostic`、`Availability`、`ListParams`、`set` |
 | `crates/biliup-cli/src/server/api/ws.rs` | 基于文件的实时日志 WebSocket：白名单逻辑文件名映射到最新滚动文件，初连取末尾记录，再轮询新增内容并发送保活。 | `ws_logs`、`websocket_logs`、`resolve_latest_log`、`send_last_lines` |
-| `app/(app)/logviewer/page.tsx` | 按日志文件切换 tab 的实时日志页：通过 WebSocket 追加文本、管理滚动/连接状态，并提供静态文件下载入口。 | `LogViewer`、`LogContent` |
+| `app/(app)/logviewer/page.tsx` | 日志入口的默认页：按 `LOG_EVENTS_IS_DEFAULT` 决定渲染旧文件日志页还是新事件页，本身不含页面逻辑。P4/17 只改开关即可切换与回退。 | `LogViewerPage` |
+| `app/(app)/log-events/page.tsx` | 新事件页的固定地址，开关怎么改都能从这里打开。 | `LogEventsPage` |
+| `app/(app)/logviewer/legacy/page.tsx` | 旧文件日志页的固定地址，新页成为默认后仍可看原始文件与静态下载。 | `LegacyLogViewerPage` |
+| `app/ui/logviewer/LegacyLogViewer.tsx` | 按日志文件切换 tab 的实时日志页（原 `logviewer/page.tsx` 逐字移出）：WebSocket 追加文本、滚动/连接状态、静态文件下载，另标注「数据来源：旧日志文件」。 | `LegacyLogViewer`、`LogContent` |
+| `app/lib/log-view-config.ts` | 默认日志入口开关与两个导航条目（谁是默认、旧页去哪），被布局与三个路由共用。 | `LOG_EVENTS_IS_DEFAULT`、`LOG_NAV_ENTRIES`、`LOG_NAV_ROUTES`、`LEGACY_LOG_HREF` |
+| `app/lib/log-events.ts` | 事件库前端契约：`StoredEvent`/`ListResponse` 类型、级别与分类中文表、字段名表、原生覆盖范围说明、筛选到查询参数的转换与列表/实时/导出 URL。**页面不解析日志字符串，级别与结果一律取结构化字段。** | `EventFilters`、`filterParams`、`listUrl`、`streamUrl`、`exportUrl`、`storageTrouble`、`NATIVE_CATEGORIES` |
+| `app/ui/logevents/LogEventsView.tsx` | 新事件页主体：视图切换、命中数与级别计数、可用性/保留期缺口/写入异常分别提示、场次范围进出与阅读位置恢复、导出与暂停刷新。 | `LogEventsView`、`Body`、`describeConnection` |
+| `app/ui/logevents/useLogEventFeed.ts` | 列表取数与实时接续：倒序取最新一页、`until_id` 往回翻、SSE 从已见最大 id 续、冻结时新事件只进缓冲、有界缓存与请求取消。 | `useLogEventFeed`、`Feed`、`FeedMeta` |
+| `app/ui/logevents/useUrlFilters.ts` | 页面状态与地址栏同步（History API，不用 `useSearchParams`，静态导出下不引入 Suspense 边界）。 | `useUrlState`、`decodeState`、`encodeState` |
+| `app/ui/logevents/FilterBar.tsx` | 级别快速筛选（带其余条件下的命中数）、业务类型/主播/时间/关键词，以及折叠的来源、事件名、运行实例与关联字段。 | `FilterBar`、`StreamerOption` |
+| `app/ui/logevents/EventRow.tsx` | 一条事件的行与行内详情：级别颜色/图标/文字、摘要、身份与技术字段分层、按需取原始诊断、场次/会话/分段跳转。 | `EventRow`、`Detail`、`RawDiagnostic` |
+| `app/ui/logevents/ProgressView.tsx` | 运行进度：复用 `/v1/status`、`/v1/uploads/missing`、`/v1/uploads/sessions/pending` 三个业务快照，无已知总量只显示阶段，过期快照单独标注，操作跳回缺失补传页。 | `ProgressView`、`workerState` |
 | `app/ui/plugins/developer.tsx` | 开发者日志设置表单，编辑旧 `LOGGING` 配置及后端动态日志过滤使用的 `loggers_level`。 | `Developer` |
 | `crates/biliup-cli/src/server/infrastructure/connection_pool.rs` | 创建固定 SQLite 类型的业务连接池（上限 2）并执行业务 migrations，另提供测试用迁移后临时库。 | `ConnectionPool`、`ConnectionManager::new_pool`、`test_support::migrated_pool` |
 
@@ -141,7 +152,10 @@
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/api/ws.rs`（`ws_logs`）：应用启动层单独挂载日志 WebSocket；检查认证边界时不能只读业务 router。
 - `crates/biliup-cli/src/server/router.rs` → `crates/biliup-cli/src/server/api/log_events.rs`、`api/ws.rs`（`list_log_events`、`ws_logs`）：新老两个日志入口都挂在 router 内，`app.rs` 的 `login_required` 因此对两者同时生效；开启 `--auth` 时未登录一律 401，显式关闭认证的部署行为不变。
-- `app/(app)/logviewer/page.tsx` → `crates/biliup-cli/src/server/api/ws.rs`（`/v1/ws/logs`）：文件 tab 以 `file` 参数订阅文本流，前端逐条追加显示。
+- `app/ui/logviewer/LegacyLogViewer.tsx` → `crates/biliup-cli/src/server/api/ws.rs`（`/v1/ws/logs`）：文件 tab 以 `file` 参数订阅文本流，前端逐条追加显示。
+- `app/(app)/layout.tsx`、`app/(app)/logviewer/page.tsx` → `app/lib/log-view-config.ts`（`LOG_NAV_ENTRIES`、`LOG_EVENTS_IS_DEFAULT`）：导航条目与默认页由同一个开关决定，切换默认页不需要改路由或页面代码。
+- `app/ui/logevents/useLogEventFeed.ts` → `crates/biliup-cli/src/server/api/log_events.rs`（`/v1/log-events`、`/stream`）：历史用 `order=desc` + `until_id` 往回翻，实时用同一套筛选从已见最大 id 接续，两边共用入库序号游标。
+- `app/ui/logevents/ProgressView.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_status`、`get_missing_uploads`、`get_pending_submit_sessions`）：进度视图只读已有业务快照，不在日志页另建一套上传状态机。
 - `app/ui/plugins/developer.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`loggers_level`、配置保存）：表单值保存后通过 reload handle 修改 tracing 过滤器。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_line_selection.rs`（`decide_upload_line`）：录制期上传、页面整场上传、静默补传和手动补传共用同一个线路决策，回退原因随决策一起写日志并返回给页面。
 - `crates/biliup-cli/src/server/common/upload_line_selection.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`cooling_lines`）：决策把持久冷却状态当作唯一的「这条线不能用」依据；成功、网络错误或传输阶段的 watchdog 超时反过来更新它。

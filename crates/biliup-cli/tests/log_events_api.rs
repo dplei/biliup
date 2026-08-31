@@ -58,14 +58,14 @@ fn write_events(path: &std::path::Path) {
     )
     .unwrap();
     let emitter = runtime.emitter();
-    for (name, message, task) in [
-        ("recording.started", "开始录制", "task-a"),
-        ("upload.failed", "分段上传失败", "task-a"),
-        ("upload.completed", "分段上传完成", "task-b"),
+    for (name, message, task, level) in [
+        ("recording.started", "开始录制", "task-a", Level::Info),
+        ("upload.failed", "分段上传失败", "task-a", Level::Error),
+        ("upload.completed", "分段上传完成", "task-b", Level::Info),
     ] {
         let mut draft = Draft::new(name, message);
         draft.context = Context(Fields::new().with("task_id", task));
-        let event = emitter.create(Level::Info, draft).unwrap();
+        let event = emitter.create(level, draft).unwrap();
         assert!(emitter.submit(event));
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
@@ -184,6 +184,73 @@ async fn query_export_and_unavailable_states_are_distinguishable() {
         call("/v1/log-events/not-a-uuid/diagnostic").await.status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
+
+    // 10. Newest-first paging: a reader opening the page starts at the newest event and walks
+    //     backwards, and the two directions must not disagree about what the range holds.
+    let newest = body_json(call("/v1/log-events?order=desc&limit=2").await).await;
+    let newest_ids: Vec<u64> = newest["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(newest_ids, vec![ids[2], ids[1]], "newest first");
+    assert_eq!(newest["total"], 3, "the count still covers the whole range");
+    assert!(newest["next_after_id"].is_null());
+    let older_cursor = newest["next_until_id"].as_u64().expect("more to read");
+    assert_eq!(older_cursor, ids[1] - 1);
+    let older = body_json(
+        call(&format!(
+            "/v1/log-events?order=desc&limit=2&until_id={older_cursor}"
+        ))
+        .await,
+    )
+    .await;
+    let older_ids: Vec<u64> = older["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(older_ids, vec![ids[0]], "no overlap with the first page");
+    assert!(older["next_until_id"].is_null());
+
+    // 11. Exact sets, not a floor: "only errors" and "recording only" are each one query.
+    let errors = body_json(call("/v1/log-events?levels=ERROR").await).await;
+    assert_eq!(errors["total"], 1);
+    assert_eq!(errors["events"][0]["data"]["event_name"], "upload.failed");
+    let information = body_json(call("/v1/log-events?levels=INFO").await).await;
+    assert_eq!(information["total"], 2, "INFO alone excludes the error");
+    let both = body_json(call("/v1/log-events?levels=INFO,ERROR").await).await;
+    assert_eq!(both["total"], 3);
+    let recording = body_json(call("/v1/log-events?categories=recording").await).await;
+    assert_eq!(recording["total"], 1);
+    let two = body_json(call("/v1/log-events?categories=recording,upload").await).await;
+    assert_eq!(two["total"], 3);
+    let combined = body_json(call("/v1/log-events?categories=upload&levels=ERROR").await).await;
+    assert_eq!(combined["total"], 1, "different dimensions intersect");
+
+    // 12. Malformed set/order values are the caller's mistake, and a stray comma is not silently
+    //     read as "no filter".
+    for uri in [
+        "/v1/log-events?order=sideways",
+        "/v1/log-events?levels=LOUD",
+        "/v1/log-events?levels=INFO,",
+    ] {
+        assert_eq!(call(uri).await.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+
+    // 13. Export keeps reading forward whatever the page is showing, and stays bounded.
+    let exported = body_text(call("/v1/log-events/export?order=desc").await).await;
+    let exported_ids: Vec<u64> = exported
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(exported_ids, ids, "export is ascending and complete");
 
     // 9. Live continuation resumes from the same cursor the list query hands out, so the history
     //    query and the subscription cannot deliver the same event twice or skip between them.
