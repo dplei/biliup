@@ -11,6 +11,8 @@
 
 ## 约定
 
+- 任务分支按 [分支命名规则](branch-naming.md) 使用整体任务类型。为重构准备 spec/ticket
+  仍属于 `refactor/`，不能因当前只有文档就选 `docs/` 或工具默认前缀。
 - 一个功能一个目录：`.scratch/<feature-slug>/`
 - spec 位于 `.scratch/<feature-slug>/spec.md`
 - 实现类 issue 一个 ticket 一个文件：`.scratch/<feature-slug>/issues/<NN>-<slug>.md`，从 `01` 开始编号——**不要**把所有 ticket 合并进单个文件
