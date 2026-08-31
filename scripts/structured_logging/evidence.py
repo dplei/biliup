@@ -20,6 +20,14 @@ MAX_SECONDS = 10
 IDS = {"instance_id", "process_run_id", "event_uid", "live_streamer_id", "streamer_info_id", "upload_session_id", "segment_id", "missing_id", "download_attempt_id", "upload_attempt_id", "task_id", "streamer_name", "original_file", "artifact_file", "history_row_id"}
 SENSITIVE = re.compile(r"cookie|authorization|token|secret|password|credential|bearer|signature|sign=|https?:|://|access_key|api_key|sessdata|bili_jct", re.I)
 CATEGORIES = {"system", "recording", "processing", "upload", "submission", "auth", "audit"}
+# Zone names are controlled identifiers, not free text: keep them readable, reject anything else.
+ZONE = re.compile(r"^(?:UTC|Z|[+-]\d{2}:\d{2}|[A-Za-z][A-Za-z_+-]{0,20}(?:/[A-Za-z][A-Za-z0-9_+-]{0,20}){0,2})$")
+
+
+def zone(value):
+    value = str(value)
+    return value if ZONE.match(value) else "unknown"
+
 OUTCOMES = {"executed", "skipped", "fallback", "failed", "waiting", "succeeded", "unknown", "recovered", "cancelled"}
 # Catalog requirements used only for native evidence. No parsing text into business identity.
 REQUIRED = {
@@ -129,7 +137,7 @@ class Anonymizer:
         if key in IDS and isinstance(obj, (str, int)):
             return self.alias(key, obj)
         if isinstance(obj, str):
-            if key in {"ref", "file_ref", "fact_id", "event_name", "category", "level", "capture_kind", "reason_code", "sha256", "raw_sha256"}:
+            if key in {"ref", "file_ref", "fact_id", "event_name", "category", "level", "capture_kind", "reason_code", "sha256", "raw_sha256", "timezone", "display_timezone"}:
                 return obj
             return self.text(obj)
         return obj
@@ -205,7 +213,7 @@ def export(request, out):
     anon.seed(request["tasks"])
     bundle = Bundle(out, budget, anon)
     reasons = []
-    manifest = {"version": VERSION, "schema_version": 1, "catalog_version": "coverage-v1", "config_version": "shadow-v1", "source_version": request.get("source_version", "unknown"), "scope": {"since_ms": since, "until_ms": until, "timezone": "UTC", "display_timezone": request.get("display_timezone", "unknown"), "tasks": request["tasks"]}, "sampling": "explicit_inventory", "atomic_snapshot": False, "native_coverage": "not-started", "legacy": [], "database": {}, "limits": {"bytes": MAX_BYTES, "rows": MAX_ROWS, "input_bytes": 32 * 1024 * 1024, "seconds": MAX_SECONDS}, "supplements": {"of": request.get("supplement_of"), "grace_ms": request.get("grace_ms", 0)}}
+    manifest = {"version": VERSION, "schema_version": 1, "catalog_version": "coverage-v1", "config_version": "shadow-v1", "source_version": request.get("source_version", "unknown"), "scope": {"since_ms": since, "until_ms": until, "timezone": "UTC", "display_timezone": zone(request.get("display_timezone", "unknown")), "tasks": request["tasks"]}, "sampling": "explicit_inventory", "atomic_snapshot": False, "native_coverage": "not-started", "legacy": [], "database": {}, "limits": {"bytes": MAX_BYTES, "rows": MAX_ROWS, "input_bytes": 32 * 1024 * 1024, "seconds": MAX_SECONDS}, "supplements": {"of": request.get("supplement_of"), "grace_ms": request.get("grace_ms", 0)}}
     for key in ("source_version", "capture_config", "health"):
         if key not in request:
             reasons.append("unknown_" + key)
@@ -331,7 +339,7 @@ def export(request, out):
         reasons.append("legacy_source_unavailable")
     for index, source in enumerate(request.get("legacy", [])):
         ref = "legacy-file:" + str(index + 1)
-        entry = {"ref": ref, "timezone": source.get("timezone", "unknown"), "complete": False}
+        entry = {"ref": ref, "timezone": zone(source.get("timezone", "unknown")), "complete": False}
         manifest["legacy"].append(entry)
         try:
             path = Path(source["path"])
