@@ -16,6 +16,8 @@
 | `crates/biliup-cli/src/uploader.rs` | 独立 CLI 上传、配置逐稿投稿、追加与登录工具；保留 checkpoint 和限流锁，上传调用显式传 task，预上传重试分别分配 attempt。 | `upload_by_command`、`upload_by_config`、`append`、`upload_with_task`、`UploadCheckpoint` |
 | `crates/biliup-cli/src/observe/standalone.rs` | 独立上传的观测上下文与结果分类：输入序号只在 task 内有效，不补造录制账本身份，不用请求错误推断投稿失败或成功。 | `UploadTask`、`UploadTask::file`、`UploadTask::submit`、`submission_result`、`failure_reason` |
 | `crates/biliup-cli/src/observe/external.rs` | 外部命令失败的有界诊断：`processing.command_failed` 经**本次调用的采集器**直接写出（附件走不了 tracing 字段），只取当前 dispatch 上的采集器，不搜索全局运行；stderr 尾部作附件按 event_uid 关联，事件字段不复制第三方输出。 | `command_failed` |
+| `crates/biliup-cli/src/observe/lifecycle.rs` | 入口一次运行的启停：两个 CLI 是一个进程、Python 绑定是一次嵌入调用；运行自带 id，与其中的录制/上传 task 是两个身份不互相代用；正常/出错/被取消分别记 executed、failed、unknown，强杀不执行析构因而没有结束事件、不补造。 | `Invocation`、`Invocation::start`、`Invocation::finish`、`run`、`command_name` |
+| `crates/biliup-cli/src/observe/auth.rs` | 凭据健康与认证操作失败：健康跃迁只能由 `cookie_health` 状态机发出，单次操作失败不改变健康状态；错误按既有分类器定型后随即丢弃文本，按 `Debug` 而非 `Display` 渲染以免 `Report` 只暴露顶层 context。 | `health_changed`、`operation_failed`、`observe`、`reason_of`、`reason_for_error` |
 | `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs` | 服务端 FFmpeg 下载器（内部/外部分段）：外部分段的目标文件本进程选定，创建与关闭都是真实观测；内部分段只能在收到分段列表行时分配身份，故只发关闭事件。关闭原因跟随进程结束方式，取消标记先于杀进程写入。`spawn_log` 在保留旧 `[ffmpeg]` 逐行输出的同时并行做有界 stderr 采集。分段列表行只有 basename，按 `output_dir` 还原；单段收尾失败或重名不结束整场录制。 | `FfmpegDownloader`、`download_external`、`download_internal`、`external_close_reason`、`internal_close_reason`、`report_command_failure`、`spawn_log`、`FfmpegDownloader::stop` |
 | `crates/stream-gears/src/uploader.rs` | Python 上传参数到上传/封面/投稿的编排，显式传递同一 task，复用服务端线路及持久限流准入。 | `StudioPre`、`upload`、`UploadLine` |
 | `crates/biliup-cli/src/downloader.rs` | 独立 CLI 下载入口：插件提取后按媒体类型走 HTTP-FLV/HLS，拒绝需 Streamlink/YtDlp 运行时的路径，另支持 FLV 转 JSON 诊断。 | `download`、`download_stream`、`generate_json` |
@@ -56,7 +58,7 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup-observability/src/lib.rs` | 独立结构化日志 crate 门面，不依赖 Web 服务或业务数据库；目前以默认关闭的旁路接入各入口，旧文件与旧页面仍是权威来源。 | `Runtime`、`Emitter`、`CaptureLayer` |
-| `crates/biliup-observability/src/model.rs` | 定义 v1 不可变事件、稳定/运行身份、显式上下文与扁平字段允许列表，区分原生与桥接来源。 | `Event`、`EventData`、`Fields`、`Context`、`Draft` |
+| `crates/biliup-observability/src/model.rs` | 定义 v1 不可变事件、稳定/运行身份、显式上下文与扁平字段允许列表，区分原生与桥接来源；允许键是唯一入口，未列出的键计入 rejected。 | `Event`、`EventData`、`Fields`、`Context`、`Draft`、`field_kind` |
 | `crates/biliup-observability/src/capture.rs` | 从父子 span、延迟 record 和事件字段构建快照，以独立层过滤控制原生/桥接采集并排除内部 SQL。 | `CaptureLayer`、`legacy_output` |
 | `crates/biliup-observability/src/sanitize.rs` | 对允许字段执行有界格式化、敏感线索与旧链完整 ResponseData 整值脱敏和控制字符处理，不序列化未知 Debug 对象。 | `clean`、`Bounded`、`debug` |
 | `crates/biliup-observability/src/diagnostic.rs` | 流式捕获外部诊断：跨 chunk 按有界行脱敏，保留首致命摘要、有限尾部和原始字节/截断信息。 | `DiagnosticCapture`、`Diagnostic` |
@@ -102,7 +104,7 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/app.rs` | 组装会话、认证、CORS、业务路由与静态回退，启动 Axum，并在退出信号后清理服务资源。 | `ApplicationController::serve`、`shutdown_signal` |
 | `crates/biliup-cli/src/server/api/stream_check.rs` | 主动检查直播流的端点：把监控层的检查结论翻译成中文提示，正常状态回 200 + `outcome`，检查失败与建会话失败如实报错。 | `check_stream_now`、`CheckStreamResponse` |
-| `crates/biliup-cli/src/server/common/cookie_health.rs` | 维护平台 Cookie 健康快照，并为钉钉、企微和通用 URL 提供共享 Webhook 告警分发。 | `record_success`、`record_error`、`notify_alert`、`snapshot` |
+| `crates/biliup-cli/src/server/common/cookie_health.rs` | 维护平台 Cookie 健康快照，并为钉钉、企微和通用 URL 提供共享 Webhook 告警分发；只有本文件的状态机能宣布异常/恢复，去抖窗口内的重复失败不计数因而也不发原生事件，时钟由参数传入以便验证窗口与阈值。 | `record_success`、`record_error`、`record_error_at`、`classify_error`、`notify_alert`、`snapshot` |
 | `crates/biliup-cli/src/server/common/recording_lease.rs` | 实现录制租约的持久状态机、纯到期/准入决策、CAS 扫描、下播收敛和带 claim/退避的通知投递。 | `RecordingLease`、`due_action`、`admit_detected_session`、`complete_grace_session`、`scan_due_recording_leases` |
 | `crates/biliup-cli/src/server/api/recording_lease.rs` | 提供租约创建/替换/清除与幂等录制状态接口，并将输入校验、乐观并发和到期恢复守卫映射为 400/404/409。 | `put_recording_lease`、`delete_recording_lease`、`put_recording_state` |
 | `crates/biliup-cli/src/server/common/upload.rs` | 编排直播分段上传、会话级幂等投稿协调、缺失补传、attempt lease/watchdog（分阶段计时）、线路决策入口以及远端结果落库；分段成功会在事务外唤醒有 durable 投稿意图的父会话。 | `process_with_upload`、`reconcile_session_submission`、`spawn_session_submission`、`persist_segment`、`decide_upload_line`、`upload_enrolled_with_watchdog`、`claim_manual_recovery`、`run_claimed_recovery`、`stop_missing_segment_attempt`、`segment_part_title` |
@@ -159,6 +161,8 @@
 - `biliup/__main__.py` → `crates/stream-gears/src/lib.rs`（`main_loop`）：Python 模块入口进入 Rust 扩展的 CLI 主循环。
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/server.rs`（`server::_main`）：PyO3 主循环规范化参数后委派实际 CLI 执行。
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-cli/src/lib.rs`（`run`）：`server` 子命令进入 Web 服务启动编排。
+- `crates/biliup-cli/src/main.rs`、`crates/stream-gears/src/server.rs`、`crates/stream-gears/src/lib.rs` → `crates/biliup-cli/src/observe/lifecycle.rs`（`run`、`Invocation`）：四个入口共用同一包装报告一次运行的启停；Rust CLI 有真实进程实跑证据，wheel 与 Python 入口目前只有编译核对。
+- `crates/biliup-cli/src/server/common/cookie_health.rs`、`crates/biliup-cli/src/uploader.rs`、`crates/stream-gears/src/lib.rs` → `crates/biliup-cli/src/observe/auth.rs`（`health_changed`、`operation_failed`、`observe`）：健康跃迁只从状态机的两次转变发出，登录/续期/Python 登录辅助函数只报告单次失败，不改变健康状态。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/infrastructure/connection_pool.rs`（`ConnectionManager::new_pool`）：服务启动时创建业务 SQLite 连接池并运行迁移。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/api/ws.rs`（`ws_logs`）：应用启动层单独挂载日志 WebSocket；检查认证边界时不能只读业务 router。

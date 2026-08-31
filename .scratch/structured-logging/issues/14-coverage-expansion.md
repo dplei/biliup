@@ -66,3 +66,15 @@ Implementation: in-progress
   见 [P3 第四批回执](../receipts/P3.md#任务-14-第四批外部下载器ffmpeg)。本任务保持
   in-progress / partial；下一批做 C01 系统启停与 C11 认证健康，审计、预处理诊断、
   分类清单与全范围观察继续待办。
+- 第五批入口生命周期与凭据健康已交付：一次运行 = 一个 `Invocation`，正常/错误/被取消分别记
+  executed`shutdown`、failed`entry_failed`、unknown`entry_interrupted`；强杀不执行析构，
+  缺结束事件即缺失、不补造。运行 task 与业务 task 是两个身份，不互相代用。
+  `auth.health_changed` 只由 `cookie_health` 状态机的两次跃迁发出，`auth.operation_failed`
+  覆盖每次被计数的失败并按既有分类器定型，错误文本只用于分类随即丢弃；去抖窗口内的重复
+  失败不计数也不发事件。新增允许键 `command`（解析后的子命令固定词）。必要前置修复两条：
+  `record_error` 抽出接受时钟参数的版本以便验证去抖与阈值；包装 CLI 结果改按 `Debug` 分类，
+  否则 `error_stack::Report` 的 Display 只有顶层 context，会把连接失败错判成 `invalid_response`。
+  真实 `biliup` 二进制两次实跑并只读回查通过，另有 8 项测试；全部离线、无账号、无外部网络。
+  见 [P3 第五批回执](../receipts/P3.md#任务-14-第五批入口生命周期与凭据健康c01--c11)。
+  本任务保持 in-progress / partial；wheel CLI、Python 下载/上传与登录辅助函数只做编译核对，
+  未起 Python 进程实跑。下一批做 C12 审计投影与 C13 剩余诊断，之后是分类清单与全范围观察。

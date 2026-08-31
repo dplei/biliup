@@ -32,6 +32,10 @@ const UNHEALTHY_THRESHOLD: u32 = 3;
 /// 用于吸收录制断流时 download.rs 的快速重试（4s/8s）风暴，避免瞬时抖动误报。
 const ERROR_DEBOUNCE_MS: i64 = 15_000;
 
+/// Where a credential failure was observed. The monitor loop and the recording reconnect path
+/// both land here, so one stage name keeps them comparable.
+const LIVE_CHECK_STAGE: &str = "live_check";
+
 /// 单个平台的 cookie 健康状态。
 #[derive(Clone, Serialize, Default)]
 pub struct PlatformHealth {
@@ -94,6 +98,7 @@ pub fn record_success(platform: &str, webhook: Option<&str>) {
     }
     if recovered {
         info!(platform, "cookie 健康已恢复");
+        crate::observe::auth::health_changed(platform, "recovered", "authentication_recovered", 0);
         notify(
             webhook,
             &format!("✅ {} cookie 已恢复正常", display(platform)),
@@ -107,11 +112,18 @@ pub fn record_success(platform: &str, webhook: Option<&str>) {
 
 /// 记录一次失败的直播间检查（取流/检测出错或风控）：去抖累计，达阈值→标记异常并推送。
 pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
+    record_error_at(platform, err, webhook, now_ms());
+}
+
+/// The clock is a parameter so the debounce window and the unhealthy threshold can be exercised
+/// without waiting real seconds. Production always passes the real clock.
+pub(crate) fn record_error_at(platform: &str, err: &str, webhook: Option<&str>, now: i64) {
     let err = redact_sensitive(err);
     let kind = classify_error(&err);
     let mut became_unhealthy = false;
-    let now = now_ms();
-    {
+    // Both native events are emitted after the write lock is released: a collector must never
+    // run while the health map is locked.
+    let consecutive = {
         let mut map = HEALTH.write().unwrap();
         let h = map.entry(platform.to_string()).or_default();
         h.platform = platform.to_string();
@@ -135,6 +147,12 @@ pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
                 error = err,
                 "live check failed without cookie invalidation"
             );
+            drop(map);
+            crate::observe::auth::operation_failed(
+                platform,
+                LIVE_CHECK_STAGE,
+                crate::observe::auth::reason_of(kind),
+            );
             return;
         }
         // 去抖：窗口内的重复失败只更新信息、不累加（吸收录制断流的快速重试）
@@ -152,9 +170,23 @@ pub fn record_error(platform: &str, err: &str, webhook: Option<&str>) {
             h.since_ms = Some(now);
             became_unhealthy = true;
         }
-    }
+        h.consecutive_errors
+    };
+    // A debounced repeat updates nothing, so it reports nothing: the event count stays equal to
+    // the counted failures rather than to the retry storm behind them.
+    crate::observe::auth::operation_failed(
+        platform,
+        LIVE_CHECK_STAGE,
+        crate::observe::auth::reason_of(kind),
+    );
     if became_unhealthy {
         warn!(platform, error = err, "cookie 鉴权失败：连续检查失败");
+        crate::observe::auth::health_changed(
+            platform,
+            "failed",
+            "authentication_failed",
+            consecutive,
+        );
         notify(
             webhook,
             &format!("⚠️ {} cookie 鉴权连续失败", display(platform)),
@@ -449,5 +481,151 @@ mod quality_alert_tests {
         assert_eq!(quality_display("uhd"), "蓝光");
         assert_eq!(quality_display("hd"), "超清");
         assert_eq!(quality_display("xxx"), "xxx");
+    }
+}
+
+#[cfg(test)]
+mod health_event_tests {
+    use super::*;
+    use biliup_observability::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct Memory(Arc<Mutex<Vec<Event>>>);
+    impl Consumer for Memory {
+        fn write(&mut self, batch: &[Event]) -> Result<Commit, StorageError> {
+            self.0.lock().unwrap().extend_from_slice(batch);
+            Ok(Commit::default())
+        }
+    }
+
+    /// Each test uses its own platform key, so the process-wide health map never couples them.
+    fn collect(body: impl FnOnce()) -> Vec<Event> {
+        let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let sink = events.clone();
+        let mut runtime = Runtime::start(
+            "synthetic",
+            "test",
+            Options {
+                enabled: true,
+                ..Options::default()
+            },
+            move || Ok(Memory(sink.clone())),
+        )
+        .unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer::new(runtime.emitter()).filtered());
+        tracing::subscriber::with_default(subscriber, body);
+        runtime.shutdown(std::time::Duration::from_secs(5));
+        events.lock().unwrap().clone()
+    }
+
+    fn native(events: &[Event], name: &str) -> Vec<EventData> {
+        events
+            .iter()
+            .map(Event::data)
+            .filter(|data| data.event_name == name)
+            .cloned()
+            .collect()
+    }
+
+    fn field(data: &EventData, key: &str) -> String {
+        data.fields
+            .get(key)
+            .map(|value| value.as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn only_the_state_machine_declares_unhealthy_and_recovered() {
+        let platform = "SyntheticTransition";
+        let events = collect(|| {
+            // Spaced past the debounce window: three counted authentication failures are what
+            // the threshold is defined in terms of.
+            for step in 0..3 {
+                record_error_at(
+                    platform,
+                    "401 unauthorized",
+                    None,
+                    step * ERROR_DEBOUNCE_MS * 2,
+                );
+            }
+            record_success(platform, None);
+        });
+
+        let failures = native(&events, "auth.operation_failed");
+        assert_eq!(failures.len(), 3);
+        for failure in &failures {
+            assert_eq!(field(failure, "reason_code"), "authentication_failed");
+            assert_eq!(field(failure, "stage"), "live_check");
+            assert_eq!(field(failure, "platform"), platform);
+            assert_eq!(field(failure, "outcome"), "failed");
+        }
+
+        // The two transitions, in order, and nothing in between: a failure below the threshold
+        // must not claim the platform is unhealthy.
+        let changes = native(&events, "auth.health_changed");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(field(&changes[0], "outcome"), "failed");
+        assert_eq!(field(&changes[0], "reason_code"), "authentication_failed");
+        assert_eq!(changes[0].fields.get("count").unwrap().as_u64(), Some(3));
+        assert_eq!(changes[0].level, Level::Warn);
+        assert_eq!(field(&changes[1], "outcome"), "recovered");
+        assert_eq!(
+            field(&changes[1], "reason_code"),
+            "authentication_recovered"
+        );
+        assert_eq!(changes[1].level, Level::Info);
+
+        // A second success does not repeat the recovery: the state is already healthy.
+        let quiet = collect(|| record_success(platform, None));
+        assert!(native(&quiet, "auth.health_changed").is_empty());
+    }
+
+    #[test]
+    fn debounced_repeats_do_not_multiply_events() {
+        let platform = "SyntheticDebounce";
+        let events = collect(|| {
+            // A reconnect storm inside one debounce window updates the record without counting,
+            // so it must not turn into a stream of events either.
+            for step in 0..5 {
+                record_error_at(platform, "403 forbidden", None, 1_000 + step * 100);
+            }
+        });
+        assert_eq!(native(&events, "auth.operation_failed").len(), 1);
+        assert!(native(&events, "auth.health_changed").is_empty());
+    }
+
+    #[test]
+    fn failure_kind_is_typed_and_carries_no_error_text() {
+        let platform = "SyntheticKinds";
+        let secret = "connection reset while fetching \
+             https://example.invalid/live?token=super-secret-value";
+        let events = collect(|| {
+            record_error_at(platform, secret, None, 1_000);
+            record_error_at(platform, "503 service unavailable", None, 2_000);
+            record_error_at(platform, "unexpected payload", None, 3_000);
+        });
+
+        let failures = native(&events, "auth.operation_failed");
+        let reasons: Vec<String> = failures
+            .iter()
+            .map(|data| field(data, "reason_code"))
+            .collect();
+        assert_eq!(
+            reasons,
+            ["transport_error", "server_error", "invalid_response"]
+        );
+        // None of these are authentication failures, so the health state never moves.
+        assert!(native(&events, "auth.health_changed").is_empty());
+
+        for failure in &failures {
+            for (_, value) in failure.fields.iter() {
+                let rendered = value.to_string();
+                assert!(!rendered.contains("super-secret-value"), "{rendered}");
+                assert!(!rendered.contains("example.invalid"), "{rendered}");
+            }
+            assert!(!failure.message.contains("super-secret-value"));
+        }
     }
 }
