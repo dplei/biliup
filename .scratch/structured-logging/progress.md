@@ -3,7 +3,7 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入独立上传、页面整场上传及 HLS，验收 partial**。
+P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入独立上传、页面整场上传、HLS 及 FFmpeg 外部下载器，验收 partial**。
 录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统/认证/审计仍只有桥接；
 P4–P6 未开始，旧日志与旧页面保留，新页只是试用入口。
 
@@ -54,7 +54,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
-| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第三批回执](receipts/P3.md#任务-14-第三批hls-下载)：HLS 原生边界、三下载入口三态/回退、服务执行器重连/取消通过；前两批独立/页面上传保留原结论；外部下载器、真实入口补样、其他覆盖与首轮观察待完成 |
+| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第四批回执](receipts/P3.md#任务-14-第四批外部下载器ffmpeg)：FFmpeg 内外分段身份、退出诊断与取消受控通过；前三批结论保留；系统/认证/审计/预处理诊断、分类清单、真实入口补样与首轮观察待完成 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
 | [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
@@ -63,21 +63,29 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近一轮仅处理任务 14 第三批 HLS，沿用 `refactor/issue2-260831-153007`，父提交
-  `b96d355`，代码与回执同批提交，未 push。FFmpeg 外部分段留下一批，不改下载器分发。
-- HLS 复用分段身份，补齐序列缺口、不连续与失败事件；Rust/wheel/Python 独立下载各有
-  task/DA。修复序号 0、ENDLIST、空直播列表、小数时长与非法列表边界，并移除原始响应
-  调试落盘；服务端只在收到媒体后记重连，取消先写原因再释放 future。详见第三批回执。
-- 最终构建三个下载入口 × off/on/broken、重复正常调用、错误返回、三份双源包和回退通过；
-  CLI 的提取器输出是受控 fixture，服务端只验执行器与关闭回调，不冒充真实平台/整链样本。
-  HLS 在线平台、服务整链、真实断连恢复、并发双路与专门量化负载仍待补验。
-- 第二批页面真实私密投稿与 `ResponseData` 脱敏补修保留原结论；首批 CLI/Python 上传及
-  wheel 页面远端正常/恢复样本仍待补验，不因共用代码代计。历史原始响应包须先重审再对外使用。
-- 12、13、15、16 既有交付保持，12 仍缺真实断连/重连；旧 601 `transport` 差异未关闭。
-  14 仍 in-progress / partial，P3 仍 in-progress / partial / pending。外部下载器、系统/
-  认证/审计/外部诊断、分类清单及首轮完整观察尚未完成。
+- 最近一轮仅处理任务 14 第四批：服务端 FFmpeg 下载器（内部/外部分段）。沿用
+  `refactor/issue2-260831-153007`，代码与回执同批提交，未 push。Streamlink/YtDlp 分支
+  `from_type` 不选，本批不激活、不冒称可用。
+- 抽出 `segment_created` / `segment_closed` / `segment_close_failed` 三个公开发射函数，
+  `LifecycleFile` 与 FFmpeg 路径共用同一套字段。外部分段的创建/关闭都是真实观测；内部分段
+  只能在拿到分段列表行时分配身份，因此只发关闭事件，不补造创建时刻。取消标记先于杀进程
+  写入，取消不记外部命令失败；退出诊断带 stage/exit_code/total_bytes，有界 stderr 作附件。
+- 为采到证据做了四条必要前置修复（外部分段 `quiet`→`error`、删除内部分段收尾处的重复改名、
+  分段列表行按 `output_dir` 还原、单段收尾失败不再结束整场录制）。逐条影响见第四批回执。
+- 验证：本批 4 项测试、`recording_events` 6 项、`biliup-observability + biliup-cli`
+  全量 410 passed / 0 failed / 6 ignored、触达文件 clippy 零告警与 rustfmt 通过。媒体本地合成、
+  直播源是测试内的限速 HTTP 服务，**未接触真实平台/账号**；本批没有新的证据包和 Agent 还原。
+- 新记录的既有缺陷：`-strftime 1` 秒级文件名会让同一秒关闭的两段同名并被 ffmpeg 覆盖，
+  受控运行稳定复现。现在如实记一次 `failed`/`unknown` 的关闭并继续下载，但数据丢失与
+  「已交付文件里其实是后一段内容」都还在，命名方案未改，需单独一轮。
+- 12 仍缺真实断连/重连；旧 601 `transport` 差异未关闭。14 仍 in-progress / partial，
+  P3 仍 in-progress / partial / pending。C01/C11/C12、`ffmpeg_scan` 预处理诊断、
+  danmaku/封面/hook 诊断、分类清单及首轮完整观察尚未完成。
+- 工作区里 `crates/biliup-cli/src/observe/lifecycle.rs` 是 C01/C11 的草稿（本轮开始前就在），
+  无调用点、未验证，本批把 `pub mod lifecycle;` 移出 `observe.rs`，文件保持未跟踪。
+  下一批接 C01/C11 时先复核这份草稿，再决定是否沿用并加回模块声明。
 - 下一轮入口：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`。
-  下批从 `core/downloader/ffmpeg_downloader.rs` 的分段身份/关闭与外部退出诊断开始；独立入口正常/恢复另批补验。
+  下批做 `system.started/stopped`（C01）与 `auth.health_changed/operation_failed`（C11）。
   全部关键覆盖通过后才开始连续 7 天且至少 10 个完整场次的首轮观察；当前不能进入 P4。
 
 ## 每次回写的检查清单

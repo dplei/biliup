@@ -18,6 +18,9 @@ impl CaptureLayer {
     pub fn new(emitter: Emitter) -> Self {
         Self { emitter }
     }
+    pub(crate) fn emitter(&self) -> Emitter {
+        self.emitter.clone()
+    }
     /// Independent dynamic per-layer filtering. Disabled capture does not visit/format fields.
     pub fn filtered<S>(self) -> impl Layer<S>
     where

@@ -4,6 +4,7 @@
 //! old files and console output are unchanged. Identity is passed explicitly — no ambient span
 //! context, no parsing of old message text.
 
+pub mod external;
 pub mod standalone;
 
 use biliup::downloader::util::RecordingOwner;
@@ -42,6 +43,18 @@ impl RecordingIdentity {
             task_id: Some(task_id.to_owned()),
             streamer_name: None,
         }
+    }
+
+    /// Owned snapshot for emitters that write through the collector directly (attachments cannot
+    /// travel as tracing fields). Same identity as the tracing path, no ambient context.
+    pub fn context(&self, download_attempt_id: Option<&str>) -> biliup_observability::Context {
+        biliup_observability::Context(
+            biliup_observability::Fields::new()
+                .with("live_streamer_id", self.live_streamer_id())
+                .with("streamer_info_id", self.streamer_info_id())
+                .with("task_id", self.task_id())
+                .with("download_attempt_id", download_attempt_id.unwrap_or("")),
+        )
     }
 
     pub fn owner(&self, download_attempt_id: Option<&str>) -> RecordingOwner {

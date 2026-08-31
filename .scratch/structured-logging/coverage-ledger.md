@@ -72,7 +72,7 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python/server 的已知m3u8/ts直接HLS，其余保留FLV探测回落 | P3/14第三批：HLS复用S，新增序列缺口/不连续与失败事件；三下载入口受控三态/回退通过，CLI提取结果为fixture；服务执行器的媒体后重连与取消通过，真实平台HLS及服务整链待验 |
-| 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | 不冒称可用；P3/14须复核实际可达性 |
+| 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | P3/14第四批：FFmpeg 内外分段已接分段身份与退出诊断，受控合成媒体实跑通过；Streamlink/YtDlp 仍不可达、未接入，不冒称可用 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
 
 CLI 命令集合：login/renew/upload/append/show/comments/reply/dump-flv/download/server/
@@ -135,6 +135,24 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   `UploadFailureKind` 与 watchdog 三类超时代码；C10 追加 `claimed_elsewhere`、`finalized`、
   `discarded_empty`、`retry_backoff`、`writeback_failed`、`submitted`、`precondition_failed`。
   全部由映射函数集中维护并有冻结性回归用例，不是自由错误文本。
+- C03、C13 / 服务端 FFmpeg 内外分段 / v1 / 14 / ffmpeg-native-v1：**原生**通过（受控合成媒体）。
+  外部分段的目标文件由本进程选定，创建与关闭都是真实观测并复用 R/DA/S；内部分段只能在收到
+  分段列表行时分配身份，因此只发 `segment_closed`，不补造创建时刻。关闭原因跟随进程结束方式，
+  取消优先于退出码。`processing.command_failed` 带 stage/exit_code/total_bytes，有界 stderr
+  尾部按 event_uid 作附件保存，含 URL/凭据线索的行整值脱敏，事件字段不复制第三方输出。
+  4 项 crate 内测试覆盖：外部切片/流结束两种关闭原因、内部多段身份与重名收尾失败、
+  失败退出的诊断与脱敏、主动取消不记为命令失败；旧的逐行 `[ffmpeg]` stderr 输出经桥接核对仍在。
+  **必要前置修复**：外部分段原为 `-loglevel quiet`，失败时 stderr 为空、诊断只剩退出码，
+  改为 `error`（旧输出因此多出 ffmpeg 自己的错误行）；内部分段原先循环内改名后又对同一个
+  `.part` 改名，最后一段重复回调且整次下载必然返回错误，已删除该收尾块；分段列表行只有
+  basename，按 `output_dir` 还原（生产 `output_dir` 为 `.`，落盘位置不变）。
+  **未解决差异**：`-strftime 1` 只有秒级精度，同一秒关闭的两段会同名并被 ffmpeg 覆盖——
+  受控运行已复现，现改为记一次 `failed`/`unknown` 的关闭并继续下载，但被覆盖的那一段
+  数据确实丢失且已交付的文件内容可能属于后一段，**命名方案本身未改**；外部分段退出码 0
+  区分不出切片与同时下播；内部分段最后一段的关闭原因区分不出切片与流结束；
+  ffmpeg 9 不接受 `ts` 作为 `-segment_format`（内部分段配 `ts` 后缀会直接失败），本批未改。
+  未验证：真实平台外部下载整链、服务端 from_type=Ffmpeg 的监控→登记→上传整链、
+  danmaku/封面/hook 诊断、`ffmpeg_scan` 的预处理诊断（属 C13 剩余部分）。
 - 查询与认证边界 / 事件库只读接口 / log-events-v1 / 15 / query-api-v1：`/v1/log-events` 列表、
   附件详情、SSE 实时接续与 JSONL/CSV 导出通过；默认只回原生、桥接需显式请求、采集关闭与
   「查到 0 条」明确区分；2 万条负载下五类查询均在冻结的 250ms 预算内且零丢弃。
