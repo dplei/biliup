@@ -56,13 +56,16 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
-| [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收全部通过；默认入口开关初值仍是旧页 |
+| [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
 | [18 停旧写入](issues/18-stop-legacy-writes.md) | P5 | not-started | pending | 待前置通过后无文件观察及回退验证 |
 | [19 移除旧实现](issues/19-remove-legacy.md) | P6 | not-started | pending | 待前置通过后移除与兼容收尾 |
 
 ## 当前交接位置
 
+- 最近一轮仅补修任务 16 的进度页补传入口样式：两处共用主题样式，修复已访问链接的紫色下划线；
+  浏览器复核桌面/360px、深浅主题、键盘焦点与跳转。未改业务和采集，未推进 14 或 P4；
+  验证范围与当前全仓类型检查限制见 [样式补修回执](receipts/P3.md#任务-16-样式补修)。
 - 最近已验收阶段：P2（09、10、11 全部 passed）。
 - 当前实施阶段/任务：P3 进行中；12、13、15、16 已完成，**只剩 14（全范围覆盖）**，单独一轮 session 做。
 - 本轮已做（第二轮，任务 16）：新增「日志与事件（试用）」页与两个固定地址（新页 `/log-events`、
