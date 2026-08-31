@@ -76,6 +76,69 @@ pub fn close_reason_code(reason: SegmentCloseReason) -> &'static str {
     }
 }
 
+/// Native segment lifecycle events. Downloaders whose files are written by an external process
+/// report through these same functions, so every path emits one identical field set.
+pub fn segment_created(owner: &RecordingOwner, identity: &SegmentIdentity) {
+    tracing::info!(
+        target: EVENT_TARGET,
+        event_name = "recording.segment_created",
+        outcome = "executed",
+        segment_id = identity.segment_id,
+        original_file = identity.original_file,
+        live_streamer_id = owner.live_streamer_id(),
+        streamer_info_id = owner.streamer_info_id(),
+        task_id = owner.task_id(),
+        download_attempt_id = owner.download_attempt_id(),
+        "开始写入新的录制分段"
+    );
+}
+
+pub fn segment_closed(
+    owner: &RecordingOwner,
+    identity: &SegmentIdentity,
+    reason: SegmentCloseReason,
+    size_bytes: u64,
+) {
+    tracing::info!(
+        target: EVENT_TARGET,
+        event_name = "recording.segment_closed",
+        outcome = "executed",
+        reason_code = close_reason_code(reason),
+        segment_id = identity.segment_id,
+        original_file = identity.original_file,
+        size_bytes,
+        live_streamer_id = owner.live_streamer_id(),
+        streamer_info_id = owner.streamer_info_id(),
+        task_id = owner.task_id(),
+        download_attempt_id = owner.download_attempt_id(),
+        "录制分段已关闭"
+    );
+}
+
+/// The file could not be moved to its final name. The identity is still reported so the temporary
+/// file can be found; the outcome stays `failed` rather than claiming a closed segment.
+pub fn segment_close_failed(
+    owner: &RecordingOwner,
+    segment_id: &str,
+    original_file: &str,
+    error: &str,
+) {
+    warn!(
+        target: EVENT_TARGET,
+        event_name = "recording.segment_closed",
+        outcome = "failed",
+        reason_code = "unknown",
+        segment_id,
+        original_file,
+        error,
+        live_streamer_id = owner.live_streamer_id(),
+        streamer_info_id = owner.streamer_info_id(),
+        task_id = owner.task_id(),
+        download_attempt_id = owner.download_attempt_id(),
+        "录制分段收尾失败，临时文件保留"
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentCloseReason {
     TimedSplit,
@@ -418,18 +481,7 @@ impl<'a> LifecycleFile<'a> {
             segment_id: allocate_segment_id(),
             original_file: self.file_name.clone(),
         };
-        tracing::info!(
-            target: EVENT_TARGET,
-            event_name = "recording.segment_created",
-            outcome = "executed",
-            segment_id = identity.segment_id,
-            original_file = identity.original_file,
-            live_streamer_id = self.owner.live_streamer_id(),
-            streamer_info_id = self.owner.streamer_info_id(),
-            task_id = self.owner.task_id(),
-            download_attempt_id = self.owner.download_attempt_id(),
-            "开始写入新的录制分段"
-        );
+        segment_created(&self.owner, &identity);
         self.identity = Some(identity);
         Ok(self.path.as_path())
     }
@@ -449,39 +501,18 @@ impl<'a> LifecycleFile<'a> {
                     original_file: self.file_name.clone(),
                 });
                 let size_bytes = fs::metadata(&self.file_name).map(|m| m.len()).unwrap_or(0);
-                tracing::info!(
-                    target: EVENT_TARGET,
-                    event_name = "recording.segment_closed",
-                    outcome = "executed",
-                    reason_code = close_reason_code(reason),
-                    segment_id = identity.segment_id,
-                    original_file = identity.original_file,
-                    size_bytes,
-                    live_streamer_id = self.owner.live_streamer_id(),
-                    streamer_info_id = self.owner.streamer_info_id(),
-                    task_id = self.owner.task_id(),
-                    download_attempt_id = self.owner.download_attempt_id(),
-                    "录制分段已关闭"
-                );
+                segment_closed(&self.owner, &identity, reason, size_bytes);
                 (self.hook)(&self.file_name, reason, identity);
                 Ok(())
             }
             Err(e) => {
                 // The file stays active: identity is kept so a later retry still names it.
                 let identity = self.identity.as_ref();
-                warn!(
-                    target: EVENT_TARGET,
-                    event_name = "recording.segment_closed",
-                    outcome = "failed",
-                    reason_code = "unknown",
-                    segment_id = identity.map(|i| i.segment_id.as_str()).unwrap_or(""),
-                    original_file = self.file_name,
-                    error = format!("{e}"),
-                    live_streamer_id = self.owner.live_streamer_id(),
-                    streamer_info_id = self.owner.streamer_info_id(),
-                    task_id = self.owner.task_id(),
-                    download_attempt_id = self.owner.download_attempt_id(),
-                    "录制分段收尾失败，临时文件保留"
+                segment_close_failed(
+                    &self.owner,
+                    identity.map(|i| i.segment_id.as_str()).unwrap_or(""),
+                    &self.file_name,
+                    &format!("{e}"),
                 );
                 error!("finalize {} {e}", self.path.display());
                 Err(e)

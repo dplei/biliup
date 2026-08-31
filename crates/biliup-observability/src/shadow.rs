@@ -200,6 +200,15 @@ pub fn health_snapshot() -> serde_json::Value {
     serde_json::json!({"schema_version":1,"capture_config_version":"shadow-v1","legacy_file_health":"unknown","runs":states})
 }
 
+/// Retrieve only this invocation's collector. Never search global runs or initialize storage
+/// from a business callback: overlapping embedded calls may use different databases.
+pub fn current_emitter() -> Option<Emitter> {
+    tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<CaptureLayer>().map(CaptureLayer::emitter)
+            .or_else(|| dispatch.downcast_ref::<Inherited>().map(|s| s.emitter.clone()))
+    })
+}
+
 thread_local! { static DISPATCH_GUARD: RefCell<Option<tracing::dispatcher::DefaultGuard>> = const { RefCell::new(None) }; }
 /// Scope root futures, worker threads and blocking workers to one entry's dispatch. No second global
 /// subscriber, no guard held over an await, and no changes to the embedding host's global state.

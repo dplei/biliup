@@ -57,6 +57,29 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - 本批未添加 HLS 解密、fMP4 初始化段支持、分段媒体内容校验或新的网络恢复状态机。列表
   解析成功不等于媒体可播放；已收字节与无损播放分别验收，不承诺跨进程去重。
 
+### P3/14 外部下载器（FFmpeg）增量
+
+- 外部分段的目标文件由本进程选定，`recording.segment_created` 与 `recording.segment_closed`
+  都是真实观测，复用 R/T + DA 和文件层的 S；关闭原因取本次进程的结束方式：取消优先记
+  `user_cancel`，退出码 0 且配置了时长/大小上限记 `split_limit`，0/255 记 `stream_end`，
+  其余非零码记 `transport_error`，被信号结束且未取消保持 `unknown`。**退出码 0 区分不出
+  「切到上限」与「刚好同时下播」**，这是 ffmpeg 的口径，不额外推断。
+- 内部分段由 ffmpeg 自己创建文件，进程外看不到创建时刻，因此**只发 `segment_closed`，
+  不补造 `segment_created`**；消费方不得要求两者成对。分段列表行写的是相对列表文件的
+  名字，管道输出时只有 basename，按配置的输出目录还原。
+- 内部分段的关闭原因按配置取值（配了 `-segment_time` 记 `split_limit`，否则 `unknown`）。
+  **最后一段实际是流结束时关闭的，拿到列表行时无法与切片区分**，整场结束原因由
+  `DownloadStatus` 与上层 `recording.stopped` 说明，不在分段事件里改写。
+- `-strftime 1` 的文件名只有秒级精度：同一秒关闭的两段会拿到同一个名字并被 ffmpeg 覆盖，
+  分段列表出现重复行。重复行与改名失败一律记 `recording.segment_closed` `failed`/`unknown`
+  并继续下载，不结束整场录制，也不冒充一个已关闭的分段。
+- `processing.command_failed`：WARN、failed/`process_failed`，带 `stage`
+  （`ffmpeg_external`/`ffmpeg_internal`）、`exit_code`（信号退出时缺省）、`total_bytes`，
+  有界 stderr 尾部作为**附件**按 event_uid 关联，事件字段不复制第三方输出。退出码 0/255
+  和主动取消都不是外部命令失败。含 URL/凭据线索的行整值脱敏，因此尾部常见 `[REDACTED]`。
+- 该事件经本次调用的采集器直接写出（附件无法走 tracing 字段），只取当前 dispatch 上的
+  采集器，不搜索全局运行，也不从业务回调里初始化存储。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify
