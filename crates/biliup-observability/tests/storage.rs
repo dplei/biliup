@@ -503,3 +503,67 @@ fn attachment_expiry_budget_rollback_and_page_clamps() {
     store.close().unwrap();
     ids.shutdown(Duration::from_secs(2));
 }
+
+/// Native and bridge live in the same table and must never be mixed by accident: the default is
+/// whatever the caller asks for, the count agrees with the page, and a keyword is text, not a
+/// LIKE pattern.
+#[test]
+fn capture_kind_keyword_and_count_agree_with_the_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.sqlite");
+    let mut runtime = start(&path);
+    let emitter = runtime.emitter();
+    for (name, message) in [
+        ("recording.started", "开始录制 100% 进度"),
+        ("upload.failed", "分段上传失败"),
+        ("upload.completed", "分段上传完成"),
+    ] {
+        let mut draft = Draft::new(name, message);
+        draft.context = Context(Fields::new().with("task_id", "alpha"));
+        let event = emitter.create(Level::Info, draft).unwrap();
+        assert!(emitter.submit(event));
+    }
+    wait(&emitter, |h| h.delivered == 3);
+    runtime.shutdown(Duration::from_secs(2));
+
+    rt().block_on(async {
+        let repo = Repository::open(&path).await.unwrap();
+        let native = Query {
+            capture_kind: Some(CaptureKind::Native),
+            limit: 50,
+            ..Query::default()
+        };
+        let page = repo.query(&native).await.unwrap();
+        assert_eq!(page.events.len(), 3, "everything emitted here is native");
+        assert_eq!(repo.count(&native).await.unwrap(), 3);
+
+        let bridge = Query {
+            capture_kind: Some(CaptureKind::LegacyBridge),
+            limit: 50,
+            ..Query::default()
+        };
+        assert!(repo.query(&bridge).await.unwrap().events.is_empty());
+        assert_eq!(repo.count(&bridge).await.unwrap(), 0);
+
+        // The count covers the whole filtered range, not just the page.
+        let one = Query {
+            capture_kind: Some(CaptureKind::Native),
+            limit: 1,
+            ..Query::default()
+        };
+        assert_eq!(repo.query(&one).await.unwrap().events.len(), 1);
+        assert_eq!(repo.count(&one).await.unwrap(), 3);
+
+        let keyword = |value: &str| Query {
+            keyword: Some(value.to_string()),
+            limit: 50,
+            ..Query::default()
+        };
+        assert_eq!(repo.query(&keyword("上传")).await.unwrap().events.len(), 2);
+        assert_eq!(repo.count(&keyword("上传")).await.unwrap(), 2);
+        // A percent sign is searched for literally; it does not match everything.
+        assert_eq!(repo.query(&keyword("100%")).await.unwrap().events.len(), 1);
+        assert_eq!(repo.query(&keyword("%")).await.unwrap().events.len(), 1);
+        assert!(repo.query(&keyword("_")).await.unwrap().events.is_empty());
+    });
+}

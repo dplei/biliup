@@ -10,6 +10,8 @@ pub mod cover_background;
 pub mod cover_preview;
 /// 通用API端点
 pub mod endpoints;
+/// 独立事件库的只读查询、实时接续与导出
+pub mod log_events;
 /// 录制租约与幂等录制状态端点。
 pub mod recording_lease;
 /// 单页应用静态文件处理

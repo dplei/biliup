@@ -1,4 +1,5 @@
 //! One private writer connection and a separate read-only pool. No business database dependencies.
+use crate::CaptureKind;
 use crate::{Commit, Consumer, Event, EventData, Level, StorageError, now_ms};
 use sqlx::{
     Connection, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
@@ -183,9 +184,11 @@ impl Consumer for SqliteStore {
                     return Err(StorageError::new("event_budget"));
                 }
                 let f = &e.fields;
-                sqlx::query("INSERT INTO log_event(event_uid,occurred_at_ms,ingested_at_ms,instance_id,level,category,event_name,live_streamer_id,streamer_info_id,upload_session_id,segment_id,missing_id,download_attempt_id,upload_attempt_id,task_id,payload,byte_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                sqlx::query("INSERT INTO log_event(event_uid,occurred_at_ms,ingested_at_ms,instance_id,level,category,event_name,capture_kind,message,live_streamer_id,streamer_info_id,upload_session_id,segment_id,missing_id,download_attempt_id,upload_attempt_id,task_id,payload,byte_size) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                     .bind(&e.event_uid).bind(e.occurred_at_ms).bind(now_ms()).bind(&e.instance_id)
                     .bind(e.level as i64).bind(&e.category).bind(&e.event_name)
+                    .bind(match e.capture_kind { crate::CaptureKind::Native => "native", crate::CaptureKind::LegacyBridge => "legacy_bridge" })
+                    .bind(&e.message)
                     .bind(f.text("live_streamer_id")).bind(f.text("streamer_info_id")).bind(f.text("upload_session_id"))
                     .bind(f.text("segment_id")).bind(f.text("missing_id")).bind(f.text("download_attempt_id"))
                     .bind(f.text("upload_attempt_id")).bind(f.text("task_id")).bind(payload).bind(bytes as i64)
@@ -304,6 +307,67 @@ pub fn available_bytes(_: &Path) -> Option<u64> {
     None
 }
 
+fn capture_kind_text(kind: CaptureKind) -> &'static str {
+    match kind {
+        CaptureKind::Native => "native",
+        CaptureKind::LegacyBridge => "legacy_bridge",
+    }
+}
+
+/// Keep user text out of LIKE's own wildcard grammar: a search for `%` is a search for `%`.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// The one place the filter grammar lives, so the page and its count can never disagree.
+fn push_filters<'a>(
+    sql: &mut QueryBuilder<'a, Sqlite>,
+    query: &'a Query,
+) -> Result<(), StorageError> {
+    if let Some(id) = query.until_id {
+        sql.push(" AND id <= ").push_bind(id as i64);
+    }
+    if let Some(ms) = query.since_ms {
+        sql.push(" AND occurred_at_ms >= ").push_bind(ms);
+    }
+    if let Some(ms) = query.until_ms {
+        sql.push(" AND occurred_at_ms <= ").push_bind(ms);
+    }
+    if let Some(level) = query.min_level {
+        sql.push(" AND level >= ").push_bind(level as i64);
+    }
+    for (column, value) in [
+        ("category", &query.category),
+        ("event_name", &query.event_name),
+        ("instance_id", &query.instance_id),
+    ] {
+        if let Some(value) = value {
+            sql.push(" AND ").push(column).push(" = ").push_bind(value);
+        }
+    }
+    if let Some((key, value)) = &query.association {
+        if crate::model::field_kind(key) != Some("id") || query.instance_id.is_none() {
+            return Err(StorageError::new("invalid_association"));
+        }
+        sql.push(" AND ").push(key).push(" = ").push_bind(value);
+    }
+    if let Some(kind) = query.capture_kind {
+        sql.push(" AND capture_kind = ")
+            .push_bind(capture_kind_text(kind));
+    }
+    if let Some(keyword) = &query.keyword {
+        // LIKE with a leading wildcard cannot use an index anywhere, so it is applied to the
+        // bounded summary column and never to the payload.
+        sql.push(" AND message LIKE ")
+            .push_bind(format!("%{}%", escape_like(keyword)))
+            .push(" ESCAPE '\\'");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 pub struct Query {
     pub after_id: u64,
@@ -316,6 +380,12 @@ pub struct Query {
     pub instance_id: Option<String>,
     /// One exact allowlisted correlation field; instance_id is mandatory when it is used.
     pub association: Option<(String, String)>,
+    /// `None` means both kinds. Callers that show business events ask for `Native` explicitly;
+    /// bridge diagnostics are never mixed in silently.
+    pub capture_kind: Option<CaptureKind>,
+    /// Case-insensitive substring of the summary only. It is a bounded scan over the filtered
+    /// range, not an index lookup, and is cut off by the same VM deadline as everything else.
+    pub keyword: Option<String>,
     pub limit: usize,
 }
 #[derive(Debug, serde::Serialize)]
@@ -383,33 +453,7 @@ impl Repository {
             "SELECT id,ingested_at_ms,payload,EXISTS(SELECT 1 FROM log_diagnostic d WHERE d.event_uid=e.event_uid) AS has_diagnostic FROM log_event e WHERE id > ",
         );
         sql.push_bind(query.after_id as i64);
-        if let Some(id) = query.until_id {
-            sql.push(" AND id <= ").push_bind(id as i64);
-        }
-        if let Some(ms) = query.since_ms {
-            sql.push(" AND occurred_at_ms >= ").push_bind(ms);
-        }
-        if let Some(ms) = query.until_ms {
-            sql.push(" AND occurred_at_ms <= ").push_bind(ms);
-        }
-        if let Some(level) = query.min_level {
-            sql.push(" AND level >= ").push_bind(level as i64);
-        }
-        for (column, value) in [
-            ("category", &query.category),
-            ("event_name", &query.event_name),
-            ("instance_id", &query.instance_id),
-        ] {
-            if let Some(value) = value {
-                sql.push(" AND ").push(column).push(" = ").push_bind(value);
-            }
-        }
-        if let Some((key, value)) = &query.association {
-            if crate::model::field_kind(key) != Some("id") || query.instance_id.is_none() {
-                return Err(StorageError::new("invalid_association"));
-            }
-            sql.push(" AND ").push(key).push(" = ").push_bind(value);
-        }
+        push_filters(&mut sql, query)?;
         sql.push(" ORDER BY id LIMIT ")
             .push_bind(query.limit.clamp(1, 200) as i64);
         // One bounded snapshot for both the page and retention marker.
@@ -449,6 +493,32 @@ impl Repository {
             unclean_shutdowns: meta.get::<i64, _>(1) as u64,
         })
     }
+    /// How many rows the whole filtered range holds, independent of the page. Counting is bounded
+    /// by the same VM deadline: a range too large to count says so instead of blocking.
+    pub async fn count(&self, query: &Query) -> Result<u64, StorageError> {
+        tokio::time::timeout(Duration::from_millis(250), self.count_inner(query))
+            .await
+            .map_err(|_| StorageError::new("query_timeout"))?
+    }
+
+    async fn count_inner(&self, query: &Query) -> Result<u64, StorageError> {
+        let mut sql = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM log_event e WHERE id > ");
+        sql.push_bind(query.after_id as i64);
+        push_filters(&mut sql, query)?;
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        conn.lock_handle()
+            .await
+            .map_err(db_error)?
+            .set_progress_handler(1000, move || std::time::Instant::now() < deadline);
+        let total: i64 = sql
+            .build_query_scalar()
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(db_error)?;
+        Ok(total.max(0) as u64)
+    }
+
     pub async fn diagnostic(
         &self,
         event_uid: &str,
