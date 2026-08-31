@@ -10,6 +10,7 @@ name = "biliup"
 path = "src/main.rs"
 
 [dependencies]
+biliup-observability = { path = "../biliup-observability" }
 biliup = { path = "../biliup", features = ["cli"] }
 danmaku-client = { package = "danmaku", path = "../danmaku" }
 

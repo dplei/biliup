@@ -13,9 +13,10 @@ use clap::Parser;
 use biliup_cli::server::common::lifecycle_backfill::run_lifecycle_backfill;
 use biliup_cli::server::errors::AppResult;
 use biliup_cli::server::infrastructure::connection_pool::ConnectionManager;
+use biliup_observability::{legacy_output, shadow::Shadow};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, reload};
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -42,10 +43,19 @@ async fn main() -> AppResult<()> {
     let console_filter = tracing_subscriber::EnvFilter::new(&cli.rust_log);
     // let (file_filter_layer, file_reload_handle) = reload::Layer::new(file_filter);
     let (console_filter_layer, console_reload_handle) = reload::Layer::new(console_filter);
-    tracing_subscriber::registry()
-        .with(console_filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_timer(timer))
-        .init();
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(timer)
+                .with_filter(tracing_subscriber::filter::filter_fn(legacy_output))
+                .with_filter(console_filter_layer),
+        )
+        .with(_shadow.layer().map(|layer| layer.filtered()));
+    // A standalone binary owns one global subscriber; a conflicting host must not panic.
+    if subscriber.try_init().is_err() {
+        eprintln!("observability: subscriber_already_installed; retaining host subscriber");
+    }
 
     let user_cookie = expand_path(cli.user_cookie);
 

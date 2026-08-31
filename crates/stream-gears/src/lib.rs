@@ -22,11 +22,14 @@ use biliup::client::StatelessClient;
 use biliup::downloader::flv_parser::header;
 use biliup::downloader::httpflv::Connection;
 use biliup_cli::server::common::construct_headers;
+use biliup_observability::{
+    legacy_output,
+    shadow::{self, Shadow},
+};
 use pyo3::exceptions::PyRuntimeError;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{Layer, layer::SubscriberExt};
 
-#[tokio::main]
-pub async fn download_with_hook(
+pub fn download_with_hook(
     url: &str,
     headers: HeaderMap,
     file_name: &str,
@@ -34,36 +37,42 @@ pub async fn download_with_hook(
     file_name_hook: CallbackFn,
     proxy: Option<&str>,
 ) -> PyResult<()> {
-    let client = StatelessClient::new(headers, proxy);
-    let response = client.retryable(url).await.unwrap();
-    let mut connection = Connection::new(response);
-    // let buf = &mut [0u8; 9];
-    let bytes = connection.read_frame(9).await.unwrap();
-    // response.read_exact(buf)?;
-    // let out = File::create(format!("{}.flv", file_name)).expect("Unable to create file.");
-    // let mut writer = BufWriter::new(out);
-    // let mut buf = [0u8; 8 * 1024];
-    // response.copy_to(&mut writer)?;
-    // io::copy(&mut resp, &mut out).expect("Unable to copy the content.");
-    match header(&bytes) {
-        Ok((_i, header)) => {
-            debug!("header: {header:#?}");
-            info!("Downloading {}...", url);
-            let file = LifecycleFile::with_hook(file_name, "flv", file_name_hook);
-            httpflv::download(connection, file, segment)
-                .await
-                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-        }
-        Err(nom::Err::Incomplete(needed)) => {
-            error!("needed: {needed:?}")
-        }
-        Err(e) => {
-            error!("{e}");
-            let file = LifecycleFile::with_hook(file_name, "ts", file_name_hook);
-            hls::download(url, &client, file, segment).await.unwrap();
-        }
-    }
-    Ok(())
+    shadow::block_on_inherited(
+        tracing::dispatcher::get_default(Clone::clone),
+        false,
+        async move {
+            let client = StatelessClient::new(headers, proxy);
+            let response = client.retryable(url).await.unwrap();
+            let mut connection = Connection::new(response);
+            // let buf = &mut [0u8; 9];
+            let bytes = connection.read_frame(9).await.unwrap();
+            // response.read_exact(buf)?;
+            // let out = File::create(format!("{}.flv", file_name)).expect("Unable to create file.");
+            // let mut writer = BufWriter::new(out);
+            // let mut buf = [0u8; 8 * 1024];
+            // response.copy_to(&mut writer)?;
+            // io::copy(&mut resp, &mut out).expect("Unable to copy the content.");
+            match header(&bytes) {
+                Ok((_i, header)) => {
+                    debug!("header: {header:#?}");
+                    info!("Downloading {}...", url);
+                    let file = LifecycleFile::with_hook(file_name, "flv", file_name_hook);
+                    httpflv::download(connection, file, segment)
+                        .await
+                        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+                }
+                Err(nom::Err::Incomplete(needed)) => {
+                    error!("needed: {needed:?}")
+                }
+                Err(e) => {
+                    error!("{e}");
+                    let file = LifecycleFile::with_hook(file_name, "ts", file_name_hook);
+                    hls::download(url, &client, file, segment).await.unwrap();
+                }
+            }
+            Ok(())
+        },
+    )?
 }
 
 #[derive(Debug, Clone)]
@@ -120,11 +129,10 @@ fn download_with_callback(
         let local_time = tracing_subscriber::fmt::time::LocalTime::new(format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second]"
         ));
-        let formatting_layer = tracing_subscriber::FmtSubscriber::builder()
+        let formatting_layer = tracing_subscriber::fmt::layer()
             // will be written to stdout.
             // builds the subscriber.
-            .with_timer(local_time.clone())
-            .finish();
+            .with_timer(local_time.clone());
         let file_appender = tracing_appender::rolling::never("", "download.log");
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         let file_layer = tracing_subscriber::fmt::layer()
@@ -159,7 +167,15 @@ fn download_with_callback(
             })
         });
 
-        let collector = formatting_layer.with(file_layer);
+        let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+        let collector = tracing_subscriber::registry()
+            .with(
+                formatting_layer
+                    .and_then(file_layer)
+                    .with_filter(tracing_subscriber::filter::filter_fn(legacy_output))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(_shadow.layer().map(|layer| layer.filtered()));
         tracing::subscriber::with_default(collector, || -> PyResult<()> {
             match download_with_hook(
                 url,
@@ -181,8 +197,11 @@ fn download_with_callback(
 
 #[pyfunction]
 fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { login::login_by_cookies(&file, proxy.as_deref()).await });
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
+        login::login_by_cookies(&file, proxy.as_deref()).await
+    })?;
     match result {
         Ok(_) => Ok(true),
         Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -194,9 +213,11 @@ fn login_by_cookies(file: String, proxy: Option<String>) -> PyResult<bool> {
 
 #[pyfunction]
 fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result =
-        rt.block_on(async { login::send_sms(country_code, phone, proxy.as_deref()).await });
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
+        login::send_sms(country_code, phone, proxy.as_deref()).await
+    })?;
     match result {
         Ok(res) => Ok(res.to_string()),
         Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -208,10 +229,11 @@ fn send_sms(country_code: u32, phone: u64, proxy: Option<String>) -> PyResult<St
 
 #[pyfunction]
 fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
         login::login_by_sms(code, serde_json::from_str(&ret).unwrap(), proxy.as_deref()).await
-    });
+    })?;
     match result {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
@@ -220,8 +242,11 @@ fn login_by_sms(code: u32, ret: String, proxy: Option<String>) -> PyResult<bool>
 
 #[pyfunction]
 fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async { login::get_qrcode(proxy.as_deref()).await });
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
+        login::get_qrcode(proxy.as_deref()).await
+    })?;
     match result {
         Ok(res) => Ok(res.to_string()),
         Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -233,14 +258,15 @@ fn get_qrcode(proxy: Option<String>) -> PyResult<String> {
 
 #[pyfunction]
 fn login_by_qrcode(ret: String, proxy: Option<String>) -> PyResult<String> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    shadow::block_on_inherited(dispatch, false, async {
         let info = Credential::new(proxy.as_deref())
             .login_by_qrcode(serde_json::from_str(&ret).unwrap())
             .await?;
         let res = serde_json::to_string_pretty(&info).unwrap();
         Ok::<_, biliup::error::Kind>(res)
-    })
+    })?
     .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("{:#?}", err)))
 }
 
@@ -250,10 +276,11 @@ fn login_by_web_cookies(
     bili_jct: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
         login::login_by_web_cookies(&sess_data, &bili_jct, proxy.as_deref()).await
-    });
+    })?;
     match result {
         Ok(_) => Ok(true),
         Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -269,10 +296,11 @@ fn login_by_web_qrcode(
     dede_user_id: String,
     proxy: Option<String>,
 ) -> PyResult<bool> {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(async {
+    let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+    let dispatch = _shadow.inherited_dispatch();
+    let result = shadow::block_on_inherited(dispatch, false, async {
         login::login_by_web_qrcode(&sess_data, &dede_user_id, proxy.as_deref()).await
-    });
+    })?;
     match result {
         Ok(_) => Ok(true),
         Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -313,9 +341,6 @@ fn upload(
     proxy: Option<String>,
 ) -> PyResult<()> {
     py.detach(|| {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         // 输出到控制台中
         // use of deprecated function `time::util::local_offset::set_soundness`: no longer needed; TZ is refreshed manually
         // unsafe {
@@ -324,11 +349,10 @@ fn upload(
         let local_time = tracing_subscriber::fmt::time::LocalTime::new(format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second]"
         ));
-        let formatting_layer = tracing_subscriber::FmtSubscriber::builder()
+        let formatting_layer = tracing_subscriber::fmt::layer()
             // will be written to stdout.
             // builds the subscriber.
-            .with_timer(local_time.clone())
-            .finish();
+            .with_timer(local_time.clone());
         let file_appender = tracing_appender::rolling::never("", "upload.log");
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         let file_layer = tracing_subscriber::fmt::layer()
@@ -336,7 +360,15 @@ fn upload(
             .with_timer(local_time)
             .with_writer(non_blocking);
 
-        let collector = formatting_layer.with(file_layer);
+        let _shadow = Shadow::from_env(env!("CARGO_PKG_VERSION"));
+        let collector = tracing_subscriber::registry()
+            .with(
+                formatting_layer
+                    .and_then(file_layer)
+                    .with_filter(tracing_subscriber::filter::filter_fn(legacy_output))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .with(_shadow.layer().map(|layer| layer.filtered()));
 
         tracing::subscriber::with_default(collector, || -> PyResult<()> {
             let studio_pre = StudioPre::builder()
@@ -369,11 +401,11 @@ fn upload(
             //     None => SubmitOption::App,
             // };
 
-            match rt.block_on(uploader::upload(
-                studio_pre,
-                submit.as_deref(),
-                proxy.as_deref(),
-            )) {
+            match shadow::block_on_inherited(
+                tracing::dispatcher::get_default(Clone::clone),
+                true,
+                uploader::upload(studio_pre, submit.as_deref(), proxy.as_deref()),
+            )? {
                 Ok(_) => Ok(()),
                 // Ok(_) => {  },
                 Err(err) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -420,6 +452,12 @@ pub fn main_loop(py: Python<'_>) -> PyResult<()> {
     })
 }
 
+/// Capture health is independent of both the old files and the event database.
+#[pyfunction]
+fn observability_health() -> String {
+    shadow::health_snapshot().to_string()
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn stream_gears(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -428,6 +466,7 @@ fn stream_gears(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // tracing_subscriber::fmt()
     //     .with_writer(non_blocking)
     //     .init();
+    m.add_function(wrap_pyfunction!(observability_health, m)?)?;
     m.add_function(wrap_pyfunction!(upload, m)?)?;
     // m.add_function(wrap_pyfunction!(upload_by_app, m)?)?;
     m.add_function(wrap_pyfunction!(download, m)?)?;

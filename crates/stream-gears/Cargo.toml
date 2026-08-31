@@ -9,6 +9,7 @@ name = "stream_gears"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+biliup-observability = { path = "../biliup-observability" }
 pyo3 = { version = "0.27.1", features = ["abi3-py38", "anyhow"] }
 pythonize = { version = "0.27.0" }
 bytes = { workspace = true }

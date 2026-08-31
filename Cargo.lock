@@ -460,6 +460,7 @@ dependencies = [
  "axum-login",
  "base64",
  "biliup",
+ "biliup-observability",
  "bon",
  "bytes",
  "chrono",
@@ -508,6 +509,25 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "biliup-observability"
+version = "1.3.5"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.17",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-core",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4162,6 +4182,7 @@ dependencies = [
  "axum",
  "biliup",
  "biliup-cli",
+ "biliup-observability",
  "bon",
  "bytes",
  "chrono",
