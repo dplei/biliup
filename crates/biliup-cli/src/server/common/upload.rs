@@ -701,6 +701,15 @@ async fn retry_submission(
             reason: format!("submit claim was lost while scheduling a retry after: {error}"),
         });
     }
+    crate::observe::submission_completed(
+        &crate::observe::SubmissionIdentity::session(session_row_id),
+        "failed",
+        if remote_attempted {
+            "remote_error"
+        } else {
+            "precondition_failed"
+        },
+    );
     notify_alert(
         webhook,
         "投稿将在退避后重试",
@@ -725,14 +734,33 @@ pub async fn reconcile_session_submission(
     trigger: SubmissionTrigger,
 ) -> AppResult<SessionSubmissionOutcome> {
     let now = chrono::Utc::now();
+    let submission = crate::observe::SubmissionIdentity::session(session_row_id);
     match session_submit_readiness(pool, session_row_id, now).await? {
         SessionSubmitReadiness::NotRequested => {
+            crate::observe::submission_decided(&submission, "skipped", "no_intent", 0);
             return Ok(SessionSubmissionOutcome::NotRequested);
         }
         SessionSubmitReadiness::NotDue(next_at) => {
+            crate::observe::submission_decided(&submission, "waiting", "retry_backoff", 0);
             return Ok(SessionSubmissionOutcome::NotDue { next_at });
         }
         SessionSubmitReadiness::Claimed { state } => {
+            // A claim held with no stable remote id is an unknown result, not a skip: nothing
+            // may resubmit it, and nothing may call it successful either.
+            crate::observe::submission_decided(
+                &submission,
+                if state.as_deref() == Some("ok_no_aid") {
+                    "unknown"
+                } else {
+                    "skipped"
+                },
+                if state.as_deref() == Some("ok_no_aid") {
+                    "missing_remote_id"
+                } else {
+                    "claimed_elsewhere"
+                },
+                0,
+            );
             return if state.as_deref() == Some("ok_no_aid") {
                 Ok(SessionSubmissionOutcome::ManualInspectionRequired {
                     reason: "remote accepted submission without a stable aid; claim preserved"
@@ -743,6 +771,7 @@ pub async fn reconcile_session_submission(
             };
         }
         SessionSubmitReadiness::Finalized => {
+            crate::observe::submission_decided(&submission, "skipped", "finalized", 0);
             return Ok(SessionSubmissionOutcome::Finalized);
         }
         SessionSubmitReadiness::NotFound => {
@@ -779,6 +808,12 @@ pub async fn reconcile_session_submission(
                 reasons = ?completeness.reasons,
                 "session submit blocked by incomplete lifecycle ledger"
             );
+            crate::observe::submission_decided(
+                &submission,
+                "waiting",
+                "pending_segments",
+                completeness.incomplete_count().max(0) as u64,
+            );
             if changed {
                 notify_alert(
                     config.cookie_health_webhook.as_deref(),
@@ -796,6 +831,7 @@ pub async fn reconcile_session_submission(
                 session = session_row_id,
                 "session submit already claimed; skipping duplicate finalize"
             );
+            crate::observe::submission_decided(&submission, "skipped", "claimed_elsewhere", 0);
             return Ok(SessionSubmissionOutcome::ClaimedElsewhere);
         }
         SubmitClaim::DiscardedEmpty => {
@@ -804,6 +840,7 @@ pub async fn reconcile_session_submission(
                 trigger = trigger.as_str(),
                 "closed session had no lifecycle baseline; finalized without remote submission"
             );
+            crate::observe::submission_decided(&submission, "skipped", "discarded_empty", 0);
             return Ok(SessionSubmissionOutcome::DiscardedEmpty);
         }
         SubmitClaim::Finalized => {
@@ -811,6 +848,7 @@ pub async fn reconcile_session_submission(
                 session = session_row_id,
                 "session already finalized; skipping submit"
             );
+            crate::observe::submission_decided(&submission, "skipped", "finalized", 0);
             return Ok(SessionSubmissionOutcome::Finalized);
         }
     };
@@ -934,6 +972,7 @@ pub async fn reconcile_session_submission(
         trigger = trigger.as_str(),
         "submit_attempt：开始下播一次性投稿"
     );
+    crate::observe::submission_started(&submission, trigger.as_str());
     let resp = match submit_to_bilibili(&bilibili, &studio, effective_config.submit_api.as_deref())
         .await
     {
@@ -979,6 +1018,20 @@ pub async fn reconcile_session_submission(
             } else {
                 info!(aid = aid_val, bvid = ?bvid, "submit_ok_with_aid：投稿成功并已写回 aid");
             }
+            // The remote result is what decides this, not the absence of an error line.
+            crate::observe::submission_completed(
+                &submission,
+                if writeback.is_ok() {
+                    "succeeded"
+                } else {
+                    "unknown"
+                },
+                if writeback.is_ok() {
+                    "submitted"
+                } else {
+                    "writeback_failed"
+                },
+            );
             if let Some(section_id) = effective_config.season_section_id {
                 add_archive_to_season_with_retry(&bilibili, section_id, aid_val).await;
             }
@@ -997,6 +1050,7 @@ pub async fn reconcile_session_submission(
             error!(resp = ?resp, "submit_ok_no_aid：投稿 code==0 但响应缺少 aid，未 finalize（待下次开播补提交）");
             // The remote accepted the request but returned no stable id. Preserve the claim so a
             // restart cannot blindly create a duplicate submission.
+            crate::observe::submission_completed(&submission, "unknown", "missing_remote_id");
             if let Err(db) = mark_submit_anomaly(
                 pool,
                 session_row_id,
@@ -1533,6 +1587,13 @@ async fn pipeline_upload_videos(
 
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
+        let identity = crate::observe::UploadIdentity::from_enrollment(
+            ctx.worker_id(),
+            ctx.id(),
+            &enrollment,
+            &original_path,
+        )
+        .with_attempt(&attempt_token);
         // 首次上传不必查 `audio_normalized_at`：这一行是刚 enroll 出来的，标记必然为空。
         // 只有失败后进补传的分段才可能已被就地替换过，那两条路径各自查。
         match upload_enrolled_with_watchdog(
@@ -1543,6 +1604,7 @@ async fn pipeline_upload_videos(
             ctx.pool(),
             enrollment.missing_id,
             &attempt_token,
+            &identity,
         )
         .await
         {
@@ -1625,8 +1687,21 @@ async fn upload_single_file_with_repair(
     repair_enabled: bool,
     settings: NormalizationSettings,
     activity_tx: Option<mpsc::UnboundedSender<UploadActivity>>,
+    identity: &crate::observe::UploadIdentity,
 ) -> AppResult<(Video, RepairOutcome, Option<TempArtifact>)> {
+    crate::observe::upload_line_decided(
+        identity,
+        &context.line_key,
+        if context.line_source == LineSource::Fallback {
+            "fallback"
+        } else {
+            "executed"
+        },
+        context.line_source.as_str(),
+    );
+    let normalize_started = std::time::Instant::now();
     let normalization = if settings.enabled {
+        crate::observe::processing_decided(identity, "audio_normalization", "executed", "enabled");
         normalize_for_upload(
             original_path,
             settings.target_lufs,
@@ -1636,10 +1711,30 @@ async fn upload_single_file_with_repair(
         )
         .await
     } else {
+        crate::observe::processing_decided(identity, "audio_normalization", "skipped", "disabled");
         NormalizationOutcome::Original {
             reason: crate::server::common::audio_normalization::OriginalReason::NoAudio,
         }
     };
+    if settings.enabled {
+        let (outcome, reason) = match &normalization {
+            NormalizationOutcome::Normalized { .. } => ("executed", "normalized"),
+            NormalizationOutcome::Original { reason } => {
+                ("fallback", original_reason_code(*reason))
+            }
+        };
+        crate::observe::processing_completed(
+            identity,
+            "audio_normalization",
+            outcome,
+            reason,
+            None,
+            normalize_started
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
     // 标准化的测量遍已经完整 demux 过原片并顺带做了时间戳诊断；原片干净时产物也干净，
     // 不必再为它单独跑一遍整片扫描。诊断缺失或原片异常时照常走完整的检测/修复链路。
     let source_timestamps_clean = matches!(
@@ -1678,9 +1773,39 @@ async fn upload_single_file_with_repair(
         .as_ref()
         .map(TempArtifact::path)
         .unwrap_or(original_path);
+    let repair_started = std::time::Instant::now();
     let outcome = if repair_enabled && !source_timestamps_clean {
-        normalize_timestamps(normalized_path, &SystemFfmpeg).await
+        crate::observe::processing_decided(identity, "timestamp_repair", "executed", "scan_needed");
+        let outcome = normalize_timestamps(normalized_path, &SystemFfmpeg).await;
+        let (result, reason) = match &outcome {
+            RepairOutcome::Clean => ("executed", "no_anomaly"),
+            RepairOutcome::Repaired(_) => ("executed", "repaired"),
+            RepairOutcome::Unfixable => ("failed", "unfixable"),
+        };
+        let artifact = match &outcome {
+            RepairOutcome::Repaired(fixed) => Some(fixed.display().to_string()),
+            _ => None,
+        };
+        crate::observe::processing_completed(
+            identity,
+            "timestamp_repair",
+            result,
+            reason,
+            artifact.as_deref(),
+            repair_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        );
+        outcome
     } else {
+        crate::observe::processing_decided(
+            identity,
+            "timestamp_repair",
+            "skipped",
+            if repair_enabled {
+                "source_clean"
+            } else {
+                "disabled"
+            },
+        );
         if repair_enabled {
             info!(
                 timestamp_repair = "skipped",
@@ -1700,8 +1825,29 @@ async fn upload_single_file_with_repair(
         if let Some(tx) = &activity_tx {
             let _ = tx.send(UploadActivity::QueueWaitStarted);
         }
+        crate::observe::upload_queued(identity, "awaiting_permit");
         let _permit = acquire_global_upload_permit().await;
-        upload_single_file(&upload_path, context, activity_tx).await
+        let total_bytes = tokio::fs::metadata(&upload_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        crate::observe::upload_started(identity, &context.line_key, total_bytes);
+        let transfer_started = std::time::Instant::now();
+        let result = upload_single_file(&upload_path, context, activity_tx).await;
+        match &result {
+            Ok(_) => crate::observe::upload_completed(
+                identity,
+                "transferred",
+                transfer_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ),
+            // The classification comes from the failure itself, never from the absence of a line.
+            Err(error) => crate::observe::upload_failed(
+                identity,
+                upload_line_health::classify_report(error).as_str(),
+                &upload_line_health::sanitized_error_summary(error),
+            ),
+        }
+        result
     };
     match result {
         Ok(mut video) => {
@@ -1723,6 +1869,41 @@ async fn upload_single_file_with_repair(
             }
             Err(e)
         }
+    }
+}
+
+/// The eligibility answer, mapped onto the frozen v1 recovery vocabulary. A refusal is a
+/// decision with a reason, never an absent event.
+fn recovery_decision(eligibility: &RecoveryEligibility) -> (&'static str, &'static str) {
+    match eligibility {
+        RecoveryEligibility::Eligible => ("executed", "eligible"),
+        RecoveryEligibility::AlreadySucceeded => ("skipped", "already_succeeded"),
+        RecoveryEligibility::AlreadyRunning => ("skipped", "lease_active"),
+        RecoveryEligibility::SourceMissing => ("failed", "source_missing"),
+        RecoveryEligibility::FinalizedRejected => ("skipped", "session_finalized"),
+        RecoveryEligibility::LegacyFinalizedEdit => ("executed", "legacy_finalized_edit"),
+        RecoveryEligibility::InvalidMedia => ("failed", "invalid_media"),
+        RecoveryEligibility::Conflict => ("skipped", "conflict"),
+    }
+}
+
+/// The frozen v1 reason vocabulary for a preprocessing fallback. New codes go into the coverage
+/// ledger first, so an unmapped variant would be a compile error rather than free text.
+fn original_reason_code(
+    reason: crate::server::common::audio_normalization::OriginalReason,
+) -> &'static str {
+    use crate::server::common::audio_normalization::OriginalReason::*;
+    match reason {
+        MissingOrEmpty => "source_missing",
+        NoAudio => "no_audio",
+        ProbeFailed => "probe_failed",
+        MeasureFailed => "measure_failed",
+        InvalidMeasurement => "invalid_measurement",
+        TranscodeFailed => "transcode_failed",
+        InvalidOutput => "invalid_output",
+        DiskAdmissionDenied => "low_disk",
+        DiskPressureAborted => "low_disk_aborted",
+        NormalizationDisabled => "disabled",
     }
 }
 
@@ -2150,6 +2331,7 @@ async fn upload_enrolled_with_watchdog(
     pool: &ConnectionPool,
     missing_id: i64,
     attempt_token: &str,
+    identity: &crate::observe::UploadIdentity,
 ) -> AppResult<(
     Video,
     RepairOutcome,
@@ -2168,6 +2350,7 @@ async fn upload_enrolled_with_watchdog(
         repair_enabled,
         settings,
         Some(activity_tx),
+        identity,
     );
     pin!(upload);
 
@@ -2227,6 +2410,11 @@ async fn upload_enrolled_with_watchdog(
                     .map(|(video, outcome, artifact)| (video, outcome, artifact, Some(guard)));
             }
             AttemptEvent::Cancelled => {
+                crate::observe::upload_failed(
+                    identity,
+                    "cancelled_by_retry",
+                    "upload attempt cancelled by manual retry",
+                );
                 return Err(error_stack::Report::new(AppError::Custom(
                     "upload attempt cancelled by manual retry".to_string(),
                 )));
@@ -2284,6 +2472,8 @@ async fn upload_enrolled_with_watchdog(
                     &format!("{kind}: {diagnostics}"),
                 )
                 .await;
+                // The watchdog is the failure here; the transfer itself never reported one.
+                crate::observe::upload_failed(identity, kind, &diagnostics);
                 return Err(error_stack::Report::new(AppError::Custom(format!(
                     "{kind}: {diagnostics}"
                 ))));
@@ -2311,6 +2501,7 @@ async fn upload_enrolled_with_watchdog(
                     &format!("total_upload_timeout: {diagnostics}"),
                 )
                 .await;
+                crate::observe::upload_failed(identity, "total_upload_timeout", &diagnostics);
                 return Err(error_stack::Report::new(AppError::Custom(format!(
                     "total_upload_timeout: {diagnostics}"
                 ))));
@@ -2535,7 +2726,14 @@ async fn recover_due_missing_segments(
     let now = chrono::Utc::now();
     let rows = due_missing_segments_for_session(ctx.pool(), session_row_id, now).await?;
     for mut row in rows {
-        match check_recovery_eligibility(ctx.pool(), &row, None, now).await? {
+        let eligibility = check_recovery_eligibility(ctx.pool(), &row, None, now).await?;
+        let (outcome, reason) = recovery_decision(&eligibility);
+        crate::observe::recovery_decided(
+            &crate::observe::UploadIdentity::from_missing_row(&row),
+            outcome,
+            reason,
+        );
+        match eligibility {
             RecoveryEligibility::Eligible => {}
             RecoveryEligibility::SourceMissing => {
                 mark_source_missing(
@@ -2622,12 +2820,19 @@ async fn recover_due_missing_segments(
         let path = PathBuf::from(&file_path);
         let effective_config = ctx.config();
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let normalization = effective_config
-            .normalization_settings()
-            .with_enabled(audio_normalization_needed(
-                &row,
-                effective_config.audio_normalization_enabled,
-            ));
+        let normalization =
+            effective_config
+                .normalization_settings()
+                .with_enabled(audio_normalization_needed(
+                    &row,
+                    effective_config.audio_normalization_enabled,
+                ));
+        let identity = crate::observe::UploadIdentity::from_missing_row(&row);
+        let identity = match &attempt_token {
+            Some(token) => identity.with_attempt(token),
+            None => identity,
+        };
+        crate::observe::recovery_started(&identity, "retry_due");
         let result = if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
             upload_enrolled_with_watchdog(
                 &path,
@@ -2637,10 +2842,18 @@ async fn recover_due_missing_segments(
                 ctx.pool(),
                 enrollment.missing_id,
                 token,
+                &identity,
             )
             .await
         } else {
-            upload_single_file_with_repair(&path, &recovery_context, repair_enabled, normalization, None)
+            upload_single_file_with_repair(
+                &path,
+                &recovery_context,
+                repair_enabled,
+                normalization,
+                None,
+                &identity,
+            )
             .await
             .map(|(video, outcome, artifact)| (video, outcome, artifact, None))
         };
@@ -3424,6 +3637,12 @@ pub async fn claim_manual_recovery(
         row.next_retry_at = claim_now;
     }
     let eligibility = check_recovery_eligibility(pool, &row, None, claim_now).await?;
+    let (outcome, reason) = recovery_decision(&eligibility);
+    crate::observe::recovery_decided(
+        &crate::observe::UploadIdentity::from_missing_row(&row),
+        outcome,
+        reason,
+    );
     match eligibility {
         RecoveryEligibility::Eligible | RecoveryEligibility::LegacyFinalizedEdit => {}
         RecoveryEligibility::SourceMissing => {
@@ -3599,12 +3818,19 @@ pub async fn run_claimed_recovery(
         }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
-        let normalization = effective_config
-            .normalization_settings()
-            .with_enabled(audio_normalization_needed(
-                &row,
-                effective_config.audio_normalization_enabled,
-            ));
+        let normalization =
+            effective_config
+                .normalization_settings()
+                .with_enabled(audio_normalization_needed(
+                    &row,
+                    effective_config.audio_normalization_enabled,
+                ));
+        let identity = crate::observe::UploadIdentity::from_missing_row(&row);
+        let identity = match &attempt_token {
+            Some(token) => identity.with_attempt(token),
+            None => identity,
+        };
+        crate::observe::recovery_started(&identity, "manual_recovery");
         let (video, outcome, _normalization_artifact, _attempt_guard) =
             if let (Some(enrollment), Some(token)) = (&v2_enrollment, &attempt_token) {
                 upload_enrolled_with_watchdog(
@@ -3615,10 +3841,18 @@ pub async fn run_claimed_recovery(
                     pool,
                     enrollment.missing_id,
                     token,
+                    &identity,
                 )
                 .await?
             } else {
-                upload_single_file_with_repair(&path, &upload_context, repair_enabled, normalization, None)
+                upload_single_file_with_repair(
+                    &path,
+                    &upload_context,
+                    repair_enabled,
+                    normalization,
+                    None,
+                    &identity,
+                )
                 .await
                 .map(|(video, outcome, artifact)| (video, outcome, artifact, None))?
             };
@@ -4047,6 +4281,155 @@ mod tests {
         // 开关关着时无论标记如何都不标准化。
         assert!(!audio_normalization_needed(&marked, false));
         assert!(!audio_normalization_needed(&unmarked, false));
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(std::sync::Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>);
+
+    struct EventCollector<'a>(&'a mut std::collections::BTreeMap<String, String>);
+    impl tracing::field::Visit for EventCollector<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != crate::observe::EVENT_TARGET {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut EventCollector(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    impl CapturedEvents {
+        fn named(&self, name: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|fields| fields.get("event_name").map(String::as_str) == Some(name))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// A session nobody asked to submit is a decision with a reason, not silence; and a session
+    /// blocked by unfinished segments must say how many, without claiming anything succeeded.
+    #[tokio::test]
+    async fn submission_decisions_are_reported_natively_with_their_reason() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (_directory, pool) = deferred_test_pool().await;
+        let captured = CapturedEvents::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let config = Config::default();
+
+        let outcome =
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::DownloadClosed)
+                .await
+                .unwrap();
+        assert!(matches!(outcome, SessionSubmissionOutcome::NotRequested));
+        let decided = captured.named("submission.decided");
+        assert_eq!(decided.len(), 1);
+        assert_eq!(decided[0]["outcome"], "skipped");
+        assert_eq!(decided[0]["reason_code"], "no_intent");
+        assert_eq!(decided[0]["upload_session_id"], "30");
+        assert!(
+            captured.named("submission.started").is_empty(),
+            "nothing may be reported as started before the claim gate"
+        );
+
+        // Ask for submission, but leave one segment unfinished: the answer is waiting, with the
+        // count that explains it.
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "UPDATE upload_session SET submit_requested_at = ?1, updated_at = ?1 WHERE id = 30",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+              segment_order, status, next_retry_at, created_at, updated_at, lifecycle_version) \
+             VALUES (70, 10, 20, 30, '/pending.flv', 0, 'pending', ?1, ?1, ?1, 2)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome =
+            reconcile_session_submission(&config, &pool, 30, SubmissionTrigger::DownloadClosed)
+                .await
+                .unwrap();
+        assert!(matches!(outcome, SessionSubmissionOutcome::Blocked { .. }));
+        let decided = captured.named("submission.decided");
+        assert_eq!(decided.len(), 2);
+        assert_eq!(decided[1]["outcome"], "waiting");
+        assert_eq!(decided[1]["reason_code"], "pending_segments");
+        assert_eq!(decided[1]["pending_count"], "1");
+        assert!(captured.named("submission.completed").is_empty());
+    }
+
+    /// The reason vocabulary is frozen: every variant maps onto a code the coverage ledger lists.
+    #[test]
+    fn preprocessing_and_recovery_reasons_stay_inside_the_frozen_vocabulary() {
+        use crate::server::common::audio_normalization::OriginalReason;
+        for reason in [
+            OriginalReason::MissingOrEmpty,
+            OriginalReason::NoAudio,
+            OriginalReason::ProbeFailed,
+            OriginalReason::MeasureFailed,
+            OriginalReason::InvalidMeasurement,
+            OriginalReason::TranscodeFailed,
+            OriginalReason::InvalidOutput,
+            OriginalReason::DiskAdmissionDenied,
+            OriginalReason::DiskPressureAborted,
+            OriginalReason::NormalizationDisabled,
+        ] {
+            let code = original_reason_code(reason);
+            assert!(
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{code} is not a valid reason_code"
+            );
+        }
+        for (eligibility, expected) in [
+            (RecoveryEligibility::Eligible, ("executed", "eligible")),
+            (
+                RecoveryEligibility::AlreadyRunning,
+                ("skipped", "lease_active"),
+            ),
+            (
+                RecoveryEligibility::SourceMissing,
+                ("failed", "source_missing"),
+            ),
+            (
+                RecoveryEligibility::FinalizedRejected,
+                ("skipped", "session_finalized"),
+            ),
+        ] {
+            assert_eq!(recovery_decision(&eligibility), expected);
+        }
     }
 
     #[tokio::test]
