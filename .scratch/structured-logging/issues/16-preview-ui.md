@@ -1,9 +1,9 @@
 # 16 — 以试用入口上线新事件页和独立进度视图
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 15, 12, 13
 Phase: P3
-Implementation: not-started
+Implementation: complete
 
 来源：[页面设计](../page-design.md)。交互草图是设计参考，不是已经接通的产品页面。
 
@@ -37,3 +37,11 @@ Implementation: not-started
 ## Comments
 
 先让用户在同一运行期比较阅读体验，再在覆盖验收后决定默认切换。
+
+交付完成，验收 passed，见 [P3 回执](../receipts/P3.md) 的「第二轮」一节。页面在本机 dev 环境的
+一场真实开播录制上验证：筛选/计数/详情/场次跳转与返回、阅读冻结与新事件提示、暂停恢复、
+断线与采集未开启状态、深浅主题与 360px 均实测通过。默认入口开关初值仍是旧页，17 只改
+`app/lib/log-view-config.ts` 一个常量即可切换与回退。
+
+已知边界：同一维度多选目前只覆盖级别与业务类型；主播等关联筛选必须带运行实例（后端约束），
+页面用最近事件所在实例作默认并在提示里说明；界面不对来源已汇总的事件再做二次折叠。
