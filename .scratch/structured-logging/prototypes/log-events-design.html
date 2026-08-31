@@ -1,0 +1,248 @@
+<div id="biliup-log-design" lang="zh-CN">
+  <style>
+    #biliup-log-design {
+      --bl-bg: light-dark(#ffffff, #181b20);
+      --bl-surface: light-dark(#f7f8fa, #21252b);
+      --bl-text: light-dark(#252933, #edf0f5);
+      --bl-muted: light-dark(#636b78, #aeb7c5);
+      --bl-line: light-dark(#e5e8ee, #353c46);
+      --bl-blue: light-dark(#215cce, #91b7ff);
+      --bl-blue-bg: light-dark(#edf3ff, #24334e);
+      --bl-warn: light-dark(#895500, #f2c06c);
+      --bl-warn-bg: light-dark(#fff5e3, #332b20);
+      --bl-error: light-dark(#bd2f3a, #ff9ea4);
+      --bl-error-bg: light-dark(#fff0f1, #382427);
+      --bl-green: light-dark(#267844, #91d8aa);
+      color: var(--bl-text);
+      background: var(--bl-bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      border: 1px solid var(--bl-line);
+      border-radius: 10px;
+    }
+    #biliup-log-design * { box-sizing: border-box; }
+    #biliup-log-design [hidden] { display: none !important; }
+    #biliup-log-design button, #biliup-log-design input, #biliup-log-design select { font: inherit; }
+    #biliup-log-design button { cursor: pointer; color: inherit; }
+    #biliup-log-design .bl-header { padding: 18px 20px 0; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+    #biliup-log-design .bl-heading { display: flex; align-items: center; gap: 10px; }
+    #biliup-log-design .bl-brand { color: var(--bl-blue); font-weight: 500; }
+    #biliup-log-design h2, #biliup-log-design h3, #biliup-log-design p { margin: 0; font-size: inherit; font-weight: 400; }
+    #biliup-log-design h2, #biliup-log-design h3 { font-weight: 500; }
+    #biliup-log-design .bl-muted { color: var(--bl-muted); }
+    #biliup-log-design .bl-tabs { display: flex; gap: 24px; padding: 12px 20px 0; border-bottom: 1px solid var(--bl-line); }
+    #biliup-log-design .bl-tab { border: 0; border-bottom: 2px solid transparent; background: transparent; padding: 10px 0; color: var(--bl-muted); }
+    #biliup-log-design .bl-tab[aria-selected="true"] { color: var(--bl-blue); border-bottom-color: var(--bl-blue); font-weight: 500; }
+    #biliup-log-design .bl-content { padding: 16px 20px; }
+    #biliup-log-design .bl-levels { display: flex; flex-wrap: wrap; gap: 8px; }
+    #biliup-log-design .bl-level { border: 1px solid var(--bl-line); background: var(--bl-bg); border-radius: 6px; padding: 7px 10px; display: inline-flex; align-items: center; gap: 7px; }
+    #biliup-log-design .bl-level[aria-pressed="true"] { border-color: var(--bl-blue); background: var(--bl-blue-bg); color: var(--bl-blue); }
+    #biliup-log-design .bl-count { font-variant-numeric: tabular-nums; color: var(--bl-muted); }
+    #biliup-log-design .bl-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding-top: 14px; }
+    #biliup-log-design label { display: flex; flex-direction: column; gap: 5px; color: var(--bl-muted); min-width: 0; }
+    #biliup-log-design select, #biliup-log-design input { width: 100%; min-width: 0; border: 1px solid var(--bl-line); border-radius: 6px; padding: 8px; background: var(--bl-bg); color: var(--bl-text); }
+    #biliup-log-design input::placeholder { color: var(--bl-muted); opacity: 1; }
+    #biliup-log-design .bl-search { padding-top: 10px; }
+    #biliup-log-design .bl-search input { background: var(--bl-surface); }
+    #biliup-log-design .bl-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 15px 0 9px; color: var(--bl-muted); }
+    #biliup-log-design .bl-session { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px; margin-bottom: 12px; background: var(--bl-blue-bg); color: var(--bl-blue); border-radius: 6px; }
+    #biliup-log-design .bl-link { border: 0; padding: 4px 0; background: transparent; color: var(--bl-blue); text-align: left; }
+    #biliup-log-design .bl-event { border-top: 1px solid var(--bl-line); border-left: 3px solid transparent; }
+    #biliup-log-design .bl-event[data-level="WARN"] { border-left-color: var(--bl-warn); }
+    #biliup-log-design .bl-event[data-level="ERROR"] { border-left-color: var(--bl-error); }
+    #biliup-log-design .bl-event summary { list-style: none; cursor: pointer; padding: 12px 10px; display: grid; grid-template-columns: 88px minmax(0, 1fr) 16px; gap: 12px; align-items: start; }
+    #biliup-log-design .bl-event summary::-webkit-details-marker { display: none; }
+    #biliup-log-design .bl-event[data-level="WARN"] > summary { background: var(--bl-warn-bg); }
+    #biliup-log-design .bl-event[data-level="ERROR"] > summary { background: var(--bl-error-bg); }
+    #biliup-log-design .bl-time { display: flex; flex-direction: column; gap: 5px; font-variant-numeric: tabular-nums; color: var(--bl-muted); }
+    #biliup-log-design .bl-time .bl-ms { color: var(--bl-muted); }
+    #biliup-log-design .bl-badge { display: inline-flex; gap: 4px; align-items: center; font-weight: 500; }
+    #biliup-log-design .bl-info { color: var(--bl-blue); }
+    #biliup-log-design .bl-warn { color: var(--bl-warn); }
+    #biliup-log-design .bl-error { color: var(--bl-error); }
+    #biliup-log-design .bl-message { font-weight: 500; overflow-wrap: anywhere; }
+    #biliup-log-design .bl-assoc { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; color: var(--bl-muted); margin-top: 5px; overflow-wrap: anywhere; }
+    #biliup-log-design .bl-category { padding: 1px 6px; border: 1px solid var(--bl-line); border-radius: 4px; color: var(--bl-text); background: var(--bl-bg); }
+    #biliup-log-design .bl-chevron { color: var(--bl-muted); transform: rotate(0); }
+    #biliup-log-design details[open] .bl-chevron { transform: rotate(90deg); }
+    #biliup-log-design .bl-detail { padding: 12px 14px 15px; background: var(--bl-surface); }
+    #biliup-log-design .bl-detail dl { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 8px 12px; margin: 0 0 12px; }
+    #biliup-log-design .bl-detail dt { color: var(--bl-muted); }
+    #biliup-log-design .bl-detail dd { margin: 0; overflow-wrap: anywhere; }
+    #biliup-log-design code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: inherit; color: var(--bl-text); background: transparent; padding: 0; }
+    #biliup-log-design .bl-empty { padding: 28px 10px; text-align: center; color: var(--bl-muted); border-top: 1px solid var(--bl-line); }
+    #biliup-log-design .bl-footer { border-top: 1px solid var(--bl-line); padding: 12px 0 0; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; color: var(--bl-muted); }
+    #biliup-log-design .bl-button { padding: 6px 10px; border: 1px solid var(--bl-line); border-radius: 6px; background: var(--bl-bg); }
+    #biliup-log-design .bl-task { padding: 16px 0; border-top: 1px solid var(--bl-line); }
+    #biliup-log-design .bl-task:first-child { border-top: 0; padding-top: 0; }
+    #biliup-log-design .bl-task-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 7px; }
+    #biliup-log-design .bl-track { margin: 11px 0; height: 6px; background: var(--bl-line); border-radius: 3px; overflow: hidden; }
+    #biliup-log-design .bl-fill { height: 100%; width: 62%; background: var(--bl-blue); }
+    #biliup-log-design .bl-task-foot { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; color: var(--bl-muted); }
+    #biliup-log-design .bl-ok { color: var(--bl-green); }
+    @media (max-width: 520px) {
+      #biliup-log-design .bl-header { padding: 14px 12px 0; }
+      #biliup-log-design .bl-tabs { padding-left: 12px; padding-right: 12px; }
+      #biliup-log-design .bl-content { padding: 12px; }
+      #biliup-log-design .bl-controls { grid-template-columns: minmax(0, 1fr); }
+      #biliup-log-design .bl-event summary { grid-template-columns: minmax(0, 1fr) 16px; gap: 7px; }
+      #biliup-log-design .bl-time { grid-column: 1 / -1; flex-direction: row; gap: 10px; }
+      #biliup-log-design .bl-detail dl { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+      #biliup-log-design .bl-detail dd { margin-bottom: 7px; }
+    }
+    @media (pointer: coarse) {
+      #biliup-log-design button { min-height: 44px; }
+      #biliup-log-design input, #biliup-log-design select { min-height: 44px; font-size: 16px; }
+    }
+  </style>
+  <header class="bl-header">
+    <div class="bl-heading"><span class="bl-brand">biliup</span><span class="bl-muted" aria-hidden="true">/</span><h2>日志与事件</h2></div>
+    <span class="bl-muted">交互草图 · 演示数据</span>
+  </header>
+  <nav class="bl-tabs" aria-label="日志页面视图" role="tablist">
+    <button type="button" class="bl-tab" id="bl-tab-events" role="tab" aria-selected="true" aria-controls="bl-events">事件日志</button>
+    <button type="button" class="bl-tab" id="bl-tab-progress" role="tab" aria-selected="false" aria-controls="bl-progress">运行进度</button>
+  </nav>
+  <section class="bl-content" id="bl-events" role="tabpanel" aria-labelledby="bl-tab-events">
+    <div class="bl-session" id="bl-session" hidden><span id="bl-session-label"></span><button type="button" class="bl-link" id="bl-back">返回原筛选</button></div>
+    <div class="bl-levels" role="group" aria-label="按严重程度筛选">
+      <button type="button" class="bl-level" data-filter-level="ALL" aria-pressed="true">全部<span class="bl-count" data-count="ALL"></span></button>
+      <button type="button" class="bl-level" data-filter-level="INFO" aria-pressed="false"><span class="bl-info">ⓘ 信息</span><span class="bl-count" data-count="INFO"></span></button>
+      <button type="button" class="bl-level" data-filter-level="WARN" aria-pressed="false"><span class="bl-warn">△ 警告</span><span class="bl-count" data-count="WARN"></span></button>
+      <button type="button" class="bl-level" data-filter-level="ERROR" aria-pressed="false"><span class="bl-error">⊗ 错误</span><span class="bl-count" data-count="ERROR"></span></button>
+    </div>
+    <div class="bl-controls">
+      <label>业务类型<select id="bl-category"><option value="ALL">全部类型</option><option>录制</option><option>上传</option><option>投稿</option><option>预处理</option></select></label>
+      <label>关联主播<select id="bl-streamer"><option value="ALL">全部主播</option><option>演示主播 A</option><option>演示主播 B</option><option>演示主播 C</option></select></label>
+      <label>时间范围<select id="bl-range"><option value="ALL">全部示例时段</option><option value="RECENT">14:30 之后</option><option value="EARLIER">14:30 及之前</option></select></label>
+    </div>
+    <label class="bl-search"><span>搜索事件</span><input id="bl-search" type="search" placeholder="摘要、事件名、文件或场次 ID" autocomplete="off"></label>
+    <div class="bl-meta"><span id="bl-result" aria-live="polite"></span><span>最新在前 · 时间精确到毫秒</span></div>
+    <div id="bl-list"></div>
+    <footer class="bl-footer"><span id="bl-shown"></span><button type="button" class="bl-button" id="bl-more">加载更早记录</button></footer>
+  </section>
+  <section class="bl-content" id="bl-progress" role="tabpanel" aria-labelledby="bl-tab-progress" hidden>
+    <article class="bl-task">
+      <div class="bl-task-head"><h3>演示主播 B · 第 3 段</h3><span class="bl-info">↑ 上传中 · 62%</span></div>
+      <p class="bl-muted">预处理完成 → 正在传输</p>
+      <div class="bl-track" role="progressbar" aria-label="演示主播 B 上传进度" aria-valuenow="62" aria-valuemin="0" aria-valuemax="100"><div class="bl-fill"></div></div>
+      <div class="bl-task-foot"><span>620 MiB / 1,000 MiB · 4.2 MiB/s</span><button class="bl-link" type="button" data-task-session="demo-recording-B">查看本场事件 →</button></div>
+    </article>
+    <article class="bl-task">
+      <div class="bl-task-head"><h3>演示主播 A · 第 3 段</h3><span class="bl-error">⊗ 上传失败</span></div>
+      <p class="bl-muted">已用尽自动重试次数 · 等待人工恢复</p>
+      <button class="bl-link" type="button" data-task-session="demo-recording-A">查看失败原因与前后事件 →</button>
+    </article>
+    <article class="bl-task">
+      <div class="bl-task-head"><h3>演示主播 C · 本场投稿</h3><span class="bl-ok">✓ 已提交</span></div>
+      <p class="bl-muted">所有分段上传完成 · 稿件等待平台审核</p>
+      <button class="bl-link" type="button" data-task-session="demo-recording-C">查看本场事件 →</button>
+    </article>
+  </section>
+  <script>
+    (function initializeBiliupLogPreview() {
+      const root = document.getElementById('biliup-log-design');
+      if (!root || root.dataset.biliupLogInitialized === 'true') return;
+      const findLogElement = selector => root.querySelector(selector);
+      const findLogElements = selector => Array.from(root.querySelectorAll(selector));
+      const events = [
+        {id: 8, time: '14:32:08.426', level: 'ERROR', category: '上传', streamer: '演示主播 A', session: 'demo-recording-A', file: 'segment-03.flv', name: 'upload.attempt_failed', message: '分段上传失败，已用尽自动重试次数', outcome: '本次上传失败；当前等待人工恢复', reason: 'retry_exhausted', facts: 'attempt=3 · uploaded_bytes=283115520'},
+        {id: 7, time: '14:31:26.103', level: 'WARN', category: '录制', streamer: '演示主播 B', session: 'demo-recording-B', file: 'segment-04.flv', name: 'recording.dts_backward', message: '检测到时间戳倒退，已标记待上传前检查', outcome: '录制继续；尚未执行时间戳修复', reason: 'non_monotonic_dts', facts: 'previous_ms=7200 · current_ms=2400'},
+        {id: 6, time: '14:30:42.812', level: 'INFO', category: '投稿', streamer: '演示主播 C', session: 'demo-recording-C', file: '本场全部分段', name: 'submission.completed', message: '本场投稿提交成功，等待平台审核', outcome: '提交完成；审核结果尚未产生', reason: 'remote_acknowledged', facts: 'submitted_parts=4'},
+        {id: 5, time: '14:30:10.061', level: 'INFO', category: '预处理', streamer: '演示主播 A', session: 'demo-recording-A', file: 'segment-03.flv', name: 'processing.normalization_completed', message: '音频标准化完成，准备上传第 3 段', outcome: '预处理完成', reason: 'validation_passed', facts: 'duration_ms=48200'},
+        {id: 4, time: '14:29:12.520', level: 'INFO', category: '上传', streamer: '演示主播 A', session: 'demo-recording-A', file: 'segment-02.flv', name: 'upload.completed', message: '第 2 段重试上传成功', outcome: '已恢复；此前超时仅影响上一尝试', reason: 'retry_succeeded', facts: 'attempt=2 · duration_ms=52100'},
+        {id: 3, time: '14:29:08.205', level: 'WARN', category: '录制', streamer: '演示主播 B', session: 'demo-recording-B', file: 'segment-03.flv', name: 'recording.connection_recovered', message: '连接意外中断，已重连并恢复录制', outcome: '本次连接异常已恢复', reason: 'upstream_disconnect', facts: 'reconnect_elapsed_ms=1240'},
+        {id: 2, time: '14:28:10.917', level: 'ERROR', category: '上传', streamer: '演示主播 A', session: 'demo-recording-A', file: 'segment-02.flv', name: 'upload.attempt_failed', message: '第 2 段上传请求超时，本次尝试失败', outcome: '本次尝试失败；后续已重试成功', reason: 'request_timeout', facts: 'attempt=1 · elapsed_ms=60000'},
+        {id: 1, time: '14:22:00.032', level: 'INFO', category: '录制', streamer: '演示主播 B', session: 'demo-recording-B', file: 'segment-01.flv', name: 'recording.started', message: '检测到开播，开始录制', outcome: '录制中', reason: 'live_detected', facts: 'protocol=flv'}
+      ];
+      const labels = {INFO: 'ⓘ 信息', WARN: '△ 警告', ERROR: '⊗ 错误'};
+      const classes = {INFO: 'bl-info', WARN: 'bl-warn', ERROR: 'bl-error'};
+      let level = 'ALL';
+      let limit = 5;
+      let session = null;
+      let previous = null;
+      const escape = value => String(value).replace(/[&<>"']/g, character => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[character]));
+      function selected() {
+        return {level, category: findLogElement('#bl-category').value, streamer: findLogElement('#bl-streamer').value, range: findLogElement('#bl-range').value, query: findLogElement('#bl-search').value, limit};
+      }
+      function baseEvents() {
+        const state = selected();
+        const query = state.query.trim().toLowerCase();
+        return events.filter(event => (!session || event.session === session)
+          && (state.category === 'ALL' || event.category === state.category)
+          && (state.streamer === 'ALL' || event.streamer === state.streamer)
+          && (state.range === 'ALL' || (state.range === 'RECENT' ? event.time > '14:30:00.000' : event.time <= '14:30:00.000'))
+          && (!query || [event.message, event.name, event.file, event.session, event.reason].join(' ').toLowerCase().includes(query)));
+      }
+      function render() {
+        const base = baseEvents();
+        const filtered = base.filter(event => level === 'ALL' || event.level === level);
+        findLogElements('[data-count]').forEach(node => { node.textContent = node.dataset.count === 'ALL' ? base.length : base.filter(event => event.level === node.dataset.count).length; });
+        findLogElements('[data-filter-level]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.filterLevel === level)));
+        findLogElement('#bl-session').hidden = !session;
+        findLogElement('#bl-session-label').textContent = session ? '场次范围 · ' + events.find(event => event.session === session).streamer : '';
+        findLogElement('#bl-result').textContent = '符合条件 ' + filtered.length + ' 条';
+        findLogElement('#bl-shown').textContent = '已显示 ' + Math.min(limit, filtered.length) + ' / ' + filtered.length + ' 条';
+        findLogElement('#bl-more').hidden = limit >= filtered.length;
+        findLogElement('#bl-list').innerHTML = filtered.length ? filtered.slice(0, limit).map(event => {
+          return '<details class="bl-event" data-level="' + event.level + '"><summary>'
+            + '<div class="bl-time"><span>' + event.time.slice(0, 8) + '<span class="bl-ms">' + event.time.slice(8) + '</span></span>'
+            + '<span class="bl-badge ' + classes[event.level] + '">' + labels[event.level] + '</span></div>'
+            + '<div><div class="bl-message">' + escape(event.message) + '</div><div class="bl-assoc"><span class="bl-category">' + event.category + '</span><span>' + event.streamer + '</span><span>' + event.file + '</span></div></div>'
+            + '<span class="bl-chevron" aria-hidden="true">›</span></summary>'
+            + '<div class="bl-detail"><dl><dt>事件结果</dt><dd>' + escape(event.outcome) + '</dd><dt>事件名称</dt><dd><code>' + event.name + '</code></dd><dt>录制场次</dt><dd><code>' + event.session + '</code></dd><dt>原因代码</dt><dd><code>' + event.reason + '</code></dd><dt>技术字段</dt><dd><code>' + escape(event.facts) + '</code></dd></dl>'
+            + '<button type="button" class="bl-link" data-session="' + event.session + '">查看本场完整事件 →</button></div></details>';
+        }).join('') : '<div class="bl-empty">没有符合条件的事件</div>';
+        findLogElements('[data-session]').forEach(button => button.addEventListener('click', () => openSession(button.dataset.session)));
+      }
+      function showTab(name) {
+        findLogElement('#bl-events').hidden = name !== 'events';
+        findLogElement('#bl-progress').hidden = name !== 'progress';
+        findLogElement('#bl-tab-events').setAttribute('aria-selected', String(name === 'events'));
+        findLogElement('#bl-tab-progress').setAttribute('aria-selected', String(name === 'progress'));
+      }
+      function openSession(id) {
+        if (!session) previous = selected();
+        session = id;
+        level = 'ALL';
+        limit = events.length;
+        findLogElement('#bl-category').value = 'ALL';
+        findLogElement('#bl-streamer').value = 'ALL';
+        findLogElement('#bl-range').value = 'ALL';
+        findLogElement('#bl-search').value = '';
+        showTab('events');
+        render();
+      }
+      findLogElement('#bl-tab-events').addEventListener('click', () => showTab('events'));
+      findLogElement('#bl-tab-progress').addEventListener('click', () => showTab('progress'));
+      [findLogElement('#bl-tab-events'), findLogElement('#bl-tab-progress')].forEach((button, index, tabs) => {
+        button.addEventListener('keydown', event => {
+          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          const next = event.key === 'Home' ? 0 : event.key === 'End' ? 1 : 1 - index;
+          showTab(next === 0 ? 'events' : 'progress');
+          tabs[next].focus();
+        });
+      });
+      findLogElements('[data-filter-level]').forEach(button => button.addEventListener('click', () => { level = button.dataset.filterLevel; limit = 5; render(); }));
+      ['#bl-category', '#bl-streamer', '#bl-range'].forEach(selector => findLogElement(selector).addEventListener('change', () => { limit = 5; render(); }));
+      findLogElement('#bl-search').addEventListener('input', () => { limit = 5; render(); });
+      findLogElement('#bl-more').addEventListener('click', () => { limit += 5; render(); });
+      findLogElements('[data-task-session]').forEach(button => button.addEventListener('click', () => openSession(button.dataset.taskSession)));
+      findLogElement('#bl-back').addEventListener('click', () => {
+        session = null;
+        if (previous) {
+          level = previous.level;
+          limit = previous.limit;
+          findLogElement('#bl-category').value = previous.category;
+          findLogElement('#bl-streamer').value = previous.streamer;
+          findLogElement('#bl-range').value = previous.range;
+          findLogElement('#bl-search').value = previous.query;
+        }
+        previous = null;
+        render();
+      });
+      render();
+      root.dataset.biliupLogInitialized = 'true';
+    })();
+  </script>
+</div>
