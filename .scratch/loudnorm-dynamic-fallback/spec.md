@@ -1,6 +1,6 @@
 # Spec：loudnorm 静默退回动态模式，响度打不到目标
 
-Status: ready-for-human（机制已实测确认，策略待定）
+Status: ready-for-human（01 已实现并提 PR；02 待真实分布，`blocked`）
 来源：[`dplei/biliup#19`](https://github.com/dplei/biliup/issues/19)
 （由 [`normalization-duration-metric`](../../.archive/normalization-duration-metric/verification.md)
 的 dev 环境验收顺带观察到，非该 effort 引入）
@@ -48,7 +48,6 @@ loudnorm=I=<target>:LRA=11:TP=-1.5:measured_I=..:measured_LRA=..:measured_TP=..
 
 ```
 测量遍 JSON：input_i=-30.47  input_tp=-16.32  input_lra=17.30
-             normalization_type="dynamic"        ← 测量遍就已经知道了
 
 转码遍 summary（传了 linear=true）：
   Normalization Type:   Dynamic                   ← 被推翻
@@ -69,14 +68,32 @@ loudnorm 退回动态是**正确的保守选择**。
 **真正的缺陷是它是静默的**——与 [#16](https://github.com/dplei/biliup/issues/16) 同一类：
 一个降级路径没有任何可观测输出，于是没人知道功能有没有真的生效。
 
-## 3. 关键事实：这个信号我们已经拿到了，只是扔掉了
+## 3. 信号在转码遍，不在测量遍——实现时纠正过一次
 
-测量遍的 JSON 里**本来就有 `normalization_type`**（见 2.1）。
-`parse_loudnorm_measurement` 解析了同一段 JSON，但 `LoudnessMeasurement` 只留了
-`input_i / input_lra / input_tp / input_thresh / target_offset` 五个字段，
-**`normalization_type` 被丢掉了**。
+初稿写的是「测量遍的 JSON 里本来就有 `normalization_type`，转码前就能预判」。
+**这是错的**，实现 ticket 01 时被实测推翻：
 
-也就是说「这一段会不会打到目标」在**转码开始之前**就能知道，零额外成本。
+```
+peaky  素材 测量遍 → "dynamic"
+varied 素材 测量遍 → "dynamic"        ← 余量充足，转码遍其实走的线性
+```
+
+**测量遍永远自报 `dynamic`**——它没有 `measured_*` 输入，本来就做不了线性。
+拿它当预测器只会得到恒为真的假信号。
+
+同时发现 `af_loudnorm` 的线性判据**不止真峰一条**：`measured_LRA` 为 0 时也会退回动态。
+纯正弦素材 LRA 恰好是 0，最初的「安静素材」用例因此误判成没余量。所以**自己复刻这个
+判据是不可靠的**，不要在转码前预判。
+
+真正的信号在**转码遍**的 summary 里：
+
+```
+Output Integrated:   -23.8 LUFS
+Normalization Type:   Dynamic
+```
+
+而 `SystemAudioFfmpeg::transcode` 本来就用 `.output()` 捕获了 stderr、**成功时直接丢掉**。
+留下来是零成本，且是 ffmpeg 自己的判断而不是我们的推算。
 → [`issues/01`](./issues/01-surface-normalization-type.md)
 
 ## 4. 待定的策略
