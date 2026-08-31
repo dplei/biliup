@@ -1,9 +1,9 @@
 # 08 — 独立 SQLite 写入、查询仓储与故障隔离
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 07
 Phase: P1
-Implementation: not-started
+Implementation: complete
 
 来源：[存储设计](../spec.md)、[实施计划](../rollout-plan.md)。
 
@@ -37,3 +37,7 @@ PostgreSQL、云汇聚和无限量 stderr 归档不是验收条件。
 ## Comments
 
 可分为 schema/写入、查询/附件、故障/维护三次小交付，但三部分都通过才进入旁路试点。
+
+独立 migrations、幂等批写、提交后高水位、只读仓储/附件、保留/容量/备份及故障隔离均已实现。
+忙锁、只读、SQLITE_FULL、溢出、强杀、长读/WAL与受控资源预算通过，见 [P1回执](../receipts/P1.md)。
+缺口计数是当前运行内存状态，重启仅保留未正常关闭提示，不承诺普通日志零丢失。

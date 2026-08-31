@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 09
 Phase: P2
-Implementation: not-started
+Implementation: complete
 
 来源：[对比流程](../reconciliation.md)。本任务无需等待新网页完成。
 
@@ -37,3 +37,7 @@ Implementation: not-started
 ## Comments
 
 稳定来源引用与完整性状态是 Agent 对比能否可信的前提。
+
+本阶段验收结论见 [P2 回执](../receipts/P2.md)：6 个证据包（5 入口 + dev server 真实服务）
+completeness 均 complete、确定性校验 passed；轮转、迟到补包、保留裁剪、异常关闭窗口、附件缺失、
+预算超限均能报不完整；凭据/注入文本不泄漏且批内别名一致；导出期间源文件与事件库字节不变。

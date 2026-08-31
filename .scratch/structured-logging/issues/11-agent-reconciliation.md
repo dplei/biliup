@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 10
 Phase: P2，之后贯穿 P3–P5
-Implementation: not-started
+Implementation: complete
 
 来源：[对比流程](../reconciliation.md)、[报告模板](../templates/reconciliation-report.md)。
 
@@ -38,3 +38,9 @@ Implementation: not-started
 ## Comments
 
 独立上下文可以顺序执行；这份任务不是要求当前立即启动多个 Agent。
+
+当前状态见 [P2 回执](../receipts/P2.md)：三份提示词与输入契约、视图隔离（互不含对方来源与
+匿名映射）、未引用/跨源引用报告被拒、12 项合成故障回归、桥接传输核对均已实跑。真实入口上
+新增一条比较边界：重复旧行与脱敏行无法按文本判定，工具判 insufficient 而非 passed。
+**未完成**：两份互不可见的独立还原报告与 `cross` 交叉复核尚未执行，因此本任务验收记 partial，
+P2 阶段判 awaiting-validation。所有输出仍固定 `native_coverage=not-started`。

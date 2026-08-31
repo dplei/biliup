@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 08
 Phase: P2
-Implementation: not-started
+Implementation: complete
 
 来源：[并行边界](../rollout-plan.md)。主要入口见 `stream-gears/src/server.rs`、
 `biliup-cli/src/main.rs`、`stream-gears/src/lib.rs`，具体受支持范围以 06 清单为准。
@@ -36,3 +36,8 @@ Implementation: not-started
 ## Comments
 
 桥接只是建立第二条可观测链路，后续必须逐条补原生语义。
+
+本阶段验收结论见 [P2 回执](../receipts/P2.md)：开关默认关闭、启动时读取、不热重装 subscriber；
+5 个支持入口 × 关闭/开启/新库不可用矩阵全部通过，本地 dev server 真实 HTTP 与旧日志页演练通过；
+新库失败与关闭态下旧文件字节与开启态一致，回退无需强杀任务。桥接统一标 `legacy_bridge`，
+不冒称原生覆盖。Rust CLI / Rust server 没有持久旧文件 sink，受控演练显式使用 wrapper stdout。

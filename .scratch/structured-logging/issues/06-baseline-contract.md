@@ -3,7 +3,7 @@
 Status: ready-for-agent
 Blocked by: —
 Phase: P0
-Implementation: not-started
+Implementation: complete
 
 来源：[实施计划](../rollout-plan.md)。本任务是建议的首个实施任务，不表示本轮已执行。
 
@@ -38,3 +38,5 @@ Implementation: not-started
 ## Comments
 
 所有后续任务引用同一版本的契约，避免采集、页面和对比工具各自解释「一条事件」。
+
+P0 契约/覆盖/预算已冻结，四组受控旧输出基线完成，见 [P0 回执](../receipts/P0.md)。

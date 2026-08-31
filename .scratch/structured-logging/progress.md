@@ -3,8 +3,8 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-当前仅完成设计、任务拆分和执行说明，**P0–P6 的实际实施/验收均未开始**。
-不要把本文件初始化、设计草图可点击或 ticket 已存在算作阶段完成。
+P0–P1 已完成并通过本地受控验收，代码在当前工作区未提交。P2 的 09–11 实现与确定性验证完成，
+等两份独立还原报告与交叉复核后才判通过；P3–P6 未开始，旧日志/页面保留。
 
 ## 状态约定
 
@@ -27,9 +27,9 @@
 
 | 阶段 | 任务 | 交付 | 验收 | 观察 | 阶段状态 | 执行回执 |
 | --- | --- | --- | --- | --- | --- | --- |
-| P0 | 06 | not-started | pending | not-required | not-started | — |
-| P1 | 07、08 | not-started | pending | not-required | not-started | — |
-| P2 | 09、10、11 | not-started | pending | not-required | not-started | — |
+| P0 | 06 | complete | passed | not-required | passed | [P0](receipts/P0.md) |
+| P1 | 07、08 | complete | passed | not-required | passed | [P1](receipts/P1.md) |
+| P2 | 09、10、11 | complete | partial | not-required | awaiting-validation | [P2](receipts/P2.md) |
 | P3 | 12、13、14、15、16 | not-started | pending | pending | not-started | — |
 | P4 | 17 | not-started | pending | pending | not-started | — |
 | P5 | 18 | not-started | pending | pending | not-started | — |
@@ -45,12 +45,12 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 | 任务 | 所属阶段 | 交付 | 验收 | 有效证据 / 待完成项 |
 | --- | --- | --- | --- | --- |
-| [06 基线与契约](issues/06-baseline-contract.md) | P0 | not-started | pending | 待冻结契约、覆盖/预算并实际测量 |
-| [07 通用事件组件](issues/07-independent-core.md) | P1 | not-started | pending | 待实现 |
-| [08 独立 SQLite](issues/08-sqlite-writer.md) | P1 | not-started | pending | 待实现 |
-| [09 入口旁路](issues/09-shadow-integration.md) | P2 | not-started | pending | 待实现 |
-| [10 证据导出](issues/10-evidence-export.md) | P2 | not-started | pending | 待实现 |
-| [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | not-started | pending | 待实现及受控演练 |
+| [06 基线与契约](issues/06-baseline-contract.md) | P0 | complete | passed | [契约](contract-v1.md)、[基线预算](baseline-budget.md)、[回执](receipts/P0.md) |
+| [07 通用事件组件](issues/07-independent-core.md) | P1 | complete | passed | [P1](receipts/P1.md)：快照/脱敏/过滤/队列/故障/并发测试 |
+| [08 独立 SQLite](issues/08-sqlite-writer.md) | P1 | complete | passed | [P1](receipts/P1.md)：幂等/只读/附件/维护/备份/强杀与量化负载 |
+| [09 入口旁路](issues/09-shadow-integration.md) | P2 | complete | passed | [P2](receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
+| [10 证据导出](issues/10-evidence-export.md) | P2 | complete | passed | [P2](receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
+| [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | partial | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对已跑；独立还原 × 2 与交叉复核待执行 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | not-started | pending | 待实现 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | not-started | pending | 待实现 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
@@ -62,13 +62,18 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近已验收阶段：无。
-- 当前实施阶段/任务：无；尚未开始编码或基线测量。
-- 本轮已做：设计与拆分、阶段提示词和空进度表；这些不计入 P0 验收。
-- 源码交付状态：没有日志重构实现；设计文档是否已提交以新 session 的 `git status` 为准。
-- 真实运行/观察记录：无。
-- 已知待办：从 06 核验当前入口、冻结契约/预算并测量，不依赖聊天记忆。
-- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 实现 P0`。
+- 最近已验收阶段：P1；P2 实现完成、确定性验证通过，判 `awaiting-validation`。
+- 当前实施阶段/任务：P2 的 11 仅剩独立还原与交叉复核；09、10 已完成验收。
+- 本轮已做：复核 P2 实现并复跑全部测试；补跑 5 个入口证据包的桥接传输核对；新增本地
+  dev server 三态（开启/关闭/新库不可用）真实服务演练及其证据包；回写回执与本表。
+- 源码交付状态：基于 3fa218f，当前 refactor/issue2-260831-153007 工作区未提交；含新 crate
+  与 `shadow.rs`、三处入口初始化改造、`scripts/structured_logging/`、effort 文档与代码索引。
+- 运行/观察记录：受控入口矩阵、本地 dev server 真实 HTTP/WebSocket 演练、20,000 条双路
+  负载、合成故障回归；没有真实录制/上传/投稿，没有生产双写，没有长观察。
+- 已知边界：原生业务覆盖 `not-started`，桥接不计任何覆盖项；纯文本桥接在重复旧行与脱敏行
+  上不可判定（工具判 insufficient）；Rust CLI/Rust server 无持久旧文件 sink，受控演练显式
+  使用 wrapper stdout；仅 macOS 本机验证，Windows 未验证。
+- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 继续 P2`。
 
 ## 每次回写的检查清单
 

@@ -1,9 +1,9 @@
 # 07 — 建立不依赖业务的通用事件组件
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 06
 Phase: P1
-Implementation: not-started
+Implementation: complete
 
 来源：[实施计划](../rollout-plan.md)、[事件模型](../spec.md)。
 
@@ -37,3 +37,6 @@ Implementation: not-started
 ## Comments
 
 这是独立底座的第一块，可单独审阅和交付。
+
+已实现独立 crate 的事件/显式Context、不可变span快照、有界脱敏、独立过滤和队列健康。
+本地合成/并发/故障与release负载通过，见 [P1回执](../receipts/P1.md)；尚未接任何应用入口。
