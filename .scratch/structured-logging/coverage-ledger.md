@@ -2,8 +2,9 @@
 
 Status: needs-triage
 来源：[实施计划](rollout-plan.md)、[对比流程](reconciliation.md)。
-P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12 起 **C02–C05 的录制域**已有
-原生事件并通过受控演练（见下方变更记录）；**C01、C06–C14 仍未接入**，只有桥接文本，
+P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12–13 起 **C02–C05 的录制域**与
+**C06–C10 的后处理域**已有原生事件；录制域与后处理域的**决定链**通过受控演练，后处理域的
+**远端执行结果尚未实跑**（见下方变更记录）。**C01、C11–C13 仍未接入**，只有桥接文本，
 不能把 P1 合成载体验证或桥接采集当作业务覆盖。
 
 ## 关键事实
@@ -117,3 +118,18 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   既不入库也不计 rejected；格式非法的 ID 仍计 rejected。已加双向回归。
 - 导出目录形态 / 导出器 / evidence-v1 / 12 / recording-native-v1：目录改为「多种合法形态取其一」，
   `recording.dts_backward` 的 1:1 与汇总形态都合法，半个形态仍判缺字段；已加回归。
+- C06–C10 / 服务端后处理链 / v1 / 13 / upload-native-v1：**原生事件已接入，验收 partial**。
+  `UploadIdentity` 从登记结果或 lifecycle 行构造，分段身份不被 attempt 覆盖，失败事件不被
+  后来的成功改写。受控演练（本地 sqlite、无账号、无网络）跑通登记 → 投稿判定
+  （no_intent / pending_segments 含 pending_count）→ 补传资格（eligible / source_missing），
+  证据包 complete、校验 passed、5 条预期事实全部 confirmed，见 [P3](receipts/P3.md)。
+  **未解决差异**：预处理执行结果、上传排队/线路/开始/失败/完成、投稿 started/completed
+  只有编译与单元证据，**没有真实远端运行样本**（需要账号与实际投稿，应在 dev 环境实跑）；
+  页面/CLI 的整场 `upload()` 入口尚未接入，归任务 14。C08 按设计不追加普通事件。
+- 原因词表扩展 / 预处理与补传 / contract-v1 / 13 / upload-native-v1：C06 追加
+  `measure_failed`、`invalid_measurement`、`transcode_failed`、`low_disk_aborted`、
+  `source_missing`、`normalized`；C09 追加 `already_succeeded`、`legacy_finalized_edit`、
+  `invalid_media`、`conflict`、`manual_recovery`、`retry_due`；C07 的失败原因直接复用既有
+  `UploadFailureKind` 与 watchdog 三类超时代码；C10 追加 `claimed_elsewhere`、`finalized`、
+  `discarded_empty`、`retry_backoff`、`writeback_failed`、`submitted`、`precondition_failed`。
+  全部由映射函数集中维护并有冻结性回归用例，不是自由错误文本。
