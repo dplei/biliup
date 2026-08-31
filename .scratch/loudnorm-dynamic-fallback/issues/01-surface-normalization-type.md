@@ -1,6 +1,6 @@
 # 01 — 把实际的标准化模式与产物响度打进日志
 
-Status: resolved（改从转码遍的 summary 读，见「落地更正」）
+Status: resolved（改从转码遍的 summary 读，见「落地更正」；随 [#20](https://github.com/dplei/biliup/pull/20) 合入 `dev`）
 Blocked by: —
 
 ## 背景

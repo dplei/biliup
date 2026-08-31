@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/main.rs` | Rust CLI 二进制入口：初始化日志，解析命令并分派登录、上传、下载、Web 服务和封面预览等子命令。 | `main` |
 | `crates/biliup-cli/src/lib.rs` | Web 服务启动与主播配置导入的编排层：建立 SQLite 连接、组装服务、恢复主播任务并启动 Axum。 | `run`、`import_config_streamers`、`import_database_streamers` |
-| `crates/stream-gears/src/lib.rs` | Rust/Python 的 PyO3 边界，向 Python 暴露下载、上传、登录和 CLI 主循环。 | `stream_gears`、`main_loop`、`download_with_hook`、`upload` |
+| `crates/stream-gears/src/lib.rs` | Rust/Python 的 PyO3 边界，向 Python 暴露下载、上传、登录和 CLI 主循环；下载回调与上传函数各自安装局部控制台/文件日志订阅器。 | `stream_gears`、`main_loop`、`download_with_callback`、`download_with_hook`、`upload` |
 | `crates/stream-gears/src/server.rs` | Python wheel 的实际 CLI 分派与日志初始化入口，同时向 Python 暴露进程内共享配置。 | `_main`、`config_bindings`、`ConfigState`、`CONFIG` |
 | `biliup/__main__.py` | `python -m biliup` 的极薄入口，把执行权交给扩展模块的 `main_loop`。 | `main` |
 
@@ -41,6 +41,15 @@
 | `app/(app)/missing/page.tsx` | 缺失补传与待投稿控制页：独立轮询待投稿会话和分段列表，展示后端给出的投稿五态、attempt 阶段/进度/线路健康/完整性与线路历史，并触发会话恢复、空会话逻辑终结、补传、换线重投、停止、删除与本场补扫。 | `MissingRecovery`、`AttemptHistoryPanel` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |
 
+## 日志与存储基础设施
+
+| 文件 | 主要作用 | 关键符号 |
+| --- | --- | --- |
+| `crates/biliup-cli/src/server/api/ws.rs` | 基于文件的实时日志 WebSocket：白名单逻辑文件名映射到最新滚动文件，初连取末尾记录，再轮询新增内容并发送保活。 | `ws_logs`、`websocket_logs`、`resolve_latest_log`、`send_last_lines` |
+| `app/(app)/logviewer/page.tsx` | 按日志文件切换 tab 的实时日志页：通过 WebSocket 追加文本、管理滚动/连接状态，并提供静态文件下载入口。 | `LogViewer`、`LogContent` |
+| `app/ui/plugins/developer.tsx` | 开发者日志设置表单，编辑旧 `LOGGING` 配置及后端动态日志过滤使用的 `loggers_level`。 | `Developer` |
+| `crates/biliup-cli/src/server/infrastructure/connection_pool.rs` | 创建固定 SQLite 类型的业务连接池（上限 2）并执行业务 migrations，另提供测试用迁移后临时库。 | `ConnectionPool`、`ConnectionManager::new_pool`、`test_support::migrated_pool` |
+
 ## 录制调度
 
 | 文件 | 主要作用 | 关键符号 |
@@ -51,7 +60,7 @@
 | `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` | 服务端拉流的具体执行器：按下载配置建 HTTP 客户端与 `Connection`，按后缀分流 FLV/HLS，读帧头失败即分类为可重试的传输错误，并给每次尝试打上 `attempt_id`/`stream_host` 便于串联断连诊断。 | `StreamGears`、`start_download`、`classify_download_error`、`classify_reqwest_error` |
 | `crates/biliup-cli/src/server/common/util.rs` | 录像分段落盘后的有效性判据：容器探测、`HeaderOnly`（FLV ≤13 字节）与小于阈值的可恢复短分段分类，决定丢弃、入队合并还是登记上传。 | `FileValidator`、`MediaValidation`、`InvalidMediaReason`、`probe_flv` |
 | `crates/biliup-cli/src/server/core/download_manager.rs` | 单平台下载编排的持有者：建 `Monitor` 与上传 Actor 池，并把房间增删、暂停入队/出队、主动检查转发给监控 Actor。 | `DownloadManager`、`add_room`、`make_waker`、`check_room_now` |
-| `crates/biliup-cli/src/server/infrastructure/context.rs` | 持有单房间 Worker 的下载/上传运行状态与当前录制画质，并在下载状态离开 Working 时安全停止对应任务。 | `Worker`、`WorkerStatus`、`Stage`、`Worker::change_status` |
+| `crates/biliup-cli/src/server/infrastructure/context.rs` | 持有单房间 Worker 的运行状态、画质与活动录制快照，并以 `Context` 传递本场 `streamer_info` 身份和业务依赖。 | `Context`、`Worker`、`ActiveRecordingSnapshot`、`WorkerStatus`、`Stage` |
 | `crates/biliup-cli/src/server/infrastructure/models/live_streamer.rs` | 定义持久化直播间配置及其新增载荷；该模型的全字段更新语义要求独立运行状态不要混入主播配置。 | `LiveStreamer`、`InsertLiveStreamer` |
 
 ## Web 服务边界
@@ -78,7 +87,7 @@
 | `crates/biliup-cli/src/server/common/ffmpeg_scan.rs` | 全片扫描类 ffmpeg 调用的 stderr 流式消费：边读边匹配时间戳异常模式，只保留尾部窗口，避免把几百 MB 日志收进内存。 | `run_scanning_stderr`、`StderrScan`、`stderr_indicates_anomaly` |
 | `crates/biliup-cli/src/server/common/disk_space.rs` | 文件系统可用空间探测（unix `statvfs`，取非特权可用的 `f_bavail`）：响度标准化的准入与硬水位共用，探测不出一律返回 `None` 让调用方放行。 | `available_bytes` |
 | `crates/biliup-cli/src/server/common/process_priority.rs` | 给上传前的 ffmpeg 预处理子进程设置后台 nice 与 IO 优先级，使其让路给网页请求；录制与用户 hook 不降级。 | `background`、`background_std` |
-| `crates/biliup-cli/src/server/router.rs` | 声明全部 v1 HTTP 路由与静态回退，是查「某个接口存不存在、挂在哪个 handler」的唯一入口。 | `router` |
+| `crates/biliup-cli/src/server/router.rs` | 组装主要 v1 业务 HTTP 路由和静态文件服务；认证与日志 WebSocket 另由应用启动层挂载。 | `router`、`static_file_router` |
 | `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失分段列表、独立待投稿会话五态、补传/重投/停止/按会话恢复、严格空会话逻辑终结、attempt 历史与上传健康查询。分段补传端点只 claim、不等上传；按会话恢复持久化人工投稿授权，并在无分段工作时异步唤醒统一投稿协调器。 | `get_missing_uploads`、`get_pending_submit_sessions`、`recover_missing_upload`、`stop_missing_upload`、`recover_session_uploads`、`discard_empty_upload_session`、`get_missing_upload_attempts` |
 | `crates/biliup-cli/src/server/common/missing_segment.rs` | 缺失分段的补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与重试延迟。⚠️ `upload_missing_segment` 是**补救账本**而非全量分段账本——走正常上传路径的会话在表中没有任何行，「无行」是健康状态；查询前先读 [`scripts/README.md`](./scripts/README.md#consistency-auditsh)。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment` |
 
@@ -103,7 +112,11 @@
 - `biliup/__main__.py` → `crates/stream-gears/src/lib.rs`（`main_loop`）：Python 模块入口进入 Rust 扩展的 CLI 主循环。
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/server.rs`（`server::_main`）：PyO3 主循环规范化参数后委派实际 CLI 执行。
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-cli/src/lib.rs`（`run`）：`server` 子命令进入 Web 服务启动编排。
+- `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/infrastructure/connection_pool.rs`（`ConnectionManager::new_pool`）：服务启动时创建业务 SQLite 连接池并运行迁移。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
+- `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/api/ws.rs`（`ws_logs`）：应用启动层单独挂载日志 WebSocket；检查认证边界时不能只读业务 router。
+- `app/(app)/logviewer/page.tsx` → `crates/biliup-cli/src/server/api/ws.rs`（`/v1/ws/logs`）：文件 tab 以 `file` 参数订阅文本流，前端逐条追加显示。
+- `app/ui/plugins/developer.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`loggers_level`、配置保存）：表单值保存后通过 reload handle 修改 tracing 过滤器。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_line_selection.rs`（`decide_upload_line`）：录制期上传、页面整场上传、静默补传和手动补传共用同一个线路决策，回退原因随决策一起写日志并返回给页面。
 - `crates/biliup-cli/src/server/common/upload_line_selection.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`cooling_lines`）：决策把持久冷却状态当作唯一的「这条线不能用」依据；成功、网络错误或传输阶段的 watchdog 超时反过来更新它。
 - `crates/biliup-cli/src/server/common/missing_segment.rs` → `crates/biliup-cli/src/server/common/attempt_lease.rs`（`classify_stale_lease`）：收割循环与健康接口共用同一份分阶段判据，避免页面显示与后台行为不一致。
