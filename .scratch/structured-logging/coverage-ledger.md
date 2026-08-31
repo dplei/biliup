@@ -67,8 +67,8 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | --- | --- | --- |
 | wheel CLI 主循环 | 全局subscriber；stdout + ds_update日期.log，daily最多7个，RUST_LOG（缺省info）总过滤，秒级本地时间；guard退出flush，Web可reload总过滤 | P2实测：旁路三态通过，旧输出不变；桥接文本重复行不可判定 |
 | Rust CLI | 全局subscriber；仅stdout，--rust-log缺省tower_http=debug,info，秒级本地时间，Web可reload，无文件guard | P2实测：旁路三态通过；无持久旧文件，受控对照用wrapper stdout |
-| Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：多次调用共享run、不覆盖宿主subscriber；旧文件照常 |
-| Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P2实测：缺凭据早退路径通过，多次调用不重复消费；旧文件照常 |
+| Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：重叠调用共享run、不覆盖宿主subscriber；顺序调用排空后新建run，旧文件照常 |
+| Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python读头失败回落HLS；server StreamGears同样探测 | P3/12实测：FLV路径稳定segment_id与原生事件通过（Python入口真实演练 + 服务端执行器集成测试）；HLS共用同一文件层但未实跑 |
 | 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | 不冒称可用；P3/14须复核实际可达性 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
@@ -167,3 +167,20 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
 - 进度页补传入口 / 试用页面 / log-events-v1 / 16 / 样式补修：两个导航链接统一主题按钮外观，
   浏览器复核深浅主题、桌面/360px、访问后样式、键盘焦点与跳转；无新增观测能力，C01–C14
   覆盖结论及默认页面开关不变。验证边界见 [P3 回执](receipts/P3.md#任务-16-样式补修)。
+
+- C07/C09/C10 / Rust CLI、wheel CLI、Python 上传函数 / contract-v1 / 14 入口上传批次 /
+  standalone-upload-v1：**实现已接入，验收 partial**。CLI 命令上传、配置逐稿上传、append
+  与 Python 上传分别持有 task；预上传重试单独 UA，排队/线路/开始/失败/完成可关联。
+  文件缺少录制账本时用 T + original_file + segment_order + UA，序号只在当前任务有效；
+  有录制账本的服务端 S 形态不变。checkpoint_reused 只表示复用，不补造本次成功事件。
+  新增理由：preparing_upload/files_ready/no_input/config_dispatch/config_failed/cover_failed/
+  target_lookup_failed/upload_failed/authentication_failed/storage_unavailable/line_selection_failed/
+  awaiting_pre_upload/source_io/lock_failed/rate_gate_unavailable/rate_limited/invalid_response/
+  remote_error/checkpoint_reused/transferred/append_ready/appended/request_failed；既有理由继续有效。
+  缺凭据三入口 × 三态、CLI 三种命令各两次、每入口关闭回退、三份双源包确定性校验通过；
+  合成载体验证成功/失败/不确定结果与交错身份，**不等于远端链路已运行**。
+  页面整场上传仍走无 task 的旧入口；录制期上传的 `transport` 限流差异仍未改，本批不计
+  C01/C11/C12/C13 覆盖。详细证据及限制见 [本批回执](receipts/P3.md#任务-14-第一批独立上传入口)。
+- 入口生命周期文字更正 / P2–P3：`Shadow` 只在 guard 重叠时共享运行实例；最后一个 guard
+  退出会排空，之后的顺序调用新建 process_run_id。历史「多次调用共享run」不适用于这种
+  顺序调用；本批重新实测了此边界，不更改底座或伪造相同 run。

@@ -103,6 +103,7 @@ pub async fn upload(
     //     .read(true)
     //     .write(true)
     //     .open(&cookie_file);
+    let task = biliup_cli::observe::standalone::UploadTask::default();
     let StudioPre {
         video_path,
         cookie_file,
@@ -132,8 +133,11 @@ pub async fn upload(
     // the same durable SQLite gate state instead of bypassing the 601 cooldown used by the web
     // server and recovery paths.
     let runtime_config = crate::server::CONFIG.read().unwrap().clone();
-    let pool = ConnectionManager::new_pool("data/data.sqlite3").await?;
-    let (bilibili, videos) = common::upload::upload(
+    let pool = task.check(
+        ConnectionManager::new_pool("data/data.sqlite3").await,
+        "storage_unavailable",
+    )?;
+    let (bilibili, videos) = common::upload::upload_with_task(
         &cookie_file,
         proxy,
         line.map(Into::into),
@@ -141,6 +145,7 @@ pub async fn upload(
         limit,
         &runtime_config,
         &pool,
+        Some(&task),
     )
     .await?;
 
@@ -176,17 +181,24 @@ pub async fn upload(
         .build();
 
     if !studio.cover.is_empty() {
-        let url = bilibili
-            .cover_up(
-                &std::fs::read(&studio.cover)
+        let url = task.check(
+            async {
+                bilibili
+                    .cover_up(
+                        &std::fs::read(&studio.cover)
+                            .change_context_lazy(|| AppError::Unknown)
+                            .attach_with(|| format!("cover: {}", studio.cover))?,
+                    )
+                    .await
                     .change_context_lazy(|| AppError::Unknown)
-                    .attach_with(|| format!("cover: {}", studio.cover))?,
-            )
-            .await
-            .change_context_lazy(|| AppError::Unknown)?;
+            }
+            .await,
+            "cover_failed",
+        )?;
         println!("{url}");
         studio.cover = url;
     }
 
-    submit_to_bilibili(&bilibili, &studio, submit).await
+    task.submit(submit_to_bilibili(&bilibili, &studio, submit))
+        .await
 }

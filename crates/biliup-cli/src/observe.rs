@@ -1,8 +1,10 @@
-//! Native structured events for the recording chain.
+//! Native structured events for recording, upload and submission chains.
 //!
 //! Every emitter here writes to the `biliup::event` target, which the old sinks filter out, so
 //! old files and console output are unchanged. Identity is passed explicitly — no ambient span
 //! context, no parsing of old message text.
+
+pub mod standalone;
 
 use biliup::downloader::util::RecordingOwner;
 use serde::{Deserialize, Serialize};
@@ -209,6 +211,7 @@ pub fn segment_enrolled(
 /// Every field is what the caller actually knows; nothing here is inferred from a file name.
 #[derive(Debug, Clone, Default)]
 pub struct UploadIdentity {
+    pub task_id: Option<String>,
     pub live_streamer_id: Option<String>,
     pub streamer_info_id: Option<String>,
     pub upload_session_id: Option<String>,
@@ -229,6 +232,7 @@ impl UploadIdentity {
         row: &crate::server::infrastructure::models::UploadMissingSegment,
     ) -> Self {
         Self {
+            task_id: None,
             live_streamer_id: Some(row.live_streamer_id.to_string()),
             streamer_info_id: Some(row.streamer_info_id.to_string()),
             upload_session_id: row.upload_session_id.map(|id| id.to_string()),
@@ -247,6 +251,7 @@ impl UploadIdentity {
         original_file: &std::path::Path,
     ) -> Self {
         Self {
+            task_id: None,
             live_streamer_id: Some(live_streamer_id.to_string()),
             streamer_info_id: Some(streamer_info_id.to_string()),
             upload_session_id: Some(enrollment.upload_session_id.to_string()),
@@ -290,6 +295,7 @@ pub fn processing_decided(
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
+        task_id = text(&identity.task_id),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "预处理决定"
@@ -321,6 +327,7 @@ pub fn processing_completed(
             upload_session_id = text(&identity.upload_session_id),
             missing_id = text(&identity.missing_id),
             upload_attempt_id = text(&identity.upload_attempt_id),
+            task_id = text(&identity.task_id),
             live_streamer_id = text(&identity.live_streamer_id),
             streamer_info_id = text(&identity.streamer_info_id),
             "预处理未完成"
@@ -339,6 +346,7 @@ pub fn processing_completed(
             upload_session_id = text(&identity.upload_session_id),
             missing_id = text(&identity.missing_id),
             upload_attempt_id = text(&identity.upload_attempt_id),
+            task_id = text(&identity.task_id),
             live_streamer_id = text(&identity.live_streamer_id),
             streamer_info_id = text(&identity.streamer_info_id),
             "预处理完成"
@@ -358,6 +366,7 @@ pub fn upload_queued(identity: &UploadIdentity, reason_code: &str) {
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
         segment_order = identity.order(),
+        task_id = text(&identity.task_id),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "分段进入上传队列"
@@ -378,9 +387,12 @@ pub fn upload_line_decided(
         reason_code,
         line,
         segment_id = text(&identity.segment_id),
+        original_file = text(&identity.original_file),
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
+        task_id = text(&identity.task_id),
+        segment_order = identity.order(),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "上传线路已决定"
@@ -399,6 +411,8 @@ pub fn upload_started(identity: &UploadIdentity, line: &str, total_bytes: u64) {
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
+        task_id = text(&identity.task_id),
+        segment_order = identity.order(),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "开始传输分段"
@@ -418,6 +432,8 @@ pub fn upload_failed(identity: &UploadIdentity, reason_code: &str, error: &str) 
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
+        task_id = text(&identity.task_id),
+        segment_order = identity.order(),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "分段上传失败"
@@ -437,6 +453,7 @@ pub fn upload_completed(identity: &UploadIdentity, reason_code: &str, duration_m
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
         segment_order = identity.order(),
+        task_id = text(&identity.task_id),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "分段上传完成"
@@ -455,6 +472,8 @@ pub fn recovery_decided(identity: &UploadIdentity, outcome: &str, reason_code: &
         original_file = text(&identity.original_file),
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
+        task_id = text(&identity.task_id),
+        segment_order = identity.order(),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "补传资格判定"
@@ -472,6 +491,8 @@ pub fn recovery_started(identity: &UploadIdentity, reason_code: &str) {
         upload_session_id = text(&identity.upload_session_id),
         missing_id = text(&identity.missing_id),
         upload_attempt_id = text(&identity.upload_attempt_id),
+        task_id = text(&identity.task_id),
+        segment_order = identity.order(),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "开始补传"
@@ -482,6 +503,7 @@ pub fn recovery_started(identity: &UploadIdentity, reason_code: &str) {
 /// by a background scan, and stays unknown rather than being guessed.
 #[derive(Debug, Clone, Default)]
 pub struct SubmissionIdentity {
+    pub task_id: Option<String>,
     pub upload_session_id: Option<String>,
     pub live_streamer_id: Option<String>,
     pub streamer_info_id: Option<String>,
@@ -510,6 +532,7 @@ pub fn submission_decided(
         reason_code,
         pending_count,
         upload_session_id = text(&identity.upload_session_id),
+        task_id = text(&identity.task_id),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "投稿判定"
@@ -523,6 +546,7 @@ pub fn submission_started(identity: &SubmissionIdentity, reason_code: &str) {
         outcome = "executed",
         reason_code,
         upload_session_id = text(&identity.upload_session_id),
+        task_id = text(&identity.task_id),
         live_streamer_id = text(&identity.live_streamer_id),
         streamer_info_id = text(&identity.streamer_info_id),
         "开始提交投稿"
@@ -539,6 +563,7 @@ pub fn submission_completed(identity: &SubmissionIdentity, outcome: &str, reason
             outcome,
             reason_code,
             upload_session_id = text(&identity.upload_session_id),
+            task_id = text(&identity.task_id),
             live_streamer_id = text(&identity.live_streamer_id),
             streamer_info_id = text(&identity.streamer_info_id),
             "投稿完成"
@@ -550,6 +575,7 @@ pub fn submission_completed(identity: &SubmissionIdentity, outcome: &str, reason
             outcome,
             reason_code,
             upload_session_id = text(&identity.upload_session_id),
+            task_id = text(&identity.task_id),
             live_streamer_id = text(&identity.live_streamer_id),
             streamer_info_id = text(&identity.streamer_info_id),
             "投稿未成功"

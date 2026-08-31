@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 13
 Phase: P3
-Implementation: not-started
+Implementation: in-progress
 
 来源：[覆盖清单](../coverage-ledger.md)、[独立原始对照](../rollout-plan.md)。
 
@@ -39,3 +39,10 @@ Implementation: not-started
 ## Comments
 
 本任务完成的是覆盖，不是文件切换；旧系统至少保留到 17 的后续观察结束。
+
+- 第一批独立上传入口已实现并提交，验收 partial：Rust/wheel CLI（命令/配置/追加）和
+  Python 上传的 task、输入序号、attempt 与投稿结论已接入；三态/重复调用/回退和双源
+  确定性校验通过。远端成功链仍须补验，详见
+  [P3 本批回执](../receipts/P3.md#任务-14-第一批独立上传入口)。
+- 本任务保持 in-progress。下一批先处理页面整场上传并补齐独立入口的正常远端样本；
+  其余下载路径、系统/认证/审计/诊断、分类清单及完整观察尚未完成，不切换页面或旧写入。
