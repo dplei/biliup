@@ -15,6 +15,9 @@ use tracing::{error, info, warn};
 pub const BASE_TARGET_LUFS: f64 = -16.0;
 const LRA: f64 = 11.0;
 const TRUE_PEAK: f64 = -1.5;
+/// 产物响度偏离目标多少才值得记一条。1 dB 以内是 loudnorm 正常的收敛残差
+/// （本机线性模式实测落在 -15.8 / 目标 -16），再大就说明它退回了动态模式。
+const LOUDNESS_SHORTFALL_TOLERANCE: f64 = 1.0;
 const STDERR_LIMIT: usize = 16 * 1024;
 const SAMPLE_DIR: &str = "audio-normalization";
 const SAMPLE_FILE: &str = "sample.m4a";
@@ -185,6 +188,48 @@ pub struct LoudnessMeasurement {
     pub target_offset: f64,
 }
 
+/// 转码那一遍 ffmpeg 自己报告的结果。
+///
+/// 转码传的是 `linear=true`，但 `af_loudnorm` 会当场推翻它：所需增益顶破 `TP`、
+/// 或者 `measured_LRA` 为 0 之类的前提不成立时，它**悄悄退回动态模式**——不报错、
+/// 退出码 0。动态模式不保证整段积分响度落到目标，于是产物可能差好几 dB 而链路全绿。
+///
+/// 这两个数都在 ffmpeg 的 summary 里，而 `transcode` 本来就 `.output()` 捕获了 stderr、
+/// 成功时直接丢掉。留下来是零成本，也是判断「这一段有没有真的做到」的唯一依据。
+///
+/// **不要试图在转码前预判**：`af_loudnorm` 的线性判据不止真峰一条，测量那一遍自报的
+/// `normalization_type` 也永远是 `dynamic`（它没有 `measured_*` 输入，本来就做不了线性），
+/// 拿它当预测器只会得到假信号。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscodeReport {
+    /// `"linear"` / `"dynamic"`；解析不到时为 `None`，不当失败。
+    pub normalization_type: Option<String>,
+    /// ffmpeg 报告的产物积分响度（LUFS）。
+    pub output_i: Option<f64>,
+}
+
+/// 从转码遍的 `print_format=summary` 里取出模式与产物响度。
+///
+/// summary 是给人看的文本，任何一行取不到都返回 `None`——这只用于日志，
+/// 解析失败绝不能影响标准化本身的成败判断。
+fn parse_transcode_summary(stderr: &str) -> TranscodeReport {
+    let value_after = |label: &str| {
+        stderr
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix(label).map(str::trim))
+    };
+    TranscodeReport {
+        normalization_type: value_after("Normalization Type:")
+            .map(|v| v.to_ascii_lowercase())
+            .filter(|v| !v.is_empty()),
+        output_i: value_after("Output Integrated:")
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite()),
+    }
+}
+
 /// 测量那一遍的产出。响度分析需要完整 demux 一遍原片，时间戳检测同样如此，
 /// 于是两件事合并到同一次 ffmpeg 调用里，省掉一整遍全片读。
 pub struct MeasureScan {
@@ -204,7 +249,7 @@ pub trait AudioFfmpegRunner: Send + Sync {
         output: &Path,
         target: LoudnessTarget,
         measured: &LoudnessMeasurement,
-    ) -> AppResult<()>;
+    ) -> AppResult<TranscodeReport>;
 }
 
 #[derive(Debug)]
@@ -601,17 +646,39 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
             Err(None)
         }
     };
-    if let Err(error) = transcoded {
-        artifact.cleanup().await;
-        let Some(error) = error else {
-            return NormalizationOutcome::Original {
-                reason: OriginalReason::DiskPressureAborted,
+    let report = match transcoded {
+        Ok(report) => report,
+        Err(error) => {
+            artifact.cleanup().await;
+            let Some(error) = error else {
+                return NormalizationOutcome::Original {
+                    reason: OriginalReason::DiskPressureAborted,
+                };
             };
-        };
-        warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during transcode");
-        return NormalizationOutcome::Original {
-            reason: OriginalReason::TranscodeFailed,
-        };
+            warn!(audio_normalization = "failed", file=%source.display(), ?error, "audio normalization failed during transcode");
+            return NormalizationOutcome::Original {
+                reason: OriginalReason::TranscodeFailed,
+            };
+        }
+    };
+    // ffmpeg 可能当场推翻 `linear=true` 退回动态模式，那时产物响度到不了目标，而链路
+    // 全绿、没有任何异常。用 `info!` 而不是 `warn!`——素材峰值放不下所需增益时，退回动态
+    // 是正确的保守选择，不是故障；但它必须可见，否则没人知道功能有没有真的生效。
+    if let Some(output_i) = report.output_i
+        && (output_i - target_lufs).abs() > LOUDNESS_SHORTFALL_TOLERANCE
+    {
+        info!(
+            audio_normalization = "loudness_target_missed",
+            file = %source.display(),
+            target_lufs,
+            output_lufs = output_i,
+            shortfall_db = target_lufs - output_i,
+            input_lufs = measurement.input_i,
+            measured_tp = measurement.input_tp,
+            normalization_type = report.normalization_type.as_deref().unwrap_or("unknown"),
+            "loudnorm did not reach the target loudness; the source most likely has no true-peak \
+             headroom for the required gain, so ffmpeg fell back to dynamic mode"
+        );
     }
     let output_bytes = tokio::fs::metadata(artifact.path())
         .await
@@ -657,6 +724,8 @@ pub async fn normalize_for_upload<R: AudioFfmpegRunner>(
     };
     info!(audio_normalization="completed", file=%source.display(), target_lufs, replaced_original=!keep_original,
         input_lufs=measurement.input_i, elapsed_ms=started.elapsed().as_millis(), output_size_bytes=output_bytes,
+        normalization_type=report.normalization_type.as_deref().unwrap_or("unknown"),
+        output_lufs=report.output_i,
         "audio normalization completed");
     NormalizationOutcome::Normalized {
         form,
@@ -970,7 +1039,7 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
         output: &Path,
         target: LoudnessTarget,
         m: &LoudnessMeasurement,
-    ) -> AppResult<()> {
+    ) -> AppResult<TranscodeReport> {
         let filter = format!(
             "loudnorm=I={}:LRA={LRA}:TP={TRUE_PEAK}:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true:print_format=summary",
             target.0, m.input_i, m.input_lra, m.input_tp, m.input_thresh, m.target_offset
@@ -1007,13 +1076,13 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
             .change_context(AppError::Custom(
                 "failed to spawn ffmpeg (loudnorm transcode)".into(),
             ))?;
+        let stderr = stderr_text(&result.stderr);
         if !result.status.success() {
             bail!(AppError::Custom(format!(
-                "ffmpeg loudnorm transcode failed: {}",
-                stderr_text(&result.stderr)
+                "ffmpeg loudnorm transcode failed: {stderr}"
             )));
         }
-        Ok(())
+        Ok(parse_transcode_summary(&stderr))
     }
 }
 
@@ -1330,6 +1399,8 @@ mod tests {
         output_has_audio: bool,
         /// 转码永不结束，用来观察硬水位能不能把它掐掉。
         transcode_hangs: bool,
+        /// 转码遍的自报结果。默认是「线性、正好打到目标」，即一切正常。
+        report: TranscodeReport,
         measured: Arc<Mutex<bool>>,
     }
 
@@ -1344,6 +1415,10 @@ mod tests {
                 source_start_time: 0.0,
                 output_has_audio: true,
                 transcode_hangs: false,
+                report: TranscodeReport {
+                    normalization_type: Some("linear".into()),
+                    output_i: Some(-16.0),
+                },
                 measured: Arc::new(Mutex::new(false)),
             }
         }
@@ -1416,12 +1491,12 @@ mod tests {
             output: &Path,
             _target: LoudnessTarget,
             _measured: &LoudnessMeasurement,
-        ) -> AppResult<()> {
+        ) -> AppResult<TranscodeReport> {
             tokio::fs::write(output, &self.output_bytes).await.unwrap();
             if self.transcode_hangs {
                 std::future::pending::<()>().await;
             }
-            Ok(())
+            Ok(self.report.clone())
         }
     }
 
@@ -1453,6 +1528,84 @@ mod tests {
         let stderr = "log {\"other\":1}\n{\"input_i\":\"-27.40\",\"input_tp\":\"-6.10\",\"input_lra\":\"3.20\",\"input_thresh\":\"-38.00\",\"target_offset\":\"0.10\"}\nlog";
         assert_eq!(parse_loudnorm_measurement(stderr).unwrap().input_i, -27.4);
     }
+    /// summary 是给人看的文本，两行都要能取到；取不到任何一行也不能 panic。
+    #[test]
+    fn the_transcode_summary_yields_the_mode_and_the_output_loudness() {
+        let dynamic = "\
+[Parsed_loudnorm_0 @ 0x1] \n\
+Input Integrated:    -30.5 LUFS\n\
+Output Integrated:   -23.8 LUFS\n\
+Output True Peak:     -1.5 dBTP\n\
+Normalization Type:   Dynamic\n\
+Target Offset:        +9.8 LU\n";
+        assert_eq!(
+            parse_transcode_summary(dynamic),
+            TranscodeReport {
+                normalization_type: Some("dynamic".into()),
+                output_i: Some(-23.8),
+            }
+        );
+
+        let linear = "Output Integrated:   -15.8 LUFS\nNormalization Type:   Linear\n";
+        assert_eq!(
+            parse_transcode_summary(linear),
+            TranscodeReport {
+                normalization_type: Some("linear".into()),
+                output_i: Some(-15.8),
+            }
+        );
+
+        // 老 ffmpeg、被截断的 stderr、格式变动——一律退化成「不知道」，不是失败。
+        assert_eq!(
+            parse_transcode_summary("frame= 200 fps=0.0\nnothing useful here\n"),
+            TranscodeReport::default()
+        );
+    }
+
+    /// 响度没打到目标只记日志，**绝不影响标准化的成败**——产物本身仍然是合法的。
+    #[tokio::test]
+    async fn a_loudness_shortfall_is_recorded_without_failing_the_segment() {
+        let _guard = exclusive_normalization().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner {
+            report: TranscodeReport {
+                normalization_type: Some("dynamic".into()),
+                output_i: Some(-23.8),
+            },
+            ..FakeRunner::default()
+        };
+        let expected = runner.output_bytes.clone();
+
+        assert!(matches!(
+            normalize_for_upload(&source, -14.0, &runner, false, DiskBudget::unlimited()).await,
+            NormalizationOutcome::Normalized {
+                form: NormalizedForm::ReplacedOriginal,
+                ..
+            }
+        ));
+        assert_eq!(tokio::fs::read(&source).await.unwrap(), expected);
+    }
+
+    /// summary 解析不出来也不能把好产物判死。
+    #[tokio::test]
+    async fn an_unparseable_summary_does_not_fail_the_segment() {
+        let _guard = exclusive_normalization().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("segment.flv");
+        tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
+        let runner = FakeRunner {
+            report: TranscodeReport::default(),
+            ..FakeRunner::default()
+        };
+
+        assert!(matches!(
+            normalize_for_upload(&source, -14.0, &runner, false, DiskBudget::unlimited()).await,
+            NormalizationOutcome::Normalized { .. }
+        ));
+    }
+
     #[test]
     fn rejects_non_finite() {
         let stderr = "{\"input_i\":\"-inf\",\"input_tp\":\"-2\",\"input_lra\":\"1\",\"input_thresh\":\"-30\",\"target_offset\":\"0\"}";
@@ -2106,6 +2259,91 @@ mod tests {
 
     /// 06 号验收里本机可跑的那一半：多路并发下，标准化带来的额外磁盘占用任何时刻不超过
     /// 一份分段。这条是跨管道的整体性质，`NORMALIZE_SLOTS` 与就地替换缺一不可，单测证明
+    /// 两种素材、两种模式，读的是 ffmpeg 自己的判断而不是我们的推算。
+    ///
+    /// 这是 [#19](https://github.com/dplei/biliup/issues/19) 的现场证据：
+    ///
+    /// - **peaky**——每 4 秒一个 50 ms 全幅脉冲、其余时间约 -34 dB。整体很轻但真峰很满，
+    ///   所需增益顶破 `TP`，ffmpeg 退回动态，产物差目标好几 dB。
+    /// - **varied**——同样很轻，但真峰也低且响度有起伏（`measured_LRA != 0` 是线性模式的
+    ///   另一个前提，纯正弦的 LRA 是 0，会被误当成没余量）。线性成立，落在目标附近。
+    ///
+    /// 需要本地 ffmpeg；手动运行：
+    /// `cargo test -p biliup-cli normalization_mode -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn the_normalization_mode_follows_the_available_headroom() {
+        let _guard = exclusive_normalization().await;
+        let dir = tempfile::tempdir().unwrap();
+        // (素材名, 音频滤镜, 目标, 期望模式, 允许的响度偏差)
+        let cases: [(&str, &str, f64, &str, f64); 2] = [
+            (
+                "peaky",
+                r"volume='if(lt(mod(t\,4),0.05),1.0,0.02)':eval=frame",
+                -14.0,
+                "dynamic",
+                f64::INFINITY, // 差多少不做断言，只断言「确实没打到」
+            ),
+            (
+                "varied",
+                r"volume='if(lt(mod(t\,4),2),0.06,0.015)':eval=frame",
+                BASE_TARGET_LUFS,
+                "linear",
+                1.0,
+            ),
+        ];
+        for (label, audio_filter, target, expected_mode, tolerance) in cases {
+            let source = dir.path().join(format!("{label}.flv"));
+            let status = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=20:sample_rate=48000",
+                    "-f", "lavfi", "-i", "testsrc=duration=20:size=160x120:rate=10",
+                    "-filter:a", audio_filter,
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-b:a", "128k", "-shortest",
+                ])
+                .arg(&source)
+                .status()
+                .await
+                .expect("spawn ffmpeg");
+            assert!(status.success(), "{label}: fixture generation failed");
+
+            let runner = SystemAudioFfmpeg::default();
+            let measured =
+                parse_loudnorm_measurement(&runner.measure(&source, LoudnessTarget(target)).await.unwrap().stderr)
+                    .unwrap();
+            // 测量遍永远自报 dynamic——它没有 measured_* 输入，本来就做不了线性。
+            // 钉住这一点，免得将来有人又把它当成预测器。
+            let output = dir.path().join(format!("{label}-out.flv"));
+            let report = runner
+                .transcode(&source, &output, LoudnessTarget(target), &measured)
+                .await
+                .unwrap();
+            println!(
+                "{label}: measured_i={} measured_tp={} measured_lra={} -> {report:?}",
+                measured.input_i, measured.input_tp, measured.input_lra
+            );
+            assert_eq!(
+                report.normalization_type.as_deref(),
+                Some(expected_mode),
+                "{label}: unexpected normalization mode"
+            );
+            let output_i = report.output_i.expect("summary must carry Output Integrated");
+            if tolerance.is_finite() {
+                assert!(
+                    (output_i - target).abs() <= tolerance,
+                    "{label}: {output_i} should be within {tolerance} of {target}"
+                );
+            } else {
+                assert!(
+                    (output_i - target).abs() > LOUDNESS_SHORTFALL_TOLERANCE,
+                    "{label}: expected a shortfall worth logging, got {output_i} vs {target}"
+                );
+            }
+        }
+    }
+
     /// 造一段与生产同构的 FLV：非零时间轴 + 没有可信的 `onMetaData.duration`。
     ///
     /// 两个开关缺一不可。`-output_ts_offset` 制造非零 `start_time`（分段录像沿用整场
