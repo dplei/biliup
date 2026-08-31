@@ -11,6 +11,7 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup-cli/src/main.rs` | Rust CLI 二进制入口：初始化日志，解析命令并分派登录、上传、下载、Web 服务和封面预览等子命令。 | `main` |
+| `crates/biliup-cli/src/observe.rs` | 录制域原生事件的唯一发射点：`RecordingIdentity` 显式携带房间/场次或 task 身份（不建 span，避免改变旧输出），按契约发 `recording.started/stopped/retry_scheduled/reconnected/segment_enrolled`。 | `RecordingIdentity`、`RecordingIdentity::server`、`RecordingIdentity::task`、`EVENT_TARGET`、`recording_started`、`recording_stopped`、`retry_scheduled`、`reconnected`、`segment_enrolled` |
 | `crates/biliup-cli/src/downloader.rs` | 独立 CLI 下载入口：插件提取后按媒体类型走 HTTP-FLV/HLS，拒绝需 Streamlink/YtDlp 运行时的路径，另支持 FLV 转 JSON 诊断。 | `download`、`download_stream`、`generate_json` |
 | `crates/biliup-cli/src/lib.rs` | Web 服务启动与主播配置导入的编排层：建立 SQLite 连接、组装服务、恢复主播任务并启动 Axum。 | `run`、`import_config_streamers`、`import_database_streamers` |
 | `crates/stream-gears/src/lib.rs` | Rust/Python 的 PyO3 边界，向 Python 暴露下载、上传、登录和 CLI 主循环；下载回调与上传函数各自安装局部控制台/文件日志订阅器。 | `stream_gears`、`main_loop`、`download_with_callback`、`download_with_hook`、`upload` |
@@ -22,9 +23,9 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup/src/lib.rs` | `biliup` 核心 crate 的公共门面，并提供带指数退避和抖动的通用异步重试。 | `retry`、`retry_with_config` |
-| `crates/biliup/src/downloader/httpflv.rs` | HTTP-FLV 拉流与逐 tag 解析：按关键帧刷盘并在关键帧边界切分段，维护 onMetaData/序列头缓存，用可配置的单次 chunk 读超时（停顿看门狗，默认 30s）兜住码流停顿，断连时产出连接寿命、静默时长、分段进度与媒体时间戳的诊断。 | `parse_flv`、`Connection`、`Connection::with_stall_timeout`、`DEFAULT_STALL_TIMEOUT`、`read_frame`、`ConnectionDiagnostics`、`FlvProgress`、`download_with_context` |
+| `crates/biliup/src/downloader/httpflv.rs` | HTTP-FLV 拉流与逐 tag 解析：按关键帧刷盘并在关键帧边界切分段，维护 onMetaData/序列头缓存，用可配置的单次 chunk 读超时（停顿看门狗，默认 30s）兜住码流停顿，断连时产出连接寿命、静默时长、分段进度与媒体时间戳的诊断。**切片关闭原因必须在计数复位之前取值**（否则恒为 `Unknown`）；DTS 倒退在源端按分段汇总（首条 1:1，其余计数/首末/极值）。 | `parse_flv`、`Connection`、`Connection::with_stall_timeout`、`DEFAULT_STALL_TIMEOUT`、`read_frame`、`ConnectionDiagnostics`、`FlvProgress`、`download_with_context`、`DtsBackwardRollup` |
 | `crates/biliup/src/downloader/flv_writer.rs` | 录制落盘的 FLV 写入器：写 FLV 头、按 tag 原样写回时间戳（**不做任何偏移重基**，CDN 给什么就写什么），分段时刷盘换文件并交给 `LifecycleFile` 收尾。 | `FlvFile`、`FlvFile::write_tag`、`FlvFile::write_tag_header`、`FlvFile::create_new`、`FLV_HEADER` |
-| `crates/biliup/src/downloader/util.rs` | 分段判据 `Segmentable`（时间/大小任一超限即切）与录制文件生命周期 `LifecycleFile`；时间判据用媒体时间戳做 `current - start` 的**饱和减法**，时间戳倒退时 elapsed 归零。 | `Segmentable`、`Segmentable::needed`、`elapsed_time`、`set_time_position`、`set_start_time`、`LifecycleFile`、`SegmentCloseReason` |
+| `crates/biliup/src/downloader/util.rs` | 分段判据 `Segmentable`（时间/大小任一超限即切）与录制文件生命周期 `LifecycleFile`；时间判据用媒体时间戳做 `current - start` 的**饱和减法**，时间戳倒退时 elapsed 归零。**文件创建时分配稳定 `SegmentIdentity`**（关闭回调与登记账本都用它），并就地发 `recording.segment_created/closed` 原生事件。 | `Segmentable`、`Segmentable::needed`、`elapsed_time`、`set_time_position`、`set_start_time`、`LifecycleFile`、`LifecycleFile::create`、`SegmentIdentity`、`RecordingOwner`、`allocate_id`、`close_reason_code`、`SegmentCloseReason` |
 | `crates/biliup/src/downloader/live/douyin.rs` | 抖音选流：解析房间信息后枚举各档位候选（含每档 `bitrate` 元数据），按请求档位就近选档并下发 flv/hls 地址与鉴权头；档位仅按名称在 `QUALITY_CODES` 内上下查找，**不参考码率**。 | `Douyin`、`DouyinLive::check_stream`、`select_quality_code`、`QUALITY_CODES`、`build_stream_candidates` |
 | `crates/danmaku/src/lib.rs` | 弹幕录制 crate 的公共门面，组织客户端、协议、消息和 XML 输出模块并重导出稳定 API。 | `DanmakuRecorder`、`RecorderConfig`、`create_platform`、`XmlWriter` |
 
@@ -117,6 +118,7 @@
 | `scripts/dev.sh` | 本机开发环境启动脚本：按需构建前端产物与后端二进制，可选带起 Next.js 热重载，绑 127.0.0.1 起服务。 | — |
 | `scripts/normalization-disk-sample.py` | 采样响度标准化中间件的数量与字节峰值并判定是否超过上限；只读，直播中可跑。 | `scan`、`Peaks` |
 | `scripts/structured_logging/evidence.py` | 有界只读双源证据导出与确定性校验：固定高水位分批、原生/桥接分列、旧文件代次与字节边界、批内一致匿名映射，manifest 记录不完整原因。 | `export`、`validate`、`Bundle`、`Budget`、`readonly` |
+| `scripts/structured_logging/recording_pilot.py` | P3/12 的受控录制演练：本地回环发合成 FLV（含人工注入的 DTS 倒退与中途截断），跑真实 Python 下载入口，核对身份链与分段/断连事件，并生成证据包请求与预期事实清单。 | `inject_dts_backward`、`serve`、`check`、`expectations` |
 | `scripts/structured_logging/reconcile.py` | 按证据包生成互不可见的双源分析视图、校验报告引用合法性，并单列桥接文本传输结论（永不为原生覆盖计分）。 | `prepare`、`cross`、`check_report`、`bridge_transport` |
 | `scripts/structured_logging/smoke_entries.py` | 手工触发的入口冒烟：5 个支持入口 × 采集关闭/开启/新库不可用三态加一次关闭回退，全程合成媒体与空业务库，不做账号或网络动作。 | `main`、`child` |
 | `scripts/consistency-audit.sh` | 只读巡检：比对每个已投稿会话的 `videos_json` 与本地分段账本，按投稿意图是否为空切成 legacy/current 两组，找出重复进稿、上传未进稿和序号不连续三类错位。 | — |
@@ -155,6 +157,8 @@
 - `crates/biliup-cli/src/server/common/lifecycle_backfill.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`session_completeness`）：回填的目标就是让历史会话的账本能被严格完整性闸门判为完整，冲突行则以未知状态持续阻塞投稿。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`、`Parcel::upload_with_observer`）：恢复与自动模式把冷却线路排除在实际探测请求之外；上传返回的 `Video` 标题由上传文件名兜底，而喂进去的是响度标准化/时间戳修复的中间件，因此 `upload_single_file_with_repair` 必须用原始录像名覆盖分P标题。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。
+- `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup/src/downloader/util.rs`（`LifecycleFile::with_owner`、`SegmentIdentity`）：服务端把房间/场次/attempt 身份交给文件层，关闭回调再把同一 `segment_id` 放进 `SegmentInfo` 交给上传管道；`recording.reconnected` 只在帧头读通后才发，退避阶段只存缺口。
+- `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/observe.rs`（`RecordingIdentity`、`segment_enrolled`）：录制循环与分段处理器共用同一身份对象，登记结果（成功/重复/outbox/finalized/源丢失）逐一映射为原生事件的 outcome/reason。
 - `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup/src/downloader/httpflv.rs`（`Connection::with_stall_timeout`、`read_frame`、`diagnostics`）：服务端录制走这条拉流路径；`read_frame` 的单次 chunk 读超时是「上游停发数据」的唯一检测手段，超时长度（`stream_stall_timeout_secs`，缺省 30s）直接决定断连后空等多久。调用方保留 `Connection` 所有权，下载返回后读 `diagnostics().silent_for` 存进 `StreamGapReport`。
 - `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup-cli/src/server/common/download.rs`（`DownloaderRuntime::take_last_gap`）：把「上游最后一个字节 → 判死」的静默时长传回重连循环，与 `check_elapsed + backoff` 合成三段式缺口（`event="stream_gap"`）并累加进 `estimated_missing`；只有 FLV 自研解析路径测得到，其余下载器退回旧口径。
 - `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/util.rs`（`FileValidator::validate`）：分段关闭后按同一份判据分流——`Invalid` 直接删除，`RecoverableShort` 仅在`preserve_recoverable_short_segments` 开启时进入合并管线，否则同样删除；进入管线后还要满足同组 `group.len() > 1` 才会 `merge_compatible_segments`，**单个短片段一律走 `defer_recovery_batch` 落库等待处理，不进成片**。
