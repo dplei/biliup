@@ -1,6 +1,6 @@
 # Spec：响度标准化的时长口径——FLV 非零起始时间戳导致的全量误判
 
-Status: ready-for-human（01–05 已实现，本机验收通过；真实录制环境的结束态待观察）
+Status: ready-for-human（01–05 已实现，本机与 dev 环境真实录制均已验收；等 PR 合入 dev 后归档）
 来源：[`dplei/biliup#16`](https://github.com/dplei/biliup/issues/16)（1.3.3 引入）
 分支：`dev`
 
@@ -28,6 +28,10 @@ Status: ready-for-human（01–05 已实现，本机验收通过；真实录制�
 
 分段录像沿用整场 session 的时间轴（同 [#13](https://github.com/dplei/biliup/issues/13) 里
 `Segmentable` 的 `start` 语义），所以除首段外 `start_time` 都远大于 0。
+
+> **实测更正（dev 环境验收）**：**第一段的 `start_time` 也不是 0**——CDN 推来的时间轴本身
+> 就不从 0 开始，实测第一段 `start_time=273.986`。所以是**每一段都踩**，不止非首段，
+> 这也解释了线上「13 次全失败、没有一次例外」。见 [`verification.md`](./verification.md)。
 
 **本机可复现**——关键是同时复现两个条件：时间轴有偏移，且没有可信的 `onMetaData.duration`：
 
@@ -151,4 +155,5 @@ span = format.duration − format.start_time      （start_time 缺失/非有限
 2. 判据失败的 WARN 能独立定位问题，不需要回到现场 ffprobe。
 3. 样片截取在非零时间轴上取到真实音频（非空产物）。
 4. 连续同 reason 失败会跳闸并留 ERROR，成功一次即复位。
-5. 真实录制环境确认结束态为 `completed`（这一条只能上线后验）。
+5. 真实录制环境确认结束态为 `completed`——**已在 dev 环境验完**（真实抖音直播间、
+   2 分钟分段、6/6 `completed`、0 次 `duration_drift`），见 [`verification.md`](./verification.md)。
