@@ -133,3 +133,10 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   `UploadFailureKind` 与 watchdog 三类超时代码；C10 追加 `claimed_elsewhere`、`finalized`、
   `discarded_empty`、`retry_backoff`、`writeback_failed`、`submitted`、`precondition_failed`。
   全部由映射函数集中维护并有冻结性回归用例，不是自由错误文本。
+- 查询与认证边界 / 事件库只读接口 / log-events-v1 / 15 / query-api-v1：`/v1/log-events` 列表、
+  附件详情、SSE 实时接续与 JSONL/CSV 导出通过；默认只回原生、桥接需显式请求、采集关闭与
+  「查到 0 条」明确区分；2 万条负载下五类查询均在冻结的 250ms 预算内且零丢弃。
+  **行为变更**：旧 `/v1/ws/logs` 由守卫外挪入守卫内——守卫态五个入口（含旧 ws）全部 401，
+  关闭认证的部署行为不变。**未解决差异**：导出并发上限未设、WAL 回收未量化观测。
+- 存储 schema / 事件库 / v1 / 15 / query-api-v1：加 `capture_kind`、`message` 两列并从 payload
+  回填（加法迁移，旧版本写出的库仍可查）。否则「默认只看原生」与关键词过滤只能全表扫 JSON。
