@@ -15,6 +15,11 @@ Status: needs-triage
 的实际代码/验收证据，再实施并回写 [阶段进度](progress.md)。本文「未实现」描述设计时的
 初始状态，后续完成度以进度表链接的有效证据和当前代码为准。
 
+P0–P1 已按 [契约v1](contract-v1.md) / [预算v1](baseline-budget.md) 落地到独立
+`biliup-observability` crate，验收见 [P0](receipts/P0.md) / [P1](receipts/P1.md)。
+与候选方案的具体化：writer用单连接而非写池、查询单独只读pool；JSON有固定可查列，
+诊断只通过详情读取；maintenance每类最多64行（严于原256上限）；没有应用集成/双写。
+
 ## 1. 建议结论
 
 - 用结构化事件表达「发生了什么」，数据库负责保存，前端负责读得懂；不再解析格式化日志行。
