@@ -11,7 +11,8 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `crates/biliup-cli/src/main.rs` | Rust CLI 二进制入口：初始化日志，解析命令并分派登录、上传、下载、Web 服务和封面预览等子命令。 | `main` |
-| `crates/biliup-cli/src/observe.rs` | 录制域原生事件的唯一发射点：`RecordingIdentity` 显式携带房间/场次或 task 身份（不建 span，避免改变旧输出），按契约发 `recording.started/stopped/retry_scheduled/reconnected/segment_enrolled`。 | `RecordingIdentity`、`RecordingIdentity::server`、`RecordingIdentity::task`、`EVENT_TARGET`、`recording_started`、`recording_stopped`、`retry_scheduled`、`reconnected`、`segment_enrolled` |
+| `crates/biliup-cli/src/observe.rs` | 业务原生事件的唯一发射点：`RecordingIdentity`/`UploadIdentity`/`SubmissionIdentity` 显式携带房间、场次、分段、attempt 与投稿会话身份（不建 span，避免改变旧输出），按契约发录制、预处理、上传、补传、投稿事件；空字符串表示「调用方没有这个身份」。 | `RecordingIdentity`、`UploadIdentity`、`UploadIdentity::from_missing_row`、`UploadIdentity::with_attempt`、`SubmissionIdentity`、`EVENT_TARGET`、`recording_started`、`segment_enrolled`、`processing_decided`、`upload_started`、`upload_failed`、`recovery_decided`、`submission_decided`、`submission_completed` |
+| `crates/biliup-cli/examples/upload_pilot.rs` | P3/13 的受控后处理演练：本地 sqlite 跑真实登记、投稿判定与补传资格判定，两个 sink 同时输出，并生成证据包请求与预期事实清单。无账号、无网络。 | `drill`、`write_evidence_request` |
 | `crates/biliup-cli/src/downloader.rs` | 独立 CLI 下载入口：插件提取后按媒体类型走 HTTP-FLV/HLS，拒绝需 Streamlink/YtDlp 运行时的路径，另支持 FLV 转 JSON 诊断。 | `download`、`download_stream`、`generate_json` |
 | `crates/biliup-cli/src/lib.rs` | Web 服务启动与主播配置导入的编排层：建立 SQLite 连接、组装服务、恢复主播任务并启动 Axum。 | `run`、`import_config_streamers`、`import_database_streamers` |
 | `crates/stream-gears/src/lib.rs` | Rust/Python 的 PyO3 边界，向 Python 暴露下载、上传、登录和 CLI 主循环；下载回调与上传函数各自安装局部控制台/文件日志订阅器。 | `stream_gears`、`main_loop`、`download_with_callback`、`download_with_hook`、`upload` |

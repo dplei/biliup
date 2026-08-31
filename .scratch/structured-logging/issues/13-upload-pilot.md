@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 12
 Phase: P3
-Implementation: not-started
+Implementation: complete
 
 来源：[覆盖清单 C06–C10、C13](../coverage-ledger.md)、[进度设计](../page-design.md)。
 
@@ -37,3 +37,12 @@ Implementation: not-started
 ## Comments
 
 可依步骤 2/3/4 分别提交，避免把整条后处理链的一次大改作为唯一验收点。
+
+- 三个小批的原生事件全部落地（预处理决定/结果、上传排队/线路/开始/失败/完成、投稿
+  判定/开始/完成，外加补传资格与开始），身份统一由 `UploadIdentity` 从登记账本或
+  lifecycle 行构造，attempt 各自独立，失败事件不会被后来的成功改写。结论见
+  [P3 回执](../receipts/P3.md)。
+- 验收 partial：受控演练实跑了登记 → 投稿判定（no_intent / pending_segments）→ 补传资格
+  （eligible / source_missing）这条链，证据包 complete、校验 passed、5 条预期事实全部确认。
+- **未验**：真实远端上传与投稿需要账号与实际投稿，本轮不做，也不用桥接文本冒充。
+  这部分按仓库约定应在 dev 环境用仅自己可见的模板实跑，属于待补验项。
