@@ -1,6 +1,6 @@
 # 06 — 多路并发峰值验收
 
-Status: ready-for-human（本机断言已验，真实录制环境的四项待做）
+Status: ready-for-human（本机断言已验；四项待做，但已确认可在 dev 环境跑，见文末补注）
 Blocked by: 01, 02, 03, 04, 05
 
 ## 背景
@@ -86,3 +86,14 @@ cargo test -p biliup-cli concurrent_normalization -- --ignored --nocapture
 - 长跑观察：多路并发录制下用
   [`scripts/normalization-disk-sample.py`](../../../scripts/normalization-disk-sample.py)
   采样一整场。
+
+## 2026-08-31 补注：这四条不必等上线
+
+标准 2、4、5、6 原先写的是「真实录制环境待观察」，实际上**在 dev 环境就能跑完**：
+本地起 `biliup server` + `next dev`，配本地 sqlite 与一个仅自己可见的投稿模板，
+对着一个真实开播的直播间录一小段即可。把 `configuration` 的 `segment_time` 改短
+（例如 `00:02:00`）就不用等 15 分钟一段。跑完记得把配置改回去、清掉录像。
+
+这条路已经在 [`normalization-duration-metric`](../../../.archive/normalization-duration-metric/verification.md)
+走通过一次，那次顺带观察到 `audio_normalization="replaced_original"` 在真实分段上成立
+（标准 1 的机制部分），但**峰值与端到端时长都没测**，所以本 ticket 仍然未完成。

@@ -1,6 +1,6 @@
 # Spec：响度标准化的时长口径——FLV 非零起始时间戳导致的全量误判
 
-Status: ready-for-human（01–05 已实现，本机与 dev 环境真实录制均已验收；等 PR 合入 dev 后归档）
+Status: resolved（01–05 全部实现，本机与 dev 环境真实录制均已验收，随 [#18](https://github.com/dplei/biliup/pull/18) 合入 `dev`）
 来源：[`dplei/biliup#16`](https://github.com/dplei/biliup/issues/16)（1.3.3 引入）
 分支：`dev`
 

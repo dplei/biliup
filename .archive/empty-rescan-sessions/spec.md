@@ -1,10 +1,10 @@
 # Spec：补扫不得复活零分段空会话
 
-Status: ready-for-human
+Status: resolved（随 `2c1b871` 合入 `dev`）
 
 来源：[`dplei/biliup#3`](https://github.com/dplei/biliup/issues/3)
 
-分支：`codex/fix-rescan-empty-sessions`
+分支：`dev`（原 `codex/fix-rescan-empty-sessions`）
 
 本文记录已经确认的根因、修复边界与任务拆分。实现 ticket 位于 [`issues/`](./issues/)；本轮不依赖
 现场遗留录像，空目录、临时 SQLite 和测试生成的媒体夹具足以覆盖主路径。
@@ -150,4 +150,4 @@ Status: ready-for-human
   `local_rescan_reuses_current_session_and_rejects_thirteen_byte_flv` 只覆盖“已有活动会话”，缺少
   “孤儿场次 + 零有效候选”回归。
 - 2026-08-30：计划已在 `codex/fix-rescan-empty-sessions` 实现并通过后端全量测试、前端 lint/typecheck
-  与代码索引校验。当前等待人工审阅并落到 `dev`，因此 effort 仍保留在 `.scratch/`。
+  与代码索引校验。已于 2026-08-31 随 `2c1b871` 落到 `dev`，effort 结项归档。

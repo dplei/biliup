@@ -1,6 +1,6 @@
 # 05 — 非零时间轴的回归覆盖
 
-Status: resolved（本机已验红→绿；真实录制环境待观察）
+Status: resolved（本机已验红→绿；dev 环境真实录制 6/6 `completed`）
 Blocked by: 01, 03
 
 ## 背景

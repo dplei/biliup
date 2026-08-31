@@ -1,6 +1,6 @@
 # Spec：响度标准化的磁盘预算——产物原地替换与两级水位
 
-Status: ready-for-human（01–05 已合入 `dev`，06 的真实环境验收待做）
+Status: ready-for-human（01–05 已合入 `dev`；06 的四项验收待做，可在 dev 环境跑）
 来源：[`dplei/biliup#8`](https://github.com/dplei/biliup/issues/8)（2026-08-30 设计讨论）
 分支：`dev`
 

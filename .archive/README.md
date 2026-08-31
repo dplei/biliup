@@ -25,3 +25,5 @@
 | [`2026-08-28-session-submit-liveness/`](2026-08-28-session-submit-liveness/) | 投稿会话活性修复：投稿意图状态、协调器、唤醒、补提交扫描与回归 | 2026-08-29 | 01–07 全部 `resolved`；生产只读核对确认迁移已应用、新路径投出过多分段稿、无卡住会话 |
 | [`douyin-config-override-investigation/`](douyin-config-override-investigation/) | 抖音三个覆写开关「显示开启却不生效」的排查 | 2026-08-29 | `wontfix`：采集 + 代码核对证明覆写链路正常，前提是误判，观感问题实为 [#6](https://github.com/dplei/biliup/issues/6) |
 | [`2026-08-26-session-227-audit/`](2026-08-26-session-227-audit/) | 一次投稿会话的分P重复/缺失只读审计 | 2026-08-29 | `resolved`：全库对照证明是孤立事故，源文件已删无法补传，决定不编辑稿件；审计逻辑已固化为 `scripts/consistency-audit.sh` |
+| [`normalization-duration-metric/`](normalization-duration-metric/) | 响度标准化的时长口径：FLV 非零起始时间戳导致的全量误判，连带样片截取、失败证据与熔断 | 2026-08-31 | 01–05 全部 `resolved`；随 [#18](https://github.com/dplei/biliup/pull/18) 合入 `dev`，dev 环境真实录制 6/6 `completed`、0 次 `duration_drift` |
+| [`empty-rescan-sessions/`](empty-rescan-sessions/) | 补扫不得复活零分段空会话 | 2026-08-31 | 01–04 全部 `resolved`；随 `2c1b871` 合入 `dev`，spec 唯一的保留理由（等待落 `dev`）已解除 |
