@@ -327,6 +327,14 @@ fn push_filters<'a>(
     sql: &mut QueryBuilder<'a, Sqlite>,
     query: &'a Query,
 ) -> Result<(), StorageError> {
+    // Set filters stay bounded here rather than at the caller, so `count` is limited exactly like
+    // the page it counts.
+    if query.levels.len() > 5
+        || query.categories.len() > 16
+        || query.categories.iter().any(|value| value.len() > 128)
+    {
+        return Err(StorageError::new("invalid_query"));
+    }
     if let Some(id) = query.until_id {
         sql.push(" AND id <= ").push_bind(id as i64);
     }
@@ -354,6 +362,24 @@ fn push_filters<'a>(
         }
         sql.push(" AND ").push(key).push(" = ").push_bind(value);
     }
+    if !query.levels.is_empty() {
+        // An exact set, not a floor: "只看信息" and "警告+错误" are both one query, and neither
+        // can be expressed by `level >=`.
+        sql.push(" AND level IN (");
+        let mut list = sql.separated(", ");
+        for level in &query.levels {
+            list.push_bind(*level as i64);
+        }
+        sql.push(")");
+    }
+    if !query.categories.is_empty() {
+        sql.push(" AND category IN (");
+        let mut list = sql.separated(", ");
+        for category in &query.categories {
+            list.push_bind(category.as_str());
+        }
+        sql.push(")");
+    }
     if let Some(kind) = query.capture_kind {
         sql.push(" AND capture_kind = ")
             .push_bind(capture_kind_text(kind));
@@ -376,6 +402,11 @@ pub struct Query {
     pub until_ms: Option<i64>,
     pub min_level: Option<Level>,
     pub category: Option<String>,
+    /// An exact set of levels; empty means "no set filter". Combined with `min_level` by AND, so a
+    /// caller uses one or the other.
+    pub levels: Vec<Level>,
+    /// An exact set of categories; empty means "no set filter". Same AND rule against `category`.
+    pub categories: Vec<String>,
     pub event_name: Option<String>,
     pub instance_id: Option<String>,
     /// One exact allowlisted correlation field; instance_id is mandatory when it is used.
@@ -386,6 +417,9 @@ pub struct Query {
     /// Case-insensitive substring of the summary only. It is a bounded scan over the filtered
     /// range, not an index lookup, and is cut off by the same VM deadline as everything else.
     pub keyword: Option<String>,
+    /// Return the newest rows of the range first. Paging older then moves `until_id` down instead
+    /// of `after_id` up; the live cursor is still the largest id seen, in either direction.
+    pub newest_first: bool,
     pub limit: usize,
 }
 #[derive(Debug, serde::Serialize)]
@@ -454,8 +488,12 @@ impl Repository {
         );
         sql.push_bind(query.after_id as i64);
         push_filters(&mut sql, query)?;
-        sql.push(" ORDER BY id LIMIT ")
-            .push_bind(query.limit.clamp(1, 200) as i64);
+        sql.push(if query.newest_first {
+            " ORDER BY id DESC LIMIT "
+        } else {
+            " ORDER BY id LIMIT "
+        })
+        .push_bind(query.limit.clamp(1, 200) as i64);
         // One bounded snapshot for both the page and retention marker.
         let mut conn = self.pool.acquire().await.map_err(db_error)?;
         // Bound the SQLite VM itself, not only the waiting Rust future: a cancelled query must not

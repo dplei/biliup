@@ -16,10 +16,12 @@ import {
     IconSendStroked,
     IconSetting,
     IconHistory,
+    IconActivity,
 } from '@douyinfe/semi-icons'
 import Image from 'next/image'
 import ThemeButton from '../ui/ThemeButton'
 import { useSystemTheme, useTheme } from '../lib/utils'
+import { LOG_NAV_ENTRIES, LOG_NAV_ROUTES } from '../lib/log-view-config'
 import { useWindowSize } from 'react-use';
 
 export default function Layout({ children }: { children: React.ReactNode }) {
@@ -142,23 +144,31 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                         </div>
                     ),
                 },
-                {
-                    text: '实时日志',
+                // 两个日志入口：默认页在前，另一套保留为对照。谁是默认由 log-view-config 的开关决定。
+                ...LOG_NAV_ENTRIES.map((entry) => ({
+                    text: entry.text,
                     icon: (
                         <div
                             style={{
-                                backgroundColor: 'rgba(var(--semi-blue-4), 1)',
+                                backgroundColor:
+                                    entry.itemKey === 'logViewer'
+                                        ? 'rgba(var(--semi-blue-4), 1)'
+                                        : 'rgba(var(--semi-cyan-4), 1)',
                                 borderRadius: 'var(--semi-border-radius-medium)',
                                 color: 'var(--semi-color-bg-0)',
                                 display: 'flex',
                                 padding: '4px',
                             }}
                         >
-                            <IconCustomerSupport size="small" />
+                            {entry.itemKey === 'logViewer' ? (
+                                <IconCustomerSupport size="small" />
+                            ) : (
+                                <IconActivity size="small" />
+                            )}
                         </div>
                     ),
-                    itemKey: 'logViewer',
-                },
+                    itemKey: entry.itemKey,
+                })),
                 {
                     text: '任务平台',
                     icon: (
@@ -208,7 +218,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             'upload-manager': '/upload-manager',
             job: '/job',
             status: '/status',
-            logViewer: '/logviewer',
+            ...LOG_NAV_ROUTES,
         }
         if (!routerMap[props.itemKey]) {
             return itemElement

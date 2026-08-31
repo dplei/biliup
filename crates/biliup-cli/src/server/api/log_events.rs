@@ -96,7 +96,12 @@ pub struct ListParams {
     since_ms: Option<i64>,
     until_ms: Option<i64>,
     min_level: Option<String>,
+    /// Exact levels, comma separated (`INFO,WARN`). Unlike `min_level` this can express "only
+    /// warnings and errors" without dragging every INFO along.
+    levels: Option<String>,
     category: Option<String>,
+    /// Exact categories, comma separated (`recording,upload`).
+    categories: Option<String>,
     event_name: Option<String>,
     instance_id: Option<String>,
     /// One allowlisted correlation field, e.g. `segment_id`; requires `instance_id`.
@@ -107,6 +112,9 @@ pub struct ListParams {
     capture_kind: Option<String>,
     keyword: Option<String>,
     limit: Option<usize>,
+    /// `asc` (default) reads forward from `after_id`; `desc` answers "the newest first", which is
+    /// what a reader opening the page wants. Live continuation and export are always ascending.
+    order: Option<String>,
     format: Option<String>,
 }
 
@@ -140,8 +148,35 @@ fn kind(value: Option<&str>) -> Result<Option<CaptureKind>, Response> {
     }
 }
 
+/// A comma separated set, bounded and de-duplicated. An empty element is the caller's mistake,
+/// not silently dropped: a stray comma would otherwise widen the filter without saying so.
+fn set(value: Option<&str>, parameter: &str) -> Result<Vec<String>, Response> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(bad_request(format!("empty value in {parameter}")));
+        }
+        if !out.iter().any(|kept: &String| kept == part) {
+            out.push(part.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl ListParams {
-    fn to_query(&self, limit: usize) -> Result<Query, Response> {
+    fn newest_first(&self) -> Result<bool, Response> {
+        match self.order.as_deref() {
+            None | Some("asc") => Ok(false),
+            Some("desc") => Ok(true),
+            Some(other) => Err(bad_request(format!("unknown order {other}"))),
+        }
+    }
+
+    fn to_query(&self, limit: usize, newest_first: bool) -> Result<Query, Response> {
         let association = match (&self.assoc_key, &self.assoc_value) {
             (Some(key), Some(value)) => Some((key.clone(), value.clone())),
             (None, None) => None,
@@ -157,18 +192,27 @@ impl ListParams {
             }
             None => None,
         };
+        let mut levels = Vec::new();
+        for value in set(self.levels.as_deref(), "levels")? {
+            levels
+                .push(level(&value).ok_or_else(|| bad_request(format!("unknown level {value}")))?);
+        }
+        let categories = set(self.categories.as_deref(), "categories")?;
         Ok(Query {
             after_id: self.after_id.unwrap_or(0),
             until_id: self.until_id,
             since_ms: self.since_ms,
             until_ms: self.until_ms,
             min_level,
+            levels,
             category: self.category.clone(),
+            categories,
             event_name: self.event_name.clone(),
             instance_id: self.instance_id.clone(),
             association,
             capture_kind: kind(self.capture_kind.as_deref())?,
             keyword: self.keyword.clone(),
+            newest_first,
             limit,
         })
     }
@@ -182,8 +226,10 @@ pub struct ListResponse {
     /// empty list is never mistaken for "no problems anywhere".
     coverage: &'static str,
     events: Vec<StoredEvent>,
-    /// Cursor for the next page; absent when this page reached the end of the range.
+    /// Cursor for the next page when reading forward; absent when this page reached the end.
     next_after_id: Option<u64>,
+    /// Cursor for the next (older) page when reading newest-first; pass it back as `until_id`.
+    next_until_id: Option<u64>,
     /// Rows matching the whole filtered range, not just this page.
     total: u64,
     /// Events deleted by retention below this id; a cursor older than it cannot be continued.
@@ -202,6 +248,7 @@ fn unavailable(availability: Availability, error: Option<String>) -> ListRespons
         coverage: "none",
         events: Vec::new(),
         next_after_id: None,
+        next_until_id: None,
         total: 0,
         pruned_through: 0,
         gap: false,
@@ -215,7 +262,7 @@ pub async fn list_log_events(
     UrlQuery(params): UrlQuery<ListParams>,
 ) -> Result<Json<ListResponse>, Response> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let query = params.to_query(limit)?;
+    let query = params.to_query(limit, params.newest_first()?)?;
     let coverage = match query.capture_kind {
         Some(CaptureKind::Native) => "native",
         Some(CaptureKind::LegacyBridge) => "legacy_bridge",
@@ -233,14 +280,26 @@ pub async fn list_log_events(
         .count(&query)
         .await
         .map_err(|error| report_to_response(AppError::Custom(error.to_string())))?;
-    let next_after_id = (page.events.len() == limit)
-        .then(|| page.events.last().map(|event| event.id))
-        .flatten();
+    // A full page means there may be more; which end to continue from depends on the direction.
+    // Reading newest-first, the oldest row on this page is the largest id the next page may hold.
+    let full = page.events.len() == limit;
+    let (next_after_id, next_until_id) = match (full, query.newest_first) {
+        (false, _) => (None, None),
+        (true, false) => (page.events.last().map(|event| event.id), None),
+        (true, true) => (
+            None,
+            page.events
+                .last()
+                .and_then(|event| event.id.checked_sub(1))
+                .filter(|id| *id > 0),
+        ),
+    };
     Ok(Json(ListResponse {
         version: "log-events-v1",
         availability: Availability::Ready,
         coverage,
         next_after_id,
+        next_until_id,
         total,
         pruned_through: page.pruned_through,
         gap: page.gap,
@@ -276,7 +335,8 @@ pub async fn stream_log_events(
     UrlQuery(params): UrlQuery<ListParams>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, Response> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let mut query = params.to_query(limit)?;
+    // Live continuation only ever moves forward, whichever way the reader is paging history.
+    let mut query = params.to_query(limit, false)?;
     let stream = async_stream::stream! {
         let mut announced_gap = false;
         loop {
@@ -326,7 +386,7 @@ pub async fn export_log_events(
     UrlQuery(params): UrlQuery<ListParams>,
 ) -> Result<Response, Response> {
     let csv = matches!(params.format.as_deref(), Some("csv"));
-    let mut query = params.to_query(MAX_LIMIT)?;
+    let mut query = params.to_query(MAX_LIMIT, false)?;
     let guard = store().await.lock().await;
     let Some(repository) = guard.repository.as_ref() else {
         return Ok((StatusCode::SERVICE_UNAVAILABLE, "event store unavailable").into_response());
