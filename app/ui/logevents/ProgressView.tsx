@@ -2,8 +2,10 @@
 import Link from 'next/link';
 import useSWR from 'swr';
 import { Button, Card, Empty, Progress, Tag, Typography } from '@douyinfe/semi-ui';
+import { IconArrowRight } from '@douyinfe/semi-icons';
 import { fetcher } from '../../lib/api-streamer';
 import { AssocField, formatBytes, formatMs, relativeText } from '../../lib/log-events';
+import styles from './ProgressView.module.css';
 
 /** 超过这个时间没有新进度就标成过期快照，不当作「仍在运行」。 */
 const STALE_MS = 120_000;
@@ -86,6 +88,15 @@ interface Props {
 	instanceId: string;
 }
 
+function RecoveryLink() {
+	return (
+		<Link href="/missing" className={styles.recoveryLink}>
+			去补传处理
+			<IconArrowRight size="small" aria-hidden="true" />
+		</Link>
+	);
+}
+
 /**
  * 运行进度：直接复用已有业务快照（房间状态、补传 attempt、待投稿会话），日志页不再自己
  * 维护一份上传状态机。没有明确总量的阶段只显示阶段名，不画假百分比；恢复/取消这类操作
@@ -164,7 +175,7 @@ export default function ProgressView({ onJump, instanceId }: Props) {
 
 			<Card
 				title="上传与补传"
-				headerExtraContent={<Link href="/missing">去缺失补传页处理</Link>}
+				headerExtraContent={<RecoveryLink />}
 				bodyStyle={{ padding: 12 }}
 			>
 				{(missing?.length ?? 0) === 0 ? (
@@ -239,7 +250,7 @@ export default function ProgressView({ onJump, instanceId }: Props) {
 
 			<Card
 				title="待投稿会话"
-				headerExtraContent={<Link href="/missing">去缺失补传页处理</Link>}
+				headerExtraContent={<RecoveryLink />}
 				bodyStyle={{ padding: 12 }}
 			>
 				{(sessions?.length ?? 0) === 0 ? (

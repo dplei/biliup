@@ -1,0 +1,34 @@
+.recoveryLink {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	min-height: 28px;
+	padding: 0 10px;
+	border-radius: var(--semi-border-radius-small);
+	background-color: var(--semi-color-primary-light-default);
+	font-size: 12px;
+	font-weight: 600;
+	line-height: 20px;
+	white-space: nowrap;
+	transition: background-color 150ms ease;
+}
+
+.recoveryLink,
+.recoveryLink:visited {
+	color: var(--semi-color-primary);
+	text-decoration: none;
+}
+
+.recoveryLink:hover {
+	background-color: var(--semi-color-primary-light-hover);
+}
+
+.recoveryLink:active {
+	background-color: var(--semi-color-primary-light-active);
+}
+
+.recoveryLink:focus-visible {
+	outline: 2px solid var(--semi-color-primary);
+	outline-offset: 2px;
+}
