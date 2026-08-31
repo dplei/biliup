@@ -43,10 +43,26 @@ pub fn download_with_hook(
         false,
         async move {
             let client = StatelessClient::new(headers, proxy);
-            let response = client.retryable(url).await.unwrap();
+            if matches!(
+                biliup::downloader::live::media_ext_from_url(url).as_deref(),
+                Some("m3u8" | "ts")
+            ) {
+                let file =
+                    LifecycleFile::with_hook(file_name, "ts", file_name_hook).with_owner(owner);
+                return hls::download(url, &client, file, segment)
+                    .await
+                    .map_err(|err| PyRuntimeError::new_err(err.to_string()));
+            }
+            let response = client
+                .retryable(url)
+                .await
+                .map_err(|err| PyRuntimeError::new_err(err.without_url().to_string()))?;
             let mut connection = Connection::new(response);
             // let buf = &mut [0u8; 9];
-            let bytes = connection.read_frame(9).await.unwrap();
+            let bytes = connection
+                .read_frame(9)
+                .await
+                .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
             // response.read_exact(buf)?;
             // let out = File::create(format!("{}.flv", file_name)).expect("Unable to create file.");
             // let mut writer = BufWriter::new(out);
@@ -64,13 +80,16 @@ pub fn download_with_hook(
                         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
                 }
                 Err(nom::Err::Incomplete(needed)) => {
-                    error!("needed: {needed:?}")
+                    error!("needed: {needed:?}");
+                    return Err(PyRuntimeError::new_err("Incomplete media header"));
                 }
                 Err(e) => {
                     error!("{e}");
                     let file =
                         LifecycleFile::with_hook(file_name, "ts", file_name_hook).with_owner(owner);
-                    hls::download(url, &client, file, segment).await.unwrap();
+                    hls::download(url, &client, file, segment)
+                        .await
+                        .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
                 }
             }
             Ok(())
@@ -184,7 +203,8 @@ fn download_with_callback(
             let identity = biliup_cli::observe::RecordingIdentity::task(
                 &biliup::downloader::util::allocate_id("task"),
             );
-            biliup_cli::observe::recording_started(&identity, "live_detected", None);
+            let attempt = biliup::downloader::util::allocate_id("download");
+            biliup_cli::observe::recording_started(&identity, "live_detected", Some(&attempt));
             let outcome = download_with_hook(
                 url,
                 map,
@@ -192,7 +212,7 @@ fn download_with_callback(
                 segmentable,
                 file_name_hook.unwrap_or(Box::new(|_, _, _| {})),
                 proxy.as_deref(),
-                identity.owner(None),
+                identity.owner(Some(&attempt)),
             );
             match &outcome {
                 Ok(()) => {

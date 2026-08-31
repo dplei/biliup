@@ -39,6 +39,24 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   _ms/_secs/_bytes 为单位，不能不带单位地添加时长/大小。最终允许键由 Fields 单一入口维护。
   事件覆盖子 span，子覆盖父；on_record 更新未来事件，入队后快照不再变。
 
+### P3/14 HLS 增量
+
+- 复用 R 或 T、DA 与文件层 S。独立 Rust/wheel/Python 下载在每次调用分配 task 和 DA；
+  `recording.stopped` 仍是 task 终态，不要求重复 DA。服务端从 DownloadConfig 传入 R/DA。
+- `recording.hls_gap`：WARN、executed/media_sequence_gap，带当前文件 S、`media_sequence`、
+  `previous_media_sequence`、`missing_segments`。三者为非负整数，missing 必须大于 0 且
+  等于 current−previous−1；表示列表序列中漏过的媒体片段数量，不换算成 gap_ms。
+- `recording.hls_discontinuity`：WARN、executed/hls_discontinuity，带不连续边界后新建文件的
+  S 与 media_sequence；旧文件关闭仍是 unknown，新边界事件补充原因，不把它冒充网络断连。
+- `recording.disconnected` 的 HLS 错误边界带 stage=hls、R/T/DA、failed；原因由类型映射为
+  invalid_playlist/http_error/read_timeout/source_io/transport_error，不解析自由错误文本。
+  当时不可可靠取得的 S、时长保持未知。它说明本次下载未完成，不能据此推断直播下播。
+- 服务端已知 HLS 后缀直接解析列表；未知后缀保留原有 FLV 探测回落。HLS 只有完整收到至少
+  一个非空媒体片段才触发已有 reconnect 上下文，不因读到列表头就恢复；不制造 FLV 静默测量。
+  配置切片及取消继续复用文件层；取消原因须在下载 future 被释放前写入 close handle。
+- 本批未添加 HLS 解密、fMP4 初始化段支持、分段媒体内容校验或新的网络恢复状态机。列表
+  解析成功不等于媒体可播放；已收字节与无损播放分别验收，不承诺跨进程去重。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify

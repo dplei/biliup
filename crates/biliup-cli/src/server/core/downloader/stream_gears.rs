@@ -101,6 +101,61 @@ impl StreamGears {
 
         // 创建HTTP客户端
         let client = StatelessClient::new(headers_in, proxy.as_deref());
+        let on_ready = || {
+            if let Some(reconnect) = download_config.reconnect {
+                crate::observe::reconnected(
+                    &download_config.owner,
+                    reconnect.gap_ms,
+                    reconnect.silent_ms,
+                    reconnect.silent_measured,
+                    Some(&attempt_id),
+                );
+            }
+        };
+        // let mut i = 0;
+        // let mut prev_file_path = None;
+        // 创建分段回调钩子
+        let hook = {
+            let mut i = 0;
+            let attempt_id = attempt_id.clone();
+            move |s: &str, close_reason, identity: biliup::downloader::util::SegmentIdentity| {
+                let file_path = PathBuf::from(s);
+
+                let event = SegmentInfo {
+                    prev_file_path: file_path,
+                    danmaku_file_path: None,
+                    next_file_path: None,
+                    segment_index: i,
+                    close_reason,
+                    attempt_id: Some(attempt_id.clone()),
+                    segment_id: Some(identity.segment_id),
+                    recovery_source_paths: Vec::new(),
+                    enrollment: None,
+                };
+                callback(SegmentEvent::Segment(event));
+
+                i += 1;
+            }
+        };
+        // Known HLS sources do not need a preliminary FLV-header request. In particular,
+        // its bytes and errors must not be counted as measured FLV media silence.
+        if requested_protocol == "hls" {
+            info!(
+                attempt_id,
+                stream_host,
+                protocol = "hls",
+                candidate_count,
+                quality = download_config.quality.as_deref().unwrap_or("unknown"),
+                "starting stream download"
+            );
+            let file =
+                LifecycleFile::with_hook_and_close_handle(&file_name, "ts", close_handle, hook)
+                    .with_owner(download_config.owner.owner(Some(&attempt_id)));
+            hls::download_with_ready(&url, &client, file, segment, on_ready)
+                .await
+                .change_context(AppError::Unknown)?;
+            return Ok(DownloadStatus::StreamEnded);
+        }
         // 获取可重试的响应
         let response = match client.retryable(&url).await {
             Ok(response) => response,
@@ -145,44 +200,10 @@ impl StreamGears {
                 return Ok(status);
             }
         };
-        // 帧头读通即连接已建立，这里才是「恢复」的真实执行点，不在退避决定时提前宣布。
-        if let Some(reconnect) = download_config.reconnect {
-            crate::observe::reconnected(
-                &download_config.owner,
-                reconnect.gap_ms,
-                reconnect.silent_ms,
-                reconnect.silent_measured,
-                Some(&attempt_id),
-            );
-        }
-        // let mut i = 0;
-        // let mut prev_file_path = None;
-        // 创建分段回调钩子
-        let hook = {
-            let mut i = 0;
-            let attempt_id = attempt_id.clone();
-            move |s: &str, close_reason, identity: biliup::downloader::util::SegmentIdentity| {
-                let file_path = PathBuf::from(s);
-
-                let event = SegmentInfo {
-                    prev_file_path: file_path,
-                    danmaku_file_path: None,
-                    next_file_path: None,
-                    segment_index: i,
-                    close_reason,
-                    attempt_id: Some(attempt_id.clone()),
-                    segment_id: Some(identity.segment_id),
-                    recovery_source_paths: Vec::new(),
-                    enrollment: None,
-                };
-                callback(SegmentEvent::Segment(event));
-
-                i += 1;
-            }
-        };
         // 解析流头部，判断流类型
         match header(&bytes) {
             Ok((_i, header)) => {
+                on_ready();
                 debug!("header: {header:#?}");
                 info!(
                     attempt_id,
@@ -251,7 +272,7 @@ impl StreamGears {
                 let file =
                     LifecycleFile::with_hook_and_close_handle(&file_name, "ts", close_handle, hook)
                         .with_owner(download_config.owner.owner(Some(&attempt_id)));
-                hls::download(&url, &client, file, segment.clone())
+                hls::download_with_ready(&url, &client, file, segment.clone(), on_ready)
                     .await
                     .change_context(AppError::Unknown)?;
                 Ok(DownloadStatus::StreamEnded)
@@ -297,12 +318,17 @@ impl StreamGears {
         *self.token.write().unwrap() = CancellationToken::new();
         let token = self.token.read().unwrap().clone();
         let close_handle = SegmentCloseHandle::default();
+        // Keep the future alive until the cancellation branch records the reason. select!
+        // drops its losing futures before running the winning handler; an owned future there
+        // would finalize the active file as a transport error before we can mark cancellation.
+        let download = self.start_download(callback, download_config, close_handle.clone());
+        tokio::pin!(download);
         tokio::select! {
             _ = token.cancelled() => {
                 close_handle.set(SegmentCloseReason::Cancelled);
                 Ok(DownloadStatus::Cancelled)
             }
-            res = self.start_download(callback, download_config, close_handle.clone()) => {res}
+            res = &mut download => {res}
         }
     }
 
@@ -392,6 +418,171 @@ mod tests {
         ]);
         bytes.extend_from_slice(body);
         bytes.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn hls_server_reconnect_requires_media_and_cancel_preserves_identity() {
+        use axum::{Router, http::StatusCode, routing::get};
+        // Recorder sanitizes templates into basenames, so the executor writes in the process
+        // cwd. Remove only paths delivered by this test, including when an assertion fails.
+        struct Cleanup(Arc<Mutex<Vec<SegmentInfo>>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for segment in self.0.lock().unwrap().iter() {
+                    let _ = std::fs::remove_file(&segment.prev_file_path);
+                }
+            }
+        }
+        for mode in ["ended", "invalid", "absent", "cancel"] {
+            let directory = tempfile::tempdir().unwrap();
+            let captured = Captured::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(captured.clone()),
+            );
+            let playlist = if mode == "invalid" {
+                "invalid playlist".to_string()
+            } else {
+                format!(
+                    "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,\npart.ts\n{}",
+                    if mode == "cancel" {
+                        ""
+                    } else {
+                        "#EXT-X-ENDLIST\n"
+                    }
+                )
+            };
+            let app = Router::new()
+                .route(
+                    "/index.m3u8",
+                    get(move || {
+                        let body = playlist.clone();
+                        async move { body }
+                    }),
+                )
+                .route(
+                    "/part.ts",
+                    get(move || async move {
+                        if mode == "absent" {
+                            (StatusCode::NOT_FOUND, "absent")
+                        } else {
+                            (StatusCode::OK, "synthetic media")
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/index.m3u8", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let streamer_info = StreamerInfo::new(
+                "受控主播",
+                "http://127.0.0.1/controlled",
+                "受控标题",
+                chrono::Utc::now(),
+                "",
+            );
+            let config = DownloadConfig {
+                url,
+                stream_candidates: Vec::new(),
+                segment_time: None,
+                file_size: None,
+                headers: Default::default(),
+                recorder: Recorder::new(
+                    Some(directory.path().join("hls-%s-%f").display().to_string()),
+                    streamer_info,
+                ),
+                output_dir: directory.path().to_path_buf(),
+                suffix: "m3u8".into(),
+                owner: RecordingIdentity::server(7, 42, "受控主播"),
+                reconnect: Some(ReconnectContext {
+                    gap_ms: 1000,
+                    silent_ms: 0,
+                    silent_measured: false,
+                }),
+                attempt_id: Some("attempt-controlled-hls".into()),
+                quality: None,
+                stall_timeout_secs: Some(5),
+            };
+            let segments = Arc::new(Mutex::new(Vec::new()));
+            let _cleanup = Cleanup(segments.clone());
+            let hook = segments.clone();
+            let downloader = StreamGears::new(None);
+            let download = downloader.download(
+                Box::new(move |event| {
+                    if let SegmentEvent::Segment(info) = event {
+                        hook.lock().unwrap().push(info);
+                    }
+                }),
+                config,
+            );
+            let stop = async {
+                if mode == "cancel" {
+                    while captured.named("recording.reconnected").is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    downloader.stop().await.unwrap();
+                }
+            };
+            let (result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(download, stop)
+            })
+            .await
+            .unwrap();
+            server.abort();
+            let reconnected = captured.named("recording.reconnected");
+            let created = captured.named("recording.segment_created");
+            let closed = captured.named("recording.segment_closed");
+            assert!(
+                downloader.take_last_gap().is_none(),
+                "HLS must not fabricate FLV silence measurements"
+            );
+            if mode == "invalid" || mode == "absent" {
+                assert!(result.is_err());
+                assert!(reconnected.is_empty());
+                let disconnected = captured.named("recording.disconnected");
+                assert_eq!(disconnected.len(), 1);
+                assert_eq!(
+                    disconnected[0]["download_attempt_id"],
+                    "attempt-controlled-hls"
+                );
+                assert_eq!(
+                    disconnected[0]["reason_code"],
+                    if mode == "invalid" {
+                        "invalid_playlist"
+                    } else {
+                        "http_error"
+                    }
+                );
+                continue;
+            }
+            assert!(matches!(
+                (mode, result.unwrap()),
+                ("ended", DownloadStatus::StreamEnded) | ("cancel", DownloadStatus::Cancelled)
+            ));
+            assert_eq!(reconnected.len(), 1);
+            assert_eq!(reconnected[0]["reason_code"], "estimated_gap");
+            assert_eq!(created.len(), 1);
+            assert_eq!(closed.len(), 1);
+            assert_eq!(
+                closed[0]["reason_code"],
+                if mode == "cancel" {
+                    "user_cancel"
+                } else {
+                    "stream_end"
+                }
+            );
+            assert_eq!(closed[0]["segment_id"], created[0]["segment_id"]);
+            assert_eq!(created[0]["live_streamer_id"], "7");
+            assert_eq!(created[0]["streamer_info_id"], "42");
+            assert_eq!(created[0]["download_attempt_id"], "attempt-controlled-hls");
+            let segments = segments.lock().unwrap();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(
+                segments[0].segment_id.as_deref(),
+                Some(created[0]["segment_id"].as_str())
+            );
+            assert!(captured.named("recording.disconnected").is_empty());
+        }
     }
 
     fn splittable_flv(keyframes: usize, payload: usize) -> Vec<u8> {

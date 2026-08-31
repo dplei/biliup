@@ -70,6 +70,24 @@ class EvidenceTest(unittest.TestCase):
         self.assertIn('missing_field:previous_ms', codes)
         self.assertIn('missing_field:last_ms', codes)
 
+    def test_hls_boundary_requires_identity_and_integer_sequence_gap(self):
+        fields = {'segment_id': 'segment-alpha', 'original_file': 'synthetic.ts',
+                  'media_sequence': 3, 'previous_media_sequence': 1, 'missing_segments': 1,
+                  'outcome': 'executed', 'reason_code': 'media_sequence_gap'}
+        self.event(True, 'recording.hls_gap', fields)
+        self.event(True, 'recording.hls_discontinuity', {k: v for k, v in fields.items()
+                   if k not in {'previous_media_sequence', 'missing_segments'}})
+        out, _ = self.export()
+        self.assertEqual(e.validate(out)['status'], 'passed')
+        self.event(True, 'recording.hls_gap', dict(fields, missing_segments=True))
+        self.event(True, 'recording.hls_gap', dict(fields, missing_segments=2))
+        self.event(True, 'recording.hls_discontinuity', {'media_sequence': 3})
+        out, _ = self.export('bad-hls')
+        codes = {x['code'] for x in e.validate(out)['errors']}
+        self.assertIn('invalid_unit:missing_segments', codes)
+        self.assertIn('invalid_hls_gap', codes)
+        self.assertIn('missing_field:segment_id', codes)
+
     def test_independent_upload_requires_task_file_and_attempt_together(self):
         self.event(True, 'upload.failed', {'task_id': 'task-alpha', 'original_file': 'input.flv', 'segment_order': 1,
                    'upload_attempt_id': 'attempt-alpha', 'outcome': 'failed', 'reason_code': 'rate_limited'})

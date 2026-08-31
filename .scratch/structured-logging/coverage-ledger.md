@@ -45,6 +45,7 @@ S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt
 | C03 | recording.segment_created、recording.segment_closed、recording.segment_enrolled / 所有下载路径 | R或T、S；关闭含size_bytes、reason_code；登记后U/missing_id | executed/failed；split_limit/stream_end/unknown/enrollment_failed | LifecycleFile::create、SegmentEventProcessor、enroll_validated_segment；创建时尚无稳定S，是P3缺口；S03 |
 | C04 | recording.dts_backward / 原生HTTP-FLV | R或T、S、previous_ms/current_ms；汇总含count/first_ms/last_ms/max_backward_ms | executed；timestamp_backward | httpflv::parse_flv DTS警告；原文无S，初期1:1，启用汇总才N:1；S03 |
 | C05 | recording.disconnected、recording.retry_scheduled、recording.reconnected / 全下载 | R或T、DA；delay_ms/silent_ms/gap_ms（测不到gap可空） | failed/waiting/recovered；read_timeout/transport_error/stream_end | Connection::read_frame、StreamGears::start_download、download重试；外部进程无FLV gap测量，N:1；S02/S03 |
+| C05 | recording.hls_gap、recording.hls_discontinuity / 原生 HLS | R或T、DA、S、media_sequence；gap另含previous_media_sequence/missing_segments | executed；media_sequence_gap/hls_discontinuity | hls::download_inner 的旧 skipped/discontinuity 警告；序列缺口不是毫秒缺口，不连续指向新文件；S03 |
 | C06 | processing.decided、processing.completed / server上传预处理 | R、S、UA；artifact_file可空、duration_ms可空 | executed/skipped/fallback/failed；disabled/no_audio/low_disk/probe_failed/invalid_output | normalize_for_upload、normalize_timestamps、process_segment_event；不同工具分别stage，N:1；S04 |
 | C07 | upload.queued、upload.started、upload.failed、upload.completed、upload.line_decided / server/CLI/Python | R或T、S、U（CLI可空）、UA（排队可空）；line可空 | executed/failed/succeeded/fallback；configured/automatic/cooldown/network_error | upload::upload_enrolled_with_watchdog、upload_single_file、decide_upload_line、Parcel/Upos；1个attempt多事件；S05 |
 | C08 | 不追加普通事件 / 上传入口 | S、UA、phase、confirmed_bytes、updated_at_ms来自业务快照 | 不由日志推断终态 | UploadActivity、record_heartbeat；旧16MiB/5秒INFO为N:1快照映射；S01/S05 |
@@ -70,7 +71,7 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：重叠调用共享run、不覆盖宿主subscriber；顺序调用排空后新建run，旧文件照常 |
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
-| HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python读头失败回落HLS；server StreamGears同样探测 | P3/12实测：FLV路径稳定segment_id与原生事件通过（Python入口真实演练 + 服务端执行器集成测试）；HLS共用同一文件层但未实跑 |
+| HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python/server 的已知m3u8/ts直接HLS，其余保留FLV探测回落 | P3/14第三批：HLS复用S，新增序列缺口/不连续与失败事件；三下载入口受控三态/回退通过，CLI提取结果为fixture；服务执行器的媒体后重连与取消通过，真实平台HLS及服务整链待验 |
 | 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | 不冒称可用；P3/14须复核实际可达性 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
 
@@ -198,3 +199,14 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   合成回归通过，原包/视图已标记撤回、在私有目录用修复后的导出器重导；原生成功样本采集
   早于这次脱敏补修，不当作最终采集版本的长观察证据。见
   [P3 第二批](receipts/P3.md#任务-14-第二批页面整场上传)。
+- C02/C03/C05 / HLS 的 Rust CLI、wheel CLI、Python 下载及服务执行器 / contract-v1 / 14 第三批 /
+  hls-entries-v2：原生序列缺口/不连续/失败与 T/DA/S 关联通过；三下载入口各正常两次、非法
+  列表、HTTP 错误 × 采集三态、关闭回退及三份包校验通过。CLI General 消费受控提取结果，
+  不宣称 yt-dlp 或在线平台通过。服务执行器测试 R/DA/S 回调、实收媒体后重连、用户取消。
+  `media_sequence/previous_media_sequence/missing_segments` 为片段序列/数量，不是时间；
+  追加原因 media_sequence_gap/hls_discontinuity/invalid_playlist/http_error/source_io，
+  通用传输错误/read_timeout 保留。独立 stopped 仍以 T 表示终态，不要求 DA。
+  旧 `SKIPPED` / `DISCONTINUITY` 文案保留；新源可区分丢片数量和输出文件，人工抽查通过，
+  未做新的三次隔离还原。HLS 真平台/服务整链/真实断连恢复、双路并发和量化负载待补；
+  C04 不因 TS 事件算 DTS 验证，C01/C11–C13 和外部下载器不计覆盖，见
+  [P3 第三批](receipts/P3.md#任务-14-第三批hls-下载)。
