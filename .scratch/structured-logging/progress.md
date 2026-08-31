@@ -3,7 +3,7 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收；P3 进行中：任务 12、13 交付完成、验收 partial，14–16 未开始。
+P0–P2 已完成并通过本地受控验收；P3 进行中：12、13 交付完成（验收 partial），15 通过，14/16 未开始。
 录制域已有原生事件，其余域仍只有桥接；P4–P6 未开始，旧日志/页面保留。
 
 ## 状态约定
@@ -54,7 +54,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通与受控演练通过；缺真实开播整场样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：决定链受控实跑通过；远端上传/投稿待 dev 实跑 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | not-started | pending | 待实现、场景验证及首轮观察 |
-| [15 查询 API](issues/15-query-api.md) | P3 | not-started | pending | 待实现 |
+| [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
 | [16 试用页面](issues/16-preview-ui.md) | P3 | not-started | pending | 待实现 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
 | [18 停旧写入](issues/18-stop-legacy-writes.md) | P5 | not-started | pending | 待前置通过后无文件观察及回退验证 |
@@ -63,7 +63,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 ## 当前交接位置
 
 - 最近已验收阶段：P2（09、10、11 全部 passed）。
-- 当前实施阶段/任务：P3 进行中；任务 12、13 完成（验收均为 partial），下一项是任务 15。
+- 当前实施阶段/任务：P3 进行中；12、13、15 已完成，剩 16（试用页面）与 14（全范围覆盖），各自单独一轮 session 做。
 - 本轮已做：核验 P2 证据后进入 P3；实现分段稳定身份与录制域原生事件（创建/关闭/登记/
   DTS/断连/重连/开始/结束），加法迁移持久化身份；补 5 项测试；跑通受控录制演练并导出
   证据包，7 条预期事实全部确认；闭环 3 处差异（切片原因恒 Unknown、导出目录不认汇总形态、
@@ -75,7 +75,10 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 - 已知边界：原生覆盖目前只到录制域（C02–C05 的受控部分），C06–C13 仍只有桥接；服务端整场
   循环缺真实开播样本；外部下载器与 HLS 路径未接入身份；纯文本桥接在重复旧行与脱敏行上
   不可判定；仅 macOS 本机验证，Windows 未验证。
-- 下一次可直接输入：`@.scratch/structured-logging/stage-prompts.md 继续 P3，从上次未完成处接着做`。
+- 下一次可直接输入（**一轮只做一个任务**，做完回写并停下）：
+  - 先做页面：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 16`
+  - 再做覆盖：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`
+  - 两个任务各自的范围与验收边界见 [P3 回执](receipts/P3.md) 的「后续拆分」一节。
 
 ## 每次回写的检查清单
 

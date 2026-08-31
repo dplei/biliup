@@ -58,6 +58,7 @@
 | `crates/biliup-observability/src/shadow.rs` | 把独立采集以可关闭旁路接进各入口：启动时读环境开关、同库多次调用共享一个 run、把 runtime worker 绑定到同一 dispatch，并保留嵌入宿主已有 subscriber。 | `Shadow`、`Config::from_env`、`block_on_inherited`、`health_snapshot`、`Inherited` |
 | `crates/biliup-observability/examples/shadow_acceptance.rs` | 新旧双路同时开启的合成负载入口：同时测量发射延迟、排空、两侧丢弃与新旧合计磁盘占用，并产出可导出的证据请求。 | `main`、`ticks` |
 | `crates/biliup-observability/examples/acceptance.rs` | 隔离的日志预算验收入口：以合成双路事件测量发射、调度延迟、排空、分页和磁盘占用，不启动业务服务。 | `main`、`workload` |
+| `crates/biliup-cli/src/server/api/log_events.rs` | 独立事件库的只读入口：按级别/分类/时间/关键词/关联 ID/采集种类分页查询（**默认只回原生事件**，桥接须显式请求），附件详情、SSE 实时接续（只发已提交事件，与列表共用入库序号游标）与 JSONL/CSV 流式导出；采集关闭或库不可用时回 `availability` 而不是空列表。 | `list_log_events`、`stream_log_events`、`export_log_events`、`get_log_event_diagnostic`、`Availability`、`ListParams` |
 | `crates/biliup-cli/src/server/api/ws.rs` | 基于文件的实时日志 WebSocket：白名单逻辑文件名映射到最新滚动文件，初连取末尾记录，再轮询新增内容并发送保活。 | `ws_logs`、`websocket_logs`、`resolve_latest_log`、`send_last_lines` |
 | `app/(app)/logviewer/page.tsx` | 按日志文件切换 tab 的实时日志页：通过 WebSocket 追加文本、管理滚动/连接状态，并提供静态文件下载入口。 | `LogViewer`、`LogContent` |
 | `app/ui/plugins/developer.tsx` | 开发者日志设置表单，编辑旧 `LOGGING` 配置及后端动态日志过滤使用的 `loggers_level`。 | `Developer` |
@@ -139,6 +140,7 @@
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/infrastructure/connection_pool.rs`（`ConnectionManager::new_pool`）：服务启动时创建业务 SQLite 连接池并运行迁移。
 - `crates/biliup-cli/src/lib.rs` → `crates/biliup-cli/src/server/app.rs`（`ApplicationController::serve`）：服务依赖与主播任务恢复完成后创建并运行 HTTP 应用。
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/api/ws.rs`（`ws_logs`）：应用启动层单独挂载日志 WebSocket；检查认证边界时不能只读业务 router。
+- `crates/biliup-cli/src/server/router.rs` → `crates/biliup-cli/src/server/api/log_events.rs`、`api/ws.rs`（`list_log_events`、`ws_logs`）：新老两个日志入口都挂在 router 内，`app.rs` 的 `login_required` 因此对两者同时生效；开启 `--auth` 时未登录一律 401，显式关闭认证的部署行为不变。
 - `app/(app)/logviewer/page.tsx` → `crates/biliup-cli/src/server/api/ws.rs`（`/v1/ws/logs`）：文件 tab 以 `file` 参数订阅文本流，前端逐条追加显示。
 - `app/ui/plugins/developer.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`loggers_level`、配置保存）：表单值保存后通过 reload handle 修改 tracing 过滤器。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_line_selection.rs`（`decide_upload_line`）：录制期上传、页面整场上传、静默补传和手动补传共用同一个线路决策，回退原因随决策一起写日志并返回给页面。

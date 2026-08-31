@@ -3,7 +3,7 @@
 Status: needs-triage
 Blocked by: 09, 10
 Phase: P3，可与业务接入分别推进
-Implementation: not-started
+Implementation: complete
 
 来源：[总体设计](../spec.md)、[页面设计](../page-design.md)。
 
@@ -37,3 +37,14 @@ Implementation: not-started
 ## Comments
 
 API 可先提供桥接诊断和有限原生样本用于开发，不承诺全覆盖已完成。
+
+- 交付完成、验收 passed，结论见 [P3 回执](../receipts/P3.md)。`/v1/log-events` 系列四个只读
+  接口（列表 / 附件详情 / SSE 实时接续 / JSONL·CSV 导出）落在登录守卫内的 router 里，
+  默认只查原生事件，桥接需显式 `capture_kind=legacy_bridge`，响应带覆盖范围、保留水位与
+  采集健康——采集关闭时明确返回 `availability=disabled`，不给一个会被误读为「没有异常」的空列表。
+- **行为变更**：旧的 `/v1/ws/logs` 从 `app.rs` 守卫之外挪进 router，开启 `--auth` 后未登录
+  不能再读旧日志文件流；显式关闭认证的部署行为不变。实跑证据：守卫态五个入口全 401，
+  关闭态列表/导出/实时 200、附件 404、旧 ws 400（需要 upgrade，行为未变）。
+- 事件库加了 `capture_kind` 与 `message` 两列（加法迁移并从 payload 回填），否则按采集种类
+  和关键词过滤只能全表扫 JSON。旧版本写出的库仍可查。
+- 未做：导出的并发上限、WAL 回收的量化观测；旧 `/v1/ws/logs` 仍读真实旧文件，不映射新库。
