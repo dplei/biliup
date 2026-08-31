@@ -91,8 +91,9 @@ async fn download_stream(
     // borrows a streamer identity it does not have.
     let identity =
         crate::observe::RecordingIdentity::task(&biliup::downloader::util::allocate_id("task"));
-    let owner = identity.owner(None);
-    crate::observe::recording_started(&identity, "live_detected", None);
+    let attempt = biliup::downloader::util::allocate_id("download");
+    let owner = identity.owner(Some(&attempt));
+    crate::observe::recording_started(&identity, "live_detected", Some(&attempt));
     let result = download_stream_inner(
         url,
         headers,

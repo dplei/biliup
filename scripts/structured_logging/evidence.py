@@ -33,6 +33,8 @@ OUTCOMES = {"executed", "skipped", "fallback", "failed", "waiting", "succeeded",
 # A value may list alternative shapes; an event satisfies the catalog by matching any one of them
 # (a source-side rollup carries counts instead of one pair, and is not a missing field).
 REQUIRED = {
+ "recording.hls_gap": ["segment_id", "original_file", "media_sequence", "previous_media_sequence", "missing_segments", "outcome", "reason_code"],
+ "recording.hls_discontinuity": ["segment_id", "original_file", "media_sequence", "outcome", "reason_code"],
  "recording.dts_backward": [["segment_id", "previous_ms", "current_ms"],
                             ["segment_id", "count", "first_ms", "last_ms", "max_backward_ms"]],
  "recording.segment_created": ["segment_id", "original_file"],
@@ -448,9 +450,15 @@ def validate(out, expectations=None):
             if fields.get("outcome", "unknown") not in OUTCOMES:
                 errors.append({"ref": ref, "code": "invalid_outcome"})
             for key, value in fields.items():
-                if key.endswith(("_ms", "_secs", "_bytes")) and (type(value) is not int or value < 0):
+                if (key.endswith(("_ms", "_secs", "_bytes")) or key in {"media_sequence", "previous_media_sequence", "missing_segments"}) and (type(value) is not int or value < 0):
                     errors.append({"ref": ref, "code": "invalid_unit:" + key})
             if e.get("capture_kind") == "native":
+                if e["event_name"] == "recording.hls_gap":
+                    numbers = [fields.get(k) for k in ("media_sequence", "previous_media_sequence", "missing_segments")]
+                    if all(type(n) is int for n in numbers):
+                        current, previous, missing = numbers
+                        if missing <= 0 or current - previous - 1 != missing:
+                            errors.append({"ref": ref, "code": "invalid_hls_gap"})
                 terminal = {"upload.failed":"failed", "upload.completed":"succeeded"}.get(e["event_name"])
                 if terminal and fields.get("outcome") != terminal:
                     errors.append({"ref": ref, "code": "terminal_outcome_conflict"})

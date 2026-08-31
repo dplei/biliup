@@ -95,10 +95,26 @@ pub(crate) fn field_kind(key: &str) -> Option<&'static str> {
         "message" => Some("message"),
         "error" => Some("error"),
         "streamer_name" | "platform" | "stage" | "phase" | "line" => Some("text"),
-        "previous_ms" | "current_ms" | "first_ms" | "last_ms" | "max_backward_ms"
-        | "duration_ms" | "delay_ms" | "silent_ms" | "gap_ms" | "size_bytes"
-        | "confirmed_bytes" | "updated_at_ms" | "total_bytes" | "count" | "pending_count"
-        | "segment_order" | "timeout_secs" => Some("number"),
+        "previous_ms"
+        | "current_ms"
+        | "first_ms"
+        | "last_ms"
+        | "max_backward_ms"
+        | "duration_ms"
+        | "delay_ms"
+        | "silent_ms"
+        | "gap_ms"
+        | "size_bytes"
+        | "confirmed_bytes"
+        | "updated_at_ms"
+        | "total_bytes"
+        | "count"
+        | "pending_count"
+        | "segment_order"
+        | "timeout_secs"
+        | "media_sequence"
+        | "previous_media_sequence"
+        | "missing_segments" => Some("number"),
         "exit_code" => Some("signed"),
         _ => None,
     }

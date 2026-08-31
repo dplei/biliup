@@ -9,6 +9,9 @@ pub enum Error {
     #[error("{0}")]
     Custom(String),
 
+    #[error("Invalid or unsupported HLS playlist")]
+    HlsInvalidPlaylist,
+
     #[error(transparent)]
     ElapsedError(#[from] Elapsed),
 
