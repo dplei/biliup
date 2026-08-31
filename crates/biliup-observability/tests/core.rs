@@ -159,6 +159,12 @@ fn safety_unknown_debug_bounded_error_and_chunked_diagnostic() {
             url = "https://example.invalid/?sign=synthetic",
             "带签名 https://example.invalid/?sign=synthetic"
         );
+        // The old uploader prints the complete typed response, not `aid=123` text.
+        tracing::info!(
+            target: "legacy::upload",
+            "通过页面上传成功 {}",
+            r#"ResponseData { code: 0, data: Some(Object {"aid": Number(987654321), "bvid": String("synthetic-archive")}) }"#
+        );
     });
     let mut capture = DiagnosticCapture::new();
     capture.push(b"fatal: decoder failed\nAuthoriz");
@@ -192,6 +198,12 @@ fn safety_unknown_debug_bounded_error_and_chunked_diagnostic() {
     assert!(events[0].data().fields.quality().truncated > 0);
     assert!(events[0].data().fields.quality().rejected > 0);
     assert_eq!(events[1].data().message, "[REDACTED]");
+    assert_eq!(events[2].data().message, "[REDACTED]");
+    assert!(
+        !serde_json::to_string(events[2].data())
+            .unwrap()
+            .contains("987654321")
+    );
     let f = Fields::new()
         .with("gap_ms", -1)
         .with("original_file", "/private/example/segment.flv")

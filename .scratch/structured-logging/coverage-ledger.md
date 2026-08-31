@@ -32,7 +32,7 @@ P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12–13 �
 
 ### v1 原生目录与旧来源映射
 
-共同字段见契约；R=服务端 live_streamer_id+streamer_info_id；T=独立命令 task_id；
+共同字段见契约；R=服务端 live_streamer_id+streamer_info_id；T=独立命令/嵌入/页面上传 task_id；
 S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt_id。
 启动时尚未建立的业务身份允许 null；所有缺失保持未知，不按 file/session 文本推断。
 路径必须 basename 脱敏，显示名可空；数值时长单位 ms、大小 bytes。结果/原因是结构化字段，
@@ -69,6 +69,7 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Rust CLI | 全局subscriber；仅stdout，--rust-log缺省tower_http=debug,info，秒级本地时间，Web可reload，无文件guard | P2实测：旁路三态通过；无持久旧文件，受控对照用wrapper stdout |
 | Python 下载函数 | 每次with_default局部subscriber，stdout + download.log不轮转，默认INFO，秒级；guard退出flush，worker绑定同一dispatch | P2实测：重叠调用共享run、不覆盖宿主subscriber；顺序调用排空后新建run，旧文件照常 |
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
+| 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python读头失败回落HLS；server StreamGears同样探测 | P3/12实测：FLV路径稳定segment_id与原生事件通过（Python入口真实演练 + 服务端执行器集成测试）；HLS共用同一文件层但未实跑 |
 | 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | 不冒称可用；P3/14须复核实际可达性 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
@@ -184,3 +185,16 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
 - 入口生命周期文字更正 / P2–P3：`Shadow` 只在 guard 重叠时共享运行实例；最后一个 guard
   退出会排空，之后的顺序调用新建 process_run_id。历史「多次调用共享run」不适用于这种
   顺序调用；本批重新实测了此边界，不更改底座或伪造相同 run。
+
+- C07/C10 / 页面整场上传 / contract-v1 / 14 第二批 / page-upload-v1：task 在请求进入时分配，
+  在响应和后台生命周期间关联；`upload_with_task` 复用首批传输事件，`UploadTask::submit`
+  复用成功/未知结果判断。新增原因 `studio_build_failed/no_videos`。任务接受不等于完成，
+  无输入与模板构建失败的完整后续分支尚无运行样本；测试只覆盖空输入在认证失败前的旧行为。
+  Rust/wheel 各三态、并发重复调用、关闭回退与两份证据包确定性校验通过；一次 Rust 页面
+  实际远端上传→投稿成功链通过，同一 task/UA/输入序号可答，远端只读回查确认仅自己可见。
+  首批 CLI/Python 的远端成功/恢复仍待补验，不因共用代码而代计；仍不计 C01/C11–C13。
+- 隐私必要补修 / 桥接与证据导出 / contract-v1 / 14 第二批：真实成功样本揭示
+  `ResponseData` 中数字稿件编号未被旧正则清理；现按原始响应整值脱敏，保留其他独立成功行。
+  合成回归通过，原包/视图已标记撤回、在私有目录用修复后的导出器重导；原生成功样本采集
+  早于这次脱敏补修，不当作最终采集版本的长观察证据。见
+  [P3 第二批](receipts/P3.md#任务-14-第二批页面整场上传)。

@@ -92,6 +92,19 @@ class EvidenceTest(unittest.TestCase):
         self.assertIn('legacy_line_limit',m['completeness']['reasons'])
         self.assertLess((out/'legacy.jsonl').stat().st_size,8192)
 
+    def test_legacy_typed_remote_response_is_omitted_in_both_sources(self):
+        payload = '通过页面上传成功 ResponseData { code: 0, data: Some(Object {"aid": Number(987654321), "bvid": String("synthetic-archive")}) }'
+        self.old.write_text(payload + '\nINFO Submit successful\n')
+        self.event(message=payload)
+        out, manifest = self.export()
+        visible = ''.join(p.read_text() for p in out.glob('*.json*') if not p.name.startswith('.'))
+        self.assertNotIn('987654321', visible)
+        self.assertNotIn('synthetic-archive', visible)
+        self.assertNotIn('ResponseData', visible)
+        self.assertIn('Submit successful', visible)
+        self.assertEqual(manifest['completeness']['status'], 'complete')
+        self.assertEqual(e.validate(out)['status'], 'passed')
+
     def test_declared_timezone_survives_and_bogus_zone_is_unknown(self):
         # Regression: a path-shaped scrub used to turn "Asia/Shanghai" into "Asia[PATH]",
         # leaving analysts unable to align the two sources' timestamps.
