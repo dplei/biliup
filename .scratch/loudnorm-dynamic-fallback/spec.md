@@ -1,8 +1,9 @@
 # Spec：loudnorm 静默退回动态模式，响度打不到目标
 
 Status: ready-for-human（机制已实测确认，策略待定）
-来源：[`normalization-duration-metric`](../../.archive/normalization-duration-metric/verification.md)
-的 dev 环境验收顺带观察到，非该 effort 引入
+来源：[`dplei/biliup#19`](https://github.com/dplei/biliup/issues/19)
+（由 [`normalization-duration-metric`](../../.archive/normalization-duration-metric/verification.md)
+的 dev 环境验收顺带观察到，非该 effort 引入）
 分支：`dev`
 
 本文只定问题与取舍，实现步骤拆在 [`issues/`](./issues/) 下。

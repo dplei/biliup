@@ -1,8 +1,13 @@
 # Issue tracker：本地 Markdown
 
-本仓库的 issue 与 spec（spec 也常被称作 PRD）以 markdown 文件形式存放在 `.scratch/` 下。
+本仓库的 spec（spec 也常被称作 PRD）与实现 ticket 以 markdown 文件形式存放在 `.scratch/` 下。
 
-> 说明：`dplei/biliup` 是个人部署用的 fork，GitHub Issues 已关闭；`gh issue create` 会落到上游 `biliup/biliup`，因此**不要**用 `gh` 建 issue。
+> **与 GitHub issue 的分工**：`dplei/biliup` 的 GitHub Issues 是**问题入口与对外记录**——
+> 发现问题在那里开 issue；`.scratch/` 是**设计与拆解的工作区**——根因分析、方案取舍、
+> ticket 拆分都落在这里，并在 spec 顶部用 `来源：` 链回那条 issue。两边都要有。
+>
+> 建 issue 用 `gh issue create --repo dplei/biliup`。**`--repo` 不能省**：本仓库是 fork，
+> 省掉它 `gh` 会把 issue 开到上游 `biliup/biliup`。
 
 ## 约定
 
