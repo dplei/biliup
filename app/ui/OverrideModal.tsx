@@ -59,6 +59,28 @@ const serializeTimeRange = (timeRange: LiveStreamerEntity['time_range']) => {
   return timeRange
 }
 
+/**
+ * 「下载设置」面板里取值型的字段。清空控件＝撤销这一条覆写，写回 `null`（patch 侧的
+ * `None`，与后端返回的形态一致）。
+ */
+const DOWNLOAD_VALUE_FIELDS = [
+  'downloader',
+  'file_size',
+  'segment_time',
+  'filtering_threshold',
+] as const
+
+/**
+ * 同一面板里的布尔字段。`Config` 上它们是裸 `bool`，patch 侧却是 `Option<bool>`——
+ * 「跟随全局」是「键为 null」，和「覆写成关闭」完全两回事，Switch 的两态说不出这个区别：
+ * 全局开着的项在弹窗里一律显示成关，用户点一下开再点回关，就从「跟随」变成了「强制关闭」，
+ * 而界面上两者长得一模一样。所以这里用三选一的 Select。
+ */
+const DOWNLOAD_BOOL_FIELDS = ['preserve_recoverable_short_segments', 'route_health_enabled'] as const
+
+/** 三态 Select 的「跟随全局」选项值。空串正好也是 Semi 清空后的值。 */
+const INHERIT = ''
+
 /** override JSON 里属于音量的键，整组一起写入或一起拿掉。 */
 const AUDIO_OVERRIDE_FIELDS = [
   'audio_normalization_enabled',
@@ -177,6 +199,14 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   // 各字段的内置默认值——总比显示一个凭空捏造的数字强。
   const { data: globalConfig } = useSWR('/v1/configuration', fetcher)
 
+  // 覆写值只存在于 entity.override 里，Form 的 initValues={entity} 够不着。取值型控件都得
+  // 自己拿 initValue 回显——库里存着 50，输入框却空着，用户只能去顶部的 JSON 框里认。
+  const overrideInit = (key: string) => (entity?.override as Record<string, any>)?.[key] ?? undefined
+  const tristateInit = (key: string) => {
+    const raw = (entity?.override as Record<string, any>)?.[key]
+    return raw === true ? 'on' : raw === false ? 'off' : INHERIT
+  }
+
   // 覆写值只存在于 entity.override 里，Form 的 initValues={entity} 够不着，得显式合进去。
   const audioOverride = (entity?.override ?? {}) as Record<string, any>
   const pickAudio = (key: string, fallback: any) =>
@@ -206,7 +236,12 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
   })
 
   const [visible, setVisible] = useState(false)
+  // 折叠面板没展开时字段压根不挂载，values 里留的是平台插件灌进去的库中原值。记下这一轮
+  // 开过哪些面板，只让开过的面板接管自己的字段——否则「清空输入框」和「面板根本没打开」
+  // 在提交时长得一模一样，想撤销一条覆写就永远做不到。
+  const [openedPanels, setOpenedPanels] = useState<string[]>([])
   const showDialog = () => {
+    setOpenedPanels([])
     setVisible(true)
   }
   const handleOk = async () => {
@@ -285,6 +320,23 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           overrideConfig[key] = values[key] === '' ? null : values[key]
         }
       })
+      // 「下载设置」展开过，这一组就由控件说了算：控件的初值来自 override 本身，不改则等值
+      // 写回，清空则写 null 撤销覆写。没展开过就一项都不碰——那时 values 里是平台插件灌进来的
+      // 库中原值，接管它等于把「没打开过的面板」也当成用户表达，清空与未展开还分不开。
+      if (openedPanels.includes('download')) {
+        DOWNLOAD_VALUE_FIELDS.forEach(key => {
+          const raw = values[key]
+          overrideConfig[key] = raw === undefined || raw === '' ? null : raw
+        })
+        DOWNLOAD_BOOL_FIELDS.forEach(key => {
+          const raw = values[key]
+          // 库里的原值是 boolean，Select 给出的是字符串，两种都要认。
+          if (raw === 'on' || raw === true) overrideConfig[key] = true
+          else if (raw === 'off' || raw === false) overrideConfig[key] = false
+          else overrideConfig[key] = null
+        })
+      }
+
       // 音量三项由控件独占：只要「音量设置」面板被展开过，控件当前值就是权威，顶部 JSON
       // 文本框里的同名旧值一律让位。不这么做的话用户从界面上撤销不掉一条已有的覆写——
       // 控件回显「跟随全局」，提交后 textOverride 里的旧值又被原样写了回去。
@@ -364,6 +416,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.Select
         label="下载插件（downloader）"
         field="downloader"
+        initValue={overrideInit('downloader')}
         placeholder="stream-gears（默认）"
         style={{ width: '100%' }}
         fieldStyle={{
@@ -381,6 +434,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.InputNumber
         label="视频分段大小（file_size）"
         field="file_size"
+        initValue={overrideInit('file_size')}
         placeholder=""
         suffix={'Byte'}
         style={{ width: '100%' }}
@@ -394,6 +448,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.Input
         field="segment_time"
         label="视频分段时长（segment_time）"
+        initValue={overrideInit('segment_time')}
         placeholder="01:00:00"
         style={{ width: '100%' }}
         fieldStyle={{
@@ -421,6 +476,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       <Form.InputNumber
         field="filtering_threshold"
         label="短片探测阈值（filtering_threshold）"
+        initValue={overrideInit('filtering_threshold')}
         suffix={'MB'}
         style={{ width: '100%' }}
         fieldStyle={{
@@ -429,18 +485,30 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
         }}
         showClear={true}
       />
-      <Form.Switch
+      <Form.Select
         field="preserve_recoverable_short_segments"
         label="保留有效短分段（preserve_recoverable_short_segments）"
-        extraText="默认关闭；开启后保留通过媒体探测的有效短分段。"
+        initValue={tristateInit('preserve_recoverable_short_segments')}
+        extraText="开启后保留通过媒体探测的有效短分段。"
+        style={{ width: '100%' }}
         fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
-      />
-      <Form.Switch
+      >
+        <Select.Option value={INHERIT}>跟随全局设置</Select.Option>
+        <Select.Option value="on">强制开启</Select.Option>
+        <Select.Option value="off">强制关闭</Select.Option>
+      </Form.Select>
+      <Form.Select
         field="route_health_enabled"
         label="拉流线路健康退避（route_health_enabled）"
-        extraText="默认关闭；开启后使用独立的线路健康计数与退避。"
+        initValue={tristateInit('route_health_enabled')}
+        extraText="开启后使用独立的线路健康计数与退避。"
+        style={{ width: '100%' }}
         fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
-      />
+      >
+        <Select.Option value={INHERIT}>跟随全局设置</Select.Option>
+        <Select.Option value="on">强制开启</Select.Option>
+        <Select.Option value="off">强制关闭</Select.Option>
+      </Form.Select>
     </Collapse.Panel>
   )
 
@@ -501,7 +569,15 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           />
           <CoverSection template={boundTemplate} templatesLoading={templatesLoading} />
           <Form.Section>
-            <Collapse defaultActiveKey={['plugin']}>
+            <Collapse
+              defaultActiveKey={['plugin']}
+              onChange={activeKey => {
+                const keys = (Array.isArray(activeKey) ? activeKey : [activeKey]).filter(
+                  Boolean
+                ) as string[]
+                setOpenedPanels(prev => Array.from(new Set([...prev, ...keys])))
+              }}
+            >
               {downloadSettings}
               {audioSettings}
               {(() => {
