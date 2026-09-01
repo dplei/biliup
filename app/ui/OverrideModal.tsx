@@ -77,7 +77,9 @@ const AUDIO_OVERRIDE_TOGGLE = 'audio_override_enabled'
  * 需要这个外层开关，是因为全局那几项是裸 `bool`/数字，覆写侧却是 `Option`——「跟随全局」
  * 只能用「override 里没有这些键」来表达，光靠内层开关的 true/false 说不出这一态。
  */
-const AudioOverrideSection: React.FC = () => {
+const AudioOverrideSection: React.FC<{ fieldInitValues: Record<string, any> }> = ({
+  fieldInitValues,
+}) => {
   const { values } = useFormState()
 
   return (
@@ -88,7 +90,9 @@ const AudioOverrideSection: React.FC = () => {
         extraText="关闭＝跟随空间配置里的全局设置。打开后下面几项只影响这个房间，初值取自当前的全局设置。"
         fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
       />
-      {values[AUDIO_OVERRIDE_TOGGLE] && <AudioNormalizationControl showSample={false} bordered={false} />}
+      {values[AUDIO_OVERRIDE_TOGGLE] && (
+        <AudioNormalizationControl showSample={false} bordered={false} fieldInitValues={fieldInitValues} />
+      )}
     </>
   )
 }
@@ -442,7 +446,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
 
   const audioSettings = (
     <Collapse.Panel header="音量设置" itemKey="audio">
-      <AudioOverrideSection />
+      <AudioOverrideSection fieldInitValues={audioInitValues} />
     </Collapse.Panel>
   )
 

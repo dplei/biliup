@@ -22,11 +22,20 @@ type AudioNormalizationControlProps = {
   showSample?: boolean
   /** 嵌在别的容器（如覆写弹窗的折叠面板）里时去掉外框，避免套两层边框。 */
   bordered?: boolean
+  /**
+   * 字段初值，按 field 名索引。
+   *
+   * 折叠面板展开时字段才挂载，而 Semi 的 InputNumber 挂载后不会回头去取表单里已有的值，
+   * 只能显式喂给它——空间配置页里字段跟着表单一起挂载，所以那边不用传。Switch 和音量推子
+   * 都是受控的，每次渲染都跟着 form value 走，不受这个问题影响。
+   */
+  fieldInitValues?: Record<string, any>
 }
 
 export default function AudioNormalizationControl({
   showSample = true,
   bordered = true,
+  fieldInitValues,
 }: AudioNormalizationControlProps = {}) {
   const formApi = useFormApi()
   const { values } = useFormState()
@@ -127,6 +136,7 @@ export default function AudioNormalizationControl({
         <Form.InputNumber
           field="audio_normalization_disk_reserve_gib"
           label="磁盘保留线"
+          initValue={fieldInitValues?.audio_normalization_disk_reserve_gib}
           suffix="GiB"
           min={1}
           max={1024}
