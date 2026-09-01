@@ -124,6 +124,27 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   pre/downloaded hook；原因只用 `danmaku_failed`、`cover_failed`、`hook_failed`、`source_io`。
   原始错误仍只在原有旧调用点输出，新事件不复制 URL、请求响应、命令文本或自由错误文本。
 
+### P3/14 外部下载器（Streamlink / yt-dlp / ytarchive）增量
+
+- Streamlink 用 `--output` 写本进程选定的 `.part`，因此 `recording.segment_created` 与
+  `recording.segment_closed` 都是真实观测，复用 R/T + DA 和文件层 S。关闭原因：取消优先记
+  `user_cancel`；退出码 0 且配了 `--hls-duration` 记 `split_limit`，0/130/143/255 记
+  `stream_end`，其余非零码记 `transport_error`，被信号结束且未取消保持 `unknown`。
+  **和 ffmpeg 一样，退出码 0 区分不出「切到上限」与「刚好同时下播」。**
+- 进程退出后没有 `.part`：如实记一次 `recording.segment_closed` `failed`/`unknown`，
+  不冒充一个已关闭的分段，也不改写旧的 `DownloadStatus`。改名失败同样记 failed 后原样报错。
+- yt-dlp / ytarchive 由外部工具自己创建、命名并搬运文件，进程外看不到创建时刻，因此
+  **只发 `segment_closed`，不补造 `segment_created`**；一次调用对应一个分段，关闭原因固定
+  `stream_end`。**`stop()` 只置标记、不杀进程**，被停止的调用不发分段事件，这是既有语义。
+- `processing.command_failed` 的 stage 新增 `streamlink`、`ytdlp`、`ytarchive`。命令起不来时
+  记 `spawn_failed` 且**没有** `exit_code`；非零退出记 `process_failed` 带真实退出码。
+  被 `stop()` 请求过的下载是预期结束，不记命令失败。
+- 第三方输出只以有界脱敏附件出现：单行超限省略、尾部封顶 8 KiB、含 URL/凭据线索的行整值
+  脱敏。**yt-dlp/ytarchive 原先把完整 combined output 塞进自由错误，本批改为有界脱敏摘要**
+  （首个致命行，没有则尾部，并注明原始字节数）；错误类型、返回值与既有分类分支不变。
+- yt-dlp 内置的直播封面下载失败改发 `recording.auxiliary_failed`，stage
+  `live_cover_download`、原因 `cover_failed`；旧告警行保留，事件不带 URL 或错误文本。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify

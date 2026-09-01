@@ -35,8 +35,8 @@ python3 scripts/structured_logging/check_diagnostic_classification.py
 | Python download / upload | 局部 subscriber 内显式传 task | 既有上传/HLS 矩阵；第五批后未重新起 Python 进程核对 lifecycle | 代码已接，入口运行证据仍 partial |
 | server StreamGears（FLV/HLS） | R/DA/S、断连/恢复、HLS gap/discontinuity 已接 | 受控断流/HLS 与一场真实录制；真实断连样本仍缺 | 已迁移，真实矩阵 partial |
 | server FFmpeg（内/外分段） | 分段身份、关闭原因与有界失败附件已接 | 本地合成媒体与失败注入 | 已迁移，真实平台矩阵 partial |
-| server Streamlink | `core/live.rs` 可由平台 hint 或配置选择；分段仍用无稳定 S 的旧 `SegmentInfo::new`，命令行/逐行 stderr 只有旧输出 | 没有本批次原生证据 | **`coverage_gap`，不能写成“不支持”** |
-| server YtDlp / YtArchive | `core/live.rs` 可选择；命令输出整体读入并把失败正文塞回自由错误，产物回调仍缺稳定 S/有界附件 | 没有本批次原生证据 | **`coverage_gap`，不能写成“不支持”** |
+| server Streamlink | 第九批接入：目标文件由 `--output` 选定，创建/关闭是真实观测，带 S/DA、关闭原因与有界退出诊断 | 只有与外部进程无关的判定口径单元测试；本机未安装 streamlink，无实跑样本 | 代码已接，运行证据 pending |
+| server YtDlp / YtArchive | 第九批接入：产物解析后发 `segment_closed`（不补造 created），失败带 stage/exit_code 与有界脱敏附件，自由错误不再整段回灌 | 只有隐私/容量边界单元测试；本机未安装 yt-dlp/ytarchive，无实跑样本 | 代码已接，运行证据 pending |
 | danmaku 异步 recorder | start/stop/roll 的外层调用已发 auxiliary 事件 | 内部 spawned recorder/write/decode 失败仍只在 `danmaku::client` 打旧行，外层 start 成功后无法观察这些失败 | **`coverage_gap`；第六批只覆盖外层失败，不覆盖运行中失败** |
 | cover / hook | 下载、渲染、读取、上传、非命令 hook 及命令失败已接 | 编译/全量回归；真实失败逐项触发仍待补 | 代码已接，运行证据 partial |
 | durable recovery audit | 业务表稳定 UID，事件库幂等投影 | 临时业务库 + 真实事件 SQLite 重放 | 已迁移；真实恢复/outbox 矩阵 partial |
@@ -58,8 +58,8 @@ options，服务端也允许显式 downloader 配置；因此它们必须继续�
 | HTTP/平台提取与协议 DEBUG | live extractor、danmaku protocol、代理/header/url 输出 | `no_persistence` | 常含签名 URL、token、header 或高频协议细节；只持久化上层稳定结果，原文不进入事件库 |
 | 投稿/登录原始响应 | `biliup::uploader::{bilibili,credential}`，上层 submission/auth 事件 | `no_persistence` | 远端响应可能含账号/稿件标识；成功、失败、不确定由类型化事件回答，不保存原响应全文 |
 | FFmpeg/loudnorm/timestamp/custom hook | `DiagnosticCapture` + `processing.command_failed` | `native_covered`；完整输出 `explicitly_unsupported` | 只保存 8 KiB 有界脱敏附件、总字节和截断信息；不承诺完整 stdout/stderr 归档 |
-| Streamlink 命令/分段 | `streamlink.rs` | `coverage_gap` | 支持的运行时仍缺 S、明确关闭原因和有界命令失败；在补原生前保留桥接且不能通过任务 14 |
-| YtDlp/YtArchive 命令/产物 | `ytdlp.rs` | `coverage_gap` | 支持的运行时仍缺 S/DA/退出附件，且当前把完整 combined output 放进自由错误；须先收敛隐私/容量边界 |
+| Streamlink 命令/分段 | `streamlink.rs` + `processing.command_failed` | `native_covered`；逐行 `[streamlink] …` 输出 `retain_bridge` | S/DA、关闭原因与退出诊断已原生；`--hls-duration` 下退出码 0 区分不出「切到上限」与「刚好同时下播」，与 ffmpeg 同口径 |
+| YtDlp/YtArchive 命令/产物 | `ytdlp.rs` + `processing.command_failed` | `native_covered`；`运行: …`、清理告警 `retain_bridge` | 只发 `segment_closed`；完整 stdout/stderr 仍 `explicitly_unsupported`，错误正文换成有界脱敏摘要 |
 | danmaku 运行中 recorder/write 失败 | `danmaku/src/client.rs` | `coverage_gap` | 外层 start 返回成功后，spawned task 的错误不会触发第六批 auxiliary 事件；需要显式回调/健康状态，不能解析旧行补造 |
 | 第三方完整 payload / 任意命令行 | 无 | `explicitly_unsupported` | 原始请求响应、cookie/token、签名 URL、完整命令行和协议 payload 不属于允许字段；只保留稳定枚举和脱敏摘要 |
 | 通过文本/时间推断身份与结果 | 无 | `explicitly_unsupported` | 不从旧文本生成 task/R/U/S/attempt，也不因相近时间宣布成功或失败；未知保持 unknown |
@@ -69,12 +69,13 @@ options，服务端也允许显式 downloader 配置；因此它们必须继续�
 `diagnostic-classification-v1.json` 当前分组为：
 
 - `native_covered`: 3 个原生发射模块；
-- `retain_bridge`: 38 个混合业务/运维模块；
+- `retain_bridge`: 40 个混合业务/运维模块；
 - `no_persistence`: 18 个请求、启动、响应或协议诊断模块；
-- `coverage_gap`: 3 个受支持但仍缺关键原生事实的模块；
+- `coverage_gap`: 1 个受支持但仍缺关键原生事实的模块；
 - `explicitly_unsupported`: 4 项能力边界，不以文件数量计。
 
-结论：**分类清单本身完成，但任务 14 不能标 complete、不能开始首轮长观察。** 当前至少要先
-补 Streamlink、YtDlp/YtArchive 和 danmaku 异步运行失败的原生边界，再跑 wheel/Python 生命周期、
-真实/受控外部下载器及第六批辅助失败矩阵。任务 12 的真实断连、录制期 601 类型差异和 FFmpeg
+结论：**任务 14 仍不能标 complete。** 第九批闭合了 Streamlink 与 YtDlp/YtArchive 两个源码
+gap，剩下 danmaku 异步 recorder 运行中失败一个；它闭合后才允许开始首轮实际双写观察。
+代码接入不等于运行证据：这两个下载器在本机没有第三方工具，只有与外部进程无关的判定/边界
+单元测试，真实样本要在实际运行中自然积累。任务 12 的真实断连、录制期 601 类型差异和 FFmpeg
 秒级文件名碰撞等既有差异同样没有被本清单消除。

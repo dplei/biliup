@@ -21,8 +21,6 @@
       "decision": "coverage_gap",
       "reason": "These are supported runtime paths whose key failure or segment facts still depend on free-form output; they remain in the P3/14 denominator and block completion.",
       "paths": [
-        "crates/biliup-cli/src/server/core/downloader/streamlink.rs",
-        "crates/biliup-cli/src/server/core/downloader/ytdlp.rs",
         "crates/danmaku/src/client.rs"
       ]
     },
@@ -71,14 +69,16 @@
         "crates/biliup-cli/src/server/common/segment_enrollment.rs",
         "crates/biliup-cli/src/server/common/submission_scheduler.rs",
         "crates/biliup-cli/src/server/common/timestamp_repair.rs",
+        "crates/biliup-cli/src/server/common/upload.rs",
         "crates/biliup-cli/src/server/common/upload_line_selection.rs",
         "crates/biliup-cli/src/server/common/upload_rate_gate.rs",
         "crates/biliup-cli/src/server/common/upload_session.rs",
-        "crates/biliup-cli/src/server/common/upload.rs",
         "crates/biliup-cli/src/server/common/util.rs",
         "crates/biliup-cli/src/server/core/downloader/cover_downloader.rs",
         "crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs",
         "crates/biliup-cli/src/server/core/downloader/stream_gears.rs",
+        "crates/biliup-cli/src/server/core/downloader/streamlink.rs",
+        "crates/biliup-cli/src/server/core/downloader/ytdlp.rs",
         "crates/biliup-cli/src/server/core/monitor.rs",
         "crates/biliup-cli/src/server/errors.rs",
         "crates/biliup-cli/src/server/infrastructure/context.rs",
