@@ -8,7 +8,10 @@ P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12–13 �
 P3/14 第五批起 **C01 入口启停**与 **C11 凭据健康**已有原生事件（Rust CLI 真实进程实跑；
 wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 **C12 持久审计投影**及
 **C13 预处理/自定义命令、弹幕、封面与 hook 失败点**；C12 幂等回放和 FFmpeg 失败附件有受控
-实跑，辅助失败调用点目前只有编译与全量单元回归，不能冒充真实平台/完整入口证据。
+实跑，辅助失败调用点目前只有编译与全量单元回归，不能冒充真实平台/完整入口证据。第七批
+[分类清单](diagnostic-classification.md) 对源码重新盘点后确认：Streamlink、YtDlp/YtArchive
+服务运行时实际可达，且 danmaku 异步 recorder 的运行中失败没有穿透第六批外层事件；三者是
+明确 `coverage_gap`，仍在 C03/C13 分母并阻止任务 14 完成。
 
 ## 关键事实
 
@@ -16,7 +19,7 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | --- | --- | --- | --- | --- |
 | C01 | system：进程启动/退出 | 哪个进程、版本、启动结果；退出是否正常，强杀没有结束事件不能伪造 | 入口输出、受控启动/退出结果 | 09、14 |
 | C02 | recording：开始/停止/关闭 | 哪个主播/录制场次、为什么开始/结束 | 旧录制输出、录制身份和租约结果 | 12 |
-| C03 | recording：分段创建/关闭/登记 | 稳定分段身份、原始文件、关闭原因、登记结果；登记前也能关联 | 分段生命周期、登记账本、合成切片 | 12 |
+| C03 | recording：分段创建/关闭/登记 | 稳定分段身份、原始文件、关闭原因、登记结果；登记前也能关联 | 分段生命周期、登记账本、合成切片 | 12、14（Streamlink/YtDlp/YtArchive 仍缺） |
 | C04 | `recording.dts_backward` | 影响分段、前后时间值/单位、处理决定；汇总次数/首末/极值 | 旧 DTS 行、受控异常流 | 12 |
 | C05 | recording：断流/重连/缺口 | 哪次连接、失败点、退避和恢复、估算缺口与不确定性 | 下载诊断、受控断流与双路交错 | 12 |
 | C06 | processing：预处理决定/结果 | 执行/跳过/降级原因、原分段与产物、失败详情 | 旧预处理输出、已知输入与退出码 | 13 |
@@ -26,12 +29,14 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | C10 | submission：决定/尝试/结果 | 为什么等待/拒绝/提交；成功、失败、不确定结果分别是什么 | 投稿意图/claim/业务历史；受控不确定结果 | 13 |
 | C11 | auth：健康变化/操作失败 | 失败类型与影响，不泄漏账号凭据 | 受控无效认证/恢复，不使用真实凭据 | 14 |
 | C12 | audit：关键人工操作/恢复 | 操作与结果及可靠性边界；durable 审计如何投影 | 已有业务审计/outbox，禁止用通用日志替代 | 14（原生已接，受控回放通过；真实操作矩阵待验） |
-| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；其余运行证据待补） |
+| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；Streamlink/YtDlp 与 danmaku 异步失败仍缺原生边界） |
 | C14 | observability：存储健康/缺口 | 何时不能写、影响级别/范围、何时恢复；强杀窗口可未知 | 独立健康快照/stderr，忙锁/满盘/强杀演练 | 08、09 |
 
 对每项补充：适用入口/平台、必填与可空字段、业务关联方式、脱敏规则、旧调用点或明确
 没有旧来源、预期一对多/多对一映射、回归场景、证据引用和待关闭差异。
 进度快照 C08 与存储健康 C14 可由独立数据源回答，不强求每次更新成为普通事件。
+未迁移旧诊断的逐类处置、显式不支持边界和 62 个含宏源码文件的机器目录见
+[diagnostic-classification.md](diagnostic-classification.md)；桥接条目一律不计上述分母。
 
 ### v1 原生目录与旧来源映射
 
@@ -76,14 +81,15 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python/server 的已知m3u8/ts直接HLS，其余保留FLV探测回落 | P3/14第三批：HLS复用S，新增序列缺口/不连续与失败事件；三下载入口受控三态/回退通过，CLI提取结果为fixture；服务执行器的媒体后重连与取消通过，真实平台HLS及服务整链待验 |
-| 外部下载 | server from_type仅显式Ffmpeg走外部，其余落StreamGears；Streamlink/YtDlp运行时实现存在，但当前from_type不选；CLI对这些hint明确拒绝 | P3/14第四批：FFmpeg 内外分段已接分段身份与退出诊断，受控合成媒体实跑通过；Streamlink/YtDlp 仍不可达、未接入，不冒称可用 |
+| 外部下载 | server 的 `core/live.rs` 会按平台 hint/runtime options 或显式配置选择 FFmpeg、Streamlink、YtDlp/YtArchive；独立 CLI 对后两种 hint 明确拒绝 | P3/14第四批仅完成 FFmpeg 内外分段。第七批源码复核确认 Streamlink/YtDlp/YtArchive 服务路径可达但仍缺稳定 S/DA 与有界命令诊断，列 `coverage_gap`，不能再写成不可达 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
 
 CLI 命令集合：login/renew/upload/append/show/comments/reply/dump-flv/download/server/
 cover-preview/list/backfill-lifecycle（以Cli::Commands为准）；wheel同枚举，非server不能依赖
 业务库来初始化日志。CLI extractor注册：Acfun/AfreecaTV/Bigo/Bilibili/CC/Douyin/Douyu/Huya/
 Inke/Kilakila/Kuaishou/Missevan/Niconico/Picarto/TTingLive/Twitcasting/TwitchVideos/Twitch/
-Youtube/YY/General；注册不等于外部运行时路径已可达，不宣称平台线上验证通过。
+Youtube/YY/General；服务端插件 hint 可进入 Streamlink/YtDlp/YtArchive，独立 CLI 会拒绝这两类
+外部运行时。注册和代码可达都不等于平台线上验证通过。
 
 旧读取入口：ws::ws_logs白名单映射ds_update/download/upload，末尾50行+500ms轮询；
 logviewer按文件tab，静态下载及developer日志设置均保持不变。没有stdout持久化的保证。
@@ -266,3 +272,13 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   6 ignored**。真实恢复/outbox/补扫、真实 loudnorm/timestamp、hook、danmaku、封面失败仍未逐项
   运行；无新双源包、隔离还原、量化负载或长观察，见
   [P3 第六批](receipts/P3.md#任务-14-第六批持久审计投影与剩余诊断c12--c13)。
+- C01–C14 / 全部含旧 tracing 宏的运行时源码文件 / classification-v1 / 14 第七批 /
+  diagnostic-classification-v1：**分类产物完成，覆盖任务仍不通过**。机器目录逐文件覆盖 62 个
+  源码文件、保守计数 554 个宏位置（含 src 内测试模块）：3 个 native emitter、38 个迁移期保留
+  bridge、18 个终态无需持久化、3 个明确 coverage gap；另冻结 4 项不支持能力边界。校验器会在
+  新增/删除含宏文件时失败，但不替代同文件内调用点语义复核。源码纠正旧结论：`core/live.rs`
+  会实际构造 Streamlink 与 YtDlp/YtArchive，不能再写成不可达；两者仍用裸 `SegmentInfo::new`
+  且缺有界命令附件，danmaku spawned recorder 的运行中失败也只有旧行。三者继续留在 C03/C13
+  分母，未补原生前不能开始长观察。详见
+  [第七批分类清单](diagnostic-classification.md) 与
+  [P3 回执](receipts/P3.md#任务-14-第七批未迁移诊断分类清单)。

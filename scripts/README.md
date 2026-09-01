@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | [`dev.sh`](dev.sh) | 起本机开发环境：按需构建前端与后端，绑 `127.0.0.1:19159` | 本地跑服务、手工验收 |
 | [`check_code_index.py`](check_code_index.py) | 校验 `CODE_INDEX.md` 的路径、重复条目和悬空关系 | 改完 `CODE_INDEX.md` 之后 |
+| [`structured_logging/check_diagnostic_classification.py`](structured_logging/check_diagnostic_classification.py) | 校验 P3/14 的旧 tracing 文件都已进入分类清单，新增/删除日志文件时阻止静默漏审 | 改观测调用点、下载器或诊断分类之后 |
 | [`consistency-audit.sh`](consistency-audit.sh) | 只读巡检：找出投稿与本地账本之间的错位 | 怀疑稿件重复/缺分P、或想确认某类问题是孤例还是系统性 |
 | [`normalization-disk-sample.py`](normalization-disk-sample.py) | 采样响度标准化中间件的数量与字节峰值，并判定是否超过上限 | 验收「就地替换」是否真的把磁盘峰值压到一份，或排查 `.part` 残留 |
 
@@ -26,6 +27,18 @@ python3 scripts/check_code_index.py
 ```
 
 改过 `CODE_INDEX.md` 就跑一次。约定见 [`docs/agents/code-index.md`](../docs/agents/code-index.md)。
+
+## `structured_logging/check_diagnostic_classification.py`
+
+```bash
+python3 scripts/structured_logging/check_diagnostic_classification.py
+```
+
+读取 [P3/14 机器清单](../.scratch/structured-logging/diagnostic-classification-v1.json)，扫描四个
+Rust 运行时源码根中的 `trace!/debug!/info!/warn!/error!` 文件。每个含宏文件必须恰好归入
+`native_covered`、`retain_bridge`、`no_persistence` 或 `coverage_gap`；不支持的能力边界另外
+列理由。脚本只做**文件级漂移检查**，不能证明同文件内新调用点的语义正确；新增诊断仍须人工
+核对，并同步 [分类说明](../.scratch/structured-logging/diagnostic-classification.md)。
 
 ## `consistency-audit.sh`
 

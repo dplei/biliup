@@ -1,0 +1,116 @@
+{
+  "version": "diagnostic-classification-v1",
+  "scope": "Default disposition of residual trace/debug/info/warn/error call sites during the P3 C01-C14 native migration. A file-level retain_bridge decision does not make bridge text a business fact.",
+  "scan_roots": [
+    "crates/biliup-cli/src",
+    "crates/biliup/src",
+    "crates/stream-gears/src",
+    "crates/danmaku/src"
+  ],
+  "groups": [
+    {
+      "decision": "native_covered",
+      "reason": "These macros are the typed native event emitters themselves; the legacy sinks exclude their dedicated target.",
+      "paths": [
+        "crates/biliup-cli/src/observe.rs",
+        "crates/biliup-cli/src/observe/auth.rs",
+        "crates/biliup-cli/src/observe/lifecycle.rs"
+      ]
+    },
+    {
+      "decision": "coverage_gap",
+      "reason": "These are supported runtime paths whose key failure or segment facts still depend on free-form output; they remain in the P3/14 denominator and block completion.",
+      "paths": [
+        "crates/biliup-cli/src/server/core/downloader/streamlink.rs",
+        "crates/biliup-cli/src/server/core/downloader/ytdlp.rs",
+        "crates/danmaku/src/client.rs"
+      ]
+    },
+    {
+      "decision": "no_persistence",
+      "reason": "These call sites are request-local UI/admin plumbing, startup progress, raw remote responses, signed endpoints, or protocol chatter. Their bounded result is returned to the caller or covered at a higher native boundary; persisting the raw text adds volume or privacy risk without a durable business fact.",
+      "paths": [
+        "crates/biliup-cli/src/server/api/cover_background.rs",
+        "crates/biliup-cli/src/server/api/cover_preview.rs",
+        "crates/biliup-cli/src/server/api/ws.rs",
+        "crates/biliup-cli/src/server/core/download_manager.rs",
+        "crates/biliup-cli/src/server/infrastructure/connection_pool.rs",
+        "crates/biliup-cli/src/server/infrastructure/service_register.rs",
+        "crates/biliup-cli/src/server/router.rs",
+        "crates/biliup/src/downloader/live/douyin.rs",
+        "crates/biliup/src/downloader/live/wbi.rs",
+        "crates/biliup/src/lib.rs",
+        "crates/biliup/src/uploader/bilibili.rs",
+        "crates/biliup/src/uploader/credential.rs",
+        "crates/danmaku/src/protocols/bilibili.rs",
+        "crates/danmaku/src/protocols/douyin.rs",
+        "crates/danmaku/src/protocols/douyu.rs",
+        "crates/danmaku/src/protocols/huya.rs",
+        "crates/danmaku/src/protocols/wbi.rs",
+        "crates/stream-gears/src/server.rs"
+      ]
+    },
+    {
+      "decision": "retain_bridge",
+      "reason": "The key workflow outcome is already native or has a business authority, but the remaining operational detail is still useful during dual-write comparison. Keep it explicitly as legacy_bridge until P5/P6; never count it as native coverage or infer missing identity from it.",
+      "paths": [
+        "crates/biliup-cli/src/downloader.rs",
+        "crates/biliup-cli/src/lib.rs",
+        "crates/biliup-cli/src/server/api/auth.rs",
+        "crates/biliup-cli/src/server/api/endpoints.rs",
+        "crates/biliup-cli/src/server/api/recording_lease.rs",
+        "crates/biliup-cli/src/server/app.rs",
+        "crates/biliup-cli/src/server/common/audio_normalization.rs",
+        "crates/biliup-cli/src/server/common/cookie_health.rs",
+        "crates/biliup-cli/src/server/common/cover_generator.rs",
+        "crates/biliup-cli/src/server/common/download.rs",
+        "crates/biliup-cli/src/server/common/lifecycle_backfill.rs",
+        "crates/biliup-cli/src/server/common/missing_segment.rs",
+        "crates/biliup-cli/src/server/common/recording_lease.rs",
+        "crates/biliup-cli/src/server/common/recovery_scheduler.rs",
+        "crates/biliup-cli/src/server/common/segment_enrollment.rs",
+        "crates/biliup-cli/src/server/common/submission_scheduler.rs",
+        "crates/biliup-cli/src/server/common/timestamp_repair.rs",
+        "crates/biliup-cli/src/server/common/upload_line_selection.rs",
+        "crates/biliup-cli/src/server/common/upload_rate_gate.rs",
+        "crates/biliup-cli/src/server/common/upload_session.rs",
+        "crates/biliup-cli/src/server/common/upload.rs",
+        "crates/biliup-cli/src/server/common/util.rs",
+        "crates/biliup-cli/src/server/core/downloader/cover_downloader.rs",
+        "crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs",
+        "crates/biliup-cli/src/server/core/downloader/stream_gears.rs",
+        "crates/biliup-cli/src/server/core/monitor.rs",
+        "crates/biliup-cli/src/server/errors.rs",
+        "crates/biliup-cli/src/server/infrastructure/context.rs",
+        "crates/biliup-cli/src/server/infrastructure/models/hook_step.rs",
+        "crates/biliup-cli/src/upload_lock.rs",
+        "crates/biliup-cli/src/uploader.rs",
+        "crates/biliup/src/downloader/flv_writer.rs",
+        "crates/biliup/src/downloader/hls.rs",
+        "crates/biliup/src/downloader/httpflv.rs",
+        "crates/biliup/src/downloader/util.rs",
+        "crates/biliup/src/uploader/line.rs",
+        "crates/biliup/src/uploader/line/upos.rs",
+        "crates/stream-gears/src/lib.rs"
+      ]
+    }
+  ],
+  "explicitly_unsupported_boundaries": [
+    {
+      "boundary": "raw_third_party_payload_persistence",
+      "reason": "Raw HTTP responses, signed URLs, command lines, cookies, tokens, and protocol payloads are not a supported event payload; only allow-listed fields and bounded redacted diagnostics may persist."
+    },
+    {
+      "boundary": "unbounded_stdout_stderr_archive",
+      "reason": "The event database does not promise full external process output. Supported command failures use an 8 KiB redacted diagnostic attachment with byte/truncation metadata."
+    },
+    {
+      "boundary": "poll_chunk_and_protocol_chatter_history",
+      "reason": "Per-poll, per-chunk, heartbeat, and wire-protocol debug streams are state or transient diagnostics, not append-only business events; existing progress/health snapshots remain authoritative."
+    },
+    {
+      "boundary": "identity_or_outcome_inference_from_text",
+      "reason": "Legacy text and timestamp proximity may not create task, session, segment, attempt, success, or failure facts. Unknown stays unknown and bridge rows never satisfy native coverage."
+    }
+  ]
+}
