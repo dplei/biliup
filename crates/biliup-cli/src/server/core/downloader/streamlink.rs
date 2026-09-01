@@ -1,9 +1,16 @@
 use crate::server::core::downloader::{DownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo};
 use crate::server::errors::{AppError, AppResult};
+use biliup::downloader::util::{
+    SegmentCloseReason, SegmentIdentity, allocate_segment_id, segment_close_failed, segment_closed,
+    segment_created,
+};
+use biliup_observability::{Diagnostic, DiagnosticCapture};
 use error_stack::ResultExt;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::RwLock;
@@ -39,6 +46,10 @@ pub struct Streamlink {
     streamlink_downloader: StreamlinkDownloader,
     /// 进程句柄
     process_handle: Arc<RwLock<Option<Child>>>,
+
+    /// `stop()` 请求过取消。被信号结束的 streamlink 没有退出码，只有这个标记能把
+    /// 「主动停止」和「进程异常死亡」分开，不靠猜测把取消写成传输失败。
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Streamlink {
@@ -46,6 +57,7 @@ impl Streamlink {
         Self {
             streamlink_downloader,
             process_handle: Arc::new(RwLock::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -54,11 +66,16 @@ impl Streamlink {
         mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
         download_config: DownloadConfig,
     ) -> AppResult<DownloadStatus> {
+        // 同一个实例可以被上层复用做下一次连接，取消标记只属于本次下载。
+        self.cancelled.store(false, Ordering::Relaxed);
         let output_file = download_config.generate_output_filename(&download_config.suffix);
         let part_file = format!("{}.part", output_file.display());
         let args = self
             .streamlink_downloader
             .build_file_args(&download_config, &part_file)?;
+        let owner = download_config
+            .owner
+            .owner(download_config.attempt_id.as_deref());
 
         let mut cmd = Command::new("streamlink");
         cmd.args(args)
@@ -69,21 +86,57 @@ impl Streamlink {
 
         info!(cmd = ?cmd, "Starting streamlink download");
         let child = cmd.spawn().change_context(AppError::Unknown)?;
-        let status = spawn_log(child, &self.process_handle).await?;
+        // 目标文件由本进程用 `--output` 选定，进程起来之后写入就开始了，因此创建是真实
+        // 观测：身份在这里分配一次，之后的关闭和交给上层的分段信息都用同一个 segment_id。
+        let identity = SegmentIdentity {
+            segment_id: allocate_segment_id(),
+            original_file: output_file.display().to_string(),
+        };
+        segment_created(&owner, &identity);
+        let (status, diagnostic) = spawn_log(child, &self.process_handle).await?;
+        self.report_command_failure(&download_config, &status, diagnostic);
 
         if tokio::fs::try_exists(&part_file)
             .await
             .change_context(AppError::Unknown)?
         {
-            tokio::fs::rename(&part_file, &output_file)
-                .await
-                .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
-            callback(SegmentEvent::Segment(SegmentInfo::new(
-                output_file,
-                None,
-                None,
-                0,
-            )));
+            if let Err(error) = tokio::fs::rename(&part_file, &output_file).await {
+                segment_close_failed(
+                    &owner,
+                    &identity.segment_id,
+                    &identity.original_file,
+                    &format!("{error}"),
+                );
+                return Err(error)
+                    .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
+            }
+            let close_reason = self.close_reason(&download_config, &status);
+            segment_closed(
+                &owner,
+                &identity,
+                close_reason,
+                file_size(&output_file).await,
+            );
+            callback(SegmentEvent::Segment(SegmentInfo {
+                prev_file_path: output_file,
+                danmaku_file_path: None,
+                next_file_path: None,
+                segment_index: 0,
+                close_reason,
+                attempt_id: download_config.attempt_id.clone(),
+                segment_id: Some(identity.segment_id),
+                recovery_source_paths: Vec::new(),
+                enrollment: None,
+            }));
+        } else {
+            // 已宣告开始写入却没有临时文件：streamlink 一个字节都没落盘。如实记一次失败的
+            // 关闭，不冒充一个已关闭的分段，也不改变旧的返回值。
+            segment_close_failed(
+                &owner,
+                &identity.segment_id,
+                &identity.original_file,
+                "streamlink 退出后没有找到分段临时文件",
+            );
         }
 
         match status.code() {
@@ -95,12 +148,67 @@ impl Streamlink {
 
     /// 停止下载
     pub(crate) async fn stop(&self) -> AppResult<()> {
+        // 先写取消原因再动进程，避免下载侧看到没有退出码的死亡进程时误判为传输失败。
+        self.cancelled.store(true, Ordering::Relaxed);
         let mut handle = self.process_handle.write().await;
         if let Some(child) = &mut *handle {
             child.kill().await.change_context(AppError::Unknown)?;
         }
         Ok(())
     }
+
+    /// 一次调用只产出一个文件，关闭原因就是本次进程的结束方式。取消优先于退出码：
+    /// 被信号结束的进程没有退出码，不能因此写成传输失败。
+    fn close_reason(
+        &self,
+        download_config: &DownloadConfig,
+        status: &ExitStatus,
+    ) -> SegmentCloseReason {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return SegmentCloseReason::Cancelled;
+        }
+        match status.code() {
+            // 配了 `--hls-duration` 时退出码 0 就是切到上限；和 ffmpeg 一样，
+            // 区分不出「刚好同时下播」。
+            Some(0) if download_config.segment_time.is_some() => SegmentCloseReason::TimedSplit,
+            Some(0) | Some(130) | Some(143) | Some(255) => SegmentCloseReason::StreamEnded,
+            Some(_) => SegmentCloseReason::TransportError,
+            None => SegmentCloseReason::Unknown,
+        }
+    }
+
+    /// 退出码 0 是正常收尾，130/143/255 是按请求结束；主动取消同样不是外部命令失败。
+    fn should_report_failure(&self, status: &ExitStatus) -> bool {
+        !self.cancelled.load(Ordering::Relaxed)
+            && !matches!(status.code(), Some(0) | Some(130) | Some(143) | Some(255))
+    }
+
+    fn report_command_failure(
+        &self,
+        download_config: &DownloadConfig,
+        status: &ExitStatus,
+        diagnostic: Diagnostic,
+    ) {
+        if !self.should_report_failure(status) {
+            return;
+        }
+        crate::observe::external::command_failed(
+            "streamlink",
+            "process_failed",
+            download_config
+                .owner
+                .context(download_config.attempt_id.as_deref()),
+            Some(diagnostic),
+            status.code(),
+        );
+    }
+}
+
+async fn file_size(path: &Path) -> u64 {
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 pub struct StreamlinkDownloader {
@@ -345,16 +453,22 @@ impl StreamOutput {
     }
 }
 
+/// 返回退出状态和有界的 stderr 诊断。旧的逐行 INFO 输出原样保留，采集只是并行地留下
+/// 首个致命行与有界尾部，不改变旧 sink 看到的内容。
 async fn spawn_log(
     mut child: Child,
     process_handle: &RwLock<Option<Child>>,
-) -> AppResult<ExitStatus> {
+) -> AppResult<(ExitStatus, Diagnostic)> {
     let mut stderr_task = child.stderr.take().map(|stderr| {
         let mut stderr_lines = BufReader::new(stderr).lines();
         tokio::spawn(async move {
+            let mut capture = DiagnosticCapture::new();
             while let Ok(Some(line)) = stderr_lines.next_line().await {
                 info!("[streamlink] {line}");
+                capture.push(line.as_bytes());
+                capture.push(b"\n");
             }
+            capture
         })
     });
 
@@ -387,12 +501,75 @@ async fn spawn_log(
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
-    if let Some(task) = stderr_task.take() {
-        let _ = task.await;
-    }
+    let capture = match stderr_task.take() {
+        Some(task) => task.await.unwrap_or_default(),
+        None => DiagnosticCapture::new(),
+    };
     if let Some(task) = stdout_task.take() {
         let _ = task.await;
     }
 
-    Ok(status)
+    Ok((status, capture.finish(status.code())))
+}
+
+/// 本批不安装 streamlink，也不构造假命令：这里只验证与外部进程无关的判定口径。
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn downloader() -> Streamlink {
+        Streamlink::new(StreamlinkDownloader::new(
+            "http://127.0.0.1/controlled".to_string(),
+            Platform::Generic,
+        ))
+    }
+
+    fn exited(code: i32) -> ExitStatus {
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn close_reason_follows_the_observed_exit() {
+        let split = DownloadConfig {
+            segment_time: Some("00:00:30".to_string()),
+            ..Default::default()
+        };
+        let plain = DownloadConfig::default();
+        let downloader = downloader();
+        assert_eq!(
+            downloader.close_reason(&split, &exited(0)),
+            SegmentCloseReason::TimedSplit
+        );
+        assert_eq!(
+            downloader.close_reason(&plain, &exited(0)),
+            SegmentCloseReason::StreamEnded
+        );
+        assert_eq!(
+            downloader.close_reason(&plain, &exited(130)),
+            SegmentCloseReason::StreamEnded
+        );
+        assert_eq!(
+            downloader.close_reason(&plain, &exited(1)),
+            SegmentCloseReason::TransportError
+        );
+        // 被信号结束的进程没有退出码：未取消时保持 unknown，不写成传输失败。
+        assert_eq!(
+            downloader.close_reason(&plain, &ExitStatus::from_raw(9)),
+            SegmentCloseReason::Unknown
+        );
+        assert!(downloader.should_report_failure(&exited(1)));
+        assert!(!downloader.should_report_failure(&exited(143)));
+    }
+
+    #[test]
+    fn cancellation_wins_over_the_exit_code() {
+        let downloader = downloader();
+        downloader.cancelled.store(true, Ordering::Relaxed);
+        assert_eq!(
+            downloader.close_reason(&DownloadConfig::default(), &exited(1)),
+            SegmentCloseReason::Cancelled
+        );
+        assert!(!downloader.should_report_failure(&exited(1)));
+    }
 }

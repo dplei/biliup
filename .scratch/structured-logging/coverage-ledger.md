@@ -11,7 +11,9 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 实跑，辅助失败调用点目前只有编译与全量单元回归，不能冒充真实平台/完整入口证据。第七批
 [分类清单](diagnostic-classification.md) 对源码重新盘点后确认：Streamlink、YtDlp/YtArchive
 服务运行时实际可达，且 danmaku 异步 recorder 的运行中失败没有穿透第六批外层事件；三者是
-明确 `coverage_gap`，仍在 C03/C13 分母并阻止任务 14 完成。
+明确 `coverage_gap`，仍在 C03/C13 分母并阻止任务 14 完成。**第九批已闭合前两个**：两个外部
+下载器接入分段身份、可知关闭语义、退出诊断与有界脱敏附件，只剩 danmaku 异步失败一个 gap；
+但这两条路径在本机没有第三方工具，只有判定/边界单元测试，真实样本要在实际运行中积累。
 
 第八批调整的是剩余验证路径，不是覆盖定义：三项 gap 仍须在旧日志旁加原生调用，但不再要求
 先构造本地假命令、账号或异常矩阵。源码闭合并通过编译/基本启动/关闭新采集不影响业务的最低
@@ -24,7 +26,7 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | --- | --- | --- | --- | --- |
 | C01 | system：进程启动/退出 | 哪个进程、版本、启动结果；退出是否正常，强杀没有结束事件不能伪造 | 入口输出、受控启动/退出结果 | 09、14 |
 | C02 | recording：开始/停止/关闭 | 哪个主播/录制场次、为什么开始/结束 | 旧录制输出、录制身份和租约结果 | 12 |
-| C03 | recording：分段创建/关闭/登记 | 稳定分段身份、原始文件、关闭原因、登记结果；登记前也能关联 | 分段生命周期、登记账本、合成切片 | 12、14（Streamlink/YtDlp/YtArchive 仍缺） |
+| C03 | recording：分段创建/关闭/登记 | 稳定分段身份、原始文件、关闭原因、登记结果；登记前也能关联 | 分段生命周期、登记账本、合成切片 | 12、14（Streamlink/YtDlp/YtArchive 第九批已接，缺实跑样本） |
 | C04 | `recording.dts_backward` | 影响分段、前后时间值/单位、处理决定；汇总次数/首末/极值 | 旧 DTS 行、受控异常流 | 12 |
 | C05 | recording：断流/重连/缺口 | 哪次连接、失败点、退避和恢复、估算缺口与不确定性 | 下载诊断、受控断流与双路交错 | 12 |
 | C06 | processing：预处理决定/结果 | 执行/跳过/降级原因、原分段与产物、失败详情 | 旧预处理输出、已知输入与退出码 | 13 |
@@ -34,7 +36,7 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | C10 | submission：决定/尝试/结果 | 为什么等待/拒绝/提交；成功、失败、不确定结果分别是什么 | 投稿意图/claim/业务历史；受控不确定结果 | 13 |
 | C11 | auth：健康变化/操作失败 | 失败类型与影响，不泄漏账号凭据 | 受控无效认证/恢复，不使用真实凭据 | 14 |
 | C12 | audit：关键人工操作/恢复 | 操作与结果及可靠性边界；durable 审计如何投影 | 已有业务审计/outbox，禁止用通用日志替代 | 14（原生已接，受控回放通过；真实操作矩阵待验） |
-| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；Streamlink/YtDlp 与 danmaku 异步失败仍缺原生边界） |
+| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；Streamlink/YtDlp 第九批已接但无实跑；danmaku 异步失败仍缺原生边界） |
 | C14 | observability：存储健康/缺口 | 何时不能写、影响级别/范围、何时恢复；强杀窗口可未知 | 独立健康快照/stderr，忙锁/满盘/强杀演练 | 08、09 |
 
 对每项补充：适用入口/平台、必填与可空字段、业务关联方式、脱敏规则、旧调用点或明确
@@ -86,7 +88,7 @@ P3/14须补原生事件及真实场景；P0不删除任何未迁移输出。
 | Python 上传函数 | 每次with_default局部subscriber，stdout + upload.log不轮转，默认INFO，秒级；current-thread runtime，guard退出flush | P3/14：独立任务事件已接入，重复调用的缺凭据/三态/回退实跑通过；远端正常链待补验 |
 | 页面整场上传 | `POST /v1/uploads` 接受请求后后台执行；返回 task 并传至每个输入/attempt/投稿，首文件反查只用于模板 | P3/14 第二批：Rust/wheel HTTP 三态、并发、关联查询和回退通过；Rust 页面真实上传/私密投稿通过；不改变页面默认或旧 sink |
 | HTTP-FLV/HLS | Rust CLI按扩展名选FLV/HLS；Python/server 的已知m3u8/ts直接HLS，其余保留FLV探测回落 | P3/14第三批：HLS复用S，新增序列缺口/不连续与失败事件；三下载入口受控三态/回退通过，CLI提取结果为fixture；服务执行器的媒体后重连与取消通过，真实平台HLS及服务整链待验 |
-| 外部下载 | server 的 `core/live.rs` 会按平台 hint/runtime options 或显式配置选择 FFmpeg、Streamlink、YtDlp/YtArchive；独立 CLI 对后两种 hint 明确拒绝 | P3/14第四批仅完成 FFmpeg 内外分段。第七批源码复核确认 Streamlink/YtDlp/YtArchive 服务路径可达但仍缺稳定 S/DA 与有界命令诊断，列 `coverage_gap`，不能再写成不可达 |
+| 外部下载 | server 的 `core/live.rs` 会按平台 hint/runtime options 或显式配置选择 FFmpeg、Streamlink、YtDlp/YtArchive；独立 CLI 对后两种 hint 明确拒绝 | P3/14第四批完成 FFmpeg 内外分段；第九批补齐 Streamlink（created+closed、关闭原因、退出诊断）与 YtDlp/YtArchive（只发 closed、spawn/退出诊断、自由错误改有界脱敏摘要），两者移出 `coverage_gap`。本机未安装这三种第三方工具，实跑样本待日常运行自然产生 |
 | 正常上传与重启/补扫/人工补传 | durable enrollment有missing/U/order，attempt各自独立；正常分段也登记；日志不能代替账本 | 源码核对；P3验原生 |
 
 CLI 命令集合：login/renew/upload/append/show/comments/reply/dump-flv/download/server/
@@ -292,3 +294,12 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   失败隔离的原生调用并行采集；取消实际观察前的本地假命令/入口穷举矩阵，改为最低运行门槛
   后在日常使用中自然采样。3 个 gap 和 P4 前第一轮完整观察门槛均未删除，未触发项保持待观察。
   见 [P3 第八批回执](receipts/P3.md#任务-14-第八批加法式双日志验证策略与工作量重估)。
+- C03 + C13 / server Streamlink 与 YtDlp/YtArchive / external-downloaders-v2 / 14 第九批 /
+  additive-dual-log：**源码 gap 闭合，运行证据待自然采样**。Streamlink 的目标文件由本进程
+  `--output` 选定，创建与关闭都是真实观测并带 S/DA；没有 `.part` 或改名失败如实记 failed。
+  yt-dlp/ytarchive 只发 `segment_closed`（外部工具自己创建/搬运文件，创建时刻不可观测），
+  失败带 stage/exit_code 与有界脱敏附件，原先塞进自由错误的完整 combined output 改为有界
+  摘要。本机没有这三个第三方工具，本批只做与外部进程无关的判定与隐私/容量边界单元测试
+  （4 项）、全量回归（`biliup-cli` lib 339 passed / 6 ignored）和入口开关对照实跑；
+  正常下载、切片、取消与真实失败样本保持待观察。见
+  [P3 第九批回执](receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)。

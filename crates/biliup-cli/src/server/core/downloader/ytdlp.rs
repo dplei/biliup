@@ -1,7 +1,12 @@
+use crate::observe::RecordingIdentity;
 use crate::server::core::downloader::{
     DownloadConfig as RuntimeDownloadConfig, DownloadStatus, SegmentEvent, SegmentInfo,
 };
 use crate::server::errors::{AppError, AppResult};
+use biliup::downloader::util::{
+    SegmentCloseReason, SegmentIdentity, allocate_segment_id, segment_closed,
+};
+use biliup_observability::{Diagnostic, DiagnosticCapture};
 use error_stack::{ResultExt, bail};
 use std::{
     path::{Path, PathBuf},
@@ -100,9 +105,18 @@ impl Default for DownloadConfig {
     }
 }
 
+/// 本次下载的录制身份。构造下载器时还拿不到它，只有 `download()` 能从运行时配置带入；
+/// 缺省为空身份，事件层不从文件名或时间反推。
+#[derive(Clone, Default)]
+struct Observed {
+    owner: RecordingIdentity,
+    attempt_id: Option<String>,
+}
+
 pub struct YouTubeDownloader {
     cfg: DownloadConfig,
     stopped: Arc<AtomicBool>,
+    observed: Observed,
 }
 
 impl YouTubeDownloader {
@@ -110,6 +124,7 @@ impl YouTubeDownloader {
         Self {
             cfg,
             stopped: Arc::new(AtomicBool::new(false)),
+            observed: Observed::default(),
         }
     }
 
@@ -127,6 +142,10 @@ impl YouTubeDownloader {
         let downloader = Self {
             cfg,
             stopped: self.stopped.clone(),
+            observed: Observed {
+                owner: runtime_cfg.owner.clone(),
+                attempt_id: runtime_cfg.attempt_id.clone(),
+            },
         };
         downloader.run().await?;
 
@@ -135,13 +154,65 @@ impl YouTubeDownloader {
         }
 
         let output_path = downloader.output_path().await?;
-        callback(SegmentEvent::Segment(SegmentInfo::new(
-            output_path,
-            None,
-            None,
-            0,
-        )));
+        // 文件由外部工具自己创建、命名甚至搬运，进程外看不到创建时刻，因此和 ffmpeg
+        // 内部分段一样**只发 `segment_closed`**，不补造 `segment_created`。
+        let identity = SegmentIdentity {
+            segment_id: allocate_segment_id(),
+            original_file: output_path.display().to_string(),
+        };
+        // 整个进程跑完才有产物：一次调用只对应一个分段，结束原因就是本次下载结束。
+        let close_reason = SegmentCloseReason::StreamEnded;
+        segment_closed(
+            &downloader.owner(),
+            &identity,
+            close_reason,
+            file_size(&output_path).await,
+        );
+        callback(SegmentEvent::Segment(SegmentInfo {
+            prev_file_path: output_path,
+            danmaku_file_path: None,
+            next_file_path: None,
+            segment_index: 0,
+            close_reason,
+            attempt_id: downloader.observed.attempt_id.clone(),
+            segment_id: Some(identity.segment_id),
+            recovery_source_paths: Vec::new(),
+            enrollment: None,
+        }));
         Ok(DownloadStatus::StreamEnded)
+    }
+
+    fn owner(&self) -> biliup::downloader::util::RecordingOwner {
+        self.observed
+            .owner
+            .owner(self.observed.attempt_id.as_deref())
+    }
+
+    fn context(&self) -> biliup_observability::Context {
+        self.observed
+            .owner
+            .context(self.observed.attempt_id.as_deref())
+    }
+
+    /// 外部命令没有成功。被 `stop()` 请求过的下载是预期结束，不记为命令失败；
+    /// 诊断只带有界脱敏尾部，第三方输出不进事件字段。
+    fn report_command_failure(
+        &self,
+        stage: &str,
+        reason_code: &str,
+        diagnostic: Option<Diagnostic>,
+        exit_code: Option<i32>,
+    ) {
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        crate::observe::external::command_failed(
+            stage,
+            reason_code,
+            self.context(),
+            diagnostic,
+            exit_code,
+        );
     }
 
     async fn run(&self) -> AppResult<()> {
@@ -160,11 +231,21 @@ impl YouTubeDownloader {
 
         // 3) 等待封面（限时 20s）
         if let Some(handle) = cover_handle {
+            // 旧的告警行原样保留；新事件只带稳定 stage 与原因，不复制 URL 或错误文本。
             match timeout(Duration::from_secs(20), handle).await {
                 Ok(Ok(Ok(()))) => info!("封面已下载"),
-                Ok(Ok(Err(e))) => warn!("封面下载失败: {e:#}"),
-                Ok(Err(e)) => warn!("封面下载任务异常: {e:#}"),
-                Err(_) => warn!("封面下载超时，继续执行"),
+                Ok(Ok(Err(e))) => {
+                    warn!("封面下载失败: {e:#}");
+                    self.report_cover_failure("live_cover_download");
+                }
+                Ok(Err(e)) => {
+                    warn!("封面下载任务异常: {e:#}");
+                    self.report_cover_failure("live_cover_download");
+                }
+                Err(_) => {
+                    warn!("封面下载超时，继续执行");
+                    self.report_cover_failure("live_cover_download");
+                }
             }
         }
 
@@ -174,6 +255,16 @@ impl YouTubeDownloader {
     pub async fn stop(&self) -> AppResult<()> {
         self.stopped.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn report_cover_failure(&self, stage: &str) {
+        crate::observe::external::auxiliary_failed(
+            "recording.auxiliary_failed",
+            "直播封面下载失败，录制继续",
+            stage,
+            "cover_failed",
+            self.context(),
+        );
     }
 
     async fn run_ytdlp(&self) -> AppResult<()> {
@@ -255,16 +346,31 @@ impl YouTubeDownloader {
         }
 
         info!("运行: {:?}", cmd);
-        let output = cmd.output().await.change_context(AppError::Custom(format!(
-            "运行 {} 失败，请确认已安装并在 PATH 中",
-            &self.cfg.ytdlp_bin
-        )))?;
+        let output = match cmd.output().await {
+            Ok(output) => output,
+            Err(error) => {
+                // 起不来的进程没有退出码，也没有输出，不补造。
+                self.report_command_failure("ytdlp", "spawn_failed", None, None);
+                return Err(error).change_context(AppError::Custom(format!(
+                    "运行 {} 失败，请确认已安装并在 PATH 中",
+                    &self.cfg.ytdlp_bin
+                )))?;
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
         if !output.status.success() {
+            let diagnostic = bounded_output(&stdout, &stderr, output.status.code());
+            let summary = failure_summary("yt-dlp", &diagnostic);
+            self.report_command_failure(
+                "ytdlp",
+                "process_failed",
+                Some(diagnostic),
+                output.status.code(),
+            );
             if combined.contains("ffmpeg is not installed")
                 || combined.contains("ffmpeg not found")
                 || combined.contains("ffprobe not found")
@@ -277,7 +383,7 @@ impl YouTubeDownloader {
                     "无法获取到流，请检查 vcodec/acodec/height/filesize 等筛选设置"
                 )));
             } else {
-                bail!(AppError::Custom(format!("yt-dlp 执行失败:\n{}", combined)));
+                bail!(AppError::Custom(summary));
             }
         }
 
@@ -348,26 +454,37 @@ impl YouTubeDownloader {
         }
         info!("运行: (cwd: {}) {:?}", cache_dir.display(), cmd);
 
-        let output = cmd.output().await.change_context(AppError::Custom(format!(
-            "运行 {} 失败，请确认已安装并在 PATH 中",
-            &self.cfg.ytarchive_bin
-        )))?;
+        let output = match cmd.output().await {
+            Ok(output) => output,
+            Err(error) => {
+                self.report_command_failure("ytarchive", "spawn_failed", None, None);
+                return Err(error).change_context(AppError::Custom(format!(
+                    "运行 {} 失败，请确认已安装并在 PATH 中",
+                    &self.cfg.ytarchive_bin
+                )))?;
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
 
         if !output.status.success() {
+            let diagnostic = bounded_output(&stdout, &stderr, output.status.code());
+            let summary = failure_summary("ytarchive", &diagnostic);
+            self.report_command_failure(
+                "ytarchive",
+                "process_failed",
+                Some(diagnostic),
+                output.status.code(),
+            );
             if combined.contains("ffmpeg is not installed") || combined.contains("ffmpeg not found")
             {
                 bail!(AppError::Custom(String::from(
                     "ffmpeg 未安装，ytarchive 无法合并流"
                 )));
             } else {
-                bail!(AppError::Custom(format!(
-                    "ytarchive 执行失败:\n{}",
-                    combined
-                )));
+                bail!(AppError::Custom(summary));
             }
         }
 
@@ -517,5 +634,68 @@ impl YouTubeDownloader {
         });
 
         Some(handle)
+    }
+}
+
+async fn file_size(path: &Path) -> u64 {
+    fs::metadata(path).await.map(|m| m.len()).unwrap_or(0)
+}
+
+/// 第三方工具的输出按行有界采集：单行超限省略、尾部封顶 8 KiB，含 URL/凭据线索的行整值
+/// 脱敏。原始 stdout/stderr 只留在本函数的入参里，不写进事件字段。
+fn bounded_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Diagnostic {
+    let mut capture = DiagnosticCapture::new();
+    capture.push(stdout.as_bytes());
+    if !stdout.is_empty() && !stdout.ends_with('\n') {
+        capture.push(b"\n");
+    }
+    capture.push(stderr.as_bytes());
+    capture.finish(exit_code)
+}
+
+/// 旧实现把完整 combined output 塞进自由错误：可能是几百 KiB，也可能带签名 URL 或
+/// cookie。这里保留同一个错误类型和控制流，只把正文换成有界脱敏摘要。
+fn failure_summary(tool: &str, diagnostic: &Diagnostic) -> String {
+    let detail = diagnostic
+        .first_fatal()
+        .unwrap_or_else(|| diagnostic.tail())
+        .trim_end();
+    format!(
+        "{tool} 执行失败（原始输出 {} 字节，已按限额脱敏）:\n{detail}",
+        diagnostic.total_bytes()
+    )
+}
+
+/// 本批不安装 yt-dlp/ytarchive，也不构造假命令：这里只验证与外部进程无关的隐私与容量边界。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_summary_is_bounded_and_redacted() {
+        let noisy = format!(
+            "{}\nERROR: unable to download https://example.invalid/v?token=abc\n",
+            "x".repeat(200_000)
+        );
+        let diagnostic = bounded_output(&noisy, "", Some(1));
+        let summary = failure_summary("yt-dlp", &diagnostic);
+
+        assert!(summary.starts_with("yt-dlp 执行失败"));
+        // 首个致命行含 URL 与 token，整值脱敏；原文一个字节都不出现在错误里。
+        assert!(summary.contains("[REDACTED]"));
+        assert!(!summary.contains("token=abc"));
+        assert!(!summary.contains("xxxxxxxx"));
+        assert!(summary.len() < 4096);
+        assert!(summary.contains(&diagnostic.total_bytes().to_string()));
+    }
+
+    #[test]
+    fn summary_falls_back_to_the_bounded_tail() {
+        let diagnostic = bounded_output("进度 1\n进度 2\n", "", Some(2));
+        let summary = failure_summary("ytarchive", &diagnostic);
+
+        assert!(summary.starts_with("ytarchive 执行失败"));
+        assert!(summary.contains("进度 2"));
+        assert_eq!(diagnostic.first_fatal(), None);
     }
 }
