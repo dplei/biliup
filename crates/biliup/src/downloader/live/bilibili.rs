@@ -113,7 +113,7 @@ impl BilibiliLive {
         self.room_id = Some(profile.room_id);
         let profile_room_id = profile.room_id;
         let candidates = self.get_stream_candidates(&profile, headers).await?;
-        let raw_stream_url = self.select_stream_url(&candidates).await?;
+        let (raw_stream_url, selected_qn) = self.select_stream_url(&candidates).await?;
         let danmaku = self.danmaku_source();
 
         Ok(LiveStatus::Live {
@@ -137,7 +137,7 @@ impl BilibiliLive {
                 downloader_hint: DownloaderHint::StreamGears,
                 runtime_options: None,
                 stream_candidates: Vec::new(),
-                recording_quality: None,
+                recording_quality: Some(selected_qn.to_string()),
                 attempt_id: None,
                 // B 站 room_id 在同一房间跨场不变，但续接只认未 finalize 的会话，上一场正常
                 // 下播即 finalize，因此这个粒度足够（详见 issue 07 的残余风险说明）。
@@ -550,7 +550,10 @@ impl BilibiliLive {
         None
     }
 
-    async fn select_stream_url(&self, candidates: &[BiliStreamCandidate]) -> LiveResult<String> {
+    async fn select_stream_url(
+        &self,
+        candidates: &[BiliStreamCandidate],
+    ) -> LiveResult<(String, u32)> {
         let selected = if !self.cdn.is_empty()
             && let Some(candidate) = self
                 .cdn
@@ -565,14 +568,14 @@ impl BilibiliLive {
         };
 
         if !self.cdn_fallback {
-            return Ok(selected.url.clone());
+            return Ok((selected.url.clone(), selected.qn));
         }
         if let Some(url) = self.check_url_healthy(&selected.url).await {
-            return Ok(url);
+            return Ok((url, selected.qn));
         }
         for candidate in candidates {
             if let Some(url) = self.check_url_healthy(&candidate.url).await {
-                return Ok(url);
+                return Ok((url, candidate.qn));
             }
         }
         Err(LiveError::custom("B 站所有 CDN 均不可用"))
@@ -710,4 +713,87 @@ fn normalize_api(value: Option<&str>) -> String {
         format!("http://{value}")
     };
     value.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[tokio::test]
+    async fn select_stream_url_preserves_selected_qn() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).unwrap();
+                let success = String::from_utf8_lossy(&request[..read]).starts_with("GET /ok ");
+                let status = if success {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+
+        let client = Client::new();
+        let live = BilibiliLive {
+            wbi_signer: WbiSigner::new(client.clone()),
+            client,
+            url: "https://live.bilibili.com/1".to_string(),
+            name: String::new(),
+            qn: 10000,
+            protocol: "stream".to_string(),
+            cdn: Vec::new(),
+            cdn_fallback: true,
+            hls_transcode_timeout: 0,
+            anonymous_origin: false,
+            api_list: Vec::new(),
+            cookie: None,
+            cookie_file: None,
+            danmaku: false,
+            danmaku_raw: false,
+            danmaku_detail: false,
+            room_id: None,
+        };
+        let good = BiliStreamCandidate {
+            qn: 10000,
+            cdn: String::new(),
+            url: format!("{base_url}/ok"),
+        };
+        let bad = BiliStreamCandidate {
+            qn: 20000,
+            cdn: String::new(),
+            url: format!("{base_url}/bad"),
+        };
+
+        assert_eq!(
+            live.select_stream_url(&[good]).await.unwrap(),
+            (format!("{base_url}/ok"), 10000)
+        );
+        assert_eq!(
+            live.select_stream_url(&[
+                bad,
+                BiliStreamCandidate {
+                    qn: 80,
+                    cdn: String::new(),
+                    url: format!("{base_url}/ok"),
+                }
+            ])
+            .await
+            .unwrap(),
+            (format!("{base_url}/ok"), 80)
+        );
+
+        server.join().unwrap();
+    }
 }
