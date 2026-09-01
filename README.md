@@ -54,8 +54,9 @@
 | 能力 | 说明 |
 |---|---|
 | **抖音断流 failover** | 候选线路模型 + 自动切线（`douyin_route_failover`），可选同画质备用协议（FLV→HLS）与受控降画质（`douyin_quality_fallback` / `douyin_min_fallback_quality`）。 |
-| **画质降级告警** | 实际录到的画质低于阈值（`douyin_quality_alert`）时 webhook 推送，列表卡片上带录制画质 tag。 |
+| **实际录制画质与降级告警** | 主播卡片显示本场最终命中的实际画质（含 B 站 CDN fallback 后的 `qn`）；抖音低于 `douyin_quality_alert` 阈值时额外 webhook 推送。 |
 | **拉流线路健康退避** | 独立的线路失败计数与指数退避（`route_health_enabled`）。 |
+| **停顿看门狗与缺口诊断** | HTTP-FLV 连续收不到字节时自动判死重连，`stream_stall_timeout_secs` 可覆盖默认 30 秒阈值；日志拆分静默、检查与退避耗时，便于定位断流缺口。 |
 | **短分段止损保留** | 断流产生的小分段不再按体积一刀切丢掉，通过媒体探测则保留并按 `merge_or_defer` 合并/延迟恢复。 |
 | **流中断防分稿件** | `delay` 宽限期内的短暂断流视作同一场，不会把一场直播切成多个稿件。 |
 | **录制期限（租约）** | 给房间设一个到期时间，到点自动暂停录制并通知；到期时仍在直播的场次走可证明匹配的 grace 收敛，不会拦腰砍断。 |
@@ -75,17 +76,30 @@
 | 能力 | 说明 |
 |---|---|
 | **时间戳异常检测与修复** | 每个分段上传前扫描时间戳，异常则自动 remux / 重编码（`timestamp_repair`，默认开），避免 B 站转码因时间戳跳变失败；正常片零额外写盘。 |
-| **响度标准化** | 上传前统一录音响度（`audio_normalization_enabled`，默认关），只重编码主音轨不动视频，网页推子可在 -6..+4 dB 间微调目标。 |
+| **响度标准化** | 上传前统一录音响度（`audio_normalization_enabled`，默认关），只重编码主音轨不动视频；网页推子可在 -6..+4 dB 间试听微调，并支持按主播覆写。 |
+| **磁盘安全降级** | 标准化结果默认原地替换原片，每段只保留一份；空间不足或处理中跌破 `audio_normalization_disk_reserve_gib` 时自动放弃产物、直传原片。 |
+| **实际响度记录** | 日志记录 FFmpeg 最终采用的线性 / 动态模式与实际输出响度，目标未打到时如实提示但不误判合法产物失败。 |
 | **分 P 标题取原始录像名** | 中间件处理过的文件不会把中间件名泄漏成分 P 标题。 |
 
 ### 🔭 运维与观测
 
 | 能力 | 说明 |
 |---|---|
-| **Cookie 健康监测** | 连续检查失败判定平台 cookie 可能失效，网页横幅提示 + webhook 推送（`cookie_health_webhook`，兼容 Bark / Server酱 / 企业微信 / 钉钉 / 自建）。 |
+| **统一运维通知** | `cookie_health_webhook` 是统一通知出口：cookie 健康、抖音画质降级、上传线路熔断、投稿结果与录制租约到期都可推送，兼容 Bark / Server酱 / 企业微信 / 钉钉 / 自建。 |
+| **结构化事件页** | 独立 SQLite 记录录制、预处理、上传、补传与投稿事件；WebUI 支持实时接续、条件筛选、场次关联、进度视图及 JSONL / CSV 导出，旧文本日志页继续保留。 |
 | **实时日志** | `ds_update.log` 按天滚动保留 7 天，WebUI 通过 WS 读取最新滚动文件。 |
+| **投稿一致性巡检** | `scripts/consistency-audit.sh` 只读核对有补救记录的已投稿会话与本地账本，排查重复分 P 与成功行残留错误，可重复运行或定期留档。 |
 | **删除时机开关** | `segment_delete_mode`：`per_segment` 每片传完即删（磁盘峰值≈单个切片，适合小盘机器）/ `stream_end` 下播后统一删。 |
 | **静态文件接口收口** | 修掉了上游静态文件接口的任意文件读取问题。 |
+
+结构化事件页目前是试用入口，开启采集后访问 `/log-events`：
+
+```shell
+BILIUP_OBSERVABILITY=1 \
+BILIUP_OBSERVABILITY_DB=data/log-events.sqlite3 \
+BILIUP_OBSERVABILITY_INSTANCE=biliup-server \
+./target/release/biliup server --auth
+```
 
 > 完整的版本演进、每次发版改了什么、踩过哪些坑，见 [`BUILD_AND_DEPLOY.md`](./BUILD_AND_DEPLOY.md) 的镜像版本历史。
 
@@ -136,12 +150,17 @@ Commands:
   dump-flv  输出flv元数据
   download  下载视频
   server    启动web服务，默认端口19159
+  cover-preview  本地渲染一张封面看效果，用于挑背景图与试参数
   list      列出所有已上传的视频
+  backfill-lifecycle  把历史投稿会话回填成 v2 生命周期账本（可中断续跑，不会投稿）
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
   -p, --proxy <PROXY>              配置代理
   -u, --user-cookie <USER_COOKIE>  登录信息文件 [default: cookies.json]
       --rust-log <RUST_LOG>        [default: tower_http=debug,info]
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 `biliup server` 支持 `-b/--bind`（默认 `0.0.0.0`）、`-p/--port`（默认 `19159`）、`--auth` 开启密码认证、`-c/--config` 用 1.0.7 风格配置文件启动。
