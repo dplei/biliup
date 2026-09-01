@@ -10,7 +10,7 @@
 python3 scripts/structured_logging/check_diagnostic_classification.py
 ```
 
-当前保守扫描覆盖 4 个运行时源码根、62 个含 tracing 级别宏的 Rust 文件和 554 个宏位置；
+当前保守扫描覆盖 4 个运行时源码根、62 个含 tracing 级别宏的 Rust 文件和 555 个宏位置；
 计数包含 `src/` 文件中的测试模块，所以只作为「是否漏掉文件」的上界，不冒充生产调用次数。
 校验器要求每个含宏文件恰好落入一个默认处置组；新增/删除/移动到新文件会使校验失败。
 它不能替代语义复核：同一文件可能同时有已迁移业务边界和应保留的内部诊断，文件级决定描述
@@ -37,7 +37,7 @@ python3 scripts/structured_logging/check_diagnostic_classification.py
 | server FFmpeg（内/外分段） | 分段身份、关闭原因与有界失败附件已接 | 本地合成媒体与失败注入 | 已迁移，真实平台矩阵 partial |
 | server Streamlink | 第九批接入：目标文件由 `--output` 选定，创建/关闭是真实观测，带 S/DA、关闭原因与有界退出诊断 | 只有与外部进程无关的判定口径单元测试；本机未安装 streamlink，无实跑样本 | 代码已接，运行证据 pending |
 | server YtDlp / YtArchive | 第九批接入：产物解析后发 `segment_closed`（不补造 created），失败带 stage/exit_code 与有界脱敏附件，自由错误不再整段回灌 | 只有隐私/容量边界单元测试；本机未安装 yt-dlp/ytarchive，无实跑样本 | 代码已接，运行证据 pending |
-| danmaku 异步 recorder | start/stop/roll 的外层调用已发 auxiliary 事件 | 内部 spawned recorder/write/decode 失败仍只在 `danmaku::client` 打旧行，外层 start 成功后无法观察这些失败 | **`coverage_gap`；第六批只覆盖外层失败，不覆盖运行中失败** |
+| danmaku 异步 recorder | 第十一批接入：后台任务终止经宿主注入的观察回调发 `recording.auxiliary_failed`/`danmaku_runtime`，panic 与取消记 `danmaku_aborted` | 真实「启动即死」（输出不可写）在测试中实跑到 `danmaku_output_failed`；真实断连/协议失败样本待自然采集 | 代码已接，运行证据 partial；逐条 write/decode 失败改归 `no_persistence` |
 | cover / hook | 下载、渲染、读取、上传、非命令 hook 及命令失败已接 | 编译/全量回归；真实失败逐项触发仍待补 | 代码已接，运行证据 partial |
 | durable recovery audit | 业务表稳定 UID，事件库幂等投影 | 临时业务库 + 真实事件 SQLite 重放 | 已迁移；真实恢复/outbox 矩阵 partial |
 
@@ -60,7 +60,8 @@ options，服务端也允许显式 downloader 配置；因此它们必须继续�
 | FFmpeg/loudnorm/timestamp/custom hook | `DiagnosticCapture` + `processing.command_failed` | `native_covered`；完整输出 `explicitly_unsupported` | 只保存 8 KiB 有界脱敏附件、总字节和截断信息；不承诺完整 stdout/stderr 归档 |
 | Streamlink 命令/分段 | `streamlink.rs` + `processing.command_failed` | `native_covered`；逐行 `[streamlink] …` 输出 `retain_bridge` | S/DA、关闭原因与退出诊断已原生；`--hls-duration` 下退出码 0 区分不出「切到上限」与「刚好同时下播」，与 ffmpeg 同口径 |
 | YtDlp/YtArchive 命令/产物 | `ytdlp.rs` + `processing.command_failed` | `native_covered`；`运行: …`、清理告警 `retain_bridge` | 只发 `segment_closed`；完整 stdout/stderr 仍 `explicitly_unsupported`，错误正文换成有界脱敏摘要 |
-| danmaku 运行中 recorder/write 失败 | `danmaku/src/client.rs` | `coverage_gap` | 外层 start 返回成功后，spawned task 的错误不会触发第六批 auxiliary 事件；需要显式回调/健康状态，不能解析旧行补造 |
+| danmaku 后台任务终止 | `danmaku/src/client.rs` 的退出观察回调 + `recording.auxiliary_failed` | `native_covered`；旧 `Recorder error` 行 `retain_bridge` | 恰好上报一次，含 panic/取消；原因只从错误类型映射，不解析文本，事件不带原文 |
+| danmaku 逐条 write/decode 失败 | `danmaku/src/client.rs` 的 `warn!`/`debug!` | `no_persistence` | 丢的是单条弹幕不是整场结果，且频率可达弹幕级；整场是否还在录由上一行的终止事件回答 |
 | 第三方完整 payload / 任意命令行 | 无 | `explicitly_unsupported` | 原始请求响应、cookie/token、签名 URL、完整命令行和协议 payload 不属于允许字段；只保留稳定枚举和脱敏摘要 |
 | 通过文本/时间推断身份与结果 | 无 | `explicitly_unsupported` | 不从旧文本生成 task/R/U/S/attempt，也不因相近时间宣布成功或失败；未知保持 unknown |
 
@@ -69,13 +70,14 @@ options，服务端也允许显式 downloader 配置；因此它们必须继续�
 `diagnostic-classification-v1.json` 当前分组为：
 
 - `native_covered`: 3 个原生发射模块；
-- `retain_bridge`: 40 个混合业务/运维模块；
+- `retain_bridge`: 41 个混合业务/运维模块；
 - `no_persistence`: 18 个请求、启动、响应或协议诊断模块；
-- `coverage_gap`: 1 个受支持但仍缺关键原生事实的模块；
+- `coverage_gap`: 0 个——第十一批闭合最后一个后归零；
 - `explicitly_unsupported`: 4 项能力边界，不以文件数量计。
 
-结论：**任务 14 仍不能标 complete。** 第九批闭合了 Streamlink 与 YtDlp/YtArchive 两个源码
-gap，剩下 danmaku 异步 recorder 运行中失败一个；它闭合后才允许开始首轮实际双写观察。
-代码接入不等于运行证据：这两个下载器在本机没有第三方工具，只有与外部进程无关的判定/边界
-单元测试，真实样本要在实际运行中自然积累。任务 12 的真实断连、录制期 601 类型差异和 FFmpeg
-秒级文件名碰撞等既有差异同样没有被本清单消除。
+结论：**源码缺口已归零，但任务 14 仍不能标 complete。** 第十一批闭合了最后一个
+`coverage_gap`（danmaku 后台任务终止），门槛条件因此满足，可以开始首轮实际双写观察——而
+**观察本身尚未进行**，14 的完成取决于观察结果而不是本清单。
+代码接入不等于运行证据：Streamlink 与 YtDlp/YtArchive 在本机没有第三方工具，弹幕只实跑到
+「输出不可写」这一种终止，真实断连、协议失败与外部工具样本都要在实际运行中自然积累。
+任务 12 的真实断连和录制期 601 类型差异同样没有被本清单消除。

@@ -3,9 +3,9 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入前六批原生能力、完成未迁移诊断分类清单，第八批调整为加法式双日志验证，第九批闭合两个外部下载器 gap，验收 partial**。
-录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统与认证域已有原生事件但只有 Rust CLI 做过真实进程实跑；审计域已通过临时业务库与真实事件 SQLite 的受控重放，FFmpeg 诊断已做受控失败验证。第九批已把 Streamlink 与 YtDlp/YtArchive 接上原生分段身份与有界退出诊断，剩余原生覆盖缺口只有 danmaku 异步 recorder 的运行中失败；
-剩余调用点不再以本地假命令/入口矩阵为前置，源码闭合并通过编译、基本启动和关闭新采集不影响业务的最低门槛后进入实际双写观察；
+P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入前六批原生能力、完成未迁移诊断分类清单，第八批调整为加法式双日志验证，第九批闭合两个外部下载器 gap，第十批关闭 FFmpeg 内部分段命名撞车，第十一批闭合最后一个 danmaku gap；源码缺口归零但首轮观察未开始，验收 partial**。
+录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统与认证域已有原生事件但只有 Rust CLI 做过真实进程实跑；审计域已通过临时业务库与真实事件 SQLite 的受控重放，FFmpeg 诊断已做受控失败验证。第九批已把 Streamlink 与 YtDlp/YtArchive 接上原生分段身份与有界退出诊断，第十一批把 danmaku 后台任务的终止穿透到辅助失败边界，**源码 `coverage_gap` 归零**；
+门槛因此满足，下一步是首轮实际双写观察——观察尚未开始，14 的完成取决于观察结果而不是源码状态；
 P4–P6 未开始，旧日志与旧页面保留，新页只是试用入口。
 
 ## 状态约定
@@ -55,7 +55,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
-| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第九批回执](receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)：外部下载器已接入，只剩 danmaku 异步失败 1 个源码 gap，预计 1 个实现 session / 1.5–3 小时；本地矩阵改为实际双写自然采样，首轮观察仍待完成。[第十批](receipts/P3.md#任务-14-第十批内部分段命名撞车与-segment_format)关闭 FFmpeg 内部分段的秒级命名撞车与 `-segment_format ts` 失败 |
+| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第十一批回执](receipts/P3.md#任务-14-第十一批弹幕后台任务终止)：源码 `coverage_gap` 已归零（第十批同时关闭了 FFmpeg 内部分段命名撞车），剩余全部是验收工作——首轮实际双写观察与差异复核未开始，未自然触发的路径保持待观察 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
 | [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
@@ -64,34 +64,34 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近一轮仅处理任务 14 第十批：内部分段命名撞车与 `-segment_format`。沿用
-  `refactor/issue2-260831-153007`，父提交为第九批 `dc94766`，代码与回执同批提交，未 push。
-- **第四批留下的「FFmpeg 秒级命名碰撞」已关闭**。`-strftime` 不再打开：ffmpeg 侧改用序号模板
-  `{展开后的名字}-%05d.{后缀}.part`（segment 复用器只能二选一，只有序号保证每段一个新文件），
-  用户配置的命名改由本进程按该分段的开始时刻展开，撞车时顺延 `-2`、`-3`。交付名的形状、
-  补扫前缀匹配、登记账本与上传路径都不变。
-- 一并修掉「ffmpeg 9 不接受 `ts` 作为 `-segment_format`」：该参数改取复用器名
-  （`ts`→`mpegts`、`mkv`→`matroska`）。
-- **口径变化**：交付名的时间戳来源从 ffmpeg 自己的 strftime 换成本进程的观测，第一段用的是
-  进程启动时刻而非 ffmpeg 打开首个输出的时刻，秒数可能与旧行为差上一次连接探测的耗时。
-- 第十批验证：`cargo test -p biliup-cli --lib ffmpeg_downloader` 7 passed（含撞车条件下
-  `ts`/`flv` 两个后缀的实跑，用 `ffprobe` 按时长核对没有分段被覆盖）、
-  `cargo test -p biliup --test recording_events` 6 passed、
-  `cargo test -p biliup-observability -p biliup-cli --lib --tests` 429 passed / 0 failed / 6 ignored、
-  `python3 scripts/check_code_index.py` 通过。全部离线，媒体本地合成，
-  不接触真实平台、账号或网络。
-- 上一轮（第九批）的结论与限制原样有效：Streamlink 的创建/关闭是真实观测、YtDlp/YtArchive
-  只发 `segment_closed`，两者都未改子进程管理与文件搬运；yt-dlp 的 `stop()` 只置标记不杀
-  进程这一既有语义保留。**本机没有安装 streamlink/yt-dlp/ytarchive，两条路径没有任何实跑
-  样本**，正常下载、切片、取消与真实失败全部保持待观察。
-- 剩余源码缺口只有 danmaku spawned recorder 的运行中 recorder/write/decode 失败，预计
-  1 个实现 session、1.5–3 小时；它闭合后才能开始首轮实际双写观察。旧 601 `transport` 差异
-  仍是待处理项；FFmpeg 秒级命名碰撞已由第十批关闭，不再列入。
-  14 仍 in-progress / partial，P3 仍 in-progress / partial / pending，当前不能进入 P4。
+- 最近一轮仅处理任务 14 第十一批：`danmaku` 后台 recorder 在 `start()` 成功之后才发生的终止，
+  也是最后一个源码 `coverage_gap`。沿用 `refactor/issue2-260831-153007`，父提交为第十批
+  `633f123`；改动集中在 `danmaku` crate、服务端弹幕客户端与 effort 文档，未 push。
+- `DanmakuRecorder` 增加终止观察回调，由宿主注入，`danmaku` crate 不依赖采集组件；没有观察者
+  时行为与从前完全一致。回调恰好触发一次，含 panic 与被取消（记 `danmaku_aborted`）。
+- 正常收尾不产生事件；失败按**错误类型**映射到 output/connection/protocol/internal 四个稳定
+  原因码，不解析错误文本，事件不带原文、路径或 URL。stage 固定 `danmaku_runtime`，与既有的
+  `danmaku_start`/`danmaku_stop`/`danmaku_roll` 三个同步边界区分开。
+- 范围有意收窄：逐条 `write_event` 与逐帧解码失败归 `no_persistence`，丢的是单条弹幕不是
+  整场结果，且频率可达弹幕级。记录但未修的既有缺陷：YouTube 轮询分支缺重连、
+  `RecorderHandle::stop()` 吞掉发送错误——两者现在都会被本事件暴露。
+- 同时更正第七批「运行中失败完全不可见」的措辞：recorder 死后下一次 `rolling()` 会因 channel
+  断开发出 `danmaku_roll` 事件，但要等到下一次分段（单段场次永不触发）且归因错误。
+- 录制身份此前根本没传进弹幕客户端，本批把本场 `RecordingIdentity` 的构造提前一步并显式
+  克隆进去，事件层不从文件名或时间反推。
+- 本批验证：真起一个输出不可写的 recorder，`download()` 如常成功，随后**恰好一条**事件落进
+  独立采集器并核对了 stage/outcome/reason_code/级别/身份/脱敏（2 项集成测试）；
+  `danmaku` 42 passed、`biliup-cli` lib 344 passed / 6 ignored、录制域 6 passed、
+  底座 22 passed、工作区构建通过、真实 `biliup dump-flv` 开关对照业务输出逐字节一致、
+  触达文件格式与 clippy 通过、分类漂移 62 files / 555 sites 且 **`coverage_gap` 1 → 0**。
+- **实跑只覆盖了终止的一种**（输出不可写）。真实断连耗尽、协议失败、panic 与被取消都还没有
+  自然样本，保持待观察；真实直播场次的弹幕录制本轮没有跑过。第九批的限制原样有效：本机没有
+  streamlink/yt-dlp/ytarchive，那两条路径仍无任何实跑样本。旧 601 `transport` 差异与任务 12
+  的真实断连样本仍是待处理项。14 仍 in-progress / partial，当前不能进入 P4。
 - 下一轮入口：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`。
-  下批只把 `danmaku/src/client.rs` 里 spawned recorder 的失败穿透到既有 auxiliary 边界，
-  旧错误行保留，不改弹幕协议、重试或录制状态机；之后才进入首轮实际双写观察，
-  未自然触发的路径仍不能写 passed。
+  下一轮是**首轮实际双写观察**：以日常运行自然产生的成功、并发与异常样本做旧日志与新事件的
+  双源核对，写观察报告与差异处置。未自然触发的路径仍不能写 passed；观察未完成之前 14 不标
+  complete。
 
 ## 每次回写的检查清单
 

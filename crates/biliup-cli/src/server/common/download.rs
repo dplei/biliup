@@ -975,16 +975,17 @@ impl DownloadTask {
             .filename_prefix
             .clone()
             .or_else(|| ctx.config().filename_prefix.clone());
-        let danmaku_client = danmaku_client(
-            stream.danmaku.as_ref(),
-            filename_prefix.as_deref(),
-            &stream.name,
-        );
         // 录制身份显式构造一次，弹幕、回调、channel 与阻塞任务都从这里克隆。
         let identity = crate::observe::RecordingIdentity::server(
             ctx.worker_id(),
             ctx.id(),
             &ctx.live_stream().name,
+        );
+        let danmaku_client = danmaku_client(
+            stream.danmaku.as_ref(),
+            filename_prefix.as_deref(),
+            &stream.name,
+            identity.clone(),
         );
         // 启动弹幕客户端
         if let Some(ref client) = danmaku_client {

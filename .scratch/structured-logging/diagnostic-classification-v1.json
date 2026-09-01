@@ -20,9 +20,7 @@
     {
       "decision": "coverage_gap",
       "reason": "These are supported runtime paths whose key failure or segment facts still depend on free-form output; they remain in the P3/14 denominator and block completion.",
-      "paths": [
-        "crates/danmaku/src/client.rs"
-      ]
+      "paths": []
     },
     {
       "decision": "no_persistence",
@@ -91,6 +89,7 @@
         "crates/biliup/src/downloader/util.rs",
         "crates/biliup/src/uploader/line.rs",
         "crates/biliup/src/uploader/line/upos.rs",
+        "crates/danmaku/src/client.rs",
         "crates/stream-gears/src/lib.rs"
       ]
     }
