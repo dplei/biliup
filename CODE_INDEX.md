@@ -19,7 +19,10 @@
 | `crates/biliup-cli/src/observe/audit.rs` | 把持久 `upload_recovery_audit` 行投影成 `audit.operation_projected`：复用业务行的稳定 event uid，按 durable reason 冻结映射 outcome/reason，显式携带恢复身份且路径只取 basename；业务审计仍是权威。 | `operation_projected`、`classify` |
 | `crates/biliup-cli/src/observe/lifecycle.rs` | 入口一次运行的启停：两个 CLI 是一个进程、Python 绑定是一次嵌入调用；运行自带 id，与其中的录制/上传 task 是两个身份不互相代用；正常/出错/被取消分别记 executed、failed、unknown，强杀不执行析构因而没有结束事件、不补造。 | `Invocation`、`Invocation::start`、`Invocation::finish`、`run`、`command_name` |
 | `crates/biliup-cli/src/observe/auth.rs` | 凭据健康与认证操作失败：健康跃迁只能由 `cookie_health` 状态机发出，单次操作失败不改变健康状态；错误按既有分类器定型后随即丢弃文本，按 `Debug` 而非 `Display` 渲染以免 `Report` 只暴露顶层 context。 | `health_changed`、`operation_failed`、`observe`、`reason_of`、`reason_for_error` |
+| `crates/biliup-cli/src/server/core/live.rs` | 把平台提取出的 `LiveStream` 转成服务端 Worker/下载运行时/弹幕客户端；downloader hint 或显式配置可实际选择 StreamGears、FFmpeg、Streamlink、YtDlp/YtArchive，不可再把后两类当作死分支移出覆盖分母。 | `live_streamer`、`streamer_info`、`downloader_runtime`、`streamlink_runtime`、`ytdlp_runtime`、`danmaku_client` |
 | `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs` | 服务端 FFmpeg 下载器（内部/外部分段）：外部分段的目标文件本进程选定，创建与关闭都是真实观测；内部分段只能在收到分段列表行时分配身份，故只发关闭事件。关闭原因跟随进程结束方式，取消标记先于杀进程写入。`spawn_log` 在保留旧 `[ffmpeg]` 逐行输出的同时并行做有界 stderr 采集。分段列表行只有 basename，按 `output_dir` 还原；单段收尾失败或重名不结束整场录制。 | `FfmpegDownloader`、`download_external`、`download_internal`、`external_close_reason`、`internal_close_reason`、`report_command_failure`、`spawn_log`、`FfmpegDownloader::stop` |
+| `crates/biliup-cli/src/server/core/downloader/streamlink.rs` | 服务端 Streamlink 子进程下载器；当前命令行和 stdout/stderr 仍走自由文本，完成产物通过 `SegmentInfo::new` 回调而没有稳定 S/DA/有界失败附件，是 P3/14 明确覆盖缺口。 | `Streamlink`、`StreamlinkDownloader`、`build_file_args`、`spawn_log` |
+| `crates/biliup-cli/src/server/core/downloader/ytdlp.rs` | 服务端 YtDlp/YtArchive 运行时：组装外部命令、可并发抓封面、搬运最终产物；当前整体收集 stdout/stderr 并把 combined 文本塞进自由错误，产物回调也没有稳定 S/DA，是 P3/14 明确覆盖缺口。 | `YouTubeDownloader`、`DownloadConfig`、`run_ytdlp`、`run_ytarchive`、`output_path` |
 | `crates/stream-gears/src/uploader.rs` | Python 上传参数到上传/封面/投稿的编排，显式传递同一 task，复用服务端线路及持久限流准入。 | `StudioPre`、`upload`、`UploadLine` |
 | `crates/biliup-cli/src/downloader.rs` | 独立 CLI 下载入口：插件提取后按媒体类型走 HTTP-FLV/HLS，拒绝需 Streamlink/YtDlp 运行时的路径，另支持 FLV 转 JSON 诊断。 | `download`、`download_stream`、`generate_json` |
 | `crates/biliup-cli/src/lib.rs` | Web 服务启动与主播配置导入的编排层：建立 SQLite 连接、组装服务、恢复主播任务并启动 Axum。 | `run`、`import_config_streamers`、`import_database_streamers` |
@@ -92,7 +95,7 @@
 | --- | --- | --- |
 | `crates/biliup-cli/src/server/core/monitor.rs` | 轮询各房间开播状态，命中开播时按平台场次键复用或新建本场 `streamer_info`，并在下载许可下拉起录制流程；单次检查抽成共用实现，供轮询与「主动检查」按钮各调一次。 | `start_monitor`、`check_room_once`、`check_now`、`CheckOutcome` |
 | `crates/biliup-cli/src/server/common/download.rs` | 录制主流程与分段事件处理：拉流、断线重试、切片校验，把有效分段登记后交给上传管道，并在尾段 durable enrollment 后持久关闭会话投稿意图。 | `start_download_workflow`、`DownloadTask`、`SegmentEventProcessor`、`persist_closed_session_intents` |
-| `crates/biliup-cli/src/server/core/downloader.rs` | 下载器类型分发与下载配置定义：`DownloaderType` 到具体实现的映射，**只有显式选 `Ffmpeg` 才走 `FfmpegDownloader` 的 `FfmpegExternal` 模式，其余一律回落到支持 FLV/HLS 的 `StreamGears`**——判断某个能力是否依赖 ffmpeg 录制路径时先看这里。 | `DownloaderType`、`DownloaderRuntime`、`DownloadConfig`、`parse_duration` |
+| `crates/biliup-cli/src/server/core/downloader.rs` | 下载器类型、下载配置、统一运行时枚举和分段回调载体。`from_type` 只直接构造 FFmpeg/StreamGears；Streamlink 与 YtDlp/YtArchive 由 `core/live.rs` 读取平台 runtime options 后显式构造。裸 `SegmentInfo::new` 的 segment/attempt identity 均为空，外部下载器不能靠它完成原生覆盖。 | `DownloaderType`、`DownloaderRuntime`、`DownloadConfig`、`SegmentInfo`、`parse_duration` |
 | `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` | 服务端拉流执行器：已知 HLS 直接解析，其余探测 FLV 并回落 HLS；传递 R/DA 与关闭回调的 S。HLS 收到非空媒体后才记重连，取消先设置关闭原因再释放下载 future。 | `StreamGears`、`start_download`、`classify_download_error`、`classify_reqwest_error`、`hls_server_reconnect_requires_media_and_cancel_preserves_identity` |
 | `crates/biliup-cli/src/server/common/util.rs` | 录像分段落盘后的有效性判据：容器探测、`HeaderOnly`（FLV ≤13 字节）与小于阈值的可恢复短分段分类，决定丢弃、入队合并还是登记上传。 | `FileValidator`、`MediaValidation`、`InvalidMediaReason`、`probe_flv` |
 | `crates/biliup-cli/src/server/core/download_manager.rs` | 单平台下载编排的持有者：建 `Monitor` 与上传 Actor 池，并把房间增删、暂停入队/出队、主动检查转发给监控 Actor。 | `DownloadManager`、`add_room`、`make_waker`、`check_room_now` |
@@ -139,6 +142,8 @@
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
 | `scripts/check_code_index.py` | 对本索引做结构校验，防止失效路径、重复条目和悬空关系逐渐累积。 | `main` |
+| `scripts/structured_logging/check_diagnostic_classification.py` | 校验 P3/14 的机器分类目录：四个 Rust 运行时源码根里每个含 tracing 级别宏的文件必须恰好有一个默认处置，新增/删除文件会阻断；只做文件级漂移检测，不替代调用点语义复核。 | `main`、`scanned_files` |
+| `.scratch/structured-logging/diagnostic-classification-v1.json` | P3/14 未迁移诊断的机器目录：按文件冻结 native/bridge/no-persistence/coverage-gap 默认处置，并另列有理由的明确不支持能力边界。人类可读语义与阶段结论见同目录 `diagnostic-classification.md`。 | `version`、`groups`、`explicitly_unsupported_boundaries` |
 | `scripts/dev.sh` | 本机开发环境启动脚本：按需构建前端产物与后端二进制，可选带起 Next.js 热重载，绑 127.0.0.1 起服务。 | — |
 | `scripts/normalization-disk-sample.py` | 采样响度标准化中间件的数量与字节峰值并判定是否超过上限；只读，直播中可跑。 | `scan`、`Peaks` |
 | `scripts/structured_logging/evidence.py` | 有界只读双源证据导出与确定性校验：固定高水位分批、原生/桥接分列、旧文件代次与字节边界、批内一致匿名映射，manifest 记录不完整原因。 | `export`、`validate`、`Bundle`、`Budget`、`readonly` |
@@ -159,6 +164,7 @@
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-observability/src/shadow.rs`（`Shadow::layer`）：Rust CLI 同样以旁路层接入，宿主已装 subscriber 时不 panic 也不替换。
 - `crates/stream-gears/src/lib.rs` → `crates/biliup-observability/src/shadow.rs`（`inherited_dispatch`、`block_on_inherited`）：Python 局部宿主路径在保留原有 subscriber 的前提下补一条采集链。
 - `scripts/structured_logging/reconcile.py` → `scripts/structured_logging/evidence.py`（`validate`）：组视图与交叉包前先做确定性校验，校验失败的包不进入比较。
+- `scripts/structured_logging/check_diagnostic_classification.py` → `.scratch/structured-logging/diagnostic-classification-v1.json`：扫描实际 tracing 文件并与机器目录做集合等价校验；人类可读理由与阶段门槛见同目录 `diagnostic-classification.md`。
 - `biliup/__main__.py` → `crates/stream-gears/src/lib.rs`（`main_loop`）：Python 模块入口进入 Rust 扩展的 CLI 主循环。
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/server.rs`（`server::_main`）：PyO3 主循环规范化参数后委派实际 CLI 执行。
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-cli/src/lib.rs`（`run`）：`server` 子命令进入 Web 服务启动编排。
@@ -199,6 +205,7 @@
 - `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup-cli/src/server/common/download.rs`（`DownloaderRuntime::take_last_gap`）：把「上游最后一个字节 → 判死」的静默时长传回重连循环，与 `check_elapsed + backoff` 合成三段式缺口（`event="stream_gap"`）并累加进 `estimated_missing`；只有 FLV 自研解析路径测得到，其余下载器退回旧口径。
 - `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/util.rs`（`FileValidator::validate`）：分段关闭后按同一份判据分流——`Invalid` 直接删除，`RecoverableShort` 仅在`preserve_recoverable_short_segments` 开启时进入合并管线，否则同样删除；进入管线后还要满足同组 `group.len() > 1` 才会 `merge_compatible_segments`，**单个短片段一律走 `defer_recovery_batch` 落库等待处理，不进成片**。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/download.rs`（`start_download_workflow`）：开播检测插入 `streamer_info` 后，以该行 id 作为本场 Context 身份进入录制与上传流水线。
+- `crates/biliup-cli/src/server/core/live.rs` → `crates/biliup-cli/src/server/core/downloader.rs`、`downloader/streamlink.rs`、`downloader/ytdlp.rs`（`downloader_runtime`）：平台 hint/运行参数和显式配置共同决定真实运行时；Streamlink/YtDlp/YtArchive 现在可达，但其裸 `SegmentInfo::new` 仍缺稳定 S/DA 和有界命令诊断，因此不能沿用旧索引的“全部回落 StreamGears”判断。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`admit_detected_session`）：直播检测在写入新场次和启动下载前读取活动租约；到期后只允许可证明匹配的持久 grace 场次。
 - `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`complete_grace_session`）：确认下播并处理尾段后，先 CAS 到期暂停再决定是否把 Worker 放回轮询队列。
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`start_recording_lease_tasks`）：Web 服务同级运行五秒到期扫描和可靠通知扫描，并在 shutdown 时中止二者；通知投递复用全局配置的 `cookie_health_webhook`，没有独立的租约 webhook 字段，未配置时到期租约停在 `not_configured`。

@@ -84,3 +84,11 @@ Implementation: in-progress
   受控实跑，全量 Rust 回归通过；真实恢复操作、弹幕/封面/hook 故障和 Python/wheel 入口仍待验。
   详见 [P3 第六批回执](../receipts/P3.md#任务-14-第六批持久审计投影与剩余诊断c12--c13)。
   本任务仍 in-progress / partial；下一批做分类清单与剩余入口运行矩阵，门槛满足后才开始长观察。
+- 第七批完成未迁移诊断分类清单及文件级漂移校验：62 个含 tracing 宏的运行时源码文件都有
+  默认处置，4 项明确不支持边界写明理由。源码复核同时纠正旧口径：`core/live.rs` 会实际选择
+  Streamlink 与 YtDlp/YtArchive，它们不是不可达分支；两者仍缺稳定分段/attempt 身份与有界命令
+  失败附件。danmaku spawned recorder 的运行中失败也未穿透第六批外层 auxiliary 事件。
+  三项记 `coverage_gap` 并继续留在 C03/C13 分母，详见
+  [分类清单](../diagnostic-classification.md) 与
+  [P3 第七批回执](../receipts/P3.md#任务-14-第七批未迁移诊断分类清单)。本任务仍
+  in-progress / partial，不能开始长观察；下一批先补这些原生边界，再做剩余入口运行矩阵。
