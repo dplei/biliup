@@ -5,6 +5,10 @@
 
 归档只挪位置，不改内容：spec、issue、验证记录一并保留，链接与引用继续有效。
 
+**例外：跨越多个阶段的长 effort 可以按阶段部分归档。** 已经通过验收、且后续阶段不再改动的
+阶段材料先挪过来，仍在推进的阶段留在 `.scratch/`。这类目录用 `<slug>-<阶段>` 命名，两侧的
+相对链接在移动时一并修正。判据不放宽：被挪走的那部分自己必须满足下面的完结条件。
+
 ## 什么时候算「完结」
 
 同时满足才归档：
@@ -27,3 +31,4 @@
 | [`2026-08-26-session-227-audit/`](2026-08-26-session-227-audit/) | 一次投稿会话的分P重复/缺失只读审计 | 2026-08-29 | `resolved`：全库对照证明是孤立事故，源文件已删无法补传，决定不编辑稿件；审计逻辑已固化为 `scripts/consistency-audit.sh` |
 | [`normalization-duration-metric/`](normalization-duration-metric/) | 响度标准化的时长口径：FLV 非零起始时间戳导致的全量误判，连带样片截取、失败证据与熔断 | 2026-08-31 | 01–05 全部 `resolved`；随 [#18](https://github.com/dplei/biliup/pull/18) 合入 `dev`，dev 环境真实录制 6/6 `completed`、0 次 `duration_drift` |
 | [`empty-rescan-sessions/`](empty-rescan-sessions/) | 补扫不得复活零分段空会话 | 2026-08-31 | 01–04 全部 `resolved`；随 `2c1b871` 合入 `dev`，spec 唯一的保留理由（等待落 `dev`）已解除 |
+| [`structured-logging-p0-p2/`](structured-logging-p0-p2/) | 日志体系重构的前三个阶段：事件契约与基线、独立事件组件与 SQLite、入口旁路与证据对比工具 | 2026-09-01 | **按阶段部分归档**：06–11 全部 `complete`/`passed`，P0–P2 三份回执的验收结论已定稿且后续阶段不再改动；随 [#22](https://github.com/dplei/biliup/pull/22) 合入 `dev`。同一 effort 的 P3 及以后仍在 [`.scratch/structured-logging/`](../.scratch/structured-logging/) 推进 |

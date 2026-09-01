@@ -30,9 +30,9 @@ P3 后续业务接入采用**加法式双日志验证**：旧调用点、旧文�
 
 | 阶段 | 具体任务 | 这一阶段交付什么 | 旧系统状态 | 进入下一阶段的条件 |
 | --- | --- | --- | --- | --- |
-| P0 定义基线 | [06](issues/06-baseline-contract.md) | 事件契约 v1、关键事实清单、支持入口清单、资源预算和验收样本 | 完全保留 | 对比口径、必测场景和预算有明确版本 |
-| P1 独立底座 | [07](issues/07-independent-core.md)、[08](issues/08-sqlite-writer.md) | 不依赖业务的事件采集、SQLite、诊断附件与健康状态；合成数据自测 | 完全保留，新系统默认关闭 | 独立组件可启动/关闭/查询，故障与容量验证通过 |
-| P2 并行采集与比较 | [09](issues/09-shadow-integration.md)、[10](issues/10-evidence-export.md)、[11](issues/11-agent-reconciliation.md) | 旁路采集旧事件，导出两份证据，完成首次独立还原和差异报告 | 文件、过滤规则、旧页面保留 | 新系统可单独关闭，已识别桥接局限，比较工具能发现预埋缺失 |
+| P0 定义基线 | [06](../../.archive/structured-logging-p0-p2/issues/06-baseline-contract.md) | 事件契约 v1、关键事实清单、支持入口清单、资源预算和验收样本 | 完全保留 | 对比口径、必测场景和预算有明确版本 |
+| P1 独立底座 | [07](../../.archive/structured-logging-p0-p2/issues/07-independent-core.md)、[08](../../.archive/structured-logging-p0-p2/issues/08-sqlite-writer.md) | 不依赖业务的事件采集、SQLite、诊断附件与健康状态；合成数据自测 | 完全保留，新系统默认关闭 | 独立组件可启动/关闭/查询，故障与容量验证通过 |
+| P2 并行采集与比较 | [09](../../.archive/structured-logging-p0-p2/issues/09-shadow-integration.md)、[10](../../.archive/structured-logging-p0-p2/issues/10-evidence-export.md)、[11](../../.archive/structured-logging-p0-p2/issues/11-agent-reconciliation.md) | 旁路采集旧事件，导出两份证据，完成首次独立还原和差异报告 | 文件、过滤规则、旧页面保留 | 新系统可单独关闭，已识别桥接局限，比较工具能发现预埋缺失 |
 | P3 逐条业务链迁移 | [12](issues/12-recording-pilot.md)、[13](issues/13-upload-pilot.md)、[14](issues/14-coverage-expansion.md)；可另行推进 [15](issues/15-query-api.md)、[16](issues/16-preview-ui.md) | 原生结构化事件逐批接入；新查询与页面作为试用入口 | 继续写旧文件；旧页面仍默认 | 原生调用点闭合并通过最低运行门槛后进入实际双写观察；全覆盖及 UI 验收后完成第一轮完整观察 |
 | P4 新体系作为默认 | [17](issues/17-default-events.md) | 默认进入新事件页，旧页仍可显式访问 | 保留旧文件与旧原始查询，再观察一轮 | 同一最终版本/配置的两轮完整观察通过，回退演练通过 |
 | P5 停止旧写入 | [18](issues/18-stop-legacy-writes.md) | 关闭旧文件 sink，以数据库为唯一应用持久化日志 | 代码与开关暂留；旧文件不删除、不冒充实时 | 无文件写入观察通过，重新启用旧写入的演练通过 |

@@ -10,8 +10,8 @@ Type: design-index
 
 | 子目标 | 任务 |
 | --- | --- |
-| 事件/字段/来源/分级/单位契约与覆盖基线 | [06](06-baseline-contract.md) |
-| 公共类型、tracing 上下文快照、脱敏与跨任务载体 | [07](07-independent-core.md) |
+| 事件/字段/来源/分级/单位契约与覆盖基线 | [06](../../../.archive/structured-logging-p0-p2/issues/06-baseline-contract.md) |
+| 公共类型、tracing 上下文快照、脱敏与跨任务载体 | [07](../../../.archive/structured-logging-p0-p2/issues/07-independent-core.md) |
 | 录制身份、稳定分段和连接尝试贯通 | [12](12-recording-pilot.md) |
 | 预处理、上传、补传与投稿关联 | [13](13-upload-pilot.md) |
 | 其余支持入口、系统/认证/审计 | [14](14-coverage-expansion.md) |

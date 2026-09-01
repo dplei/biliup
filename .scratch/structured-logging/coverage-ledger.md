@@ -109,13 +109,13 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
 业务原生覆盖自 P3/12 起有第一条通过记录（录制域）。新增路径、新事件或必填字段变更后，相关条目回到待验证。
 
 - C01–C14 / 合成调用者 / v1 / 06–08 / synthetic-v1：P0来源映射和P1载体/存储能力通过，
-  [P0](receipts/P0.md)、[P1](receipts/P1.md)；不计为业务迁移覆盖，所有实际入口仍待P2/P3。
+  [P0](../../.archive/structured-logging-p0-p2/receipts/P0.md)、[P1](../../.archive/structured-logging-p0-p2/receipts/P1.md)；不计为业务迁移覆盖，所有实际入口仍待P2/P3。
 - C13 / 独立DiagnosticCapture / v1 / 08 / synthetic-v1：有界长行/尾部、跨chunk凭据脱敏、
   首致命信息、7天附件清理和超限回滚通过。旧ffmpeg扫描器未改，实际工具接入待13/14。
 - C14 / 独立Runtime+SQLite / v1 / 07–08 / synthetic-v1：队列计损、忙锁/只读/满页/低盘/WAL
   降级及恢复通过，强杀已提交可查、未提交窗口明确未知；真实入口健康暴露待09。
 - C01–C14 / 5个支持入口 + 本地dev server / v1 / 09–11 / shadow-v1：仅**桥接**链路通过，
-  [P2](receipts/P2.md)。开启/关闭/新库不可用三态、回退、真实HTTP与旧日志页、双路负载、
+  [P2](../../.archive/structured-logging-p0-p2/receipts/P2.md)。开启/关闭/新库不可用三态、回退、真实HTTP与旧日志页、双路负载、
   证据导出与确定性校验均通过；所有 manifest 固定 native_coverage=not-started，
   **本行不为任何覆盖项计原生分**，C01–C14 的业务原生事件仍未接入，待 P3/12–14。
 - 比较规则边界 / 桥接文本 / reconciliation-v1 / 11 / shadow-v1：逐字重复的旧行与脱敏后的

@@ -10,8 +10,8 @@ Type: design-index
 
 | 子目标 | 任务 |
 | --- | --- |
-| executed/skipped/fallback/failed、reason 与分级规范 | [06](06-baseline-contract.md) |
-| 独立还原、压缩差异与缺口回归 | [11](11-agent-reconciliation.md) |
+| executed/skipped/fallback/failed、reason 与分级规范 | [06](../../../.archive/structured-logging-p0-p2/issues/06-baseline-contract.md) |
+| 独立还原、压缩差异与缺口回归 | [11](../../../.archive/structured-logging-p0-p2/issues/11-agent-reconciliation.md) |
 | 录制/重连/DTS 原生观测与有界告警汇总 | [12](12-recording-pilot.md) |
 | 上传进度复用、预处理/补传/投稿原因和结果 | [13](13-upload-pilot.md) |
 | 进度单独展示，日志不会顶掉阅读位置 | [16](16-preview-ui.md) |

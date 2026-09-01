@@ -11,7 +11,7 @@ Type: design-index
 
 | 子目标 | 任务 |
 | --- | --- |
-| 在页面完成前就能导出双源证据 | [10](10-evidence-export.md) |
+| 在页面完成前就能导出双源证据 | [10](../../../.archive/structured-logging-p0-p2/issues/10-evidence-export.md) |
 | 有认证的查询、实时接续、详情与导出 | [15](15-query-api.md) |
 | 颜色/筛选/详情/时间线/独立进度的试用页 | [16](16-preview-ui.md) |
 | 新页默认、旧页仍可用 | [17](17-default-events.md) |

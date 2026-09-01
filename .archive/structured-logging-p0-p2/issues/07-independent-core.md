@@ -5,7 +5,7 @@ Blocked by: 06
 Phase: P1
 Implementation: complete
 
-来源：[实施计划](../rollout-plan.md)、[事件模型](../spec.md)。
+来源：[实施计划](../../../.scratch/structured-logging/rollout-plan.md)、[事件模型](../../../.scratch/structured-logging/spec.md)。
 
 ## 交付与步骤
 

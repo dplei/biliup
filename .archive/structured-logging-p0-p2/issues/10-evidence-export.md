@@ -5,7 +5,7 @@ Blocked by: 09
 Phase: P2
 Implementation: complete
 
-来源：[对比流程](../reconciliation.md)。本任务无需等待新网页完成。
+来源：[对比流程](../../../.scratch/structured-logging/reconciliation.md)。本任务无需等待新网页完成。
 
 ## 交付与步骤
 

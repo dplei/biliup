@@ -5,7 +5,7 @@ Blocked by: 07
 Phase: P1
 Implementation: complete
 
-来源：[存储设计](../spec.md)、[实施计划](../rollout-plan.md)。
+来源：[存储设计](../../../.scratch/structured-logging/spec.md)、[实施计划](../../../.scratch/structured-logging/rollout-plan.md)。
 
 ## 交付与步骤
 

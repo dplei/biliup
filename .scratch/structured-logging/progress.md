@@ -29,15 +29,18 @@ P4–P6 未开始，旧日志与旧页面保留，新页只是试用入口。
 
 | 阶段 | 任务 | 交付 | 验收 | 观察 | 阶段状态 | 执行回执 |
 | --- | --- | --- | --- | --- | --- | --- |
-| P0 | 06 | complete | passed | not-required | passed | [P0](receipts/P0.md) |
-| P1 | 07、08 | complete | passed | not-required | passed | [P1](receipts/P1.md) |
-| P2 | 09、10、11 | complete | passed | not-required | passed | [P2](receipts/P2.md) |
+| P0 | 06 | complete | passed | not-required | passed | [P0](../../.archive/structured-logging-p0-p2/receipts/P0.md) |
+| P1 | 07、08 | complete | passed | not-required | passed | [P1](../../.archive/structured-logging-p0-p2/receipts/P1.md) |
+| P2 | 09、10、11 | complete | passed | not-required | passed | [P2](../../.archive/structured-logging-p0-p2/receipts/P2.md) |
 | P3 | 12、13、14、15、16 | in-progress | partial | pending | in-progress | [P3](receipts/P3.md) |
 | P4 | 17 | not-started | pending | pending | not-started | — |
 | P5 | 18 | not-started | pending | pending | not-started | — |
 | P6 | 19 | not-started | pending | not-required | not-started | — |
 
-执行回执在阶段实际开始后按模板建立为 `receipts/P0.md` 等文件，创建后再补可点击链接。
+执行回执在阶段实际开始后按模板建立为 `receipts/P<n>.md`，创建后再补可点击链接。
+**P0–P2 的 issue（06–11）与三份回执已按阶段归档到
+[`.archive/structured-logging-p0-p2/`](../../.archive/structured-logging-p0-p2/)**：它们的验收
+已定稿、后续阶段不再改动，上表链接直接指向归档位置。P3 及以后仍在本目录推进。
 P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受控场景和验收条件。
 
 ## 任务检查表
@@ -47,12 +50,12 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 | 任务 | 所属阶段 | 交付 | 验收 | 有效证据 / 待完成项 |
 | --- | --- | --- | --- | --- |
-| [06 基线与契约](issues/06-baseline-contract.md) | P0 | complete | passed | [契约](contract-v1.md)、[基线预算](baseline-budget.md)、[回执](receipts/P0.md) |
-| [07 通用事件组件](issues/07-independent-core.md) | P1 | complete | passed | [P1](receipts/P1.md)：快照/脱敏/过滤/队列/故障/并发测试 |
-| [08 独立 SQLite](issues/08-sqlite-writer.md) | P1 | complete | passed | [P1](receipts/P1.md)：幂等/只读/附件/维护/备份/强杀与量化负载 |
-| [09 入口旁路](issues/09-shadow-integration.md) | P2 | complete | passed | [P2](receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
-| [10 证据导出](issues/10-evidence-export.md) | P2 | complete | passed | [P2](receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
-| [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
+| [06 基线与契约](../../.archive/structured-logging-p0-p2/issues/06-baseline-contract.md) | P0 | complete | passed | [契约](contract-v1.md)、[基线预算](baseline-budget.md)、[回执](../../.archive/structured-logging-p0-p2/receipts/P0.md) |
+| [07 通用事件组件](../../.archive/structured-logging-p0-p2/issues/07-independent-core.md) | P1 | complete | passed | [P1](../../.archive/structured-logging-p0-p2/receipts/P1.md)：快照/脱敏/过滤/队列/故障/并发测试 |
+| [08 独立 SQLite](../../.archive/structured-logging-p0-p2/issues/08-sqlite-writer.md) | P1 | complete | passed | [P1](../../.archive/structured-logging-p0-p2/receipts/P1.md)：幂等/只读/附件/维护/备份/强杀与量化负载 |
+| [09 入口旁路](../../.archive/structured-logging-p0-p2/issues/09-shadow-integration.md) | P2 | complete | passed | [P2](../../.archive/structured-logging-p0-p2/receipts/P2.md)：5 入口 × 关闭/开启/不可用矩阵、dev server 真实服务、回退演练、双路负载 |
+| [10 证据导出](../../.archive/structured-logging-p0-p2/issues/10-evidence-export.md) | P2 | complete | passed | [P2](../../.archive/structured-logging-p0-p2/receipts/P2.md)：6 个证据包 complete + 校验 passed、12 项合成故障回归 |
+| [11 Agent 对比](../../.archive/structured-logging-p0-p2/issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](../../.archive/structured-logging-p0-p2/receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第十一批回执](receipts/P3.md#任务-14-第十一批弹幕后台任务终止)：源码 `coverage_gap` 已归零（第十批同时关闭了 FFmpeg 内部分段命名撞车），剩余全部是验收工作——首轮实际双写观察与差异复核未开始，未自然触发的路径保持待观察 |

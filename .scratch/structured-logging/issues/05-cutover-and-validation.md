@@ -11,8 +11,8 @@ Type: design-index
 
 | 子目标 | 任务 |
 | --- | --- |
-| 保留旧链的入口旁路与开关 | [09](09-shadow-integration.md) |
-| 真实双源证据和只读比较 | [10](10-evidence-export.md)、[11](11-agent-reconciliation.md) |
+| 保留旧链的入口旁路与开关 | [09](../../../.archive/structured-logging-p0-p2/issues/09-shadow-integration.md) |
+| 真实双源证据和只读比较 | [10](../../../.archive/structured-logging-p0-p2/issues/10-evidence-export.md)、[11](../../../.archive/structured-logging-p0-p2/issues/11-agent-reconciliation.md) |
 | 全支持入口的覆盖验收 | [14](14-coverage-expansion.md) |
 | 新页面默认，继续双写观察 | [17](17-default-events.md) |
 | 关闭旧写入，保留可恢复实现 | [18](18-stop-legacy-writes.md) |

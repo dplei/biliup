@@ -5,13 +5,13 @@ Blocked by: —
 Phase: P0
 Implementation: complete
 
-来源：[实施计划](../rollout-plan.md)。本任务是建议的首个实施任务，不表示本轮已执行。
+来源：[实施计划](../../../.scratch/structured-logging/rollout-plan.md)。本任务是建议的首个实施任务，不表示本轮已执行。
 
 ## 交付与步骤
 
 1. 从 `CODE_INDEX.md` 定位三个 Rust 日志初始化位置及所有支持的命令/下载路径，逐一记录
    subscriber 所有者、旧 sink、过滤配置、时间精度、退出处理和读取入口。
-2. 完成 [覆盖清单](../coverage-ledger.md) 的 v1：每个关键事实列出旧调用点、原生事件名、
+2. 完成 [覆盖清单](../../../.scratch/structured-logging/coverage-ledger.md) 的 v1：每个关键事实列出旧调用点、原生事件名、
    适用入口、必填/允许未知字段、单位、结果/原因枚举及一对多映射。不是批量重写调用点。
 3. 冻结基础 schema：事件身份、时间、级别/分类、上下文、脱敏/截断，以及
    `capture_kind=native|legacy_bridge`；普通诊断、进度和 durable 审计各自明确来源。

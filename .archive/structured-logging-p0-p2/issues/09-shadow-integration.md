@@ -5,7 +5,7 @@ Blocked by: 08
 Phase: P2
 Implementation: complete
 
-来源：[并行边界](../rollout-plan.md)。主要入口见 `stream-gears/src/server.rs`、
+来源：[并行边界](../../../.scratch/structured-logging/rollout-plan.md)。主要入口见 `stream-gears/src/server.rs`、
 `biliup-cli/src/main.rs`、`stream-gears/src/lib.rs`，具体受支持范围以 06 清单为准。
 
 ## 交付与步骤

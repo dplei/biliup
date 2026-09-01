@@ -96,7 +96,7 @@
 
 ### P0 — 契约、基线和验收样本
 
-前置：无。执行：[06](issues/06-baseline-contract.md)。
+前置：无。执行：[06](../../.archive/structured-logging-p0-p2/issues/06-baseline-contract.md)。
 
 读取当前日志初始化和支持路径，冻结事件契约 v1、关键覆盖事实与旧输出基线。明确录制
 场次、投稿会话、分段、attempt 与 CLI task 身份，以及原生/桥接的区别。完成受控基线
@@ -105,7 +105,7 @@
 
 ### P1 — 独立通用日志底座
 
-前置：P0/06 通过。执行：[07](issues/07-independent-core.md) → [08](issues/08-sqlite-writer.md)。
+前置：P0/06 通过。执行：[07](../../.archive/structured-logging-p0-p2/issues/07-independent-core.md) → [08](../../.archive/structured-logging-p0-p2/issues/08-sqlite-writer.md)。
 
 直接实现不依赖 Web server/业务库的通用事件组件、上下文快照、脱敏、独立过滤、有界队列
 和健康接口，再实现独立 SQLite migrations、批量写入、只读仓储、附件与保留/备份。
@@ -114,8 +114,8 @@
 
 ### P2 — 并行采集、证据导出和交叉比较
 
-前置：P1/07–08 通过。执行：[09](issues/09-shadow-integration.md) →
-[10](issues/10-evidence-export.md) → [11](issues/11-agent-reconciliation.md)。
+前置：P1/07–08 通过。执行：[09](../../.archive/structured-logging-p0-p2/issues/09-shadow-integration.md) →
+[10](../../.archive/structured-logging-p0-p2/issues/10-evidence-export.md) → [11](../../.archive/structured-logging-p0-p2/issues/11-agent-reconciliation.md)。
 
 把新组件以可关闭的旁路接进全部支持入口，不重复初始化 subscriber，保留原文件、旧过滤
 和旧页。新库桥接记录明确 `legacy_bridge`，不是原生覆盖。实现有界只读双源导出器及

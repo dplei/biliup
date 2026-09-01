@@ -5,7 +5,7 @@ Blocked by: 10
 Phase: P2，之后贯穿 P3–P5
 Implementation: complete
 
-来源：[对比流程](../reconciliation.md)、[报告模板](../templates/reconciliation-report.md)。
+来源：[对比流程](../../../.scratch/structured-logging/reconciliation.md)、[报告模板](../../../.scratch/structured-logging/templates/reconciliation-report.md)。
 
 ## 交付与步骤
 
