@@ -105,6 +105,25 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - 登录成功不发原生事件：`auth.health_changed` 的 recovered 属于状态机，一次成功的登录不等于
   平台健康跃迁；「这次登录跑完了且正常结束」由该入口的 `system.stopped` 回答。
 
+### P3/14 持久审计投影与辅助诊断增量
+
+- `upload_recovery_audit` 仍是恢复拒绝事实的权威来源；加法字段 `event_uid` 保存 UUID，仅用于
+  向独立事件库投影。新审计先落业务表再尽力投影；采集关闭、队列拒绝或日志库故障都不能改变
+  恢复判定。迁移前的空 UID 由回放先写回业务表，再发事件，不按时间或路径生成身份。
+- `audit.operation_projected` 使用业务表中的 UID 和原 `created_at`，WARN；stage 保留稳定的业务
+  审计原因，结果映射为 failed/`source_missing`、skipped/`session_finalized`，未知新增原因保守记
+  unknown/`audit_reason_unknown`。启动时分页回放一次，运行中有界重放最近行；事件库按 UID 幂等，
+  业务审计不会随普通事件保留策略删除，必要时可重新生成视图。它不是跨库原子提交承诺。
+- 预处理外部进程统一复用 `processing.command_failed`：stage 为 `loudnorm_measure`、
+  `loudnorm_transcode`、`timestamp_detect`、`timestamp_remux`、`timestamp_reencode`、`hook_remux`
+  或 `custom_hook`。非零退出带真实 `exit_code`；spawn/read/wait 失败没有退出码，不补造。
+  `ffmpeg_scan` 同时保留旧解析所需的 64KiB 尾部和独立附件的 8KiB 脱敏尾部；原先继承 stderr
+  的 remux/reencode/hook 路径继续 tee 到原输出，原先静默捕获的扫描/转码路径仍不新增旧行。
+- 弹幕、封面与非命令 hook 失败使用 `recording.auxiliary_failed` 或
+  `processing.auxiliary_failed`，WARN/failed，stage 区分 start/stop/roll、下载/读取/渲染/上传和
+  pre/downloaded hook；原因只用 `danmaku_failed`、`cover_failed`、`hook_failed`、`source_io`。
+  原始错误仍只在原有旧调用点输出，新事件不复制 URL、请求响应、命令文本或自由错误文本。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify

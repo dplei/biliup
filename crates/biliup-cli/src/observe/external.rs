@@ -38,3 +38,26 @@ pub fn command_failed(
         draft
     });
 }
+
+/// Native marker for auxiliary subsystems which are not OS commands. Raw third-party errors stay
+/// in the unchanged legacy output; the event only carries a stable stage and reason.
+pub fn auxiliary_failed(
+    event_name: &str,
+    message: &str,
+    stage: &str,
+    reason_code: &str,
+    context: Context,
+) {
+    let Some(emitter) = current_emitter() else {
+        return;
+    };
+    emitter.emit_with(Level::Warn, || {
+        let mut draft = Draft::new(event_name, message);
+        draft.context = context;
+        draft.fields = Fields::new()
+            .with("stage", stage)
+            .with("outcome", "failed")
+            .with("reason_code", reason_code);
+        draft
+    });
+}

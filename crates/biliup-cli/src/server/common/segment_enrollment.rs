@@ -1,5 +1,5 @@
 use crate::server::common::recovery_eligibility::{
-    finalized_session_for_streamer_info, record_recovery_audit,
+    finalized_session_for_streamer_info, record_recovery_audit, replay_recovery_audits,
 };
 use crate::server::core::downloader::SegmentEnrollment;
 use crate::server::errors::{AppError, AppResult};
@@ -606,9 +606,29 @@ pub async fn import_outbox_once(store: &EnrollmentStore) -> AppResult<usize> {
 pub fn spawn_outbox_importer(pool: ConnectionPool) {
     let store = EnrollmentStore::production(pool);
     tokio::spawn(async move {
+        // Rebuild the best-effort event view from the authoritative table once at startup.  The
+        // stable UID makes this harmless when the event database already contains the row.
+        let mut audit_cursor = 0;
+        loop {
+            match replay_recovery_audits(&store.pool, audit_cursor, 256).await {
+                Ok(page) if page.rows > 0 => audit_cursor = page.last_id,
+                Ok(_) => break,
+                Err(error) => {
+                    warn!(?error, "recovery audit projection replay deferred");
+                    break;
+                }
+            }
+        }
         loop {
             if let Err(error) = import_outbox_once(&store).await {
                 error!(?error, "upload enrollment outbox scan failed");
+            }
+            // Recent rows are intentionally replayed: an accepted event may still have been lost
+            // to a later storage failure.  SQLite de-duplicates the stable UID on recovery.
+            let recent_after = audit_cursor.saturating_sub(128);
+            match replay_recovery_audits(&store.pool, recent_after, 256).await {
+                Ok(page) => audit_cursor = audit_cursor.max(page.last_id),
+                Err(error) => warn!(?error, "recent recovery audit projection retry deferred"),
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
         }

@@ -1,4 +1,4 @@
-use crate::server::common::ffmpeg_scan::run_scanning_stderr;
+use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
@@ -117,9 +117,12 @@ impl FfmpegRunner for SystemFfmpeg {
             ])
             .arg(path)
             .args(["-c", "copy", "-f", "null", "-"]);
-        let (status, scan) = run_scanning_stderr(background(&mut command))
-            .await
-            .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
+        let (status, scan) = run_scanning_stderr(
+            background(&mut command),
+            ScanObserver::quiet("timestamp_detect", path),
+        )
+        .await
+        .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
         // 模式命中优先：即使退出码非零也应尝试修复。
         if scan.timestamp_anomaly {
             return Ok(true);
@@ -136,7 +139,7 @@ impl FfmpegRunner for SystemFfmpeg {
 
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
         let mut command = Command::new("ffmpeg");
-        let status = background(&mut command)
+        background(&mut command)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -162,10 +165,17 @@ impl FfmpegRunner for SystemFfmpeg {
                 "0",
             ])
             .arg(dst)
-            .kill_on_drop(true)
-            .status()
-            .await
-            .change_context(AppError::Custom("failed to spawn ffmpeg (remux)".into()))?;
+            .kill_on_drop(true);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver {
+                stage: "timestamp_remux",
+                original_file: Some(src),
+                tee_stderr: true,
+            },
+        )
+        .await
+        .change_context(AppError::Custom("failed to spawn ffmpeg (remux)".into()))?;
         if !status.success() {
             let _ = tokio::fs::remove_file(dst).await;
             bail!(AppError::Custom(format!(
@@ -189,7 +199,7 @@ impl FfmpegRunner for SystemFfmpeg {
 
     async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()> {
         let mut command = Command::new("ffmpeg");
-        let status = background(&mut command)
+        background(&mut command)
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -215,10 +225,17 @@ impl FfmpegRunner for SystemFfmpeg {
                 "make_zero",
             ])
             .arg(dst)
-            .kill_on_drop(true)
-            .status()
-            .await
-            .change_context(AppError::Custom("failed to spawn ffmpeg (reencode)".into()))?;
+            .kill_on_drop(true);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver {
+                stage: "timestamp_reencode",
+                original_file: Some(src),
+                tee_stderr: true,
+            },
+        )
+        .await
+        .change_context(AppError::Custom("failed to spawn ffmpeg (reencode)".into()))?;
         if !status.success() {
             let _ = tokio::fs::remove_file(dst).await;
             bail!(AppError::Custom(format!(

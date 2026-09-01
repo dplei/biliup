@@ -3028,6 +3028,16 @@ pub(crate) async fn build_studio(
     videos: Vec<Video>,
     recorder: &Recorder,
 ) -> AppResult<Studio> {
+    let cover_context = || {
+        let mut fields = biliup_observability::Fields::new();
+        if recorder.streamer_info.id >= 0 {
+            fields.insert(
+                "streamer_info_id",
+                recorder.streamer_info.id.to_string().into(),
+            );
+        }
+        biliup_observability::Context(fields)
+    };
     // 使用 Builder 模式简化构建
     let mut studio: Studio = Studio::builder()
         .desc(recorder.format(&upload_config.description.clone().unwrap_or_default()))
@@ -3080,16 +3090,46 @@ pub(crate) async fn build_studio(
                 studio.cover = f.path().to_string_lossy().into_owned();
                 _auto_cover_tmp = Some(f);
             }
-            Err(e) => error!(e=?e, "生成自动封面失败，回退到 cover_path"),
+            Err(e) => {
+                crate::observe::external::auxiliary_failed(
+                    "processing.auxiliary_failed",
+                    "自动封面渲染失败，回退到配置封面",
+                    "auto_cover_render",
+                    "cover_failed",
+                    cover_context(),
+                );
+                error!(e=?e, "生成自动封面失败，回退到 cover_path")
+            }
         }
     }
     // 处理封面上传
-    if !studio.cover.is_empty()
-        && let Ok(c) = &std::fs::read(&studio.cover).inspect_err(|e| error!(e=?e))
-        && let Ok(url) = bilibili.cover_up(c).await.inspect_err(|e| error!(e=?e))
-    {
-        studio.cover = url;
-    };
+    if !studio.cover.is_empty() {
+        match std::fs::read(&studio.cover) {
+            Ok(bytes) => match bilibili.cover_up(&bytes).await {
+                Ok(url) => studio.cover = url,
+                Err(e) => {
+                    crate::observe::external::auxiliary_failed(
+                        "processing.auxiliary_failed",
+                        "投稿封面上传失败，沿用既有降级行为",
+                        "cover_upload",
+                        "cover_failed",
+                        cover_context(),
+                    );
+                    error!(e=?e)
+                }
+            },
+            Err(e) => {
+                crate::observe::external::auxiliary_failed(
+                    "processing.auxiliary_failed",
+                    "投稿封面读取失败，沿用既有降级行为",
+                    "cover_read",
+                    "source_io",
+                    cover_context(),
+                );
+                error!(e=?e)
+            }
+        }
+    }
 
     Ok(studio)
 }

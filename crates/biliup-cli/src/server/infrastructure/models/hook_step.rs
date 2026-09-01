@@ -1,4 +1,6 @@
+use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
 use crate::server::errors::{AppError, AppResult};
+use biliup_observability::{Context as EventContext, DiagnosticCapture};
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -121,7 +123,8 @@ impl HookStep {
     async fn ffmpeg_remux_to_mp4(src: &Path, dst: &Path) -> AppResult<()> {
         info!("remux ts→mp4: {} → {}", src.display(), dst.display());
         let started = std::time::Instant::now();
-        let status = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        command
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -143,10 +146,17 @@ impl HookStep {
                 "make_zero",
             ])
             .arg(dst)
-            .kill_on_drop(true)
-            .status()
-            .await
-            .change_context(AppError::Custom("failed to spawn ffmpeg".into()))?;
+            .kill_on_drop(true);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver {
+                stage: "hook_remux",
+                original_file: Some(src),
+                tee_stderr: true,
+            },
+        )
+        .await
+        .change_context(AppError::Custom("failed to spawn ffmpeg".into()))?;
         if !status.success() {
             // Clean up partial output so a retry restarts cleanly.
             let _ = tokio::fs::remove_file(dst).await;
@@ -214,14 +224,26 @@ impl HookStep {
         // 执行自定义命令
         // 解析命令和参数
         // 启动子进程，配置标准输入管道
-        let mut process = Command::new(shell)
+        let mut process = match Command::new(shell)
             .arg(flag)
             .arg(cmd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .change_context(AppError::Unknown)?;
+        {
+            Ok(process) => process,
+            Err(error) => {
+                crate::observe::external::command_failed(
+                    "custom_hook",
+                    "process_failed",
+                    EventContext::default(),
+                    None,
+                    None,
+                );
+                return Err(error).change_context(AppError::Unknown);
+            }
+        };
 
         // 将自定义输入写入标准输入
         if let Some(mut stdin) = process.stdin.take() {
@@ -246,18 +268,27 @@ impl HookStep {
             stdout,
             tokio::io::stdout(),
             "download.log",
+            false,
         ));
         let stderr_task = tokio::spawn(Self::tee_command_output(
             stderr,
             tokio::io::stderr(),
             "download.log",
+            true,
         ));
 
         let status = process.wait().await.change_context(AppError::Unknown)?;
         stdout_task.await.change_context(AppError::Unknown)??;
-        stderr_task.await.change_context(AppError::Unknown)??;
+        let diagnostic = stderr_task.await.change_context(AppError::Unknown)??;
 
         if !status.success() {
+            crate::observe::external::command_failed(
+                "custom_hook",
+                "process_failed",
+                EventContext::default(),
+                diagnostic.map(|capture| capture.finish(status.code())),
+                status.code(),
+            );
             bail!(AppError::Custom(format!(
                 "Command failed with status: {}",
                 status
@@ -271,7 +302,8 @@ impl HookStep {
         mut reader: R,
         mut terminal: W,
         log_file: &'static str,
-    ) -> AppResult<()>
+        capture_diagnostic: bool,
+    ) -> AppResult<Option<DiagnosticCapture>>
     where
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
@@ -282,6 +314,7 @@ impl HookStep {
             .open(log_file)
             .await
             .change_context(AppError::Unknown)?;
+        let mut diagnostic = capture_diagnostic.then(DiagnosticCapture::new);
         let mut buf = [0; 8192];
         loop {
             let n = reader
@@ -290,6 +323,9 @@ impl HookStep {
                 .change_context(AppError::Unknown)?;
             if n == 0 {
                 break;
+            }
+            if let Some(capture) = &mut diagnostic {
+                capture.push(&buf[..n]);
             }
             terminal
                 .write_all(&buf[..n])
@@ -301,7 +337,7 @@ impl HookStep {
         }
         terminal.flush().await.change_context(AppError::Unknown)?;
         log.flush().await.change_context(AppError::Unknown)?;
-        Ok(())
+        Ok(diagnostic)
     }
 
     /// 移动文件到指定目录
@@ -532,12 +568,24 @@ mod tests {
     }
 }
 
-pub async fn process(input: &[u8], processors: &Option<Vec<HookStep>>) {
+pub async fn process(
+    input: &[u8],
+    processors: &Option<Vec<HookStep>>,
+    stage: &str,
+    context: EventContext,
+) {
     if let Some(hooks) = processors {
         // 依次执行每个处理器步骤
         for processor in hooks {
             info!(processor=?processor, "Starting processing...");
             if let Err(e) = processor.execute_with(input).await {
+                crate::observe::external::auxiliary_failed(
+                    "recording.auxiliary_failed",
+                    "自定义录制钩子失败，主流程继续",
+                    stage,
+                    "hook_failed",
+                    context.clone(),
+                );
                 error!(error=?e, "自定义处理执行出错");
             }
             info!(processor=?processor, "processing completed");

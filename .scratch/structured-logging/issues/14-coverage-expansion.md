@@ -78,3 +78,9 @@ Implementation: in-progress
   见 [P3 第五批回执](../receipts/P3.md#任务-14-第五批入口生命周期与凭据健康c01--c11)。
   本任务保持 in-progress / partial；wheel CLI、Python 下载/上传与登录辅助函数只做编译核对，
   未起 Python 进程实跑。下一批做 C12 审计投影与 C13 剩余诊断，之后是分类清单与全范围观察。
+- 第六批 C12/C13 已交付：恢复审计表新增稳定 `event_uid`，业务行先持久化、事件视图可启动回放
+  且按 UID 幂等；预处理 FFmpeg、hook 命令失败统一带退出码和有界脱敏附件，弹幕/封面/非命令
+  hook 补稳定辅助失败事件，原错误文本和 stderr 输出口径保留。审计双重回放和非零扫描器有
+  受控实跑，全量 Rust 回归通过；真实恢复操作、弹幕/封面/hook 故障和 Python/wheel 入口仍待验。
+  详见 [P3 第六批回执](../receipts/P3.md#任务-14-第六批持久审计投影与剩余诊断c12--c13)。
+  本任务仍 in-progress / partial；下一批做分类清单与剩余入口运行矩阵，门槛满足后才开始长观察。
