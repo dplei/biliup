@@ -8,6 +8,7 @@ use biliup::downloader::util::{
     segment_created,
 };
 use biliup_observability::DiagnosticCapture;
+use chrono::{DateTime, Local};
 use error_stack::{ResultExt, bail};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{error, info};
 
 /// FFmpeg下载器实现
 /// 使用FFmpeg进行直播流下载，支持内部和外部分段
@@ -68,7 +69,7 @@ impl FfmpegDownloader {
         args.extend(["-f".to_string(), "segment".to_string()]);
         args.extend([
             "-segment_format".to_string(),
-            download_config.suffix.to_string(),
+            segment_muxer_name(&download_config.suffix).to_string(),
         ]);
         // -segment_list pipe:1: 将分段文件名输出到stdout
         // 这样我们可以实时获取新生成的分段文件
@@ -81,10 +82,11 @@ impl FfmpegDownloader {
         // -reset_timestamps 1: 每个分段重置时间戳从0开始
         // 确保每个分段文件可以独立播放
         args.extend(["-reset_timestamps".to_string(), "1".to_string()]);
-        // %Y-%m-%dT%H_%M_%S 是 strftime 的时间占位符（需要配合 -strftime 1）
-        // %d 是序号占位符（printf 风格，默认模式）
-        // segment 复用器不能同时用这两种
-        args.extend(["-strftime".to_string(), "1".to_string()]);
+        // 这里**不开** -strftime：segment 复用器要么认 strftime 时间占位符（`-strftime 1`），
+        // 要么认 printf 风格的序号 `%d`，两者不能同时用。strftime 只有秒级精度，同一秒关闭的
+        // 两段会拿到同一个名字并被 ffmpeg 以 O_TRUNC 覆盖，前一段的数据就没了。序号是唯一
+        // 能保证「每段一个新文件」的那种，所以时间占位符改由本进程展开（见
+        // `internal_segment_pattern`），ffmpeg 只负责编号。
 
         // -segment_time: 分段时长（秒）
         if let Some(segment_time) = &download_config.segment_time {
@@ -277,15 +279,14 @@ impl FfmpegDownloader {
         let owner = download_config
             .owner
             .owner(download_config.attempt_id.as_deref());
-        let template = download_config.output_dir.join(format!(
-            "{}.{}.part",
-            download_config.recorder.filename_template(),
-            download_config.suffix
-        ));
+        // 分段文件名先由 ffmpeg 按序号写出，保证同一秒关闭的两段也各占一个文件；用户配置的
+        // 命名在交付之前由本进程展开，见 `internal_segment_pattern` / `internal_delivery_stem`。
+        let mut segment_started_at = Local::now();
+        let pattern = internal_segment_pattern(&download_config, segment_started_at);
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args(&args)
-            .arg(template.display().to_string())
+            .arg(pattern.display().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -304,36 +305,48 @@ impl FfmpegDownloader {
         let mut reader = BufReader::new(stdout).lines();
         let mut segment_index = 0;
         let close_reason = internal_close_reason(&download_config);
-        // 分段文件名只有秒级精度：同一秒内关闭的两段会拿到同一个名字，ffmpeg 直接覆盖，
-        // 分段列表里也就出现重复行。记住本次已交付的目标名，重复行如实记为收尾失败。
+        // 本次已经交付过的目标名。磁盘上的同名文件也算占用，但上层随时可能把交付过的文件
+        // 移走，光看磁盘不足以避免第二次用同一个名字。
         let mut delivered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         while let Some(line) = reader.next_line().await.change_context(AppError::Unknown)? {
             // 分段列表写的是相对列表文件的名字，管道输出时就只剩 basename，
             // 因此按配置的输出目录还原；行本身给出绝对路径时 join 保持原样。
             let file_path = download_config.output_dir.join(line.trim());
+            // segment 复用器先关闭这一段、写出列表行，再打开下一段：读到行的时刻既是本段的
+            // 关闭时刻，也是下一段的开始时刻。第一段没有更早的观测点，用进程启动的时刻。
+            let started_at = std::mem::replace(&mut segment_started_at, Local::now());
 
-            // segment 复用器先关闭分段文件、再写这一行，所以拿到行时文件已经写完，
-            // 不需要额外等待；分段身份也只能在这一刻分配，进程外看不到创建时刻。
-            let no_ext = file_path.with_extension("");
-            let identity = SegmentIdentity {
-                segment_id: allocate_segment_id(),
-                original_file: no_ext.display().to_string(),
-            };
-
-            if !delivered.insert(no_ext.clone()) {
+            // 交付名按用户模板展开，取本段的开始时刻，与旧的 `-strftime 1` 同口径。撞车时
+            // 顺延序号：源文件是 ffmpeg 按编号写的独立文件，顺延只改这一段叫什么，
+            // 不会像以前那样让一段的数据被另一段覆盖。
+            let stem = internal_delivery_stem(&download_config, started_at);
+            let Some(target) = unique_delivery_path(
+                &download_config.output_dir,
+                &stem,
+                &download_config.suffix,
+                &delivered,
+            ) else {
                 segment_close_failed(
                     &owner,
-                    &identity.segment_id,
-                    &identity.original_file,
-                    "ffmpeg 重复使用了同一个分段文件名，同名的前一段可能已被覆盖",
+                    &allocate_segment_id(),
+                    &file_path.display().to_string(),
+                    "同名的交付文件过多，无法为这一段取到唯一的文件名",
                 );
                 continue;
-            }
+            };
+
+            // 拿到行时分段文件已经写完，不需要额外等待；分段身份也只能在这一刻分配，
+            // 进程外看不到创建时刻。
+            let identity = SegmentIdentity {
+                segment_id: allocate_segment_id(),
+                original_file: target.display().to_string(),
+            };
+            delivered.insert(target.clone());
 
             // 重命名文件。单个分段收不了尾不应结束整场录制：如实记一次失败的关闭，
             // 临时文件原样保留交给补扫，循环继续处理后面的分段。
-            if let Err(error) = tokio::fs::rename(&file_path, &no_ext).await {
+            if let Err(error) = tokio::fs::rename(&file_path, &target).await {
                 segment_close_failed(
                     &owner,
                     &identity.segment_id,
@@ -342,12 +355,12 @@ impl FfmpegDownloader {
                 );
                 continue;
             }
-            info!("renamed file: from {file_path:?} to {no_ext:?}");
-            segment_closed(&owner, &identity, close_reason, file_size(&no_ext).await);
+            info!("renamed file: from {file_path:?} to {target:?}");
+            segment_closed(&owner, &identity, close_reason, file_size(&target).await);
 
             // 触发分段回调
             callback(SegmentEvent::Segment(SegmentInfo {
-                prev_file_path: no_ext,
+                prev_file_path: target,
                 danmaku_file_path: None,
                 next_file_path: None,
                 segment_index,
@@ -417,6 +430,70 @@ impl FfmpegDownloader {
             Some(diagnostic),
             status.code(),
         );
+    }
+}
+
+/// 交付名顺延的上限。撞车最多也就是同一秒里关闭的那几段，给到这个量级只是为了让循环
+/// 一定有尽头，真到不了这里说明目录本身出了问题，那一段如实记为收尾失败。
+const MAX_DELIVERY_NAME_ATTEMPTS: u32 = 1000;
+
+/// 内部分段交给 ffmpeg 的输出模板：`{展开后的名字}-%05d.{后缀}.part`。
+///
+/// `%05d` 是 segment 复用器唯一能保证「每段一个新文件」的占位符。整条路径里其它位置的
+/// 字面 `%`——展开后的名字（主播名、标题里都可能有）和输出目录本身——都必须转义成 `%%`，
+/// 否则 ffmpeg 会把它当成另一个占位符，整条模板被判非法、连头都写不出来。
+fn internal_segment_pattern(
+    download_config: &DownloadConfig,
+    started_at: DateTime<Local>,
+) -> PathBuf {
+    let stem = internal_delivery_stem(download_config, started_at).replace('%', "%%");
+    let output_dir = download_config.output_dir.display().to_string();
+    PathBuf::from(output_dir.replace('%', "%%"))
+        .join(format!("{stem}-%05d.{}.part", download_config.suffix))
+}
+
+/// 按用户配置的文件名模板展开出这一段该叫什么，时间取该分段的开始时刻。
+fn internal_delivery_stem(download_config: &DownloadConfig, at: DateTime<Local>) -> String {
+    let template = download_config.recorder.filename_template();
+    match download_config.recorder.try_format_at(&template, at) {
+        Some(stem) => stem,
+        None => {
+            // 与 `Recorder::format` 同一口径：模板非法时占位符原样保留，不让一场录制炸掉。
+            error!(template, "时间格式串不合法，占位符按原样保留");
+            template
+        }
+    }
+}
+
+/// 交付名的候选序列：先用模板展开的名字，被占用就顺延 `-2`、`-3`……
+///
+/// 「被占用」既包括磁盘上已经存在，也包括本次已经交付过的名字——上层拿到分段后随时可能
+/// 把文件移走，只看磁盘不足以避免第二次用同一个名字。源文件是 ffmpeg 按序号写出的独立
+/// 文件，顺延只影响这一段叫什么，不会丢数据。
+fn unique_delivery_path(
+    output_dir: &Path,
+    stem: &str,
+    suffix: &str,
+    delivered: &std::collections::HashSet<PathBuf>,
+) -> Option<PathBuf> {
+    (0..MAX_DELIVERY_NAME_ATTEMPTS).find_map(|attempt| {
+        let candidate = if attempt == 0 {
+            output_dir.join(format!("{stem}.{suffix}"))
+        } else {
+            output_dir.join(format!("{stem}-{}.{suffix}", attempt + 1))
+        };
+        (!delivered.contains(&candidate) && !candidate.exists()).then_some(candidate)
+    })
+}
+
+/// `-segment_format` 要的是**复用器名**，不是文件扩展名：ffmpeg 9 不认 `ts`
+/// （报 "Muxer not found"），内部分段配 ts 后缀会在写头时直接失败。只映射扩展名与复用器名
+/// 对不上的那几个，其余原样交给 ffmpeg 判断。
+fn segment_muxer_name(suffix: &str) -> &str {
+    match suffix {
+        "ts" => "mpegts",
+        "mkv" => "matroska",
+        other => other,
     }
 }
 
@@ -529,6 +606,7 @@ mod tests {
     use biliup_observability::{
         CaptureKind, CaptureLayer, Commit, Consumer, Event, Options, Runtime, StorageError,
     };
+    use chrono::{Duration as ChronoDuration, TimeZone};
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -541,6 +619,9 @@ mod tests {
             Ok(Commit::default())
         }
     }
+
+    /// 合成源的时长，秒。分段断言按它核对「有没有整段被覆盖掉」。
+    const SOURCE_SECONDS: f64 = 6.0;
 
     /// 本批只验证外部下载器自己的边界，媒体全部本地合成，不接触任何真实平台。
     fn synthetic_source(dir: &Path) -> PathBuf {
@@ -555,7 +636,7 @@ mod tests {
                 "-i",
                 "testsrc=size=160x120:rate=10",
                 "-t",
-                "6",
+                "6", // 与 SOURCE_SECONDS 一致
                 "-c:v",
                 "libx264",
                 // 短 GOP 才有足够的关键帧让 segment 复用器按秒切片。
@@ -569,6 +650,26 @@ mod tests {
             .expect("ffmpeg 不可用，无法合成受控媒体");
         assert!(status.success());
         path
+    }
+
+    /// 媒体文件的时长（秒）。读不出来记 0，让断言按「数据丢了」处理。
+    fn media_duration_secs(path: &Path) -> f64 {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe 不可用，无法核对分段时长");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0)
     }
 
     /// 按块限速回放合成媒体的最小 HTTP/1.0 服务：不带 Content-Length，由连接关闭定界，
@@ -731,98 +832,129 @@ mod tests {
 
     /// 内部分段：segment 复用器先关闭分段再写列表行，所以每一行恰好对应一次关闭。
     ///
-    /// 这里同时回归两个缺陷：一是原先「循环里改名、循环后又对同一个 .part 改名」，最后一段
-    /// 必然重复回调且整次下载返回错误；二是 ffmpeg 的秒级文件名撞车时，第二次改名 ENOENT
-    /// 会直接结束整场录制。修复后单段收不了尾只记一次失败的关闭，下载继续。
+    /// 这里回归三个缺陷：一是原先「循环里改名、循环后又对同一个 .part 改名」，最后一段必然
+    /// 重复回调且整次下载返回错误；二是 `-strftime 1` 只有秒级精度，同一秒关闭的两段拿到
+    /// 同一个文件名、被 ffmpeg 以 O_TRUNC 覆盖，数据真的丢了；三是 ffmpeg 9 不认 `ts` 这个
+    /// `-segment_format` 值。**源不限速地喂完**，几段必然落在同一秒内关闭——这正是撞车的
+    /// 复现条件，修复后每段各占一个文件，没有一次失败的收尾。
+    ///
+    /// 两个后缀都跑：`ts` 要经过复用器名映射（mpegts），`flv` 原样下发。
     #[tokio::test]
     async fn internal_segments_close_once_each_and_keep_distinct_identity() {
-        let directory = tempfile::tempdir().unwrap();
-        let media = std::fs::read(synthetic_source(directory.path())).unwrap();
-        let collected = Arc::new(Mutex::new(Vec::<Event>::new()));
-        let sink = collected.clone();
-        let mut runtime = Runtime::start(
-            "synthetic",
-            "test",
-            Options {
-                enabled: true,
-                // 打开桥接才能确认旧的逐行 ffmpeg stderr 输出没有被有界采集取代。
-                bridge: true,
-                ..Options::default()
-            },
-            move || Ok(Memory(sink.clone())),
-        )
-        .unwrap();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(CaptureLayer::new(runtime.emitter()).filtered()),
-        );
-        // 至少按真实速率回放：分段文件名只有秒级精度，喂得比实时快会让相邻分段落在同一秒，
-        // ffmpeg 直接覆盖前一个文件并写出重复的列表行（见回执记录的既有命名缺陷）。
-        let (url, _) = paced_origin(media, 2048, Duration::from_millis(250)).await;
-        let downloader = FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal);
-        let segments = Arc::new(Mutex::new(Vec::new()));
-        let hook = segments.clone();
-        let status = tokio::time::timeout(
-            Duration::from_secs(30),
-            downloader.download(
-                Box::new(move |event| {
-                    if let SegmentEvent::Segment(info) = event {
-                        hook.lock().unwrap().push(info);
-                    }
-                }),
-                // flv 是 segment 复用器认得的容器名；ffmpeg 9 不接受 "ts" 作为 -segment_format。
-                config(url, directory.path(), "flv", Some("00:00:02")),
-            ),
-        )
-        .await
-        .expect("内部分段下载超时")
-        .unwrap();
-        assert_eq!(status, DownloadStatus::SegmentCompleted);
-        assert!(runtime.shutdown(Duration::from_secs(2)).closed);
+        let source_dir = tempfile::tempdir().unwrap();
+        let media = std::fs::read(synthetic_source(source_dir.path())).unwrap();
 
-        let segments = segments.lock().unwrap();
-        let events = collected.lock().unwrap();
-        let closed: Vec<_> = native(&events, "recording.segment_closed")
-            .into_iter()
-            .filter(|e| field(e, "outcome") == "executed")
-            .collect();
-        // 秒级文件名是否撞车由 ffmpeg 的输出节奏决定，测不稳；这里断言与之无关的不变量。
-        assert!(!segments.is_empty(), "受控源至少应交付一个分段");
-        assert_eq!(closed.len(), segments.len());
-        for failed in native(&events, "recording.segment_closed")
-            .into_iter()
-            .filter(|e| field(e, "outcome") == "failed")
-        {
-            // 收尾失败只影响那一段：原因如实记录，整场下载仍然正常结束。
-            assert_eq!(field(failed, "reason_code"), "unknown");
-            assert!(!field(failed, "segment_id").is_empty());
-        }
-        // 外部进程创建文件，进程外看不到创建时刻；这里不伪造 segment_created。
-        assert!(native(&events, "recording.segment_created").is_empty());
+        for suffix in ["ts", "flv"] {
+            let directory = tempfile::tempdir().unwrap();
+            let collected = Arc::new(Mutex::new(Vec::<Event>::new()));
+            let sink = collected.clone();
+            let mut runtime = Runtime::start(
+                "synthetic",
+                "test",
+                Options {
+                    enabled: true,
+                    // 打开桥接才能确认旧的逐行 ffmpeg stderr 输出没有被有界采集取代。
+                    bridge: true,
+                    ..Options::default()
+                },
+                move || Ok(Memory(sink.clone())),
+            )
+            .unwrap();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry()
+                    .with(CaptureLayer::new(runtime.emitter()).filtered()),
+            );
+            // 一次性喂完：分段全部在同一秒内关闭，交付名必然撞车，走的正是顺延分支。
+            let (url, _) = paced_origin(media.clone(), usize::MAX, Duration::ZERO).await;
+            let downloader = FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal);
+            let segments = Arc::new(Mutex::new(Vec::new()));
+            let hook = segments.clone();
+            let status = tokio::time::timeout(
+                Duration::from_secs(30),
+                downloader.download(
+                    Box::new(move |event| {
+                        if let SegmentEvent::Segment(info) = event {
+                            hook.lock().unwrap().push(info);
+                        }
+                    }),
+                    config(url, directory.path(), suffix, Some("00:00:02")),
+                ),
+            )
+            .await
+            .expect("内部分段下载超时")
+            .unwrap();
+            assert_eq!(status, DownloadStatus::SegmentCompleted);
+            assert!(runtime.shutdown(Duration::from_secs(2)).closed);
 
-        let mut ids: Vec<String> = Vec::new();
-        for (index, segment) in segments.iter().enumerate() {
-            let id = segment.segment_id.clone().expect("分段必须带身份");
-            assert_eq!(field(closed[index], "segment_id"), id);
-            assert_eq!(field(closed[index], "reason_code"), "split_limit");
-            assert_eq!(segment.segment_index, index);
-            assert!(segment.prev_file_path.exists());
-            assert!(segment.prev_file_path.starts_with(directory.path()));
-            ids.push(id);
-        }
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), segments.len(), "每个分段各有独立身份");
-        let mut paths: Vec<_> = segments.iter().map(|s| s.prev_file_path.clone()).collect();
-        paths.sort();
-        paths.dedup();
-        assert_eq!(paths.len(), segments.len(), "同一个文件不会被交付两次");
-        assert!(
-            events
+            let segments = segments.lock().unwrap();
+            let events = collected.lock().unwrap();
+            let closed: Vec<_> = native(&events, "recording.segment_closed")
+                .into_iter()
+                .filter(|e| field(e, "outcome") == "executed")
+                .collect();
+            assert!(
+                segments.len() >= 2,
+                "两秒切一次的六秒源应当交付多个分段，{suffix} 实际 {}",
+                segments.len()
+            );
+            assert_eq!(closed.len(), segments.len());
+            // 每一段都收得了尾：撞车靠顺延交付名解决，不再有被覆盖后记一次失败的分段。
+            assert!(
+                native(&events, "recording.segment_closed")
+                    .into_iter()
+                    .all(|e| field(e, "outcome") == "executed"),
+                "同一秒关闭的分段不应再出现失败的收尾"
+            );
+            // 外部进程创建文件，进程外看不到创建时刻；这里不伪造 segment_created。
+            assert!(native(&events, "recording.segment_created").is_empty());
+
+            let mut ids: Vec<String> = Vec::new();
+            for (index, segment) in segments.iter().enumerate() {
+                let id = segment.segment_id.clone().expect("分段必须带身份");
+                assert_eq!(field(closed[index], "segment_id"), id);
+                assert_eq!(field(closed[index], "reason_code"), "split_limit");
+                assert_eq!(segment.segment_index, index);
+                assert!(segment.prev_file_path.exists());
+                assert!(segment.prev_file_path.starts_with(directory.path()));
+                assert_eq!(
+                    segment.prev_file_path.extension().and_then(|e| e.to_str()),
+                    Some(suffix),
+                    "交付的仍是配置的后缀，补扫按扩展名筛选才认得"
+                );
+                ids.push(id);
+            }
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), segments.len(), "每个分段各有独立身份");
+            let mut paths: Vec<_> = segments.iter().map(|s| s.prev_file_path.clone()).collect();
+            paths.sort();
+            paths.dedup();
+            assert_eq!(paths.len(), segments.len(), "同一个文件不会被交付两次");
+            // 数据没丢：各段时长之和应当接近整个源。比字节数可靠——不同容器的开销差得远，
+            // 而撞车覆盖时这里只会剩下最后一段的长度。
+            let delivered_secs: f64 = segments
                 .iter()
-                .any(|e| e.data().capture_kind == CaptureKind::LegacyBridge
-                    && e.data().message.contains("[ffmpeg]")),
-            "旧的逐行 stderr 输出必须保留"
-        );
+                .map(|s| {
+                    assert!(
+                        std::fs::metadata(&s.prev_file_path).unwrap().len() > 0,
+                        "交付的分段不应是空文件"
+                    );
+                    media_duration_secs(&s.prev_file_path)
+                })
+                .sum();
+            assert!(
+                delivered_secs >= SOURCE_SECONDS - 1.0,
+                "{suffix} 交付 {delivered_secs:.2} 秒，源有 {SOURCE_SECONDS} 秒，\
+                 差得太多说明有分段被覆盖"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.data().capture_kind == CaptureKind::LegacyBridge
+                        && e.data().message.contains("[ffmpeg]")),
+                "旧的逐行 stderr 输出必须保留"
+            );
+        }
     }
 
     /// 外部命令失败：退出码与有界 stderr 尾部作为附件保存，凭据线索整值脱敏，
@@ -887,6 +1019,93 @@ mod tests {
         let closed = native(&events, "recording.segment_closed");
         assert_eq!(closed.len(), 1);
         assert_eq!(field(closed[0], "outcome"), "failed");
+    }
+
+    /// 内部分段的命名分工：ffmpeg 侧只有序号占位符，时间占位符由本进程展开。
+    /// segment 复用器不能同时用 strftime 和 `%d`，而只有 `%d` 能保证每段落在一个新文件里。
+    #[test]
+    fn internal_segment_pattern_numbers_the_files_and_expands_the_time_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(String::new(), directory.path(), "ts", Some("00:00:02"));
+        let at = Local.with_ymd_and_hms(2026, 9, 1, 10, 15, 30).unwrap();
+
+        let pattern = internal_segment_pattern(&config, at);
+        assert_eq!(
+            pattern,
+            directory.path().join("ffmpeg-20260901T101530-%05d.ts.part")
+        );
+
+        let downloader = FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal);
+        let args = downloader.build_ffmpeg_args_internal_segment(&config);
+        assert!(!args.iter().any(|arg| arg == "-strftime"));
+        // 后缀是文件扩展名，`-segment_format` 要的是复用器名：ffmpeg 9 不认 "ts"。
+        let format = args
+            .iter()
+            .position(|arg| arg == "-segment_format")
+            .and_then(|index| args.get(index + 1));
+        assert_eq!(format.map(String::as_str), Some("mpegts"));
+    }
+
+    /// 展开后的名字里若还留着字面 `%`，交给 ffmpeg 前必须转义，否则整条模板被判非法。
+    #[test]
+    fn a_literal_percent_in_the_expanded_name_is_escaped_for_ffmpeg() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(String::new(), directory.path(), "flv", None);
+        config.recorder = Recorder::new(
+            Some("cut%%name".into()),
+            config.recorder.streamer_info.clone(),
+        );
+        let at = Local.with_ymd_and_hms(2026, 9, 1, 10, 15, 30).unwrap();
+
+        assert_eq!(internal_delivery_stem(&config, at), "cut%name");
+        assert_eq!(
+            internal_segment_pattern(&config, at),
+            directory.path().join("cut%%name-%05d.flv.part")
+        );
+        // 输出目录里的字面 `%` 同样要转义，否则整条路径会被 ffmpeg 判为非法模板。
+        config.output_dir = PathBuf::from("/media/100%live");
+        assert_eq!(
+            internal_segment_pattern(&config, at),
+            PathBuf::from("/media/100%%live/cut%%name-%05d.flv.part")
+        );
+    }
+
+    /// 交付名按各段自己的开始时刻展开，同一秒的两段撞车时顺延序号而不是互相覆盖。
+    #[test]
+    fn delivery_names_follow_the_template_and_step_aside_on_a_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(String::new(), directory.path(), "ts", Some("00:00:02"));
+        let first = Local.with_ymd_and_hms(2026, 9, 1, 10, 15, 30).unwrap();
+        let second = first + ChronoDuration::seconds(2);
+        assert_ne!(
+            internal_delivery_stem(&config, first),
+            internal_delivery_stem(&config, second),
+            "不同秒的分段各有各的名字"
+        );
+
+        let stem = internal_delivery_stem(&config, first);
+        let mut delivered = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let path = unique_delivery_path(directory.path(), &stem, "ts", &delivered)
+                .expect("应能取到唯一的交付名");
+            delivered.insert(path.clone());
+            names.push(path);
+        }
+        assert_eq!(
+            names,
+            vec![
+                directory.path().join("ffmpeg-20260901T101530.ts"),
+                directory.path().join("ffmpeg-20260901T101530-2.ts"),
+                directory.path().join("ffmpeg-20260901T101530-3.ts"),
+            ]
+        );
+        // 磁盘上已经存在的同名文件同样算被占用，补扫留下的旧文件不会被顶掉。
+        std::fs::write(directory.path().join("ffmpeg-20260901T101530.ts"), b"old").unwrap();
+        assert_eq!(
+            unique_delivery_path(directory.path(), &stem, "ts", &Default::default()),
+            Some(directory.path().join("ffmpeg-20260901T101530-2.ts"))
+        );
     }
 
     /// 主动取消：进程被信号结束时没有退出码，关闭原因是 user_cancel，且不记外部命令失败。

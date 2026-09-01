@@ -70,9 +70,18 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - 内部分段的关闭原因按配置取值（配了 `-segment_time` 记 `split_limit`，否则 `unknown`）。
   **最后一段实际是流结束时关闭的，拿到列表行时无法与切片区分**，整场结束原因由
   `DownloadStatus` 与上层 `recording.stopped` 说明，不在分段事件里改写。
-- `-strftime 1` 的文件名只有秒级精度：同一秒关闭的两段会拿到同一个名字并被 ffmpeg 覆盖，
-  分段列表出现重复行。重复行与改名失败一律记 `recording.segment_closed` `failed`/`unknown`
-  并继续下载，不结束整场录制，也不冒充一个已关闭的分段。
+- 内部分段的文件名由**序号**保证唯一。segment 复用器要么认 strftime 时间占位符、要么认
+  printf 风格的 `%d`，不能同时用；只有后者能保证每段落在一个新文件里，所以 ffmpeg 侧写
+  `{展开后的名字}-%05d.{后缀}.part`（名字与输出目录里的字面 `%` 转义成 `%%`），
+  `-strftime` 不再打开。用户配置的命名由本进程在交付前
+  按**该分段的开始时刻**展开（读到上一行的时刻就是下一段的开始时刻，第一段用进程启动时刻），
+  与旧的 `-strftime 1` 同口径；展开名被占用时顺延 `-2`、`-3`，磁盘上已存在的同名文件同样
+  算被占用。因此分段列表不再出现重复行，也不再有分段被同名的后一段覆盖。改名失败仍记
+  `recording.segment_closed` `failed`/`unknown` 并继续下载，不结束整场录制，也不冒充一个
+  已关闭的分段。
+- `-segment_format` 取的是**复用器名**，不是文件扩展名：`ts` 下发 `mpegts`、`mkv` 下发
+  `matroska`，其余原样。ffmpeg 9 直接拒绝 `ts`（`Muxer not found`），内部分段配 ts 后缀
+  在写头时就会失败。
 - `processing.command_failed`：WARN、failed/`process_failed`，带 `stage`
   （`ffmpeg_external`/`ffmpeg_internal`）、`exit_code`（信号退出时缺省）、`total_bytes`，
   有界 stderr 尾部作为**附件**按 event_uid 关联，事件字段不复制第三方输出。退出码 0/255

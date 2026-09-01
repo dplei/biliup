@@ -1,7 +1,7 @@
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::models::StreamerInfo;
 use chrono::format::{Item, StrftimeItems};
-use chrono::{Duration, Local};
+use chrono::{DateTime, Duration, Local};
 use error_stack::ResultExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -82,19 +82,21 @@ impl Recorder {
     ///
     /// 校验的是**替换之后**的串：主播名、直播标题里都可能带 `%`，只验模板原文会漏。
     pub fn try_format(&self, template: &str) -> Option<String> {
+        self.try_format_at(template, self.streamer_info.date.with_timezone(&Local))
+    }
+
+    /// 同 `try_format`，但按调用方给出的时刻展开时间占位符。
+    ///
+    /// 内部分段需要这个：一场录制里每个分段各有自己的开始时刻，用本场的 `streamer_info.date`
+    /// 展开会让所有分段拿到同一个名字。
+    pub fn try_format_at(&self, template: &str, at: DateTime<Local>) -> Option<String> {
         let substituted = self.template_with(template);
 
         if StrftimeItems::new(&substituted).any(|item| matches!(item, Item::Error)) {
             return None;
         }
 
-        Some(
-            self.streamer_info
-                .date
-                .with_timezone(&Local)
-                .format(&substituted)
-                .to_string(),
-        )
+        Some(at.format(&substituted).to_string())
     }
 
     /// 非法格式串退化成「占位符原样保留」而非 panic：封面只是稿件的附属品，
