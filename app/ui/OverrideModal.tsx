@@ -14,6 +14,7 @@ import useSWR from 'swr'
 import { fetcher, LiveStreamerEntity, StudioEntity } from '../lib/api-streamer'
 import { SupportedPlatforms } from '@/app/ui/plugins'
 import { useBiliUsers } from '../lib/use-streamers'
+import AudioNormalizationControl from './AudioNormalizationControl'
 import CoverBackgroundField from './CoverBackgroundField'
 import CoverPreviewButton from './CoverPreviewButton'
 
@@ -56,6 +57,40 @@ const serializeTimeRange = (timeRange: LiveStreamerEntity['time_range']) => {
     return JSON.stringify(timeRange.map(date => date.toISOString()))
   }
   return timeRange
+}
+
+/** override JSON 里属于音量的键，整组一起写入或一起拿掉。 */
+const AUDIO_OVERRIDE_FIELDS = [
+  'audio_normalization_enabled',
+  'audio_normalization_offset_db',
+  'audio_normalization_disk_reserve_gib',
+  'audio_normalization_keep_original',
+] as const
+
+/** 「为这个房间单独设置音量」——只在表单里存在，不是 config 的字段，不能进 override。 */
+const AUDIO_OVERRIDE_TOGGLE = 'audio_override_enabled'
+
+/**
+ * 音量覆写区：外层开关表达「这个房间要不要单独设」，里面直接复用空间配置那套控件，
+ * 两处界面完全一致。
+ *
+ * 需要这个外层开关，是因为全局那几项是裸 `bool`/数字，覆写侧却是 `Option`——「跟随全局」
+ * 只能用「override 里没有这些键」来表达，光靠内层开关的 true/false 说不出这一态。
+ */
+const AudioOverrideSection: React.FC = () => {
+  const { values } = useFormState()
+
+  return (
+    <>
+      <Form.Switch
+        field={AUDIO_OVERRIDE_TOGGLE}
+        label="为这个房间单独设置音量"
+        extraText="关闭＝跟随空间配置里的全局设置。打开后下面几项只影响这个房间，初值取自当前的全局设置。"
+        fieldStyle={{ alignSelf: 'stretch', padding: 0 }}
+      />
+      {values[AUDIO_OVERRIDE_TOGGLE] && <AudioNormalizationControl showSample={false} bordered={false} />}
+    </>
+  )
 }
 
 /**
@@ -134,6 +169,25 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
 
   const api = useRef<FormApi>()
 
+  // 「跟随全局」时开关打开后要显示全局此刻的值，所以得把全局配置读进来。没读到就退回
+  // 各字段的内置默认值——总比显示一个凭空捏造的数字强。
+  const { data: globalConfig } = useSWR('/v1/configuration', fetcher)
+
+  // 覆写值只存在于 entity.override 里，Form 的 initValues={entity} 够不着，得显式合进去。
+  const audioOverride = (entity?.override ?? {}) as Record<string, any>
+  const pickAudio = (key: string, fallback: any) =>
+    audioOverride[key] ?? globalConfig?.[key] ?? fallback
+  const audioInitValues = {
+    // 只要 override 里已经存着任何一项，这个房间就是「单独设置」状态。
+    [AUDIO_OVERRIDE_TOGGLE]: AUDIO_OVERRIDE_FIELDS.some(
+      key => audioOverride[key] !== null && audioOverride[key] !== undefined
+    ),
+    audio_normalization_enabled: pickAudio('audio_normalization_enabled', false),
+    audio_normalization_offset_db: pickAudio('audio_normalization_offset_db', 0),
+    audio_normalization_disk_reserve_gib: pickAudio('audio_normalization_disk_reserve_gib', 5),
+    audio_normalization_keep_original: pickAudio('audio_normalization_keep_original', false),
+  }
+
   const { biliUsers } = useBiliUsers()
   const list = biliUsers?.map(item => {
     return {
@@ -176,6 +230,8 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       // 不列在这里的话，下面那圈循环会把它一并塞进 override，
       // 库里于是同时存在「列上的值」和「override 里的值」，投稿只认前者。
       'cover_background',
+      // 表单自己的状态位，不是 config 的字段。
+      AUDIO_OVERRIDE_TOGGLE,
     ])
 
     if (values) {
@@ -225,6 +281,48 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           overrideConfig[key] = values[key] === '' ? null : values[key]
         }
       })
+      // 音量三项由控件独占：只要「音量设置」面板被展开过，控件当前值就是权威，顶部 JSON
+      // 文本框里的同名旧值一律让位。不这么做的话用户从界面上撤销不掉一条已有的覆写——
+      // 控件回显「跟随全局」，提交后 textOverride 里的旧值又被原样写了回去。
+      //
+      // 反过来，面板没展开时 Semi 压根不挂载这些字段（values 里没有这些键），那就一个都不能碰，
+      // 否则点一次「确定」就把用户配好的音量覆写洗掉了。
+      // 音量这一组由「为这个房间单独设置音量」独占：关掉就意味着整组从 override 里拿走
+      // （= 跟随全局）。面板没展开时 Semi 不挂载这些字段，values 里连开关都没有，那就一项
+      // 都不能碰——否则「打开弹窗改个别的再确定」会顺手洗掉用户配好的音量覆写。
+      if (Object.prototype.hasOwnProperty.call(values, AUDIO_OVERRIDE_TOGGLE)) {
+        AUDIO_OVERRIDE_FIELDS.forEach(key => delete overrideConfig[key])
+        if (values[AUDIO_OVERRIDE_TOGGLE]) {
+          // 与全局同值、而且本来也没覆写过的项就不写进去。控件的初值取自全局设置，用户没动过
+          // 的那几项照单写下来只会把它们钉死在此刻的全局值上——生效结果一样，却从此不再跟随
+          // 全局调整。override 保持最小，才对得上「只覆写需要单独设的项」。
+          const write = (key: string, value: any) => {
+            const hadOverride = audioOverride[key] !== null && audioOverride[key] !== undefined
+            if (!hadOverride && value === globalConfig?.[key]) return
+            overrideConfig[key] = value
+          }
+
+          const enabled = Boolean(values.audio_normalization_enabled)
+          write('audio_normalization_enabled', enabled)
+          // 关闭时后面几项在界面上根本不显示，也就没有用户表达过的值可写，只留开关本身。
+          if (enabled) {
+            // 只认真正的数字。空输入框在 Semi 里是空字符串，`Number('')` 却是 0——照着写下去
+            // 会把磁盘保留线悄悄覆写成 1 GiB，比不写危险得多。
+            const offset = values.audio_normalization_offset_db
+            if (typeof offset === 'number' && Number.isFinite(offset)) {
+              // 后端 `effective_audio_target_lufs` 同样 clamp 在 -6..=4，这里先夹一次是为了让
+              // 库里存的就是生效值，排查时不必再心算一遍。
+              write('audio_normalization_offset_db', Math.max(-6, Math.min(4, Math.round(offset))))
+            }
+            const reserve = values.audio_normalization_disk_reserve_gib
+            if (typeof reserve === 'number' && Number.isFinite(reserve)) {
+              write('audio_normalization_disk_reserve_gib', Math.max(1, Math.min(1024, Math.round(reserve))))
+            }
+            write('audio_normalization_keep_original', Boolean(values.audio_normalization_keep_original))
+          }
+        }
+      }
+
       nextValues.override = overrideConfig
 
       // 处理循环引用
@@ -342,6 +440,12 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
     </Collapse.Panel>
   )
 
+  const audioSettings = (
+    <Collapse.Panel header="音量设置" itemKey="audio">
+      <AudioOverrideSection />
+    </Collapse.Panel>
+  )
+
   return (
     <>
       {childrenWithProps}
@@ -358,7 +462,17 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           paddingRight: 10,
         }}
       >
-        <Form initValues={entity} getFormApi={formApi => (api.current = formApi)}>
+        {/*
+          `key` 让每次打开都重建表单。Semi 在弹窗关闭后并不卸载已经渲染过的 Collapse 面板，
+          而 initValues 只在字段真正首次挂载时生效——不重建的话，展开过音量面板的用户第二次
+          打开会看到一片空白，库里明明存着覆写。顺带也清掉了上次取消时留下的未提交编辑。
+          全局配置是异步到的，它落地后同样要重建一次，否则「跟随全局」的初值会停在兜底值。
+        */}
+        <Form
+          key={visible ? `open-${entity?.id ?? 'new'}-${globalConfig ? 'cfg' : 'nocfg'}` : 'closed'}
+          initValues={{ ...entity, ...audioInitValues }}
+          getFormApi={formApi => (api.current = formApi)}
+        >
           <Form.TextArea
             field="override_text"
             label="配置覆写"
@@ -385,6 +499,7 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
           <Form.Section>
             <Collapse defaultActiveKey={['plugin']}>
               {downloadSettings}
+              {audioSettings}
               {(() => {
                 const Plugin = platformSetting()
                 return Plugin ? (

@@ -56,6 +56,8 @@
 | `app/ui/StreamerActions/CheckStreamButton.tsx` | 直播管理卡片上的「立即检查直播流」按钮：调一次主动检查接口并按结论提示，随后刷新主播列表。 | `CheckStreamButton` |
 | `app/ui/StreamerActions/PauseButton.tsx` | 以显式目标状态暂停/恢复单个直播间；到期暂停的恢复入口会禁用并提示先处理期限。 | `PauseButton`、`setRecordingState` |
 | `app/(app)/missing/page.tsx` | 缺失补传与待投稿控制页：独立轮询待投稿会话和分段列表，展示后端给出的投稿五态、attempt 阶段/进度/线路健康/完整性与线路历史，并触发会话恢复、空会话逻辑终结、补传、换线重投、停止、删除与本场补扫。 | `MissingRecovery`、`AttemptHistoryPanel` |
+| `app/ui/OverrideModal.tsx` | 主播级「配置覆写」弹窗：顶部 JSON 文本框与各分区控件合成同一份 `override`，提交时控件值覆盖文本框的同名键。`entityFields` 里的键是 livestreamers 表上的真实列，不进 override。音量一组由「为这个房间单独设置音量」独占，与全局同值且原先未覆写的项不写入，override 保持最小。Form 带 `key`，每次打开重建，否则 Semi 保留的折叠面板不会重新应用 initValues。 | `OverrideModal`、`handleOk`、`AudioOverrideSection`、`CoverSection`、`AUDIO_OVERRIDE_FIELDS`、`AUDIO_OVERRIDE_TOGGLE` |
+| `app/ui/AudioNormalizationControl.tsx` | 响度标准化的表单控件，空间配置页与主播覆写弹窗共用同一套界面：开关、磁盘保留线、保留原片、竖向音量推子，以及基于 WebAudio 增益的样片试听。样片全局唯一，覆写弹窗传 `showSample={false}` 隐藏其更新/删除按钮。 | `AudioNormalizationControl`、`prepareAudio`、`STATUS_URL`、`SAMPLE_URL` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |
 
 ## 日志与存储基础设施
@@ -102,6 +104,7 @@
 | `crates/biliup-cli/src/server/core/download_manager.rs` | 单平台下载编排的持有者：建 `Monitor` 与上传 Actor 池，并把房间增删、暂停入队/出队、主动检查转发给监控 Actor。 | `DownloadManager`、`add_room`、`make_waker`、`check_room_now` |
 | `crates/biliup-cli/src/server/infrastructure/context.rs` | 持有单房间 Worker 的运行状态、画质与活动录制快照，并以 `Context` 传递本场 `streamer_info` 身份和业务依赖。 | `Context`、`Worker`、`ActiveRecordingSnapshot`、`WorkerStatus`、`Stage` |
 | `crates/biliup-cli/src/server/infrastructure/models/live_streamer.rs` | 定义持久化直播间配置及其新增载荷；该模型的全字段更新语义要求独立运行状态不要混入主播配置。 | `LiveStreamer`、`InsertLiveStreamer` |
+| `crates/biliup-cli/src/server/config.rs` | 全局配置结构体与其 `struct_patch` 派生的 `ConfigPatch`（房间级覆写的载体）：录制、分段、上传节流、响度标准化等所有可配项都在这里，各带 serde 默认值与取值区间校验。新增字段自动获得覆写能力，无需 migration。 | `Config`、`ConfigPatch`、`Config::apply`、`normalization_settings`、`effective_audio_target_lufs`、`validate_segment_limits`、`normalize_segment_limits` |
 
 ## Web 服务边界
 
@@ -211,6 +214,8 @@
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`admit_detected_session`）：直播检测在写入新场次和启动下载前读取活动租约；到期后只允许可证明匹配的持久 grace 场次。
 - `crates/biliup-cli/src/server/common/download.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`complete_grace_session`）：确认下播并处理尾段后，先 CAS 到期暂停再决定是否把 Worker 放回轮询队列。
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/common/recording_lease.rs`（`start_recording_lease_tasks`）：Web 服务同级运行五秒到期扫描和可靠通知扫描，并在 shutdown 时中止二者；通知投递复用全局配置的 `cookie_health_webhook`，没有独立的租约 webhook 字段，未配置时到期租约停在 `not_configured`。
+- `app/ui/OverrideModal.tsx` → `crates/biliup-cli/src/server/config.rs`（`ConfigPatch`、`Config::apply`）：弹窗写的 `override` JSON 落在 livestreamers 表的 `override` 列，反序列化成 `struct_patch` 生成的 `ConfigPatch`。`Config` 的裸 `bool`/数字在 patch 侧都是 `Option`，因此**「键不存在」才表示跟随全局**，写 `false` 是显式覆写成关闭——界面上要区分这两态，靠的是额外的「是否单独设置」开关而不是字段本身。整份 override 每次提交整体替换，没有增量合并。
+- `crates/biliup-cli/src/server/infrastructure/context.rs`、`common/upload.rs` → `crates/biliup-cli/src/server/config.rs`（`Config::apply`）：房间级覆写在三处各自合并进生效配置——`ctx.config()`（录制与首传，`global_config()` 才是未合并的全局值）、投稿前的 `build_studio` 链路、以及补传/手动恢复。新增一个需要按房间覆写的配置项时这三处都已覆盖，不必再改后端。
 - `app/ui/StreamerActions/RecordingLeaseModal.tsx` → `crates/biliup-cli/src/server/api/recording_lease.rs`（租约 mutation）：弹窗提交明确 UTC 时间、当前租约 id 和客户备注，后端返回权威状态与服务器时间。
 - `crates/biliup/src/uploader/line.rs` → `crates/biliup/src/uploader/line/upos.rs`（`Upos::upload_stream`）：线路对象把实际分块传输委派给 upos 协议实现，观察者回调据此产生已确认字节进度。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/audio_normalization.rs`、`timestamp_repair.rs`（`normalize_for_upload`、`normalize_timestamps`）：预处理顺序是先标准化、后时间戳检测，检测的对象是标准化产物而不是原片。标准化的测量遍已经完整 demux 过原片并顺带扫了时间戳，原片干净时 `upload_single_file_with_repair` 跳过对产物的整片扫描；诊断缺失或原片异常时照常走完整的检测/修复链路。

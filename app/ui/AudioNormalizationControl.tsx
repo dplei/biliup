@@ -14,7 +14,20 @@ type SampleStatus = {
 const STATUS_URL = '/v1/audio-normalization/sample/status'
 const SAMPLE_URL = '/v1/audio-normalization/sample'
 
-export default function AudioNormalizationControl() {
+type AudioNormalizationControlProps = {
+  /**
+   * 样片是全局唯一一份，「更新 / 删除样片」也都是全局操作。主播级的覆写弹窗里要关掉，
+   * 否则那两个按钮看起来像是只作用于当前房间，点下去却影响所有人。
+   */
+  showSample?: boolean
+  /** 嵌在别的容器（如覆写弹窗的折叠面板）里时去掉外框，避免套两层边框。 */
+  bordered?: boolean
+}
+
+export default function AudioNormalizationControl({
+  showSample = true,
+  bordered = true,
+}: AudioNormalizationControlProps = {}) {
   const formApi = useFormApi()
   const { values } = useFormState()
   const enabled = Boolean(values.audio_normalization_enabled)
@@ -96,7 +109,13 @@ export default function AudioNormalizationControl() {
   const cacheBuster = encodeURIComponent(status?.updated_at ?? 'current')
 
   return (
-    <div style={{ border: '1px solid var(--semi-color-border)', borderRadius: 8, padding: 16, marginBottom: 20 }}>
+    <div
+      style={
+        bordered
+          ? { border: '1px solid var(--semi-color-border)', borderRadius: 8, padding: 16, marginBottom: 20 }
+          : undefined
+      }
+    >
       <Form.Switch
         field="audio_normalization_enabled"
         label="自动增强录音音量"
@@ -127,7 +146,17 @@ export default function AudioNormalizationControl() {
       )}
 
       {enabled && (
-        <div style={{ display: 'flex', gap: 28, alignItems: 'center', flexWrap: 'wrap', marginTop: 16 }}>
+        <div
+          style={{
+            display: 'flex',
+            gap: 28,
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            marginTop: 16,
+            // 没有样片那一栏时推子会孤零零地贴在左边，居中才不显得是残缺的两栏布局。
+            justifyContent: showSample ? undefined : 'center',
+          }}
+        >
           <div style={{ minWidth: 130, textAlign: 'center' }}>
             <div style={{ fontSize: 13, marginBottom: 8 }}>更响</div>
             <input
@@ -148,6 +177,7 @@ export default function AudioNormalizationControl() {
             </Button>
           </div>
 
+          {showSample && (
           <div style={{ flex: 1, minWidth: 280 }}>
             <p style={{ marginTop: 0 }}>{sampleMessage}</p>
             {status?.sample_ready && (
@@ -177,6 +207,7 @@ export default function AudioNormalizationControl() {
               样片只用于试听；删除样片不会关闭音量增强。处理时会暂时增加磁盘占用。
             </p>
           </div>
+          )}
         </div>
       )}
     </div>
