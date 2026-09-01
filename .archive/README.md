@@ -32,3 +32,4 @@
 | [`normalization-duration-metric/`](normalization-duration-metric/) | 响度标准化的时长口径：FLV 非零起始时间戳导致的全量误判，连带样片截取、失败证据与熔断 | 2026-08-31 | 01–05 全部 `resolved`；随 [#18](https://github.com/dplei/biliup/pull/18) 合入 `dev`，dev 环境真实录制 6/6 `completed`、0 次 `duration_drift` |
 | [`empty-rescan-sessions/`](empty-rescan-sessions/) | 补扫不得复活零分段空会话 | 2026-08-31 | 01–04 全部 `resolved`；随 `2c1b871` 合入 `dev`，spec 唯一的保留理由（等待落 `dev`）已解除 |
 | [`structured-logging-p0-p2/`](structured-logging-p0-p2/) | 日志体系重构的前三个阶段：事件契约与基线、独立事件组件与 SQLite、入口旁路与证据对比工具 | 2026-09-01 | **按阶段部分归档**：06–11 全部 `complete`/`passed`，P0–P2 三份回执的验收结论已定稿且后续阶段不再改动；随 [#22](https://github.com/dplei/biliup/pull/22) 合入 `dev`。同一 effort 的 P3 及以后仍在 [`.scratch/structured-logging/`](../.scratch/structured-logging/) 推进 |
+| [`bilibili-recording-quality/`](bilibili-recording-quality/) | B 站录制状态透传并显示最终命中候选的实际画质 | 2026-09-01 | ticket `resolved`；[#24](https://github.com/dplei/biliup/pull/24) 已合入 `dev`，实网选流返回数字 `qn`，fallback 回环测试与前端生产构建通过 |

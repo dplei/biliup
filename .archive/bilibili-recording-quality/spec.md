@@ -1,6 +1,6 @@
 # Spec：B 站录制状态显示实际画质
 
-Status: ready-for-human
+Status: resolved
 来源：[`dplei/biliup#23`](https://github.com/dplei/biliup/issues/23)
 分支：`fix/issue23-260901-190253`
 

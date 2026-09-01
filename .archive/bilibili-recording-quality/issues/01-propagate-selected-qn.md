@@ -1,6 +1,6 @@
 # 01 — 透传 B 站最终选中候选的实际 `qn`
 
-Status: ready-for-human
+Status: resolved
 Blocked by: —
 
 ## 背景
@@ -47,7 +47,8 @@ Blocked by: —
   login 页面 `<img>` lint warning）。
 - `pnpm build` 在本机 pnpm 11 的依赖状态检查阶段被 `@parcel/watcher` 构建脚本审批门禁阻止，
   尚未进入 Next.js；未为本任务改动依赖审批配置。
-- dev 实录验收与 CDN fallback 实际观测待人工完成，因此 ticket 保持 `ready-for-human`，
-  effort 留在 `.scratch/`。
+- [PR #24](https://github.com/dplei/biliup/pull/24) 已合入 `dev`。
+- dev 实网调用现有 `check_stream` 检查当前开播的公开房间，成功返回数字 `qn`；未下载内容，
+  也未记录房间号或 URL。CDN fallback 由本地 HTTP 回环测试覆盖，未人为干扰真实 CDN。
 
 ## Comments
