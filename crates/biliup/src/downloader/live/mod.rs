@@ -325,7 +325,7 @@ pub struct LiveStream {
     /// 平台响应真实提供的可选下载路线。`raw_stream_url` 仍是兼容主选。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stream_candidates: Vec<StreamCandidate>,
-    /// 实际选中的画质代码（origin/uhd/...）。仅抖音填充，其它平台为 None。
+    /// 平台实际选中的画质代码（例如 origin、uhd、10000）。
     #[serde(default)]
     pub recording_quality: Option<String>,
     /// 一次选流/下载尝试的脱敏关联 ID；不包含 URL、Cookie 或签名参数。

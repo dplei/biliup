@@ -84,6 +84,8 @@ export default function Home() {
       ) : null
     const qualityName: Record<string, string> = {
       origin: '原画', uhd: '蓝光', hd: '超清', sd: '高清', ld: '标清', md: '流畅',
+      30000: '杜比', 20000: '4K', 10000: '原画', 401: '蓝光-杜比', 400: '蓝光',
+      250: '超清', 150: '高清', 80: '流畅', 0: '最低画质',
     }
     const recordingTag =
       live.status === 'Working' && live.recording_quality ? (

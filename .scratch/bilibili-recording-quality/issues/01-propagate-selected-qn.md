@@ -1,6 +1,6 @@
 # 01 — 透传 B 站最终选中候选的实际 `qn`
 
-Status: ready-for-agent
+Status: ready-for-human
 Blocked by: —
 
 ## 背景
@@ -37,6 +37,17 @@ Blocked by: —
 
 ## 回执
 
-待实现后填写：改动提交、自动检查、dev 验收结论及是否观察到 CDN fallback。
+实现已完成并提交到本任务分支：
+
+- `select_stream_url` 现在返回最终 URL 与该候选的实际 `qn`，`check_stream` 将其写入
+  `recording_quality`；首选失败时使用 fallback 候选自己的 `qn`。
+- 主播页沿用现有映射与未知值 fallback，补齐九个 B 站画质代码。
+- `cargo test -p biliup downloader::live::bilibili`：通过（1 passed）。
+- `./node_modules/.bin/next build`：通过（编译、类型检查与静态页面生成均成功；保留一条既有
+  login 页面 `<img>` lint warning）。
+- `pnpm build` 在本机 pnpm 11 的依赖状态检查阶段被 `@parcel/watcher` 构建脚本审批门禁阻止，
+  尚未进入 Next.js；未为本任务改动依赖审批配置。
+- dev 实录验收与 CDN fallback 实际观测待人工完成，因此 ticket 保持 `ready-for-human`，
+  effort 留在 `.scratch/`。
 
 ## Comments
