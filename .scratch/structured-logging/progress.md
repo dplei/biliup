@@ -3,8 +3,8 @@
 本文件是新 session 的进度入口，配合 [阶段执行提示词](stage-prompts.md) 使用。
 它是证据的索引，不替代代码、测试和运行报告；状态过时或与实现不符时先核实，再更正。
 
-P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入独立上传、页面整场上传、HLS、FFmpeg 外部下载器及入口启停/凭据健康，验收 partial**。
-录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统与认证域已有原生事件但只有 Rust CLI 做过真实进程实跑，审计域仍只有桥接；
+P0–P2 已完成并通过本地受控验收；P3 进行中：12（验收 partial）、13、15、16 均已交付，**14 已接入独立上传、页面整场上传、HLS、FFmpeg 外部下载器、入口启停/凭据健康、持久审计投影与剩余辅助诊断，验收 partial**。
+录制域与后处理域已有原生事件并在一场真实开播录制上跑通全链，系统与认证域已有原生事件但只有 Rust CLI 做过真实进程实跑；审计域已通过临时业务库与真实事件 SQLite 的受控重放，FFmpeg 诊断已做受控失败验证，其余辅助诊断仍缺逐项运行样本；
 P4–P6 未开始，旧日志与旧页面保留，新页只是试用入口。
 
 ## 状态约定
@@ -54,7 +54,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
-| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第五批回执](receipts/P3.md#任务-14-第五批入口生命周期与凭据健康c01--c11)：入口三态与健康跃迁通过，Rust CLI 真实进程实跑；前四批结论保留；审计投影、预处理与第三方诊断、分类清单、wheel/Python 入口实跑与首轮观察待完成 |
+| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第六批回执](receipts/P3.md#任务-14-第六批持久审计投影与剩余诊断c12--c13)：C12 稳定 uid 重放与 C13 FFmpeg 受控失败通过；其余辅助诊断只完成接入/回归。前五批结论保留；分类清单、剩余运行矩阵、wheel/Python 入口实跑与首轮观察待完成 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
 | [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
@@ -63,34 +63,30 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近一轮仅处理任务 14 第五批：入口启停（C01）与凭据健康（C11）。沿用
-  `refactor/issue2-260831-153007`，代码与回执同批提交，未 push。
-- 工作区里那份 `observe/lifecycle.rs` 草稿**已复核后重写，未沿用原样**：原稿把登录成功记成
-  不在 v1 目录里的 `auth.operation_completed`，也没区分入口种类与子命令。C11 拆到新的
-  `observe/auth.rs`，与 C01 分开。
-- 一次运行 = 一个 `Invocation`：正常记 executed/`shutdown`，出错记 failed/`entry_failed`，
-  被取消或 panic 展开记 unknown/`entry_interrupted`；**强杀不执行析构，缺结束事件即缺失**。
-  运行 task 与业务 task 是两个身份，不互相代用；CLI 上靠 process_run_id 关联，重叠的嵌入
-  调用没有关联手段（有意为之）。新增允许键 `command`，取值是解析后的子命令固定词。
-- `auth.health_changed` 只由 `cookie_health` 状态机的两次跃迁发出；`auth.operation_failed`
-  覆盖每次被计数的失败，原因由既有分类器定型，错误文本只用于分类随即丢弃。去抖窗口内的
-  重复失败不计数也不发事件——事件条数等于被计数的失败数，不是重试风暴次数。
-- 两条必要前置修复：`record_error` 抽出接受时钟参数的版本（生产始终传真实时钟）；包装 CLI
-  结果改按 `Debug` 分类，否则 `Report` 的 Display 只有顶层 context，会把连接失败错判成
-  `invalid_response`。
-- 验证：真实 `biliup` 二进制两次实跑（成功的 `cover-preview` 与失败的 `dump-flv`）后只读
-  回查到 4 条 system 事件；另有 8 项测试（入口三态、重叠运行、子命令词表、健康两次跃迁、
-  去抖、三类失败定型与脱敏）。全量 **419 passed / 0 failed / 6 ignored**，触达文件 clippy
-  零告警。**全部离线，无账号、无外部网络**（凭据失败用本机已关闭端口作代理）。
-- 未验证：wheel CLI（`stream_gears::_main`）、Python `download`/`upload` 与 7 个登录辅助
-  函数只做编译核对，**没有起 Python 进程实跑**；服务端监控循环里的真实鉴权失败与恢复未验。
-- 前四批的未解决差异全部保留：12 缺真实断连/重连；旧 601 `transport` 差异未关闭；
+- 最近一轮仅处理任务 14 第六批：持久恢复审计投影（C12）与剩余辅助诊断（C13）。沿用
+  `refactor/issue2-260831-153007`，父提交 `c5929fe`，代码与回执同批提交，未 push。
+- `upload_recovery_audit` 继续是业务事实权威；迁移 23 增加 nullable 稳定 `event_uid`。新审计在
+  业务提交后 best-effort 投影，启动时全量分页重放，运行时重试最近窗口；遗留 NULL uid 先回填
+  再投影，事件库按 uid 去重。**不承诺跨业务库与事件库原子提交。**
+- `audit.operation_projected` 以冻结映射投影 durable reason，显式携带业务身份且路径只放
+  basename。事件库留存不会删除业务审计，未知原因也只记 unknown，不猜测结果。
+- `ffmpeg_scan` 现在覆盖 spawn/read/wait/非零退出；业务解析的 64 KiB 尾部与脱敏附件的 8 KiB
+  capture 分开。loudnorm、timestamp 与 hook 各用固定 stage，原来继承 stderr 的调用继续 tee，
+  不删除旧输出。danmaku、封面和非命令 hook 失败增发 auxiliary 事件，原始错误不进原生字段。
+- 验证：C12 重复重放测试与 C13 本地 shell 退出 7/脱敏测试通过；
+  `cargo test -p biliup-observability -p biliup-cli --lib --tests` 为
+  **422 passed / 0 failed / 6 ignored**。clippy 完成但仍报告仓库既有告警；全仓 fmt check 也有
+  本批前已有差异，因此只对触达文件定向 rustfmt 并通过 `git diff --check`。全部离线，无账号、
+  外部网络或真实平台操作。
+- 未验证：真实恢复/outbox/补扫矩阵、真实 loudnorm/timestamp 失败、自定义 hook、danmaku 与各类
+  封面失败；没有新的双源证据包、三次隔离还原、专门负载或长观察。wheel CLI、Python
+  下载/上传/登录辅助函数及真实凭据恢复也仍没有运行证据。
+- 前五批的未解决差异全部保留：12 缺真实断连/重连；旧 601 `transport` 差异未关闭；
   FFmpeg `-strftime 1` 秒级文件名重名覆盖未修。14 仍 in-progress / partial，
   P3 仍 in-progress / partial / pending。
 - 下一轮入口：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`。
-  下批做 `audit.operation_projected`（C12）与 C13 剩余诊断（`ffmpeg_scan` 预处理、
-  danmaku/封面/hook）。之后是分类清单；全部关键覆盖通过后才开始连续 7 天且至少 10 个
-  完整场次的首轮观察，当前不能进入 P4。
+  下批做分类清单与剩余运行矩阵；全部关键覆盖通过后才开始连续 7 天且至少 10 个完整场次的
+  首轮观察，当前不能进入 P4。
 
 ## 每次回写的检查清单
 

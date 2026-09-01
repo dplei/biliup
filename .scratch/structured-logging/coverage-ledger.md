@@ -6,8 +6,9 @@ P0 已核对并冻结 coverage-v1 / [contract-v1](contract-v1.md)。P3/12–13 �
 **C06–C10 的后处理域**已有原生事件；P3/16 那一轮在本机 dev 环境用**一场真实开播录制**跑通了
 从开播到投稿成功的整条链路，两域的**决定链与执行结果都已有真实样本**（见下方变更记录）。
 P3/14 第五批起 **C01 入口启停**与 **C11 凭据健康**已有原生事件（Rust CLI 真实进程实跑；
-wheel/Python 入口共用同一包装但未起进程实跑）。**C12 与 C13 的剩余部分仍未接入**，
-只有桥接文本，不能把 P1 合成载体验证或桥接采集当作业务覆盖。
+wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 **C12 持久审计投影**及
+**C13 预处理/自定义命令、弹幕、封面与 hook 失败点**；C12 幂等回放和 FFmpeg 失败附件有受控
+实跑，辅助失败调用点目前只有编译与全量单元回归，不能冒充真实平台/完整入口证据。
 
 ## 关键事实
 
@@ -24,8 +25,8 @@ wheel/Python 入口共用同一包装但未起进程实跑）。**C12 与 C13 �
 | C09 | upload：恢复资格/补传 | 为什么允许/拒绝/延后、关联原分段与新 attempt | 恢复审计、资格判定和受控重启 | 13 |
 | C10 | submission：决定/尝试/结果 | 为什么等待/拒绝/提交；成功、失败、不确定结果分别是什么 | 投稿意图/claim/业务历史；受控不确定结果 | 13 |
 | C11 | auth：健康变化/操作失败 | 失败类型与影响，不泄漏账号凭据 | 受控无效认证/恢复，不使用真实凭据 | 14 |
-| C12 | audit：关键人工操作/恢复 | 操作与结果及可靠性边界；durable 审计如何投影 | 已有业务审计/outbox，禁止用通用日志替代 | 14 |
-| C13 | diagnostics：外部命令失败 | 退出码、首个致命错误、有界尾部、是否截断 | 合成长 stderr、扫描器结果 | 08、13、14 |
+| C12 | audit：关键人工操作/恢复 | 操作与结果及可靠性边界；durable 审计如何投影 | 已有业务审计/outbox，禁止用通用日志替代 | 14（原生已接，受控回放通过；真实操作矩阵待验） |
+| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；其余运行证据待补） |
 | C14 | observability：存储健康/缺口 | 何时不能写、影响级别/范围、何时恢复；强杀窗口可未知 | 独立健康快照/stderr，忙锁/满盘/强杀演练 | 08、09 |
 
 对每项补充：适用入口/平台、必填与可空字段、业务关联方式、脱敏规则、旧调用点或明确
@@ -54,8 +55,9 @@ S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt
 | C09 | upload.recovery_decided、upload.recovery_started / 服务补传 | R、S、U、missing_id；开始有新UA | executed/skipped/waiting/failed；eligible/source_missing/lease_active/retry_due | check_recovery_eligibility、claim_manual_recovery、run_claimed_recovery；原分段不换ID；S05 |
 | C10 | submission.decided、submission.started、submission.completed / server/CLI/Python | U或T；R可空；pending_count可空 | waiting/failed/succeeded/unknown；pending_segments/no_intent/remote_error/missing_remote_id | reconcile_session_submission、submit_failed/submit_ok_with_aid/submit_ok_no_aid；桥接不得保存resp原文，N:1；S06 |
 | C11 | auth.health_changed、auth.operation_failed / server/登录CLI/嵌入 | platform、stage；T可空 | failed/recovered；authentication_failed/authentication_recovered | cookie_health::record_error/record_success、Python login helpers（无局部subscriber，继承宿主）；不写账号、cookie路径；S10 |
-| C12 | audit.operation_projected / server | 稳定event_uid、stage；关联随操作存在 | executed/failed；manual_recovery/finalized/source_missing | record_recovery_audit及业务outbox为权威，旧文本可能无独立对应；幂等投影N:1；S05/S07 |
-| C13 | processing.command_failed / 外部工具 | stage、exit_code（信号退出可空）、diagnostic_id；S可空 | failed/fallback；process_failed | ffmpeg_scan::run_scanning_stderr 有界尾部；首致命信息并非旧扫描器保证，需新采集；S10 |
+| C12 | audit.operation_projected / server | 业务表持久 event_uid、stage；R随审计存在，文件只作辅助 | failed/skipped/unknown；source_missing/session_finalized/audit_reason_unknown | record_recovery_audit为权威；先落业务表、启动/近期有界重放，事件库按UID幂等；旧文本可能无独立对应；N:1；S05/S07 |
+| C13 | processing.command_failed / 外部工具 | stage、exit_code（spawn/信号退出可空）、附件由event_uid关联；S可空 | failed；process_failed | ffmpeg_scan、响度/时间戳预处理、hook命令；64KiB业务尾部与8KiB脱敏附件分开，旧输出口径保留；S10 |
+| C13 | recording.auxiliary_failed、processing.auxiliary_failed / server | stage、R可用时必带；错误正文不进字段 | failed；danmaku_failed/cover_failed/hook_failed/source_io | 弹幕start/stop/roll、直播/投稿封面和非命令hook；旧错误行保留，当前真实平台失败样本待补；S10 |
 | C14 | 独立health（可投影system.storage_recovered） / 全入口 | queue_depth/bytes、dropped分级、storage_failures、last_commit_ms、committed_id | unknown/recovered；storage_unavailable/queue_full | 旧无统一来源；强杀范围未知；S09 |
 
 Python login/send_sms/qrcode helpers 没有独立初始化；作为宿主继承路径列入C11，不能假定
@@ -252,3 +254,15 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   Python 进程实跑**，共用代码不代计这些入口的运行证据；服务端监控循环里的真实鉴权失败与
   恢复（需真实平台）未验；webhook 告警与新事件同时发生的表现未验。C12、C13 剩余部分
   （`ffmpeg_scan`、danmaku/封面/hook 诊断）不因本行计任何原生分。
+- C12/C13 / 持久恢复审计、全片 FFmpeg 扫描、danmaku/封面/hook / contract-v1 / 14 第六批 /
+  audit-diagnostics-v1：**原生已接入，验收 partial**。`upload_recovery_audit` 仍是业务权威，
+  每行持有稳定 event uid；业务提交后 best-effort 投影，启动全量分页重放、运行中重试最近窗口，
+  遗留 NULL uid 先回填，事件库唯一约束去重。临时业务库 + 真实事件 SQLite 的重复重放通过，
+  不承诺跨库原子提交，事件留存也不删除业务审计。`audit.operation_projected` 冻结映射 durable
+  reason，带显式身份，路径只放 basename。FFmpeg scan 覆盖 spawn/read/wait/非零退出，保留
+  64 KiB 业务解析尾部，另用 8 KiB 脱敏附件；loudnorm/timestamp/hook 固定 stage，旧继承
+  stderr 的路径继续 tee。danmaku、封面与非命令 hook 增发 auxiliary 失败事件，原始错误不进
+  原生字段。受控 `sh` 退出 7 的 stage/退出码/脱敏通过；全量 **422 passed / 0 failed /
+  6 ignored**。真实恢复/outbox/补扫、真实 loudnorm/timestamp、hook、danmaku、封面失败仍未逐项
+  运行；无新双源包、隔离还原、量化负载或长观察，见
+  [P3 第六批](receipts/P3.md#任务-14-第六批持久审计投影与剩余诊断c12--c13)。

@@ -122,6 +122,7 @@ pub async fn download_cover_with(
     enabled: bool,
     fmtname: &str,
     client: reqwest::Client,
+    identity: &crate::observe::RecordingIdentity,
 ) -> Option<PathBuf> {
     // 使用 guard clause 提前返回
     if !enabled {
@@ -143,6 +144,13 @@ pub async fn download_cover_with(
             Some(path)
         }
         Err(e) => {
+            crate::observe::external::auxiliary_failed(
+                "recording.auxiliary_failed",
+                "直播封面下载失败，录制继续",
+                "live_cover_download",
+                "cover_failed",
+                identity.context(None),
+            );
             error!("封面下载失败: {e:#}");
             None
         }

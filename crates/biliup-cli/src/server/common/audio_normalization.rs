@@ -1,4 +1,4 @@
-use crate::server::common::ffmpeg_scan::run_scanning_stderr;
+use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
@@ -1016,11 +1016,14 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
             .arg(input)
             .args(["-c", "copy", "-f", "null", "-"])
             .args(["-map", "0:a:0", "-af", &filter, "-f", "null", "-"]);
-        let (status, scan) = run_scanning_stderr(background(&mut command))
-            .await
-            .change_context(AppError::Custom(
-                "failed to spawn ffmpeg (loudnorm measure)".into(),
-            ))?;
+        let (status, scan) = run_scanning_stderr(
+            background(&mut command),
+            ScanObserver::quiet("loudnorm_measure", input),
+        )
+        .await
+        .change_context(AppError::Custom(
+            "failed to spawn ffmpeg (loudnorm measure)".into(),
+        ))?;
         if !status.success() {
             bail!(AppError::Custom(format!(
                 "ffmpeg loudnorm measure failed: {}",
@@ -1068,21 +1071,22 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
         ) {
             command.args(["-movflags", "+faststart"]);
         }
-        let result = command
-            .arg(output)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .change_context(AppError::Custom(
-                "failed to spawn ffmpeg (loudnorm transcode)".into(),
-            ))?;
-        let stderr = stderr_text(&result.stderr);
-        if !result.status.success() {
+        command.arg(output);
+        let (status, scan) = run_scanning_stderr(
+            &mut command,
+            ScanObserver::quiet("loudnorm_transcode", input),
+        )
+        .await
+        .change_context(AppError::Custom(
+            "failed to spawn ffmpeg (loudnorm transcode)".into(),
+        ))?;
+        if !status.success() {
             bail!(AppError::Custom(format!(
-                "ffmpeg loudnorm transcode failed: {stderr}"
+                "ffmpeg loudnorm transcode failed: {}",
+                scan.tail
             )));
         }
-        Ok(parse_transcode_summary(&stderr))
+        Ok(parse_transcode_summary(&scan.tail))
     }
 }
 

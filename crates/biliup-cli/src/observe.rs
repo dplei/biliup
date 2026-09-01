@@ -4,6 +4,7 @@
 //! old files and console output are unchanged. Identity is passed explicitly — no ambient span
 //! context, no parsing of old message text.
 
+pub mod audit;
 pub mod auth;
 pub mod external;
 pub mod lifecycle;

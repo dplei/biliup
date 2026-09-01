@@ -980,19 +980,27 @@ impl DownloadTask {
             filename_prefix.as_deref(),
             &stream.name,
         );
-        // 启动弹幕客户端
-        if let Some(ref client) = danmaku_client {
-            // 启动弹幕下载逻辑
-            info!("Starting danmaku client for stream: {}", url);
-            client.download().await?;
-        }
-
-        // 录制身份显式构造一次，回调、channel 与阻塞任务都从这里克隆，不依赖环境上下文。
+        // 录制身份显式构造一次，弹幕、回调、channel 与阻塞任务都从这里克隆。
         let identity = crate::observe::RecordingIdentity::server(
             ctx.worker_id(),
             ctx.id(),
             &ctx.live_stream().name,
         );
+        // 启动弹幕客户端
+        if let Some(ref client) = danmaku_client {
+            // 启动弹幕下载逻辑
+            info!("Starting danmaku client for stream: {}", url);
+            if let Err(error) = client.download().await {
+                crate::observe::external::auxiliary_failed(
+                    "recording.auxiliary_failed",
+                    "弹幕录制启动失败",
+                    "danmaku_start",
+                    "danmaku_failed",
+                    identity.context(None),
+                );
+                return Err(error);
+            }
+        }
         // 结束原因取自真正执行到的分支，不从日志文案反推；未走到任何分支时保持 unknown。
         let stop_outcome: &str;
         let stop_reason: &str;
@@ -1334,6 +1342,13 @@ impl DownloadTask {
         if let Some(client) = danmaku_client.clone()
             && let Err(e) = client.stop().await
         {
+            crate::observe::external::auxiliary_failed(
+                "recording.auxiliary_failed",
+                "弹幕录制停止失败，录制主流程已收尾",
+                "danmaku_stop",
+                "danmaku_failed",
+                identity.context(None),
+            );
             error!("Error stopping danmaku client: {}", e);
         }
         // 租约的本场结束边界必须先于重新入队。数据库异常时保守留在 Pause，避免在状态不明时
@@ -1378,6 +1393,11 @@ impl DownloadTask {
         // let hook = processor.create_hook(danmaku_client.clone());
         let completed_configured_segment = Arc::new(AtomicBool::new(false));
         let completed_configured_segment_for_hook = completed_configured_segment.clone();
+        let identity_for_hook = crate::observe::RecordingIdentity::server(
+            ctx.worker_id(),
+            ctx.id(),
+            &ctx.live_stream().name,
+        );
         let (segment_tx, segment_rx) = async_channel::unbounded::<SegmentInfo>();
         let hook = move |event| {
             match event {
@@ -1399,7 +1419,16 @@ impl DownloadTask {
                         match client.rolling(&danmaku_file_path.display().to_string()) {
                             Ok(true) => event.danmaku_file_path = Some(danmaku_file_path),
                             Ok(false) => {}
-                            Err(e) => error!("Danmaku rolling error: {}", e),
+                            Err(e) => {
+                                crate::observe::external::auxiliary_failed(
+                                    "recording.auxiliary_failed",
+                                    "弹幕分段滚动失败，视频分段继续登记",
+                                    "danmaku_roll",
+                                    "danmaku_failed",
+                                    identity_for_hook.context(None),
+                                );
+                                error!("Danmaku rolling error: {}", e)
+                            }
                         }
                     }
                     if let Err(error) = segment_tx.try_send(event) {
@@ -1556,6 +1585,12 @@ pub async fn start_download_workflow(
         notify_douyin_quality_fallback(&ctx, recording_quality.as_deref());
     }
 
+    let workflow_identity = crate::observe::RecordingIdentity::server(
+        ctx.worker_id(),
+        ctx.id(),
+        &ctx.live_stream().name,
+    );
+
     tokio::spawn({
         let streamer_info = ctx.streamer_info();
         let live_cover_url = streamer_info.live_cover_path.clone();
@@ -1566,18 +1601,26 @@ pub async fn start_download_workflow(
             .use_live_cover
             .map(|u| u && !live_cover_url.is_empty())
             .unwrap_or(false);
+        let identity = workflow_identity.clone();
         async move {
             cover_downloader::download_cover_with(
                 &live_cover_url,
                 enabled,
                 &format_filename,
                 client,
+                &identity,
             )
             .await
         }
     });
 
-    process(&[], &ctx.live_streamer().preprocessor).await;
+    process(
+        &[],
+        &ctx.live_streamer().preprocessor,
+        "preprocessor_hook",
+        workflow_identity.context(None),
+    )
+    .await;
 
     let _ = task.execute(&ctx, sender, downloader, rooms_handle).await;
     // execute 的正常路径会在确认下播边界清理；早期初始化错误也必须清掉，避免扫描器把
@@ -1586,7 +1629,13 @@ pub async fn start_download_workflow(
 
     ctx.worker().set_recording_quality(None);
 
-    process(&[], &ctx.live_streamer().downloaded_processor).await;
+    process(
+        &[],
+        &ctx.live_streamer().downloaded_processor,
+        "downloaded_hook",
+        workflow_identity.context(None),
+    )
+    .await;
 
     info!(
         "Download workflow completed {} => {:?}",
