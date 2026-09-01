@@ -55,7 +55,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [11 Agent 对比](issues/11-agent-reconciliation.md) | P2 | complete | passed | [P2](receipts/P2.md)：三份提示词、视图隔离、桥接传输核对、独立还原 × 2 与交叉复核、一次真实差异闭环 |
 | [12 录制试点](issues/12-recording-pilot.md) | P3 | complete | partial | [P3](receipts/P3.md)：身份贯通、受控演练与一场真实开播录制通过；缺断连/重连的真实样本 |
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
-| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第九批回执](receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)：外部下载器已接入，只剩 danmaku 异步失败 1 个源码 gap，预计 1 个实现 session / 1.5–3 小时；本地矩阵改为实际双写自然采样，首轮观察仍待完成 |
+| [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第九批回执](receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)：外部下载器已接入，只剩 danmaku 异步失败 1 个源码 gap，预计 1 个实现 session / 1.5–3 小时；本地矩阵改为实际双写自然采样，首轮观察仍待完成。[第十批](receipts/P3.md#任务-14-第十批内部分段命名撞车与-segment_format)关闭 FFmpeg 内部分段的秒级命名撞车与 `-segment_format ts` 失败 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
 | [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
@@ -64,26 +64,30 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 
 ## 当前交接位置
 
-- 最近一轮仅处理任务 14 第九批：服务端 Streamlink 与 YtDlp/YtArchive 的加法式原生接入。
-  沿用 `refactor/issue2-260831-153007`，父提交 `ce40c48`；改动集中在两个下载器源码与
-  effort 文档，未 push。
-- Streamlink：目标 `.part` 由本进程 `--output` 选定，创建与关闭都是真实观测，带 S/DA、
-  关闭原因与有界退出诊断；新增取消标记，`stop()` 先写标记再动进程。退出后没有 `.part` 或
-  改名失败如实记 `segment_closed` failed，不冒充已关闭的分段。
-- YtDlp/YtArchive：外部工具自己创建、命名并搬运文件，创建时刻不可观测，因此只发
-  `segment_closed`；spawn 失败记 `spawn_failed`（无退出码），非零退出记 `process_failed`
-  带退出码与有界脱敏附件；原先塞进自由错误的完整 combined output 改成有界脱敏摘要。
-  内置封面失败补 `recording.auxiliary_failed`。
-- 未改子进程管理、文件搬运、清理、重试或业务状态机；yt-dlp 的 `stop()` 只置标记不杀进程
-  这一既有语义原样保留，被停止的调用仍不发分段事件。
-- 剩余源码缺口只有 danmaku spawned recorder 的运行中 recorder/write/decode 失败，
-  预计 1 个实现 session、1.5–3 小时；它闭合后才能开始首轮实际双写观察。
-- 本批验证：4 项新单元测试（判定口径 2 + 隐私/容量边界 2）、`biliup-cli` lib
-  339 passed / 6 ignored、`biliup --test recording_events` 6 passed、
-  `biliup-observability` 13 passed、真实 `biliup dump-flv` 二进制的采集开/关对照实跑、
-  触达文件 clippy 与 rustfmt 通过、分类漂移 62 files / 554 sites 且 `coverage_gap` 3 → 1。
-  **本机没有安装 streamlink/yt-dlp/ytarchive，两条路径没有任何实跑样本**，正常下载、切片、
-  取消与真实失败全部保持待观察。旧 601 `transport` 差异与 FFmpeg 秒级命名碰撞仍是待处理项。
+- 最近一轮仅处理任务 14 第十批：内部分段命名撞车与 `-segment_format`。沿用
+  `refactor/issue2-260831-153007`，父提交为第九批 `dc94766`，代码与回执同批提交，未 push。
+- **第四批留下的「FFmpeg 秒级命名碰撞」已关闭**。`-strftime` 不再打开：ffmpeg 侧改用序号模板
+  `{展开后的名字}-%05d.{后缀}.part`（segment 复用器只能二选一，只有序号保证每段一个新文件），
+  用户配置的命名改由本进程按该分段的开始时刻展开，撞车时顺延 `-2`、`-3`。交付名的形状、
+  补扫前缀匹配、登记账本与上传路径都不变。
+- 一并修掉「ffmpeg 9 不接受 `ts` 作为 `-segment_format`」：该参数改取复用器名
+  （`ts`→`mpegts`、`mkv`→`matroska`）。
+- **口径变化**：交付名的时间戳来源从 ffmpeg 自己的 strftime 换成本进程的观测，第一段用的是
+  进程启动时刻而非 ffmpeg 打开首个输出的时刻，秒数可能与旧行为差上一次连接探测的耗时。
+- 第十批验证：`cargo test -p biliup-cli --lib ffmpeg_downloader` 7 passed（含撞车条件下
+  `ts`/`flv` 两个后缀的实跑，用 `ffprobe` 按时长核对没有分段被覆盖）、
+  `cargo test -p biliup --test recording_events` 6 passed、
+  `cargo test -p biliup-observability -p biliup-cli --lib --tests` 429 passed / 0 failed / 6 ignored、
+  `python3 scripts/check_code_index.py` 通过。全部离线，媒体本地合成，
+  不接触真实平台、账号或网络。
+- 上一轮（第九批）的结论与限制原样有效：Streamlink 的创建/关闭是真实观测、YtDlp/YtArchive
+  只发 `segment_closed`，两者都未改子进程管理与文件搬运；yt-dlp 的 `stop()` 只置标记不杀
+  进程这一既有语义保留。**本机没有安装 streamlink/yt-dlp/ytarchive，两条路径没有任何实跑
+  样本**，正常下载、切片、取消与真实失败全部保持待观察。
+- 剩余源码缺口只有 danmaku spawned recorder 的运行中 recorder/write/decode 失败，预计
+  1 个实现 session、1.5–3 小时；它闭合后才能开始首轮实际双写观察。旧 601 `transport` 差异
+  仍是待处理项；FFmpeg 秒级命名碰撞已由第十批关闭，不再列入。
+  14 仍 in-progress / partial，P3 仍 in-progress / partial / pending，当前不能进入 P4。
 - 下一轮入口：`@.scratch/structured-logging/stage-prompts.md 继续 P3，仅处理任务 14`。
   下批只把 `danmaku/src/client.rs` 里 spawned recorder 的失败穿透到既有 auxiliary 边界，
   旧错误行保留，不改弹幕协议、重试或录制状态机；之后才进入首轮实际双写观察，
