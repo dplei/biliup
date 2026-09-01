@@ -44,7 +44,9 @@ pub mod output;
 pub mod protocols;
 
 // Re-exports
-pub use client::{DanmakuRecorder, RecorderConfig, RecorderHandle};
+pub use client::{
+    DanmakuRecorder, ExitObserver, RecorderConfig, RecorderExit, RecorderFailure, RecorderHandle,
+};
 pub use error::{DanmakuError, Result};
 pub use message::{ChatMessage, DanmakuEvent, GiftMessage, GuardBuyMessage, SuperChatMessage};
 pub use output::XmlWriter;

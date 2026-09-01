@@ -154,6 +154,27 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - yt-dlp 内置的直播封面下载失败改发 `recording.auxiliary_failed`，stage
   `live_cover_download`、原因 `cover_failed`；旧告警行保留，事件不带 URL 或错误文本。
 
+### P3/14 弹幕后台任务终止增量
+
+- `DanmakuRecorder::start()` 交回句柄后，后台任务的失败既不进返回值也不进任何状态；本批给它
+  加一个**终止观察回调**，由宿主注入，`danmaku` crate 本身不依赖采集组件。没有注入观察者时
+  行为与从前完全一致（只有原来那行 `Recorder error`）。
+- 回调**恰好触发一次**，包括任务 panic 或被取消这种任何分支都没跑完的情况：正常收尾记
+  `Completed`（**不产生事件**），返回错误记 `Failed`，其余记 `Aborted`。观察者内部的 panic 被
+  隔离，不回传进录制任务，也不在展开时终止进程。
+- 事件复用 `recording.auxiliary_failed`，WARN/failed，stage 固定 `danmaku_runtime`，与既有的
+  `danmaku_start`/`danmaku_stop`/`danmaku_roll` 区分开——后三者是外层调用的同步失败，本批覆盖的
+  是「启动已经成功之后才死掉」。
+- **原因词表扩展**：`danmaku_failed` 之外新增 `danmaku_output_failed`（XML 创建/写入/收尾）、
+  `danmaku_connection_failed`（WS/TCP/HTTP 且循环无法自愈）、`danmaku_protocol_failed`（解码/
+  JSON/解压）、`danmaku_internal_failed`（平台不支持、内部 channel）与 `danmaku_aborted`
+  （panic 或被取消）。分类只从错误类型映射，**不解析错误文本**，事件不携带原文。
+- 明确不做：逐条 `write_event` 失败与逐帧解码失败仍是 `no_persistence`，不逐条发事件也不做
+  计数事件——它们丢的是单条弹幕，不是整场结果，且频率可达弹幕级。
+- 记录但不在本批修的既有缺陷：YouTube 轮询分支单次出错即终止（WS/TCP 分支有 30s 重连），
+  `RecorderHandle::stop()` 吞掉发送错误。两者现在都会由本事件暴露出来，修法属于业务行为
+  变更，不在加法式接入范围内。
+
 ## 安全和边界
 
 字段先允许列表再格式化：未知 Debug 不调用；允许值有界格式化（超限停止），不 stringify

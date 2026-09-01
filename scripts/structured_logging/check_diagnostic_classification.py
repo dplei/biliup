@@ -63,7 +63,9 @@ def main() -> None:
             fail(f"unknown decision: {decision!r}")
         if not isinstance(reason, str) or not reason.strip():
             fail(f"missing reason for {decision}")
-        if not isinstance(paths, list) or not paths:
+        if not isinstance(paths, list):
+            fail(f"{decision} must list paths")
+        if not paths and decision != "coverage_gap":
             fail(f"{decision} must list at least one path")
         for relative in paths:
             if relative in catalog_files:

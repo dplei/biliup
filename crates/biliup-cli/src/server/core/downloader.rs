@@ -15,12 +15,12 @@ use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use biliup::downloader::live::StreamCandidate;
 use biliup::downloader::util::SegmentCloseReason;
-use danmaku_client::{DanmakuRecorder, RecorderConfig, RecorderHandle};
+use danmaku_client::{DanmakuRecorder, RecorderConfig, RecorderExit, RecorderHandle};
 use error_stack::Report;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 一次重连所继承的缺口线索。`silent_measured` 区分实测与估算，估算不冒充测量。
@@ -304,16 +304,50 @@ pub trait DanmakuClient {
 
 pub struct RustDanmakuClient {
     config: RecorderConfig,
+    identity: crate::observe::RecordingIdentity,
     handle: Mutex<Option<RecorderHandle>>,
 }
 
 impl RustDanmakuClient {
     pub fn new(config: RecorderConfig) -> Self {
+        Self::with_identity(config, crate::observe::RecordingIdentity::default())
+    }
+
+    /// 录制身份显式传入，后台弹幕任务的终止诊断才能落到本场，而不是靠时间相近推断。
+    pub fn with_identity(
+        config: RecorderConfig,
+        identity: crate::observe::RecordingIdentity,
+    ) -> Self {
         Self {
             config,
+            identity,
             handle: Mutex::new(None),
         }
     }
+}
+
+/// 后台弹幕任务终止时的稳定原因码；正常收尾不产生事件。
+fn danmaku_exit_reason_code(exit: RecorderExit) -> Option<&'static str> {
+    match exit {
+        RecorderExit::Completed => None,
+        RecorderExit::Failed(failure) => Some(failure.code()),
+        RecorderExit::Aborted => Some("danmaku_aborted"),
+    }
+}
+
+/// `download()` 返回成功之后，弹幕任务的失败没有任何返回值可看，只有一行旧日志。这里把终止
+/// 方式转成既有的辅助失败事件；旧日志行保持不变，录制主流程不受影响。
+fn report_danmaku_exit(identity: &crate::observe::RecordingIdentity, exit: RecorderExit) {
+    let Some(reason_code) = danmaku_exit_reason_code(exit) else {
+        return;
+    };
+    crate::observe::external::auxiliary_failed(
+        "recording.auxiliary_failed",
+        "弹幕录制中途终止，本场后续弹幕不再产生",
+        "danmaku_runtime",
+        reason_code,
+        identity.context(None),
+    );
 }
 
 #[async_trait]
@@ -324,8 +358,10 @@ impl DanmakuClient for RustDanmakuClient {
             return Ok(());
         }
 
+        let identity = self.identity.clone();
         let recorder = DanmakuRecorder::new(self.config.clone())
-            .map_err(|e| Report::new(AppError::Custom(e.to_string())))?;
+            .map_err(|e| Report::new(AppError::Custom(e.to_string())))?
+            .with_exit_observer(Arc::new(move |exit| report_danmaku_exit(&identity, exit)));
         *handle = Some(recorder.start());
         Ok(())
     }
@@ -412,3 +448,45 @@ fn parse_duration(duration: &str) -> u64 {
 //
 //     Ok(())
 // }
+
+#[cfg(test)]
+mod danmaku_exit_tests {
+    use super::*;
+    use danmaku_client::RecorderFailure;
+
+    #[test]
+    fn only_an_abnormal_end_becomes_an_event() {
+        assert_eq!(danmaku_exit_reason_code(RecorderExit::Completed), None);
+        assert_eq!(
+            danmaku_exit_reason_code(RecorderExit::Failed(RecorderFailure::Output)),
+            Some("danmaku_output_failed")
+        );
+        assert_eq!(
+            danmaku_exit_reason_code(RecorderExit::Failed(RecorderFailure::Connection)),
+            Some("danmaku_connection_failed")
+        );
+        assert_eq!(
+            danmaku_exit_reason_code(RecorderExit::Aborted),
+            Some("danmaku_aborted")
+        );
+    }
+
+    #[test]
+    fn reason_codes_stay_inside_the_contract_vocabulary() {
+        for exit in [
+            RecorderExit::Failed(RecorderFailure::Output),
+            RecorderExit::Failed(RecorderFailure::Connection),
+            RecorderExit::Failed(RecorderFailure::Protocol),
+            RecorderExit::Failed(RecorderFailure::Internal),
+            RecorderExit::Aborted,
+        ] {
+            let code = danmaku_exit_reason_code(exit).expect("an abnormal end has a code");
+            assert!(code.len() <= 64, "{code} exceeds the 64-byte reason budget");
+            assert!(
+                code.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit()),
+                "{code} is not a lowercase ascii underscore code"
+            );
+        }
+    }
+}

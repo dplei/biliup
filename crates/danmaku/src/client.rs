@@ -84,6 +84,94 @@ enum RecorderCommand {
     Stop,
 }
 
+/// How the background recorder task ended.
+///
+/// `start()` returns as soon as the task is spawned, so every failure after that point is
+/// invisible to the caller unless it is reported here. The variants carry a stable
+/// classification only — raw error text stays in the unchanged log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderExit {
+    /// Stopped on request or the stream ended, and the XML file was finalized.
+    Completed,
+    /// Recording ended early; no further danmaku is produced for this session.
+    Failed(RecorderFailure),
+    /// The task neither finalized nor returned an error, i.e. it panicked or was cancelled.
+    Aborted,
+}
+
+/// Stable classification of a terminal recorder failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderFailure {
+    /// The XML output could not be created, written or finalized.
+    Output,
+    /// A connection, HTTP or transport failure the loop could not recover from.
+    Connection,
+    /// A protocol payload could not be decoded.
+    Protocol,
+    /// Anything else, including internal channel failures.
+    Internal,
+}
+
+impl RecorderFailure {
+    fn of(error: &DanmakuError) -> Self {
+        match error {
+            DanmakuError::Xml(_) | DanmakuError::Io(_) => Self::Output,
+            DanmakuError::WebSocket(_) | DanmakuError::Http(_) | DanmakuError::ConnectionClosed => {
+                Self::Connection
+            }
+            DanmakuError::Decode(_) | DanmakuError::Json(_) | DanmakuError::Compression(_) => {
+                Self::Protocol
+            }
+            DanmakuError::UnsupportedPlatform(_)
+            | DanmakuError::ChannelSend
+            | DanmakuError::Stopped => Self::Internal,
+        }
+    }
+
+    /// Stable lowercase code for the host's diagnostic vocabulary.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Output => "danmaku_output_failed",
+            Self::Connection => "danmaku_connection_failed",
+            Self::Protocol => "danmaku_protocol_failed",
+            Self::Internal => "danmaku_internal_failed",
+        }
+    }
+}
+
+/// Callback invoked exactly once when the background task ends.
+pub type ExitObserver = Arc<dyn Fn(RecorderExit) + Send + Sync>;
+
+/// Reports the task's end exactly once, including the panicked or cancelled case in which no
+/// branch of the task body runs to completion. The observer is isolated from the recorder: a
+/// panic inside it must not escape into the task or abort the process during unwinding.
+struct ExitReport {
+    observer: Option<ExitObserver>,
+    exit: RecorderExit,
+}
+
+impl ExitReport {
+    fn new(observer: Option<ExitObserver>) -> Self {
+        Self {
+            observer,
+            exit: RecorderExit::Aborted,
+        }
+    }
+
+    fn settle(&mut self, exit: RecorderExit) {
+        self.exit = exit;
+    }
+}
+
+impl Drop for ExitReport {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            let exit = self.exit;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(exit)));
+        }
+    }
+}
+
 /// Handle for controlling a running recorder.
 #[derive(Clone)]
 pub struct RecorderHandle {
@@ -117,6 +205,7 @@ impl RecorderHandle {
 pub struct DanmakuRecorder {
     config: RecorderConfig,
     platform: Arc<dyn Platform>,
+    exit_observer: Option<ExitObserver>,
 }
 
 impl DanmakuRecorder {
@@ -126,7 +215,15 @@ impl DanmakuRecorder {
         Ok(Self {
             config,
             platform: Arc::from(platform),
+            exit_observer: None,
         })
+    }
+
+    /// Observe how the background task ends. Without an observer the recorder behaves exactly as
+    /// before: the failure is only written to the existing log line.
+    pub fn with_exit_observer(mut self, observer: ExitObserver) -> Self {
+        self.exit_observer = Some(observer);
+        self
     }
 
     /// Start recording in a background task.
@@ -141,9 +238,16 @@ impl DanmakuRecorder {
             stop_tx: stop_tx.clone(),
         };
 
+        let observer = self.exit_observer.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = self.run(cmd_rx, stop_rx).await {
-                error!("Recorder error: {}", e);
+            let mut report = ExitReport::new(observer);
+            match self.run(cmd_rx, stop_rx).await {
+                Ok(()) | Err(DanmakuError::Stopped) => report.settle(RecorderExit::Completed),
+                Err(e) => {
+                    error!("Recorder error: {}", e);
+                    report.settle(RecorderExit::Failed(RecorderFailure::of(&e)));
+                }
             }
         });
 
@@ -833,5 +937,88 @@ mod tests {
         let result = format_output_path(&template);
         assert!(result.to_string_lossy().contains("/tmp/test_"));
         assert!(result.extension().map(|e| e == "xml").unwrap_or(false));
+    }
+
+    fn recording_observer() -> (ExitObserver, Arc<std::sync::Mutex<Vec<RecorderExit>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let observer: ExitObserver = Arc::new(move |exit| sink.lock().unwrap().push(exit));
+        (observer, seen)
+    }
+
+    #[test]
+    fn failure_classification_follows_the_error_kind() {
+        assert_eq!(
+            RecorderFailure::of(&DanmakuError::Xml("write".into())),
+            RecorderFailure::Output
+        );
+        assert_eq!(
+            RecorderFailure::of(&DanmakuError::ConnectionClosed),
+            RecorderFailure::Connection
+        );
+        assert_eq!(
+            RecorderFailure::of(&DanmakuError::Decode("frame".into())),
+            RecorderFailure::Protocol
+        );
+        assert_eq!(
+            RecorderFailure::of(&DanmakuError::ChannelSend),
+            RecorderFailure::Internal
+        );
+        assert_eq!(RecorderFailure::Output.code(), "danmaku_output_failed");
+    }
+
+    #[test]
+    fn an_unsettled_report_is_an_abort_and_fires_once() {
+        let (observer, seen) = recording_observer();
+        drop(ExitReport::new(Some(observer.clone())));
+        assert_eq!(*seen.lock().unwrap(), vec![RecorderExit::Aborted]);
+
+        let mut report = ExitReport::new(Some(observer));
+        report.settle(RecorderExit::Failed(RecorderFailure::Output));
+        report.settle(RecorderExit::Completed);
+        drop(report);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![RecorderExit::Aborted, RecorderExit::Completed]
+        );
+    }
+
+    #[test]
+    fn a_panicking_observer_does_not_escape_the_recorder() {
+        let observer: ExitObserver = Arc::new(|_| panic!("observer is broken"));
+        let mut report = ExitReport::new(Some(observer));
+        report.settle(RecorderExit::Completed);
+        drop(report);
+    }
+
+    /// The failure this closes: `start()` has already handed back a handle, so a recorder that
+    /// dies while opening its output leaves the caller believing danmaku is being recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recorder_that_dies_after_start_reports_its_exit() {
+        let (observer, seen) = recording_observer();
+        let config = RecorderConfig::new(
+            "https://www.twitch.tv/shroud",
+            "/dev/null/unwritable/danmaku",
+        );
+        let handle = DanmakuRecorder::new(config)
+            .expect("platform is supported")
+            .with_exit_observer(observer)
+            .start();
+
+        for _ in 0..100 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![RecorderExit::Failed(RecorderFailure::Output)],
+            "an unwritable output must be reported as a terminal output failure"
+        );
+        // The handle outlives the dead task; stopping it must stay harmless.
+        handle.stop().await.expect("stop is infallible");
     }
 }

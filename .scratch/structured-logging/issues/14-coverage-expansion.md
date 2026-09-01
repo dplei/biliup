@@ -43,12 +43,13 @@ Implementation: in-progress
 | 批次 | 范围 | 预计主动工作量 | 边界 |
 | --- | --- | --- | --- |
 | ~~外部下载器~~（第九批已完成） | `streamlink.rs`、`ytdlp.rs`/YtArchive：补 S/DA、按实际可知的关闭语义、退出码与有界诊断；保留旧日志和现有进程/文件行为 | 实际约 1 个 session | 未安装第三方工具，未写假命令矩阵，未改 yt-dlp stop 与文件搬运 |
-| danmaku 异步失败 | 将 spawned recorder 的 recorder/write/decode 失败穿透到既有 auxiliary 原生边界；旧错误行继续保留 | 1–2 小时，1 个 session | 不改弹幕协议、重试或录制状态机 |
+| ~~danmaku 异步失败~~（第十一批已完成） | 只把 spawned recorder 的**终止性**失败穿透到既有 auxiliary 边界；逐条 write/decode 收窄为 `no_persistence`；旧错误行保留 | 实际约 1 个 session | 未改弹幕协议、重连、重试或录制状态机；轮询分支缺重连与 `stop()` 吞错误记录未修 |
 | 收口 | 更新分类目录、覆盖表、回执；运行格式/编译/基本启动与漂移检查 | 0.5–1 小时，可并入上一批 | 只证明最低运行安全，不宣称低频语义通过 |
 
-第九批之后剩余**主动实现约 1.5–3 小时、1 个实现 session**（danmaku 异步失败 + 收口）。第一轮实际双写观察和
-差异复核另计日历时间；它们是验收工作，不再计入“待实现代码”。wheel/Python、恢复/outbox、
+第十一批之后**主动实现归零，分类目录 `coverage_gap` 由 1 降到 0**。剩下的全部是验收工作：
+第一轮实际双写观察与差异复核另计日历时间，不计入“待实现代码”。wheel/Python、恢复/outbox、
 真实辅助失败、真实断连和外部工具矩阵从本地待实现项移到自然运行样本，不为制造样本改业务。
+**源码闭合不等于任务完成**：14 能否标 complete 取决于观察结果。
 
 ## 回退与非目标
 
@@ -129,3 +130,18 @@ Implementation: in-progress
   [P3 第九批回执](../receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)。
   本任务仍 in-progress / partial；下一批只做 danmaku 异步 recorder 的运行中失败，之后才能
   开始第一轮实际双写观察。
+- 第十一批 danmaku 后台任务终止已交付，最后一个源码 gap 闭合：`start()` 交回句柄后的终止由
+  宿主注入的回调恰好上报一次（含 panic 与被取消），正常收尾不发事件，失败按错误类型映射到
+  `danmaku_output/connection/protocol/internal_failed` 与 `danmaku_aborted`，stage 固定
+  `danmaku_runtime`，不解析错误文本、不携带原文或路径。`danmaku` crate 不依赖采集组件，
+  没有观察者时行为与从前完全一致。录制身份此前根本没传进弹幕客户端，本批显式贯通。
+  范围按源码复核收窄：逐条 `write_event` 与逐帧解码失败明确归 `no_persistence`（丢的是单条
+  弹幕不是整场结果，频率可达弹幕级）；同时更正第七批「运行中失败完全不可见」的措辞——
+  recorder 死后下一次 `rolling()` 会发事件，但时机不定且归因错误。
+  验证：真起一个输出不可写的 recorder，`download()` 如常成功、随后恰好一条事件落进独立
+  采集器并核对 stage/结果/原因码/级别/身份/脱敏；`danmaku` 42 passed、`biliup-cli` lib
+  344 passed / 6 ignored、录制域 6 passed、底座 22 passed、真实二进制开关对照业务输出逐字节
+  一致、格式与 clippy 通过，分类漂移 `coverage_gap` 1 → 0。真实断连、协议失败、panic 与取消
+  仍无自然样本，保持待观察。详见
+  [P3 第十一批回执](../receipts/P3.md#任务-14-第十一批弹幕后台任务终止)。
+  本任务仍 in-progress / partial；下一轮是首轮实际双写观察，观察完成前不标 complete。

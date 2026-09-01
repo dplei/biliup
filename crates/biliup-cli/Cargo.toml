@@ -78,6 +78,8 @@ dirs = "6.0"
 [dev-dependencies]
 # 集成测试要把 axum 响应体读成字节；生产代码不需要这个 crate。
 http-body-util = "0.1"
+# 弹幕后台任务的终止事件要用真实 recorder 触发，集成测试直接构造它的配置。
+danmaku-client = { package = "danmaku", path = "../danmaku" }
 
 [features]
 default = []

@@ -265,6 +265,7 @@ pub fn danmaku_client(
     source: Option<&DanmakuSource>,
     filename_prefix: Option<&str>,
     name: &str,
+    identity: crate::observe::RecordingIdentity,
 ) -> Option<Arc<dyn crate::server::core::downloader::DanmakuClient + Send + Sync>> {
     let source = source?;
     let mut context = PlatformContext::new();
@@ -286,7 +287,7 @@ pub fn danmaku_client(
     .with_raw(source.raw)
     .with_detail(source.detail);
 
-    Some(Arc::new(RustDanmakuClient::new(config)))
+    Some(Arc::new(RustDanmakuClient::with_identity(config, identity)))
 }
 
 #[cfg(test)]

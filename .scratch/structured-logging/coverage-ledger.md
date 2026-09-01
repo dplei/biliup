@@ -11,8 +11,9 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 实跑，辅助失败调用点目前只有编译与全量单元回归，不能冒充真实平台/完整入口证据。第七批
 [分类清单](diagnostic-classification.md) 对源码重新盘点后确认：Streamlink、YtDlp/YtArchive
 服务运行时实际可达，且 danmaku 异步 recorder 的运行中失败没有穿透第六批外层事件；三者是
-明确 `coverage_gap`，仍在 C03/C13 分母并阻止任务 14 完成。**第九批已闭合前两个**：两个外部
-下载器接入分段身份、可知关闭语义、退出诊断与有界脱敏附件，只剩 danmaku 异步失败一个 gap；
+明确 `coverage_gap`，仍在 C03/C13 分母并阻止任务 14 完成。**第九批闭合前两个、第十一批闭合最后
+一个**：两个外部下载器接入分段身份、可知关闭语义、退出诊断与有界脱敏附件，弹幕后台任务的
+终止经宿主注入的观察回调发辅助失败事件，源码 `coverage_gap` 归零；
 但这两条路径在本机没有第三方工具，只有判定/边界单元测试，真实样本要在实际运行中积累。
 
 第八批调整的是剩余验证路径，不是覆盖定义：三项 gap 仍须在旧日志旁加原生调用，但不再要求
@@ -36,7 +37,7 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | C10 | submission：决定/尝试/结果 | 为什么等待/拒绝/提交；成功、失败、不确定结果分别是什么 | 投稿意图/claim/业务历史；受控不确定结果 | 13 |
 | C11 | auth：健康变化/操作失败 | 失败类型与影响，不泄漏账号凭据 | 受控无效认证/恢复，不使用真实凭据 | 14 |
 | C12 | audit：关键人工操作/恢复 | 操作与结果及可靠性边界；durable 审计如何投影 | 已有业务审计/outbox，禁止用通用日志替代 | 14（原生已接，受控回放通过；真实操作矩阵待验） |
-| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；Streamlink/YtDlp 第九批已接但无实跑；danmaku 异步失败仍缺原生边界） |
+| C13 | diagnostics：外部命令失败与辅助链 | 退出码、首个致命错误、有界尾部、是否截断；无进程码的辅助失败明确 stage | 合成长 stderr、扫描器、弹幕/封面/hook 失败 | 08、13、14（FFmpeg 受控通过；Streamlink/YtDlp 第九批已接但无实跑；danmaku 后台终止第十一批已接，实跑到「输出不可写」一种） |
 | C14 | observability：存储健康/缺口 | 何时不能写、影响级别/范围、何时恢复；强杀窗口可未知 | 独立健康快照/stderr，忙锁/满盘/强杀演练 | 08、09 |
 
 对每项补充：适用入口/平台、必填与可空字段、业务关联方式、脱敏规则、旧调用点或明确
@@ -69,7 +70,7 @@ S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt
 | C11 | auth.health_changed、auth.operation_failed / server/登录CLI/嵌入 | platform、stage；T可空 | failed/recovered；authentication_failed/authentication_recovered | cookie_health::record_error/record_success、Python login helpers（无局部subscriber，继承宿主）；不写账号、cookie路径；S10 |
 | C12 | audit.operation_projected / server | 业务表持久 event_uid、stage；R随审计存在，文件只作辅助 | failed/skipped/unknown；source_missing/session_finalized/audit_reason_unknown | record_recovery_audit为权威；先落业务表、启动/近期有界重放，事件库按UID幂等；旧文本可能无独立对应；N:1；S05/S07 |
 | C13 | processing.command_failed / 外部工具 | stage、exit_code（spawn/信号退出可空）、附件由event_uid关联；S可空 | failed；process_failed | ffmpeg_scan、响度/时间戳预处理、hook命令；64KiB业务尾部与8KiB脱敏附件分开，旧输出口径保留；S10 |
-| C13 | recording.auxiliary_failed、processing.auxiliary_failed / server | stage、R可用时必带；错误正文不进字段 | failed；danmaku_failed/cover_failed/hook_failed/source_io | 弹幕start/stop/roll、直播/投稿封面和非命令hook；旧错误行保留，当前真实平台失败样本待补；S10 |
+| C13 | recording.auxiliary_failed、processing.auxiliary_failed / server | stage、R可用时必带；错误正文不进字段 | failed；danmaku_failed/cover_failed/hook_failed/source_io，弹幕后台终止另用 danmaku_output/connection/protocol/internal_failed 与 danmaku_aborted | 弹幕start/stop/roll 与 danmaku_runtime、直播/投稿封面和非命令hook；旧错误行保留，当前真实平台失败样本待补；S10 |
 | C14 | 独立health（可投影system.storage_recovered） / 全入口 | queue_depth/bytes、dropped分级、storage_failures、last_commit_ms、committed_id | unknown/recovered；storage_unavailable/queue_full | 旧无统一来源；强杀范围未知；S09 |
 
 Python login/send_sms/qrcode helpers 没有独立初始化；作为宿主继承路径列入C11，不能假定
@@ -306,3 +307,10 @@ logviewer按文件tab，静态下载及developer日志设置均保持不变。�
   （4 项）、全量回归（`biliup-cli` lib 339 passed / 6 ignored）和入口开关对照实跑；
   正常下载、切片、取消与真实失败样本保持待观察。见
   [P3 第九批回执](receipts/P3.md#任务-14-第九批外部下载器streamlink--ytdlp)。
+- C13 / danmaku 后台 recorder / danmaku-runtime-exit-v1 / 14 第十一批 /
+  additive-dual-log：**最后一个源码 gap 闭合，观察尚未开始**。`start()` 交回句柄后的终止由
+  宿主注入的回调恰好上报一次，含 panic 与被取消；正常收尾不发事件，失败按错误类型映射到
+  稳定原因码，不解析错误文本、不携带原文，旧 `Recorder error` 行不变。逐条 write/decode
+  失败明确归 `no_persistence`。真实「启动即死」（输出不可写）在测试中实跑通过，真实断连与
+  协议失败样本待自然采集。分类目录 `coverage_gap` 由 1 归 0，校验器同步允许该组为空。见
+  [P3 第十一批回执](receipts/P3.md#任务-14-第十一批弹幕后台任务终止)。
