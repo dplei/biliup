@@ -57,7 +57,7 @@ P0/P1/P2/P6 没有独立的长观察窗口，但仍有各自必测的真实/受�
 | [13 上传等后处理](issues/13-upload-pilot.md) | P3 | complete | passed | [P3](receipts/P3.md)：决定链受控实跑 + 真实远端上传、人工补传与投稿成功全部通过 |
 | [14 全范围覆盖](issues/14-coverage-expansion.md) | P3 | in-progress | partial | [第十一批回执](receipts/P3.md#任务-14-第十一批弹幕后台任务终止)：源码 `coverage_gap` 已归零（第十批同时关闭了 FFmpeg 内部分段命名撞车），剩余全部是验收工作——首轮实际双写观察与差异复核未开始，未自然触发的路径保持待观察 |
 | [15 查询 API](issues/15-query-api.md) | P3 | complete | passed | [P3](receipts/P3.md)：接口/实时/导出/认证边界与 2 万条负载均实跑通过 |
-| [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；补传入口样式补修已复核；默认入口仍是旧页。当前全仓类型检查限制见回执 |
+| [16 试用页面](issues/16-preview-ui.md) | P3 | complete | passed | [P3](receipts/P3.md)：真数据下 13 项页面验收通过；默认入口仍是旧页。**合并前复核更正**：`FilterBar.tsx` 是本 effort 新增文件而非历史遗留，在本机 pnpm 树（Semi 2.102）上构建失败，已修；镜像构建走 npm 树（Semi 2.89.1）不受影响，见回执「发版前复核」 |
 | [17 默认新页面](issues/17-default-events.md) | P4 | not-started | pending | 待前置通过后切换和第二轮观察 |
 | [18 停旧写入](issues/18-stop-legacy-writes.md) | P5 | not-started | pending | 待前置通过后无文件观察及回退验证 |
 | [19 移除旧实现](issues/19-remove-legacy.md) | P6 | not-started | pending | 待前置通过后移除与兼容收尾 |

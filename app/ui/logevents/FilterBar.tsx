@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useState } from 'react';
+import type { CSSProperties, FC, ReactNode } from 'react';
 import {
 	Button,
 	Checkbox,
@@ -27,6 +28,26 @@ import {
 	fieldText,
 	levelText,
 } from '../../lib/log-events';
+
+/**
+ * Semi 2.102 的 `Select` props 在 strict 模式下会把类型实例化推到 TS 的深度上限，本文件里
+ * 每个用法都报 TS2589 并让 `next build` 失败。这里只把它的 props 收窄成实际用到的那几个，
+ * 组件本身和运行时行为不变；prop 名与取值仍然受检查，`Select.Option` 继续用原组件。
+ */
+type FilterSelectProps = {
+	multiple?: boolean;
+	filter?: boolean;
+	showClear?: boolean;
+	disabled?: boolean;
+	maxTagCount?: number;
+	placeholder?: string;
+	style?: CSSProperties;
+	value?: string | string[];
+	onChange?: (value: unknown) => void;
+	optionList?: { value: string; label: string }[];
+	children?: ReactNode;
+};
+const FilterSelect = Select as unknown as FC<FilterSelectProps>;
 
 /** 快速筛选只放这三级；DEBUG/TRACE 在更多条件里，避免首屏堆字段。 */
 const QUICK_LEVELS: LogLevel[] = ['INFO', 'WARN', 'ERROR'];
@@ -110,7 +131,7 @@ export default function FilterBar({
 				})}
 			</div>
 			<div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-				<Select
+				<FilterSelect
 					multiple
 					maxTagCount={2}
 					placeholder="全部业务类型"
@@ -123,7 +144,7 @@ export default function FilterBar({
 							{CATEGORY_TEXT[category]}
 						</Select.Option>
 					))}
-				</Select>
+				</FilterSelect>
 				<Tooltip
 					content={
 						filters.instanceId || defaultInstance
@@ -131,7 +152,7 @@ export default function FilterBar({
 							: '关联筛选需要运行实例；页面还没读到任何事件，暂时无法按主播过滤。'
 					}
 				>
-					<Select
+					<FilterSelect
 						filter
 						showClear
 						disabled={!filters.instanceId && !defaultInstance}
@@ -152,7 +173,7 @@ export default function FilterBar({
 						optionList={streamers}
 					/>
 				</Tooltip>
-				<Select
+				<FilterSelect
 					style={{ minWidth: 140 }}
 					value={filters.range}
 					onChange={(value) => patch({ range: value as RangeKey })}
@@ -162,7 +183,7 @@ export default function FilterBar({
 							{RANGE_TEXT[key]}
 						</Select.Option>
 					))}
-				</Select>
+				</FilterSelect>
 				{filters.range === 'custom' ? (
 					<DatePicker
 						type="dateTimeRange"
@@ -231,7 +252,7 @@ export default function FilterBar({
 							</Checkbox>
 						))}
 					</CheckboxGroup>
-					<Select
+					<FilterSelect
 						style={{ minWidth: 170 }}
 						value={filters.captureKind}
 						onChange={(value) => patch({ captureKind: value as EventFilters['captureKind'] })}
@@ -239,7 +260,7 @@ export default function FilterBar({
 						<Select.Option value="native">仅原生事件</Select.Option>
 						<Select.Option value="legacy_bridge">仅桥接诊断</Select.Option>
 						<Select.Option value="all">原生 + 桥接</Select.Option>
-					</Select>
+					</FilterSelect>
 					<Input
 						showClear
 						placeholder="事件名，如 recording.segment_closed"
@@ -247,7 +268,7 @@ export default function FilterBar({
 						value={filters.eventName}
 						onChange={(value) => patch({ eventName: value })}
 					/>
-					<Select
+					<FilterSelect
 						showClear
 						placeholder="运行实例"
 						style={{ minWidth: 180 }}
@@ -255,7 +276,7 @@ export default function FilterBar({
 						onChange={(value) => patch({ instanceId: value ? String(value) : '' })}
 						optionList={instances.map((instance) => ({ value: instance, label: instance }))}
 					/>
-					<Select
+					<FilterSelect
 						showClear
 						placeholder="关联字段"
 						style={{ minWidth: 150 }}
