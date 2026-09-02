@@ -121,6 +121,11 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
     }
 }
 
+/// 把 packet 时间戳夹成单调递增。见 `remux_copy` 里的注释说明为什么是这个写法。
+const SETTS_MONOTONIC: &str = r"setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)";
+const SETTS_MONOTONIC_AFTER_ADTSTOASC: &str =
+    r"aac_adtstoasc,setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)";
+
 pub struct SystemFfmpeg;
 
 #[async_trait]
@@ -170,16 +175,35 @@ impl FfmpegRunner for SystemFfmpeg {
                 "-loglevel",
                 "warning",
                 "-y",
+                // `+genpts` 只是给缺 PTS 的源兜底，好让下面的 setts 不会拿到 NOPTS 去比大小；
+                // 源本来就有 PTS 时它没有任何作用（实测三种 fflags 组合产物一致）。
+                //
+                // 这里曾经还有 `+igndts`，它对本类故障结构上无效：语义是丢弃 DTS 改用 PTS
+                // 推导，而直播重连造成的回退是 PTS 和 DTS 一起倒退，所以这一级必然修不好，
+                // 每次都掉到第 3 级的整段 x264 重编码。
                 "-fflags",
-                "+genpts+igndts",
+                "+genpts",
                 "-i",
             ])
             .arg(src)
             .args([
                 "-c",
                 "copy",
+                // 时间戳是容器/packet 元数据，修它不该动 H.264/AAC payload。setts 把每个
+                // packet 的时间戳夹到「不小于上一个已输出的时间戳」，回退的那一段时间被压掉，
+                // 成本是一次顺序读写而不是一次视频编码。
+                //
+                // 两处细节，改之前先看这里：
+                // 1. 变量名是 PREV_OUTPTS / PREV_OUTDTS。没有 PREV_OUTTS，写错会直接
+                //    "Error initializing bitstream filter: setts"。
+                // 2. 分开写 pts=/dts= 而不是省事的 ts=：ts= 会把两者设成同一个值，有 B 帧
+                //    的源会被破坏。直播 FLV 通常没有 B 帧，但不值得赌。
+                "-bsf:v",
+                SETTS_MONOTONIC,
+                // 音频这条是链式：aac_adtstoasc 之后再跑 setts。不能写成第二个 -bsf:a，
+                // 那是覆盖而不是追加。
                 "-bsf:a",
-                "aac_adtstoasc",
+                SETTS_MONOTONIC_AFTER_ADTSTOASC,
                 "-movflags",
                 "+faststart",
                 "-avoid_negative_ts",
@@ -432,6 +456,75 @@ mod tests {
         );
         // 超时路径也要清掉半成品，不然每次重试都留一份垃圾。
         assert!(!repaired_temp_path(&path).exists());
+    }
+
+    /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
+    ///
+    /// remux copy 这一级必须能修好「PTS/DTS 一起回退」这类故障——它正是直播重连产生的
+    /// 形态，而在 setts 接进来之前这一级对它结构上无效，每次都掉到整段 x264 重编码。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_remux_repairs_backward_timestamps() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_remux_good.flv");
+        let bad = dir.join("tsr_remux_bad.flv");
+
+        let st = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=20:size=320x240:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=d=20",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&good)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(st.success());
+
+        // 从第 300 个 packet 起把时间戳整体倒退 2.6 秒，复现生产上那次回退的形态。
+        let inject = r"setts=ts=if(gt(N\,300)\,TS-2600\,TS)";
+        let st = tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-fflags", "+igndts", "-i"])
+            .arg(&good)
+            .args(["-c", "copy", "-bsf:v", inject, "-bsf:a", inject])
+            .arg(&bad)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(st.success());
+
+        let runner = SystemFfmpeg;
+        assert!(
+            runner.detect_anomaly(&bad).await.expect("detect"),
+            "注入回退后应检测到时间戳异常，否则这个测试什么也没验"
+        );
+
+        let fixed = repaired_temp_path(&bad);
+        runner.remux_copy(&bad, &fixed).await.expect("remux");
+        assert!(
+            !runner.detect_anomaly(&fixed).await.expect("detect fixed"),
+            "remux copy 应当已经修好，不该再需要重编码"
+        );
+
+        for path in [&good, &bad, &fixed] {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
 
     /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
