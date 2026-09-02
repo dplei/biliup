@@ -1,12 +1,12 @@
 # 04 · 重型 ffmpeg 共享全局 permit
 
 Status: needs-info
-Blocked by: 03
+Blocked by: 05
 优先级：P1，**条件性**
 
 ## 条件
 
-**只有 03 决定保留 x264 兜底时才做。** 如果 setts 全项通过、重编码被删掉，剩下的
+**只有 05 决定保留 x264 兜底时才做。** 03 已经判定 x264 不是大回退的正确守卫，所以这一步大概率会标 `wontfix`。 如果 setts 全项通过、重编码被删掉，剩下的
 remux/scan 都是 IO 密集的，CPU 争抢的前提消失，这一步直接标 wontfix。
 
 ## 为什么
