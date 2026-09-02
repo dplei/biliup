@@ -1,6 +1,6 @@
 # 02 · remux copy 接入 setts，去掉无效的 igndts
 
-Status: ready-for-agent
+Status: resolved
 优先级：P0
 
 ## 为什么
@@ -41,3 +41,26 @@ Status: ready-for-agent
 
 `max()` 的语义是把回退的那段时间**压掉**——回退点之后的内容整体相对提前。这对「重连
 造成时间重叠」是正确的，对其他成因不一定。03 会用真实片段确认，本步不下结论。
+
+## Answer
+
+已实现。
+
+- `-fflags` 从 `+genpts+igndts` 改为 `+genpts`：`igndts` 去掉（对本类故障结构上无效），
+  `genpts` **保留**——实测三种 fflags 组合在有 setts 时产物完全一致，但缺 PTS 的源会让
+  `max(PTS,...)` 拿到 NOPTS 去比大小，`genpts` 是那个边界的兜底，代价为零。
+- 表达式提成两个常量 `SETTS_MONOTONIC` / `SETTS_MONOTONIC_AFTER_ADTSTOASC`，用 Rust 原始
+  字符串写 `\,`——argv 直接交给 ffmpeg，中间没有 shell，所以不需要再转义一层。
+- 新增 `#[ignore]` 集成测试 `system_ffmpeg_remux_repairs_backward_timestamps`：造 20 秒素材
+  → 从第 300 个 packet 起注入 2.6 秒回退 → 断言 `detect_anomaly` 命中 → `remux_copy` →
+  断言复检干净。
+- `cargo test -p biliup-cli --lib`：345 passed；
+  `--lib system_ffmpeg -- --ignored`：4 passed。
+
+顺带一条 03 用得上的证据：测试素材的 x264 日志里有 `ref B L0/L1`，即**源确实带 B 帧**，
+而这个测试是过的。这从侧面确认了 `pts=`/`dts=` 分开写的必要性——用省事的 `ts=` 会把两者
+设成同一个值，这条测试就会挂。
+
+**仍未回答**：`max()` 压掉回退时间在真实片段上的音画同步表现，以及两条流回退量的差值
+量级。人工注入的样本证明不了这些，见 [03](./03-verify-and-drop-reencode.md)。x264 fallback
+按计划**保留未删**。
