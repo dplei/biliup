@@ -1627,34 +1627,23 @@ async fn pipeline_upload_videos(
                     }
                     continue;
                 }
-                // durable，按 outcome 处理本地文件。
-                match outcome {
-                    RepairOutcome::Unfixable => {
-                        // 保留本地原文件 + 告警，跳过自动删除。
-                        error!(file = ?original_path, "时间戳无法修复，保留本地文件待手动处理");
-                        notify_alert(
-                            ctx.config().cookie_health_webhook.as_deref(),
-                            "biliup 时间戳修复失败",
-                            &format!(
-                                "分段 {} 时间戳异常且无法自动修复，已保留本地文件，请手动处理（B 站「修改视频」重传）。",
-                                original_path.display()
-                            ),
-                        );
-                    }
-                    RepairOutcome::Repaired(fixed) => {
-                        // 先删修复临时件，再删原始 paths（原片+弹幕）。
-                        let _ = tokio::fs::remove_file(&fixed).await;
-                        paths.extend(recovery_source_paths);
-                        if let Err(e) = execute_postprocessor(paths, ctx).await {
-                            error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
-                        }
-                    }
-                    RepairOutcome::Clean => {
-                        paths.extend(recovery_source_paths);
-                        if let Err(e) = execute_postprocessor(paths, ctx).await {
-                            error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
-                        }
-                    }
+                // durable，按 outcome 处理本地文件。三种 outcome 的本地清理是同一套：
+                // 原片都已经上传成功（`Unfixable` 走的是原片直传），差别只在要不要告警。
+                if matches!(outcome, RepairOutcome::Unfixable) {
+                    error!(file = ?original_path, "时间戳无法安全修复，已按原片直传");
+                    notify_alert(
+                        ctx.config().cookie_health_webhook.as_deref(),
+                        "biliup 时间戳修复失败",
+                        &unfixable_alert("分段", &original_path),
+                    );
+                }
+                // 先删修复临时件，再删原始 paths（原片+弹幕）。
+                if let RepairOutcome::Repaired(fixed) = &outcome {
+                    let _ = tokio::fs::remove_file(fixed).await;
+                }
+                paths.extend(recovery_source_paths);
+                if let Err(e) = execute_postprocessor(paths, ctx).await {
+                    error!(file = ?original_path, "per-segment postprocessor failed: {:?}", e);
                 }
             }
             Err(e) => {
@@ -1676,6 +1665,18 @@ async fn pipeline_upload_videos(
     } else {
         Some(archive)
     })
+}
+
+/// `Unfixable` 的告警文案。
+///
+/// 本地不再留档：原片已经直传成功，需要重修时用上传凭证从 B 站 OS 库把原片取回来，
+/// 在性能更好的机器上处理，而不是让录制盘长期压着一份等人工。
+fn unfixable_alert(kind: &str, path: &Path) -> String {
+    format!(
+        "{kind} {} 时间戳异常且无法安全自动修复，已按原片直传（画面完整，时间轴异常）。\
+         本地文件按常规清理，需要重修时凭上传凭证从 B 站取回原片再处理。",
+        path.display()
+    )
 }
 
 /// 上传前时间戳检测/修复 + 上传。返回 (Video, RepairOutcome) 供调用方决定本地文件清理与告警。
@@ -2884,35 +2885,22 @@ async fn recover_due_missing_segments(
                         .await
                         .change_context(AppError::Unknown)?;
                 }
-                match outcome {
-                    RepairOutcome::Unfixable => {
-                        error!(row_id, file = ?path, "补传分段时间戳无法修复，保留本地文件待手动处理");
-                        notify_alert(
-                            ctx.config().cookie_health_webhook.as_deref(),
-                            "biliup 时间戳修复失败",
-                            &format!(
-                                "补传分段 {} 时间戳异常且无法自动修复，已保留本地文件，请手动处理。",
-                                path.display()
-                            ),
-                        );
-                    }
-                    RepairOutcome::Repaired(fixed) => {
-                        let _ = tokio::fs::remove_file(&fixed).await;
-                        if let Err(e) = execute_postprocessor(vec![path], ctx).await {
-                            error!(
-                                row_id,
-                                "postprocessor failed after missing segment recovery: {:?}", e
-                            );
-                        }
-                    }
-                    RepairOutcome::Clean => {
-                        if let Err(e) = execute_postprocessor(vec![path], ctx).await {
-                            error!(
-                                row_id,
-                                "postprocessor failed after missing segment recovery: {:?}", e
-                            );
-                        }
-                    }
+                if matches!(outcome, RepairOutcome::Unfixable) {
+                    error!(row_id, file = ?path, "补传分段时间戳无法安全修复，已按原片直传");
+                    notify_alert(
+                        ctx.config().cookie_health_webhook.as_deref(),
+                        "biliup 时间戳修复失败",
+                        &unfixable_alert("补传分段", &path),
+                    );
+                }
+                if let RepairOutcome::Repaired(fixed) = &outcome {
+                    let _ = tokio::fs::remove_file(fixed).await;
+                }
+                if let Err(e) = execute_postprocessor(vec![path], ctx).await {
+                    error!(
+                        row_id,
+                        "postprocessor failed after missing segment recovery: {:?}", e
+                    );
                 }
             }
             Err(e) => {
@@ -4007,10 +3995,7 @@ pub async fn run_claimed_recovery(
                 notify_alert(
                     effective_config.cookie_health_webhook.as_deref(),
                     "biliup 时间戳修复失败",
-                    &format!(
-                        "手动补投分段 {} 时间戳异常且无法自动修复，本地文件已保留，请手动处理。",
-                        path.display()
-                    ),
+                    &unfixable_alert("手动补投分段", &path),
                 );
             }
             RepairOutcome::Clean => {}
@@ -4108,9 +4093,9 @@ pub async fn run_claimed_recovery(
         }
 
         // 补传成功并入稿/入会话后，按主播 postprocessor 清理本地文件，对齐自动补传路径
-        // recover_due_missing_segments。Unfixable（时间戳无法修复）保留本地文件，留待手动处理。
-        if !matches!(outcome, RepairOutcome::Unfixable)
-            && let Some(processor) = &live_streamer.postprocessor
+        // recover_due_missing_segments。`Unfixable` 也一样清理：原片已经直传成功，需要重修
+        // 时凭上传凭证从 B 站取回，录制盘不再长期压一份等人工。
+        if let Some(processor) = &live_streamer.postprocessor
             && let Err(e) = process_video(&[path.as_path()], processor).await
         {
             error!(

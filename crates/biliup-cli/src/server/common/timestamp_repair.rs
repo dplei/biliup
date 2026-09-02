@@ -4,20 +4,34 @@ use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use error_stack::{ResultExt, bail};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-/// 重编码这一级自己的上限。
+/// 单次 DTS 回退的上限：超过它就不做时间戳重写，直接判 `Unfixable`。
 ///
-/// 它必须明显小于 attempt 层的 `preprocess_deadline`（10 min + 10 min/GiB）：一旦让那个
-/// watchdog 先到点，被杀掉的是整个 attempt——扫描结论和 remux 中间产物一起丢弃，恢复
-/// 调度再从第一步重来，而重编码的成本由内容时长×分辨率×帧率决定，重来一次必然再次超时。
-/// 生产上一个 40 分钟 1080p60 的分段就这样连烧了三轮各 30 分钟，一次可上传结果都没有。
+/// setts 的 `max()` 把回退的那段时间夹掉。**它的损害上限恰好等于回退量**——最坏情况下
+/// 回退点之后的内容追不上，被压进「回退量 × 1ms/packet」的窗口里，被毁的内容不会超过
+/// 回退的那一段。所以这条判据不需要知道文件总时长，一个绝对值就够；而总时长在这类文件上
+/// 恰恰是拿不到的：`format.duration` 在有回退的 FLV 上返回的是回退点，不是真实跨度。
 ///
-/// 超时不是「失败」，是「这一级修不好」：按 `Unfixable` 处理，原片照常上传、本地留档、
-/// 发告警，attempt 本身是成功的。在 2 vCPU 上十分钟做不完的软件编码，再给多久也做不完。
-const REENCODE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// 取 10 秒的依据：
+///
+/// - 回退量的物理含义是 CDN 回放的重叠时长，边缘节点缓冲区是秒级；生产实测 2.6 秒，
+///   本地构造的重叠样本 3.6 秒。10 秒留了约 4 倍余量。
+/// - 万一误放行，损害上限是 10 秒内容被压成快进，对 30–60 分钟的分段是 0.5% 以下。
+/// - 时间戳重置／回绕（见 #13）的回退量是分钟到小时级，被稳稳挡在外面。实测「重置到 0」
+///   的样本回退 12 秒，clamp 会把之后 10.6 秒的真实内容压进 0.35 秒，而复检看不出来——
+///   它只看单调性。没有这道闸门，那种输入会被当成修复成功上传。
+const MAX_REPAIRABLE_BACKWARD_MS: i64 = 10_000;
+
+/// 一次全片扫描的结论。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Detection {
+    Clean,
+    /// 命中时间戳异常。`max_backward_ms` 是解析到的最大单次回退量；`None` 表示一条数值
+    /// 都没解出来（ffmpeg 换了措辞），此时必须保守当作「超过上限」，绝不能当作 0。
+    Anomalous { max_backward_ms: Option<i64> },
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
@@ -28,12 +42,10 @@ pub enum RepairOutcome {
 
 #[async_trait]
 pub trait FfmpegRunner {
-    /// 全片扫描，返回 true 表示检测到时间戳异常（非单调/跳变）。
-    async fn detect_anomaly(&self, path: &Path) -> AppResult<bool>;
-    /// -c copy 重封装到 dst。
+    /// 全片扫描，报告是否有时间戳异常以及最大回退量。
+    async fn detect(&self, path: &Path) -> AppResult<Detection>;
+    /// `-c copy` + setts 重封装到 dst。
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()>;
-    /// 保画质重编码到 dst。
-    async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()>;
 }
 
 pub fn repaired_temp_path(src: &Path) -> PathBuf {
@@ -50,71 +62,62 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
     runner: &R,
 ) -> RepairOutcome {
     // 1) 检测。检测出错 → 保守降级直传原片。
-    match runner.detect_anomaly(path).await {
-        Ok(false) => return RepairOutcome::Clean,
-        Ok(true) => info!(file = ?path, "检测到时间戳异常，尝试修复"),
+    let backward = match runner.detect(path).await {
+        Ok(Detection::Clean) => return RepairOutcome::Clean,
+        Ok(Detection::Anomalous { max_backward_ms }) => max_backward_ms,
         Err(e) => {
             warn!(file = ?path, "时间戳检测失败，降级直传原片: {e:?}");
             return RepairOutcome::Clean;
+        }
+    };
+
+    // 2) 回退量闸门。见 `MAX_REPAIRABLE_BACKWARD_MS`：超限的输入被 setts 修过之后是单调的，
+    //    复检也认为修好了，但内容已经被压成帧风暴——所以必须在动手之前拦住。
+    match backward {
+        Some(ms) if ms <= MAX_REPAIRABLE_BACKWARD_MS => {
+            info!(file = ?path, backward_ms = ms, "检测到时间戳异常，尝试修复");
+        }
+        Some(ms) => {
+            error!(
+                file = ?path,
+                backward_ms = ms,
+                limit_ms = MAX_REPAIRABLE_BACKWARD_MS,
+                "时间戳回退超过可安全重写的上限，标记 Unfixable 并直传原片"
+            );
+            return RepairOutcome::Unfixable;
+        }
+        None => {
+            error!(
+                file = ?path,
+                "检测到时间戳异常但解析不出回退量，保守标记 Unfixable 并直传原片"
+            );
+            return RepairOutcome::Unfixable;
         }
     }
 
     let dst = repaired_temp_path(path);
 
-    // 2) copy 重封装修复。
+    // 3) copy + setts 重封装修复，一律以复检为准。
     match runner.remux_copy(path, &dst).await {
-        Ok(()) => match runner.detect_anomaly(&dst).await {
-            Ok(false) => {
-                info!(file = ?path, "remux copy 修复成功");
-                return RepairOutcome::Repaired(dst);
-            }
-            Ok(true) => warn!(file = ?path, "remux copy 后仍异常，尝试重编码"),
-            Err(e) => {
-                warn!(file = ?dst, "修复后检测失败，降级直传原片: {e:?}");
-                let _ = tokio::fs::remove_file(&dst).await;
-                return RepairOutcome::Clean;
-            }
-        },
-        Err(e) => {
-            warn!(file = ?path, "remux copy 进程失败: {e:?}");
-            let _ = tokio::fs::remove_file(&dst).await;
-        }
-    }
-
-    // 3) 重编码修复。
-    let reencode = match tokio::time::timeout(REENCODE_TIMEOUT, runner.reencode(path, &dst)).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            // future 被 drop 时 `kill_on_drop` 会收掉 ffmpeg。
-            error!(
-                file = ?path,
-                timeout_secs = REENCODE_TIMEOUT.as_secs(),
-                "重编码超过自身上限，标记 Unfixable 并直传原片"
-            );
-            let _ = tokio::fs::remove_file(&dst).await;
-            return RepairOutcome::Unfixable;
-        }
-    };
-    match reencode {
-        Ok(()) => match runner.detect_anomaly(&dst).await {
-            Ok(false) => {
-                warn!(file = ?path, "重编码修复成功");
+        Ok(()) => match runner.detect(&dst).await {
+            Ok(Detection::Clean) => {
+                info!(file = ?path, "时间戳重写修复成功");
                 RepairOutcome::Repaired(dst)
             }
-            Ok(true) => {
-                error!(file = ?path, "重编码后仍异常，标记 Unfixable");
+            Ok(Detection::Anomalous { .. }) => {
+                error!(file = ?path, "时间戳重写后仍异常，标记 Unfixable");
                 let _ = tokio::fs::remove_file(&dst).await;
                 RepairOutcome::Unfixable
             }
             Err(e) => {
-                warn!(file = ?dst, "重编码后检测失败，降级直传原片: {e:?}");
+                warn!(file = ?dst, "修复后检测失败，降级直传原片: {e:?}");
                 let _ = tokio::fs::remove_file(&dst).await;
                 RepairOutcome::Clean
             }
         },
         Err(e) => {
-            // 进程层面失败（如 ffmpeg 不可用）→ 不阻断上传，降级直传原片。
-            warn!(file = ?path, "重编码进程失败，降级直传原片: {e:?}");
+            // 进程层面失败（如 ffmpeg 不可用）是环境问题不是媒体问题，不阻断上传。
+            warn!(file = ?path, "时间戳重写进程失败，降级直传原片: {e:?}");
             let _ = tokio::fs::remove_file(&dst).await;
             RepairOutcome::Clean
         }
@@ -130,7 +133,7 @@ pub struct SystemFfmpeg;
 
 #[async_trait]
 impl FfmpegRunner for SystemFfmpeg {
-    async fn detect_anomaly(&self, path: &Path) -> AppResult<bool> {
+    async fn detect(&self, path: &Path) -> AppResult<Detection> {
         // 全片扫描：-c copy -f null，只读不重编码。
         // 使用 verbose 级别确保 "Invalid timestamp" / "Application provided invalid" 等
         // 低于 warning 的模式也能输出；-nostats 抑制进度行噪声。
@@ -155,7 +158,9 @@ impl FfmpegRunner for SystemFfmpeg {
         .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
         // 模式命中优先：即使退出码非零也应尝试修复。
         if scan.timestamp_anomaly {
-            return Ok(true);
+            return Ok(Detection::Anomalous {
+                max_backward_ms: scan.max_backward_ms,
+            });
         }
         // 无异常模式，但退出码非零 → 可能是路径错误等无关故障，向上报错。
         if !status.success() {
@@ -164,7 +169,7 @@ impl FfmpegRunner for SystemFfmpeg {
                 path.display()
             )));
         }
-        Ok(false)
+        Ok(Detection::Clean)
     }
 
     async fn remux_copy(&self, src: &Path, dst: &Path) -> AppResult<()> {
@@ -246,93 +251,42 @@ impl FfmpegRunner for SystemFfmpeg {
         Ok(())
     }
 
-    async fn reencode(&self, src: &Path, dst: &Path) -> AppResult<()> {
-        let mut command = Command::new("ffmpeg");
-        background(&mut command)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-i",
-            ])
-            .arg(src)
-            .args([
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-preset",
-                "veryfast",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart",
-                "-avoid_negative_ts",
-                "make_zero",
-            ])
-            .arg(dst)
-            .kill_on_drop(true);
-        let (status, _) = run_scanning_stderr(
-            &mut command,
-            ScanObserver {
-                stage: "timestamp_reencode",
-                original_file: Some(src),
-                tee_stderr: true,
-            },
-        )
-        .await
-        .change_context(AppError::Custom("failed to spawn ffmpeg (reencode)".into()))?;
-        if !status.success() {
-            let _ = tokio::fs::remove_file(dst).await;
-            bail!(AppError::Custom(format!(
-                "ffmpeg reencode failed (status {status:?}) for {}",
-                src.display()
-            )));
-        }
-        // Guard: ffmpeg may exit 0 but produce no output (e.g. codec unavailable).
-        match tokio::fs::metadata(dst).await {
-            Ok(m) if m.len() > 0 => {}
-            _ => {
-                let _ = tokio::fs::remove_file(dst).await;
-                bail!(AppError::Custom(format!(
-                    "ffmpeg reencode produced empty output for {}",
-                    src.display()
-                )));
-            }
-        }
-        Ok(())
-    }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// 脚本化 fake：按预设返回 detect 各阶段结果与 remux/reencode 成败。
+    /// 脚本化 fake：按预设依次返回 detect 结果，并决定 remux 成败。
     struct FakeFfmpeg {
-        // detect 调用依次返回的结果队列（true=异常）
-        detect_results: Mutex<std::collections::VecDeque<AppResult<bool>>>,
+        detect_results: Mutex<std::collections::VecDeque<AppResult<Detection>>>,
         remux_ok: bool,
-        reencode_ok: bool,
     }
 
     impl FakeFfmpeg {
-        fn new(detect: Vec<AppResult<bool>>, remux_ok: bool, reencode_ok: bool) -> Self {
+        fn new(detect: Vec<AppResult<Detection>>, remux_ok: bool) -> Self {
             Self {
                 detect_results: Mutex::new(detect.into_iter().collect()),
                 remux_ok,
-                reencode_ok,
             }
         }
     }
 
+    fn anomalous(backward_ms: i64) -> AppResult<Detection> {
+        Ok(Detection::Anomalous {
+            max_backward_ms: Some(backward_ms),
+        })
+    }
+
+    fn failed(message: &str) -> AppResult<Detection> {
+        Err(error_stack::Report::new(AppError::Custom(message.into())))
+    }
+
     #[async_trait]
     impl FfmpegRunner for FakeFfmpeg {
-        async fn detect_anomaly(&self, _path: &Path) -> AppResult<bool> {
+        async fn detect(&self, _path: &Path) -> AppResult<Detection> {
             self.detect_results
                 .lock()
                 .unwrap()
@@ -344,19 +298,9 @@ mod tests {
                 tokio::fs::write(dst, b"x").await.ok();
                 Ok(())
             } else {
-                Err(error_stack::Report::new(
-                    crate::server::errors::AppError::Custom("remux fail".into()),
-                ))
-            }
-        }
-        async fn reencode(&self, _src: &Path, dst: &Path) -> AppResult<()> {
-            if self.reencode_ok {
-                tokio::fs::write(dst, b"x").await.ok();
-                Ok(())
-            } else {
-                Err(error_stack::Report::new(
-                    crate::server::errors::AppError::Custom("reencode fail".into()),
-                ))
+                Err(error_stack::Report::new(AppError::Custom(
+                    "remux fail".into(),
+                )))
             }
         }
     }
@@ -368,37 +312,57 @@ mod tests {
     #[tokio::test]
     async fn clean_when_no_anomaly() {
         let path = p("clean_when_no_anomaly");
-        let f = FakeFfmpeg::new(vec![Ok(false)], true, true);
+        let f = FakeFfmpeg::new(vec![Ok(Detection::Clean)], true);
         assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 
     #[tokio::test]
-    async fn repaired_by_copy_when_remux_fixes() {
-        // detect: 原片异常 → copy 后干净
-        let path = p("repaired_by_copy_when_remux_fixes");
-        let f = FakeFfmpeg::new(vec![Ok(true), Ok(false)], true, true);
+    async fn repaired_when_small_backward_is_rewritten() {
+        let path = p("repaired_when_small_backward_is_rewritten");
+        let f = FakeFfmpeg::new(vec![anomalous(2_599), Ok(Detection::Clean)], true);
         assert_eq!(
             normalize_timestamps(&path, &f).await,
             RepairOutcome::Repaired(repaired_temp_path(&path))
         );
     }
 
+    /// 闸门：回退量超过上限时**一次 remux 都不能发起**。setts 会把这种输入压成帧风暴，
+    /// 而复检只看单调性、会认为修好了，于是坏片被当成成功产物上传、原片被删。
     #[tokio::test]
-    async fn repaired_by_reencode_when_copy_insufficient() {
-        // detect: 原异常 → copy 后仍异常 → reencode 后干净
-        let path = p("repaired_by_reencode_when_copy_insufficient");
-        let f = FakeFfmpeg::new(vec![Ok(true), Ok(true), Ok(false)], true, true);
+    async fn unfixable_when_backward_exceeds_limit() {
+        let path = p("unfixable_when_backward_exceeds_limit");
+        // detect 只排了一次结果：如果闸门放行去 remux，第二次 detect 会 panic。
+        let f = FakeFfmpeg::new(vec![anomalous(MAX_REPAIRABLE_BACKWARD_MS + 1)], true);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Unfixable
+        );
+        assert!(!repaired_temp_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn repaired_exactly_at_the_limit() {
+        let path = p("repaired_exactly_at_the_limit");
+        let f = FakeFfmpeg::new(
+            vec![anomalous(MAX_REPAIRABLE_BACKWARD_MS), Ok(Detection::Clean)],
+            true,
+        );
         assert_eq!(
             normalize_timestamps(&path, &f).await,
             RepairOutcome::Repaired(repaired_temp_path(&path))
         );
     }
 
+    /// 解析不出回退量不等于「没有回退」：ffmpeg 换了措辞时必须保守，不能盲目 clamp。
     #[tokio::test]
-    async fn unfixable_when_reencode_still_anomalous() {
-        // detect: 原异常 → copy 仍异常 → reencode 仍异常
-        let path = p("unfixable_when_reencode_still_anomalous");
-        let f = FakeFfmpeg::new(vec![Ok(true), Ok(true), Ok(true)], true, true);
+    async fn unfixable_when_backward_is_unparsed() {
+        let path = p("unfixable_when_backward_is_unparsed");
+        let f = FakeFfmpeg::new(
+            vec![Ok(Detection::Anomalous {
+                max_backward_ms: None,
+            })],
+            true,
+        );
         assert_eq!(
             normalize_timestamps(&path, &f).await,
             RepairOutcome::Unfixable
@@ -406,70 +370,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn degrades_to_clean_when_detect_errors() {
-        // 检测阶段进程出错 → 保守降级为 Clean（直传原片）
-        let path = p("degrades_to_clean_when_detect_errors");
-        let f = FakeFfmpeg::new(
-            vec![Err(error_stack::Report::new(
-                crate::server::errors::AppError::Custom("ffmpeg missing".into()),
-            ))],
-            true,
-            true,
+    async fn unfixable_when_rewrite_leaves_anomaly() {
+        let path = p("unfixable_when_rewrite_leaves_anomaly");
+        let f = FakeFfmpeg::new(vec![anomalous(1_000), anomalous(1_000)], true);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Unfixable
         );
+        assert!(!repaired_temp_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn degrades_to_clean_when_detect_errors() {
+        let path = p("degrades_to_clean_when_detect_errors");
+        let f = FakeFfmpeg::new(vec![failed("ffmpeg missing")], true);
         assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 
     #[tokio::test]
     async fn degrades_to_clean_when_remux_process_fails() {
-        // 原片异常但 remux 进程报错，且 reencode 也报错 → 无法修复进程层面 → 降级 Clean（不阻断上传）
+        // 进程层面失败是环境问题，不阻断上传。
         let path = p("degrades_to_clean_when_remux_process_fails");
-        let f = FakeFfmpeg::new(vec![Ok(true)], false, false);
+        let f = FakeFfmpeg::new(vec![anomalous(1_000)], false);
         assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
     }
 
-    /// reencode 永不返回的 fake，用来验证第 3 级自己的超时。
-    struct HangingReencode;
-
-    #[async_trait]
-    impl FfmpegRunner for HangingReencode {
-        async fn detect_anomaly(&self, _path: &Path) -> AppResult<bool> {
-            Ok(true)
-        }
-        async fn remux_copy(&self, _src: &Path, dst: &Path) -> AppResult<()> {
-            tokio::fs::write(dst, b"x").await.ok();
-            Ok(())
-        }
-        async fn reencode(&self, _src: &Path, _dst: &Path) -> AppResult<()> {
-            std::future::pending().await
-        }
-    }
-
-    /// 卡住的重编码必须由本模块自己收口成 `Unfixable`（原片直传 + 本地留档 + 告警），
-    /// 而不是拖到 attempt 层的 preprocess watchdog 把整个 attempt 杀掉。
-    /// `start_paused` 让 tokio 在运行时空闲时把时钟直接推到超时点，测试不真的等十分钟。
-    #[tokio::test(start_paused = true)]
-    async fn unfixable_when_reencode_exceeds_its_own_timeout() {
-        let path = p("unfixable_when_reencode_exceeds_its_own_timeout");
-        assert_eq!(
-            normalize_timestamps(&path, &HangingReencode).await,
-            RepairOutcome::Unfixable
-        );
-        // 超时路径也要清掉半成品，不然每次重试都留一份垃圾。
-        assert!(!repaired_temp_path(&path).exists());
-    }
-
-    /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
-    ///
-    /// remux copy 这一级必须能修好「PTS/DTS 一起回退」这类故障——它正是直播重连产生的
-    /// 形态，而在 setts 接进来之前这一级对它结构上无效，每次都掉到整段 x264 重编码。
-    #[tokio::test]
-    #[ignore]
-    async fn system_ffmpeg_remux_repairs_backward_timestamps() {
-        let dir = std::env::temp_dir();
-        let good = dir.join("tsr_remux_good.flv");
-        let bad = dir.join("tsr_remux_bad.flv");
-
-        let st = tokio::process::Command::new("ffmpeg")
+    /// 造一段 `seconds` 秒的测试素材。
+    async fn make_source(path: &Path, seconds: u32) {
+        let status = tokio::process::Command::new("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
@@ -478,11 +406,11 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=duration=20:size=320x240:rate=30",
+                &format!("testsrc=duration={seconds}:size=320x240:rate=30"),
                 "-f",
                 "lavfi",
                 "-i",
-                "sine=d=20",
+                &format!("sine=d={seconds}"),
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -491,70 +419,132 @@ mod tests {
                 "aac",
                 "-shortest",
             ])
-            .arg(&good)
+            .arg(path)
             .status()
             .await
             .expect("spawn ffmpeg");
-        assert!(st.success());
+        assert!(status.success());
+    }
 
-        // 从第 300 个 packet 起把时间戳整体倒退 2.6 秒，复现生产上那次回退的形态。
-        let inject = r"setts=ts=if(gt(N\,300)\,TS-2600\,TS)";
-        let st = tokio::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-fflags", "+igndts", "-i"])
-            .arg(&good)
-            .args(["-c", "copy", "-bsf:v", inject, "-bsf:a", inject])
-            .arg(&bad)
+    /// 把 `src` 的 `[0, head_secs)` 和「从 `resume_secs` 起的剩余部分」拼成一个文件。
+    ///
+    /// FLV 允许裸拼 tag 流，去掉第二份的 13 字节头即可——录制器遇到 CDN 回放时落盘的
+    /// 就是这个形状（`flv_writer` 按 tag 原样写回，不做任何偏移重基）。
+    /// `keep_timestamps` 决定第二段保留原时间戳（CDN 回放重叠）还是从零重来（时间戳重置）。
+    async fn splice(
+        src: &Path,
+        head_secs: &str,
+        resume_secs: &str,
+        keep_timestamps: bool,
+        dst: &Path,
+    ) {
+        // 中间件名字必须跟着 dst 走：两个集成测试是并发跑的，共用固定名字会互相覆盖。
+        let dir = dst.parent().unwrap();
+        let stem = dst.file_stem().unwrap().to_str().unwrap();
+        let head = dir.join(format!("{stem}.head.flv"));
+        let tail = dir.join(format!("{stem}.tail.flv"));
+        let status = tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(src)
+            .args(["-t", head_secs, "-c", "copy"])
+            .arg(&head)
             .status()
             .await
             .expect("spawn ffmpeg");
-        assert!(st.success());
+        assert!(status.success());
 
-        let runner = SystemFfmpeg;
+        let mut command = tokio::process::Command::new("ffmpeg");
+        command
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", resume_secs, "-i"])
+            .arg(src)
+            .args(["-c", "copy"]);
+        if keep_timestamps {
+            command.args(["-copyts", "-avoid_negative_ts", "disabled"]);
+        }
+        let status = command
+            .args(["-muxdelay", "0", "-muxpreload", "0"])
+            .arg(&tail)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+
+        let mut spliced = tokio::fs::read(&head).await.expect("read head");
+        let tail_bytes = tokio::fs::read(&tail).await.expect("read tail");
+        spliced.extend_from_slice(&tail_bytes[13..]);
+        tokio::fs::write(dst, spliced).await.expect("write splice");
+        let _ = tokio::fs::remove_file(&head).await;
+        let _ = tokio::fs::remove_file(&tail).await;
+    }
+
+    /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
+    ///
+    /// CDN 回放重叠：回退量远小于剩余内容，setts 能追上，必须修好。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_repairs_a_cdn_replay_overlap() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_replay_source.flv");
+        let replay = dir.join("tsr_replay.flv");
+        make_source(&good, 30).await;
+        splice(&good, "25", "21.4", true, &replay).await;
+
         assert!(
-            runner.detect_anomaly(&bad).await.expect("detect"),
-            "注入回退后应检测到时间戳异常，否则这个测试什么也没验"
+            matches!(
+                SystemFfmpeg.detect(&replay).await.expect("detect"),
+                Detection::Anomalous { .. }
+            ),
+            "拼出来的样本应当检测到时间戳异常，否则这个测试什么也没验"
         );
-
-        let fixed = repaired_temp_path(&bad);
-        runner.remux_copy(&bad, &fixed).await.expect("remux");
+        let outcome = normalize_timestamps(&replay, &SystemFfmpeg).await;
         assert!(
-            !runner.detect_anomaly(&fixed).await.expect("detect fixed"),
-            "remux copy 应当已经修好，不该再需要重编码"
+            matches!(outcome, RepairOutcome::Repaired(_)),
+            "回放重叠应当由 setts 修好，实际 {outcome:?}"
         );
-
-        for path in [&good, &bad, &fixed] {
+        if let RepairOutcome::Repaired(fixed) = outcome {
+            let _ = tokio::fs::remove_file(&fixed).await;
+        }
+        for path in [&good, &replay] {
             let _ = tokio::fs::remove_file(path).await;
         }
     }
 
-    /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
+    /// 时间戳重置（#13 的形态）：回退量吃掉了剩余内容，setts 会把后半段压成帧风暴，
+    /// 而复检看不出来。闸门必须在动手之前拦住它。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_refuses_to_rewrite_a_timestamp_reset() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_reset_source.flv");
+        let reset = dir.join("tsr_reset.flv");
+        make_source(&good, 30).await;
+        splice(&good, "25", "21.4", false, &reset).await;
+
+        let outcome = normalize_timestamps(&reset, &SystemFfmpeg).await;
+        assert_eq!(
+            outcome,
+            RepairOutcome::Unfixable,
+            "时间戳重置必须被闸门拦住，绝不能产出被压扁的修复件"
+        );
+        assert!(!repaired_temp_path(&reset).exists());
+        for path in [&good, &reset] {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    /// 干净文件走整条流程应得 Clean。
     #[tokio::test]
     #[ignore]
     async fn system_ffmpeg_detect_clean_on_generated_file() {
-        let dir = std::env::temp_dir();
-        let good = dir.join("tsr_good.mp4");
-        // 生成 2 秒正常测试视频
-        let st = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=2:size=320x240:rate=10",
-            ])
-            .arg(&good)
-            .status()
-            .await
-            .expect("spawn ffmpeg");
-        assert!(st.success());
-
-        let runner = SystemFfmpeg;
-        let anomaly = runner.detect_anomaly(&good).await.expect("detect");
-        assert!(!anomaly, "正常文件不应报时间戳异常");
-
-        // 正常文件走整条流程应得 Clean
+        let good = std::env::temp_dir().join("tsr_good.mp4");
+        make_source(&good, 2).await;
         assert_eq!(
-            normalize_timestamps(&good, &runner).await,
+            SystemFfmpeg.detect(&good).await.expect("detect"),
+            Detection::Clean,
+            "正常文件不应报时间戳异常"
+        );
+        assert_eq!(
+            normalize_timestamps(&good, &SystemFfmpeg).await,
             RepairOutcome::Clean
         );
         let _ = tokio::fs::remove_file(&good).await;
