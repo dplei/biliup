@@ -264,6 +264,7 @@ fn replace_index(part: usize, parts: usize) -> Result<usize, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn append(
     user_cookie: PathBuf,
     vid: Vid,
@@ -297,7 +298,7 @@ pub async fn append(
     )?;
     if let Some(part) = replace {
         let index = replace_index(part, studio.videos.len())
-            .map_err(|message| AppError::Custom(message))?;
+            .map_err(AppError::Custom)?;
         if video_path.len() != 1 {
             return Err(AppError::Custom(format!(
                 "替换一个分P只能给一个文件，收到 {} 个",
@@ -323,7 +324,7 @@ pub async fn append(
         Some(part) => {
             // 序号在上传前已经校验过，这里重算一次只是为了拿下标。
             let index = replace_index(part, studio.videos.len())
-                .map_err(|message| AppError::Custom(message))?;
+                .map_err(AppError::Custom)?;
             let replacement = uploaded_videos.remove(0);
             println!(
                 "替换第 {part} 个分P：{} -> {}",
