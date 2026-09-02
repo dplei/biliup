@@ -71,7 +71,8 @@
 | `crates/biliup-observability/src/sanitize.rs` | 对允许字段执行有界格式化、敏感线索与旧链完整 ResponseData 整值脱敏和控制字符处理，不序列化未知 Debug 对象。 | `clean`、`Bounded`、`debug` |
 | `crates/biliup-observability/src/diagnostic.rs` | 流式捕获外部诊断：跨 chunk 按有界行脱敏，保留首致命摘要、有限尾部和原始字节/截断信息。 | `DiagnosticCapture`、`Diagnostic` |
 | `crates/biliup-observability/src/runtime.rs` | 提供条数/字节双限队列、重要级别预留、可替换后台消费者、提交后高水位、独立健康与限时关闭；身份感知 factory 在 consumer 重建时复用同一运行身份。 | `Runtime`、`Runtime::start_with_identity`、`Emitter`、`Consumer`、`Health`、`Options` |
-| `crates/biliup-observability/src/sqlite.rs` | 独立 SQLite migrations 与每 Runtime 私有连接；共享库中的 writer 按运行身份注册、续租、关闭和一次性标记心跳中断，事件/附件仍走幂等事务，并保留只读游标查询、保留/WAL/低盘保护和一致性备份。Repository 在事件页的同一只读事务快照中聚合当前活跃/状态未知 writer；查询支持级别/分类的精确集合与 `newest_first` 倒序，集合大小在 `push_filters` 里统一设界，`count` 与分页受同一约束。 | `SqliteStore`、`StoreOptions`、`Repository`、`Query`、`Page`、`MIGRATOR`、`touch_writer`、`reap_stale_writers`、`push_filters` |
+| `crates/biliup-observability/src/sqlite.rs` | 独立 SQLite migrations 与每 Runtime 私有连接；同机多进程以 WAL 短事务共享库，writer 按运行身份注册、续租、关闭和一次性标记心跳中断，不支持网络盘或多机共享。事件/附件仍走幂等事务，并保留只读游标查询、保留/WAL/低盘保护和一致性备份。Repository 在事件页的同一只读事务快照中聚合当前活跃/状态未知 writer；查询支持级别/分类的精确集合与 `newest_first` 倒序，集合大小在 `push_filters` 里统一设界，`count` 与分页受同一约束。 | `SqliteStore`、`StoreOptions`、`Repository`、`Query`、`Page`、`MIGRATOR`、`touch_writer`、`reap_stale_writers`、`push_filters` |
+| `crates/biliup-observability/tests/storage.rs` | SQLite 存储与恢复验收：覆盖运行身份/租约、迁移、预算、保留、备份、只读查询，以及 TempDir 内真实 A/B 子进程共享写入和强杀后的未知窗口；子进程健康回执同时约束额外 dropped/storage failure。 | `separate_process_writer_does_not_disturb_resident_writer`、`force_kill_retains_commit_and_reports_unclean_window` |
 | `crates/biliup-observability/src/shadow.rs` | 把独立采集以可关闭旁路接进各入口：启动时读环境开关、同库重叠调用共享 run（全部 guard 退出后的顺序调用新建 run）、把 runtime worker 绑定到同一 dispatch，并保留嵌入宿主已有 subscriber。 | `Shadow`、`Config::from_env`、`block_on_inherited`、`health_snapshot`、`Inherited` |
 | `crates/biliup-observability/examples/shadow_acceptance.rs` | 新旧双路同时开启的合成负载入口：同时测量发射延迟、排空、两侧丢弃与新旧合计磁盘占用，并产出可导出的证据请求。 | `main`、`ticks` |
 | `crates/biliup-observability/examples/acceptance.rs` | 隔离的日志预算验收入口：以合成双路事件测量发射、调度延迟、排空、分页和磁盘占用，不启动业务服务。 | `main`、`workload` |
@@ -164,7 +165,7 @@
 ## 高信号关系
 
 - `crates/biliup-observability/src/capture.rs` → `crates/biliup-observability/src/runtime.rs`（`Emitter::submit`）：tracing 回调只交付已脱敏快照，SQL 不在采集线程执行。
-- `crates/biliup-observability/src/runtime.rs` → `crates/biliup-observability/src/sqlite.rs`（`Runtime::start_with_identity`、`Consumer::write`）：宿主以 factory 选择 SQLite 消费者并把稳定运行身份带入每次重连；只有事务提交后才更新健康高水位。
+- `crates/biliup-observability/src/runtime.rs` → `crates/biliup-observability/src/sqlite.rs`（`Runtime::start_with_identity`、`Consumer::write`）：宿主以 factory 把稳定运行身份带入每次 SQLite 重连；同机多个 Runtime 通过各自的运行行和 WAL 短事务共享库，只有事件事务提交后才更新健康高水位。
 - `crates/biliup-observability/examples/acceptance.rs` → `crates/biliup-observability/src/sqlite.rs`（`Repository::query`）：隔离负载完成后按游标检查持久化完整性与查询预算。
 - `crates/stream-gears/src/server.rs` → `crates/biliup-observability/src/shadow.rs`（`Shadow::from_env`、`shadow::block_on`）：wheel server 入口只组合一个 subscriber，旧 sink 走 per-layer 过滤，新采集默认关闭。
 - `crates/biliup-cli/src/main.rs` → `crates/biliup-observability/src/shadow.rs`（`Shadow::layer`）：Rust CLI 同样以旁路层接入，宿主已装 subscriber 时不 panic 也不替换。

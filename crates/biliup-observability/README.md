@@ -10,9 +10,11 @@ use std::time::Duration;
 
 let storage = StoreOptions::new("data/observability.sqlite3");
 // 父目录由宿主显式创建。instance_id 由宿主持久保存，不能每次启动随意换。
-let mut runtime = Runtime::start("local-instance", env!("CARGO_PKG_VERSION"),
+let mut runtime = Runtime::start_with_identity("local-instance", env!("CARGO_PKG_VERSION"),
     Options { enabled: true, ..Options::default() },
-    move || SqliteStore::open(storage.clone()))?;
+    move |instance_id, process_run_id| {
+        SqliteStore::open(storage.clone(), instance_id, process_run_id)
+    })?;
 let emitter = runtime.emitter();
 emitter.emit_with(Level::Info, || {
     let mut event = Draft::new("system.started", "独立任务开始");
@@ -52,8 +54,9 @@ assert!(health.closed && !health.shutdown_timed_out);
 - 单写连接WAL，busy 50ms，每批≤64、最多3次尝试。写入事务失败全部回滚，UID去重。仅COMMIT
   后更新committed_id，不提前广播。日志内部SQL关闭statement日志，也从Layer按target排除。
 - SQLite application_id 防止误迁移已有业务/外来库。日志迁移仅本crate migrations。
-  同一数据库只由一个Runtime所有者运行；不在网络盘多机共享。独立读取者可有多个。
-- 30/90/7天清理，每轮各类最多256条；每批及空闲约1秒维护。空间到75%提前删附件/低级事件，
+  同一台主机上的多个 Runtime/进程可通过 WAL 共享同一数据库，各自只维护自己的 writer run；
+  不支持网络盘或多台主机共享，也不支持新旧版本 writer 混跑。独立读取者可有多个。
+- 30/90/7天清理，每轮各类最多64条；每批及空闲约1秒维护。空间到75%提前删附件/低级事件，
   达硬逻辑上限拒写；删除不缩小主文件，页可复用。维护可能产生保留缺口；Page.gap是保守标志，
   pruned_through是删除过的最大ID，不表示低于它的记录全不存在。
 - 4KiB页、最多192MiB主库，WAL预留8MiB事务余量，超过水位先短checkpoint；读者pin住就拒写。
@@ -64,9 +67,10 @@ assert!(health.closed && !health.shutdown_timed_out);
 - 默认关闭deadline建议2秒。超时丢弃未取队列、返回in_flight未知并停止等线程；已开始的
   I/O可能稍后完成，不能把返回当作“所有后台工作都已终止”。自定义Consumer必须有界；
   它永久阻塞时线程最多持有一个受限批次，不阻塞调用者无限join。Drop不隐式等待。
-- 每次写入器打开记录dirty，正常close清理；强杀/异常重开通过unclean_shutdowns给出未知
-  丢失窗口，不伪造结束事件。已提交记录在进程强杀后可查；NORMAL synchronous不承诺掉电
-  零丢失。普通队列不是业务账本。
+- 每个 Runtime 按 `process_run_id` 注册、约 1 秒续租并只关闭自己的 writer run。心跳超过 60 秒
+  仍未正常关闭时，其他 writer 会把它首次计入 `unclean_shutdowns`；这只表示未确认正常关闭或
+  心跳中断的未知窗口，不是 OS 崩溃证明。已提交记录在进程强杀后可查；NORMAL synchronous
+  不承诺掉电零丢失，普通队列也不是业务账本。
 - 备份使用显式 `SqliteStore::backup`（VACUUM INTO），目标必须不存在、预留≥208MiB，
   不复制运行中的主文件。返回成功后备份可单独只读打开；超时/失败的目标属于不完整备份，
   保留排查但不得恢复。恢复时停止该库写入者，选择一个新的路径放已验证备份并重新启动；
