@@ -26,11 +26,55 @@ pub fn stderr_indicates_anomaly(stderr: &str) -> bool {
     PATTERNS.iter().any(|p| stderr.contains(p))
 }
 
+/// 从一行时间戳异常里解出「倒退了多少」。单位是该行数值自身的单位——`-f null` 的 copy
+/// 扫描下 muxer 用输入流的 timebase，直录 FLV 是 1/1000，即毫秒。
+///
+/// 认两种写法，都是 muxer 报的：
+///
+/// ```text
+/// ... non monotonically increasing dts to muxer in stream 0: 11990 >= 8356
+/// Non-monotonic DTS in output stream 0:1; previous: 11990, current: 8356;
+/// ```
+///
+/// 解不出来返回 `None`。调用方必须把 `None` 当作「回退量未知」保守处理，不能当作 0——
+/// 一个认不出的新写法不是「没有回退」。
+pub fn parse_backward_ms(line: &str) -> Option<i64> {
+    let (previous, current) = if let Some((head, tail)) = line.split_once(" >= ") {
+        // "... increasing dts to muxer in stream 0: 11990 >= 8356"
+        (head.rsplit(':').next()?, tail)
+    } else if let Some((_, tail)) = line.split_once("previous:") {
+        // "...; previous: 11990, current: 8356;"
+        let (previous, rest) = tail.split_once(',')?;
+        (previous, rest.split_once("current:")?.1)
+    } else {
+        return None;
+    };
+    let delta = leading_number(previous)? - leading_number(current)?;
+    (delta > 0).then_some(delta)
+}
+
+/// 取一段文本里的第一个整数，容忍前导空白和尾部的其它字符。
+fn leading_number(text: &str) -> Option<i64> {
+    let text = text.trim_start();
+    let negative = text.starts_with('-');
+    let digits: String = text
+        .trim_start_matches('-')
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let value: i64 = digits.parse().ok()?;
+    Some(if negative { -value } else { value })
+}
+
 pub struct StderrScan {
     /// stderr 的尾部窗口。
     pub tail: String,
     /// 扫描过程中是否命中过时间戳异常模式（覆盖全部输出，不止尾部窗口）。
     pub timestamp_anomaly: bool,
+    /// 命中的异常行里解出的最大单次回退量，`None` 表示一条都没解出来。
+    pub max_backward_ms: Option<i64>,
+    /// 命中的异常行数。
+    pub anomaly_lines: u64,
 }
 
 /// Native diagnostic metadata for one ffmpeg call.  The source file is optional because some
@@ -101,6 +145,8 @@ pub async fn run_scanning_stderr(
     let mut scan = StderrScan {
         tail: String::new(),
         timestamp_anomaly: false,
+        max_backward_ms: None,
+        anomaly_lines: 0,
     };
     loop {
         line.clear();
@@ -122,8 +168,13 @@ pub async fn run_scanning_stderr(
             let _ = legacy_stderr.write_all(&line).await;
         }
         let text = String::from_utf8_lossy(&line);
-        if !scan.timestamp_anomaly && stderr_indicates_anomaly(&text) {
+        if stderr_indicates_anomaly(&text) {
             scan.timestamp_anomaly = true;
+            scan.anomaly_lines += 1;
+            if let Some(backward) = parse_backward_ms(&text) {
+                scan.max_backward_ms =
+                    Some(scan.max_backward_ms.map_or(backward, |seen| seen.max(backward)));
+            }
         }
         scan.tail.push_str(&text);
         if scan.tail.len() > STDERR_TAIL_LIMIT * 2 {
@@ -158,6 +209,41 @@ fn trim_to_tail(buffer: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_muxer_form() {
+        assert_eq!(
+            parse_backward_ms(
+                "[null @ 0x1] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11990 >= 8356"
+            ),
+            Some(3634)
+        );
+    }
+
+    #[test]
+    fn parses_the_previous_current_form() {
+        assert_eq!(
+            parse_backward_ms("Non-monotonic DTS in output stream 0:1; previous: 11990, current: 8356; changing to 11991"),
+            Some(3635 - 1)
+        );
+    }
+
+    #[test]
+    fn parses_a_reset_to_zero() {
+        assert_eq!(
+            parse_backward_ms(
+                "[null @ 0x1] Application provided invalid, non monotonically increasing dts to muxer in stream 0: 24990 >= 0"
+            ),
+            Some(24990)
+        );
+    }
+
+    /// 认不出的行返回 None，调用方据此保守拒绝——绝不能退化成「回退量 0」。
+    #[test]
+    fn unknown_wording_yields_none() {
+        assert_eq!(parse_backward_ms("Invalid timestamp in stream 0"), None);
+        assert_eq!(parse_backward_ms(""), None);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

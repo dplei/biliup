@@ -1,6 +1,6 @@
 # 04 · 重型 ffmpeg 共享全局 permit
 
-Status: needs-info
+Status: wontfix
 Blocked by: 05
 优先级：P1，**条件性**
 
@@ -38,3 +38,11 @@ permit，于是两个 CPU 密集型 ffmpeg 能在 2 vCPU 上同时跑。
 
 - `cargo test -p biliup-cli` 全绿，尤其是那条依赖 `NORMALIZE_SLOTS` 的跨管道不变量测试。
 - 一个断言「两个重型任务不会同时进入临界区」的单测；别为此搭测试框架。
+
+## Answer — wontfix
+
+05 把整段 x264 重编码删掉了。预处理里剩下的时间戳工作只有 `-c copy` + setts 的一次顺序
+读写，是 IO 密集而不是 CPU 密集的，和 loudnorm 抢 2 vCPU 的前提不复存在。
+
+issue #25 里那组「响度标准化从 7 分 40 秒退化到 22 分 54 秒」的观测，成因是重编码占着
+CPU；成因消失，共享 permit 就是为一个不存在的问题加锁。真出现新的 CPU 争抢再开新票。

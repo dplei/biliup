@@ -85,31 +85,33 @@ setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)
 落点是**改现有 remux 那一步的几行**，不是新增一个流水线阶段：去掉无效的 `igndts`，
 加上 `setts`（`-bsf:a` 需要链式写成 `aac_adtstoasc,setts=...`）。
 
-**语义前提（03 已实测，结论比原本的担心更尖锐）**：`max()` 只在「回退量 ≪ 剩余内容
-时长」时正确。
+**语义前提（03/05 已实测并已加闸门）**：`max()` 只在「回退量 ≪ 剩余内容时长」时正确。
 
 - 生产的实际形态是 **CDN 回放重叠内容**，clamp 把重复段压掉正是正确语义：总时长不变、
   内容不丢、A/V **零漂移**，只在回退点留下约 0.1 秒的快进抖动。
 - 但**时间戳重置／回绕**（#13 的形态）下，clamp 会把回退点之后的全部真实内容压进几百
-  毫秒，而复检看不出来——它只看单调性。这条路径会静默上传坏片并删掉原片。
+  毫秒，而复检看不出来——它只看单调性。
 
-所以 setts 必须配一道产出合理性校验才能上生产，见 [`steps/05`](./steps/05-guard-against-collapsed-output.md)。
+闸门就建在这个前提上：`MAX_REPAIRABLE_BACKWARD_MS = 10_000`，超限或解析不出回退量一律
+`Unfixable`。判据不需要总时长，因为 **clamp 的损害上限恰好等于回退量**；这一点很关键，
+因为总时长在这类文件上根本拿不到（`format.duration` 返回的是回退点）。详见
+[`steps/05`](./steps/05-guard-against-collapsed-output.md)。
+
 两条流独立 clamp 不引入漂移（`max()` 一旦追上就完全透明），issue 里那个 25ms 差值无害。
 
-### 采纳：给重编码一个自带超时，超时按 `Unfixable` 降级
+### 最终采纳：整段 x264 重编码直接删除
 
-不需要新表、不需要 fingerprint 字段。问题的实质是「重编码超时」被表达成了「attempt 失败」，
-而它本该是「预处理修不好 → 降级直传原片 + 告警」——这个语义 `RepairOutcome::Unfixable`
-已经有了，`upload.rs` 里已经在保留本地文件并发 webhook 告警。
+01 先给它加了自带超时止血，05 把它整个删掉了。setts 按构造保证产物单调，闸门又挡住了
+它修不了的形态，第 2 级永远不会被触发——留着只是一条随时可能又烧 30 分钟 CPU 的死路。
 
-给 `reencode` 一个明显短于 `preprocess_deadline` 的内部超时即可：一次 attempt 必然得到
-确定结果，重复重跑自然消失。这一条与 setts 无耦合，可以先合，作为止血。
+`RepairOutcome::Unfixable` 的语义随之收敛为「修不了 → 原片直传 + 告警」，且**本地不留档**：
+原片已经上传成功，需要重修时凭上传凭证从 B 站 OS 库取回，在性能更好的机器上做
+（见 [`steps/06`](./steps/06-macos-side-repair.md)），录制盘不再长期压一份等人工。
 
-### 条件采纳：重型 ffmpeg 共享 permit
+### 不采纳：重型 ffmpeg 共享 permit
 
-把 `NORMALIZE_SLOTS` 提成公共 permit、时间戳修复也持有，改动约十行。但**优先级取决于
-上一条**：x264 从链路里消失后，剩下的 remux/scan 是 IO 密集的，CPU 争抢自己就没了。
-只有最终决定保留重编码兜底路径时才有必要。
+x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO 密集而不是 CPU 密集的，和 loudnorm
+抢 2 vCPU 的前提不复存在。见 [`steps/04`](./steps/04-shared-ffmpeg-permit.md)（wontfix）。
 
 ## 明确不做
 
@@ -137,11 +139,11 @@ setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)
 
 | # | 步骤 | 优先级 | 阻塞于 | 状态 |
 | --- | --- | --- | --- | --- |
-| 01 | [重编码自带超时，超时降级直传](./steps/01-reencode-internal-timeout.md) | P0 止血 | — | ✅ resolved |
+| 01 | [重编码自带超时，超时降级直传](./steps/01-reencode-internal-timeout.md) | P0 止血 | — | ✅ resolved（超时随 05 删除重编码一并移除） |
 | 02 | [remux 接入 setts，去掉 igndts](./steps/02-setts-in-remux.md) | P0 | — | ✅ resolved |
 | 03 | [验证 setts 语义，并决定 x264 去留](./steps/03-verify-and-drop-reencode.md) | P0 | 02 | ✅ resolved |
-| 05 | [守住「修复产物被压扁」的静默毁片路径](./steps/05-guard-against-collapsed-output.md) | **P0 阻塞发布** | 03 | ready-for-agent |
-| 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 05 | needs-info |
+| 05 | [回退量闸门，并删掉 x264](./steps/05-guard-against-collapsed-output.md) | P0 | 03 | ✅ resolved |
+| 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 05 | ⛔ wontfix |
+| 06 | [修不了的片子改到本机 macOS 重修](./steps/06-macos-side-repair.md) | P2 | 05 | needs-triage |
 
-> ⚠️ **05 落地之前不要发版**：02 引入的 setts 在时间戳回绕（#13 形态）下会静默产出坏片
-> 并删掉原片。03 的 Answer 有完整实测证据。
+发版路径已经打通：01–05 全部 resolved，06 不阻塞发布。归档要等 06 有结论。
