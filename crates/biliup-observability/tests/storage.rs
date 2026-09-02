@@ -181,6 +181,27 @@ fn multiple_expired_writers_and_self_renewal_are_deterministic() {
 }
 
 #[test]
+fn repository_reports_current_writer_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("health.sqlite");
+    let mut active = store(&path, "active");
+    let mut stale = store(&path, "stale");
+    let mut closed = store(&path, "closed");
+    closed.close().unwrap();
+    expire(&path, &["stale"]);
+
+    rt().block_on(async {
+        let repo = Repository::open(&path).await.unwrap();
+        let page = repo.query(&Query::default()).await.unwrap();
+        assert_eq!(page.active_writer_runs, 1);
+        assert_eq!(page.unknown_writer_runs, 1);
+        repo.close().await;
+    });
+    active.close().unwrap();
+    stale.close().unwrap();
+}
+
+#[test]
 fn writer_history_cleanup_keeps_recovered_stale_run() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cleanup.sqlite");

@@ -347,7 +347,13 @@ export default function LogEventsView({ preview = true }: { preview?: boolean })
 							) : null}
 							{feed.meta.uncleanShutdowns > 0 ? (
 								<Typography.Text type="warning" size="small">
-									事件库记录到 {feed.meta.uncleanShutdowns} 次非正常退出，那些时刻可能有事件没写完。
+									事件库曾检测到 {feed.meta.uncleanShutdowns}
+									 个未确认正常关闭或心跳中断的运行，相关时段可能有事件未写完。
+								</Typography.Text>
+							) : null}
+							{feed.meta.unknownWriterRuns > 0 ? (
+								<Typography.Text type="warning" size="small">
+									当前仍有 {feed.meta.unknownWriterRuns} 个状态未知的 writer。
 								</Typography.Text>
 							) : null}
 						</div>

@@ -90,9 +90,25 @@ async fn query_export_and_unavailable_states_are_distinguishable() {
     assert_eq!(disabled["coverage"], "none");
     assert!(disabled["error"].is_string());
     assert_eq!(disabled["events"].as_array().unwrap().len(), 0);
+    assert_eq!(disabled["unclean_shutdowns"], 0);
+    assert_eq!(disabled["active_writer_runs"], 0);
+    assert_eq!(disabled["unknown_writer_runs"], 0);
 
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("events.sqlite");
+    unsafe {
+        std::env::set_var("BILIUP_OBSERVABILITY", "1");
+        std::env::set_var(
+            "BILIUP_OBSERVABILITY_DB",
+            directory.path().join("missing.sqlite"),
+        );
+    }
+    let unavailable = body_json(call("/v1/log-events").await).await;
+    assert_eq!(unavailable["availability"], "unavailable");
+    assert_eq!(unavailable["unclean_shutdowns"], 0);
+    assert_eq!(unavailable["active_writer_runs"], 0);
+    assert_eq!(unavailable["unknown_writer_runs"], 0);
+
     write_events(&database);
     unsafe {
         std::env::set_var("BILIUP_OBSERVABILITY", "1");
@@ -106,6 +122,9 @@ async fn query_export_and_unavailable_states_are_distinguishable() {
     assert_eq!(listed["events"].as_array().unwrap().len(), 3);
     assert_eq!(listed["total"], 3);
     assert_eq!(listed["gap"], false);
+    assert_eq!(listed["unclean_shutdowns"], 0);
+    assert_eq!(listed["active_writer_runs"], 0);
+    assert_eq!(listed["unknown_writer_runs"], 0);
     assert!(
         listed["next_after_id"].is_null(),
         "the page reached the end"

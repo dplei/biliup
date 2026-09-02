@@ -513,6 +513,8 @@ pub struct Page {
     pub pruned_through: u64,
     pub gap: bool,
     pub unclean_shutdowns: u64,
+    pub active_writer_runs: u64,
+    pub unknown_writer_runs: u64,
 }
 #[derive(Clone)]
 pub struct Repository {
@@ -582,11 +584,13 @@ impl Repository {
             .map_err(db_error)?
             .set_progress_handler(1000, move || std::time::Instant::now() < deadline);
         let mut tx = conn.begin().await.map_err(db_error)?;
-        let meta =
-            sqlx::query("SELECT pruned_through,unclean_shutdowns FROM log_meta WHERE singleton=1")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db_error)?;
+        let lease_deadline = now_ms().saturating_sub(WRITER_LEASE_MS);
+        let meta = sqlx::query("SELECT pruned_through,unclean_shutdowns,(SELECT COUNT(*) FROM log_writer_run WHERE closed_at_ms IS NULL AND heartbeat_at_ms>?),(SELECT COUNT(*) FROM log_writer_run WHERE closed_at_ms IS NULL AND heartbeat_at_ms<=?) FROM log_meta WHERE singleton=1")
+            .bind(lease_deadline)
+            .bind(lease_deadline)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_error)?;
         let rows = sql.build().fetch_all(&mut *tx).await.map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         let pruned_through = meta.get::<i64, _>(0) as u64;
@@ -607,6 +611,8 @@ impl Repository {
             pruned_through,
             gap: query.after_id > 0 && query.after_id < pruned_through,
             unclean_shutdowns: meta.get::<i64, _>(1) as u64,
+            active_writer_runs: meta.get::<i64, _>(2) as u64,
+            unknown_writer_runs: meta.get::<i64, _>(3) as u64,
         })
     }
     /// How many rows the whole filtered range holds, independent of the page. Counting is bounded

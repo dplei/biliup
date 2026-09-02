@@ -70,6 +70,8 @@ export interface ListResponse {
 	pruned_through: number;
 	gap: boolean;
 	unclean_shutdowns: number;
+	active_writer_runs: number;
+	unknown_writer_runs: number;
 	health: HealthSnapshot;
 	error: string | null;
 }
