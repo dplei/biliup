@@ -1,6 +1,6 @@
 # 01 · 重编码自带超时，超时按降级处理而不是拖垮 attempt
 
-Status: ready-for-agent
+Status: resolved
 优先级：P0（止血，与 02 无耦合，可先合）
 
 ## 为什么
@@ -39,3 +39,21 @@ attempt 判失败，扫描结论和 remux 中间产物一起丢弃，恢复调�
 
 - 超时后临时件要清掉（现有失败分支已经在 `remove_file`，确认新路径也走到）。
 - 不要顺手改 `preprocess_deadline`。那是另一个问题，且 02/03 落地后 x264 大概率整个消失。
+
+## Answer
+
+已实现，选了「超时映射为 `Unfixable`」那一支。
+
+- `REENCODE_TIMEOUT = 10 min`，定义在 `timestamp_repair.rs` 顶部，注释写明它为什么必须
+  小于 attempt 层的 `preprocess_deadline`。取固定值而不是随文件大小变化的公式：R3 已经
+  说明字节数对像素重编码不是合适的代理变量，而在 2 vCPU 上十分钟做不完的软件编码，再给
+  多久也做不完。
+- 超时在 `normalize_timestamps` 里收口（不在 `SystemFfmpeg::reencode` 内），这样它对任何
+  `FfmpegRunner` 实现都成立，也才能用 fake 驱动测试。future 被 drop 时 `kill_on_drop`
+  收掉 ffmpeg，半成品临时件同路清掉。
+- 核对过下游语义：`upload.rs` 的 `upload_path` 在 `Unfixable` 时取标准化产物/原片照常
+  上传，落库后保留本地文件并发 webhook 告警，attempt 本身成功。正是想要的效果。
+- 新单测 `unfixable_when_reencode_exceeds_its_own_timeout`，用 `#[tokio::test(start_paused)]`
+  的虚拟时钟，跑完 0.01s。为此给 `biliup-cli` 的 dev-dependencies 加了
+  `tokio` 的 `test-util` feature——只影响测试构建。
+- `cargo test -p biliup-cli --lib timestamp_repair`：9 passed, 1 ignored。

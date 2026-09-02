@@ -4,8 +4,20 @@ use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
 use error_stack::{ResultExt, bail};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::{error, info, warn};
+
+/// 重编码这一级自己的上限。
+///
+/// 它必须明显小于 attempt 层的 `preprocess_deadline`（10 min + 10 min/GiB）：一旦让那个
+/// watchdog 先到点，被杀掉的是整个 attempt——扫描结论和 remux 中间产物一起丢弃，恢复
+/// 调度再从第一步重来，而重编码的成本由内容时长×分辨率×帧率决定，重来一次必然再次超时。
+/// 生产上一个 40 分钟 1080p60 的分段就这样连烧了三轮各 30 分钟，一次可上传结果都没有。
+///
+/// 超时不是「失败」，是「这一级修不好」：按 `Unfixable` 处理，原片照常上传、本地留档、
+/// 发告警，attempt 本身是成功的。在 2 vCPU 上十分钟做不完的软件编码，再给多久也做不完。
+const REENCODE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
@@ -70,7 +82,20 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
     }
 
     // 3) 重编码修复。
-    match runner.reencode(path, &dst).await {
+    let reencode = match tokio::time::timeout(REENCODE_TIMEOUT, runner.reencode(path, &dst)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // future 被 drop 时 `kill_on_drop` 会收掉 ffmpeg。
+            error!(
+                file = ?path,
+                timeout_secs = REENCODE_TIMEOUT.as_secs(),
+                "重编码超过自身上限，标记 Unfixable 并直传原片"
+            );
+            let _ = tokio::fs::remove_file(&dst).await;
+            return RepairOutcome::Unfixable;
+        }
+    };
+    match reencode {
         Ok(()) => match runner.detect_anomaly(&dst).await {
             Ok(false) => {
                 warn!(file = ?path, "重编码修复成功");
@@ -376,6 +401,37 @@ mod tests {
         let path = p("degrades_to_clean_when_remux_process_fails");
         let f = FakeFfmpeg::new(vec![Ok(true)], false, false);
         assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
+    }
+
+    /// reencode 永不返回的 fake，用来验证第 3 级自己的超时。
+    struct HangingReencode;
+
+    #[async_trait]
+    impl FfmpegRunner for HangingReencode {
+        async fn detect_anomaly(&self, _path: &Path) -> AppResult<bool> {
+            Ok(true)
+        }
+        async fn remux_copy(&self, _src: &Path, dst: &Path) -> AppResult<()> {
+            tokio::fs::write(dst, b"x").await.ok();
+            Ok(())
+        }
+        async fn reencode(&self, _src: &Path, _dst: &Path) -> AppResult<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// 卡住的重编码必须由本模块自己收口成 `Unfixable`（原片直传 + 本地留档 + 告警），
+    /// 而不是拖到 attempt 层的 preprocess watchdog 把整个 attempt 杀掉。
+    /// `start_paused` 让 tokio 在运行时空闲时把时钟直接推到超时点，测试不真的等十分钟。
+    #[tokio::test(start_paused = true)]
+    async fn unfixable_when_reencode_exceeds_its_own_timeout() {
+        let path = p("unfixable_when_reencode_exceeds_its_own_timeout");
+        assert_eq!(
+            normalize_timestamps(&path, &HangingReencode).await,
+            RepairOutcome::Unfixable
+        );
+        // 超时路径也要清掉半成品，不然每次重试都留一份垃圾。
+        assert!(!repaired_temp_path(&path).exists());
     }
 
     /// 需要本地 ffmpeg；手动运行：cargo test -p biliup-cli system_ffmpeg -- --ignored
