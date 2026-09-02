@@ -118,7 +118,7 @@
 | `crates/biliup-cli/src/server/api/recording_lease.rs` | 提供租约创建/替换/清除与幂等录制状态接口，并将输入校验、乐观并发和到期恢复守卫映射为 400/404/409。 | `put_recording_lease`、`delete_recording_lease`、`put_recording_state` |
 | `crates/biliup-cli/src/server/common/upload.rs` | 编排直播分段上传、会话级幂等投稿协调、缺失补传、attempt lease/watchdog（分阶段计时）、线路决策入口以及远端结果落库；分段成功会在事务外唤醒有 durable 投稿意图的父会话。 | `process_with_upload`、`reconcile_session_submission`、`spawn_session_submission`、`persist_segment`、`decide_upload_line`、`upload_enrolled_with_watchdog`、`claim_manual_recovery`、`run_claimed_recovery`、`stop_missing_segment_attempt`、`segment_part_title` |
 | `crates/biliup-cli/src/server/common/attempt_lease.rs` | 定义 attempt 的三个阶段与各自的收割判据，提供心跳/阶段落库和 `upload_attempt` 历史表的读写。 | `AttemptPhase`、`classify_stale_lease`、`preprocess_deadline`、`record_heartbeat`、`close_attempt_history` |
-| `crates/biliup-cli/src/server/common/upload_line_selection.rs` | 全仓唯一的上传线路决策：纯函数规划（配置/手动优先、冷却回退、auto 兜底）加一步 probe 解析。 | `plan_upload_line`、`resolve_planned_line`、`LinePlan`、`LineSource`、`cooling_lines` |
+| `crates/biliup-cli/src/server/common/upload_line_selection.rs` | 全仓唯一的上传线路决策：纯函数规划（配置/手动优先、冷却回退、auto 兜底）加一步 probe 解析。probe **优先只在 `RECOVERABLE_LINES` 里挑**——那是实测能凭原始 `X-Upos-Auth` 把源对象 GET 回来的线路，而「事后能取回原片」是删本地原片的前提；这些线路全不可用时放开限制重探并 warn，因为传不上去比失去取回通道更严重。显式配置的线路不受此影响。 | `plan_upload_line`、`resolve_planned_line`、`RECOVERABLE_LINES`、`LinePlan`、`LineSource`、`cooling_lines` |
 | `crates/biliup-cli/src/server/common/recovery_scheduler.rs` | 到期补传的主动扫描循环与后台执行：按会话串行、按 `segment_order` 顺序领取，接口只负责 claim。 | `start_due_recovery_scan`、`recover_due_segments`、`spawn_claimed_recovery` |
 | `crates/biliup-cli/src/server/common/submission_scheduler.rs` | 数据库驱动的待投稿会话启动/周期扫描：只选有持久投稿意图、无 claim 且已到期的会话，以有界并发唤醒统一协调器并分类记录结果。 | `start_submission_reconciliation_scan`、`scan_due_submissions`、`due_submission_session_ids` |
 | `crates/biliup-cli/src/server/common/segment_enrollment.rs` | 在有效媒体进入内存队列前原子登记 session/分段 identity，按场次键续接会话（时钟窗口只作缺键兜底），并在数据库不可用时写 fsync outbox。后台 importer 启动时全量分页重放持久恢复审计，运行中重试最近窗口；事件库按稳定 uid 去重。 | `enroll_validated_segment`、`find_or_create_session`、`import_outbox_once`、`spawn_outbox_importer` |
@@ -139,7 +139,7 @@
 
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
-| `crates/biliup/src/uploader/line.rs` | 定义 B 站上传线路、健康过滤后的自动探测、pre-upload 与服务端确认分块进度。`Parcel::recovery()` 取走本次 preupload 的 UPOS 取回描述符，必须在 `upload()` 消耗 parcel 之前调用。 | `Line`、`Probe::probe_excluding`、`Parcel::upload_with_observer`、`Parcel::recovery`、`UploadProgress` |
+| `crates/biliup/src/uploader/line.rs` | 定义 B 站上传线路、健康过滤后的自动探测、pre-upload 与服务端确认分块进度。`Parcel::recovery()` 取走本次 preupload 的 UPOS 取回描述符，必须在 `upload()` 消耗 parcel 之前调用。探测的候选过滤是纯函数 `retained_lines`：先剔冷却，再在 `allowed` 非空时限定子集。 | `Line`、`Probe::probe_excluding`、`Probe::probe_filtered_with_failures`、`retained_lines`、`Parcel::upload_with_observer`、`Parcel::recovery`、`UploadProgress` |
 | `crates/biliup/src/uploader/line/upos.rs` | upos 协议的分块 PUT 实现：并发窗口、单请求超时与有限重试（每次失败带线路/分块号/耗时的结构化日志），最后汇总分片完成上传。另定义 `UposRecovery`（endpoint + upos_uri + auth）——上传完还能把源对象取回来所需的一切，**只能在 preupload 时拿到**，事后重新申请是 403。**含凭证，不得进日志/事件/告警。** 取回是否可行按线路而定：实测 tx/bda2/alia 的 GET 逐字节一致，bldsa 只给 HEAD 200、GET 403。 | `Upos::upload_stream`、`CHUNK_REQUEST_TIMEOUT`、`Upos::get_ret_video_info`、`UposRecovery`、`UposRecovery::object_url`、`Bucket::recovery` |
 
 ## 仓库维护

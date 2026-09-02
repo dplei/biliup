@@ -185,6 +185,18 @@ impl Probe {
         client: &reqwest::Client,
         excluded: &[String],
     ) -> Result<(Line, Vec<ProbeFailure>)> {
+        Self::probe_filtered_with_failures(client, &[], excluded).await
+    }
+
+    /// 同上，但可以额外**限定**只在 `allowed` 这几条线路里选。`allowed` 为空表示不限定。
+    ///
+    /// 调用方用它表达「优先只考虑某个子集」——例如只在能把源对象 GET 回来的线路里挑，
+    /// 子集全军覆没时再退回不限定的探测。
+    pub async fn probe_filtered_with_failures(
+        client: &reqwest::Client,
+        allowed: &[String],
+        excluded: &[String],
+    ) -> Result<(Line, Vec<ProbeFailure>)> {
         let res: Self = client
             .get("https://member.bilibili.com/preupload?r=probe")
             .timeout(PROBE_INDEX_TIMEOUT)
@@ -193,11 +205,7 @@ impl Probe {
             .json()
             .await?;
 
-        let lines: Vec<_> = res
-            .lines
-            .into_iter()
-            .filter(|line| !excluded.iter().any(|key| key == line.key()))
-            .collect();
+        let lines = retained_lines(res.lines, allowed, excluded);
         let total_lines = lines.len();
         let probe = res.probe;
         let client = client.clone();
@@ -374,12 +382,65 @@ fn parse_rate_limit(bytes: &[u8]) -> Option<crate::error::Kind> {
     Some(RateLimit { code, message })
 }
 
+/// 探测前的候选过滤：先剔除 `excluded`，再在 `allowed` 非空时只保留其中的线路。
+fn retained_lines(lines: Vec<Line>, allowed: &[String], excluded: &[String]) -> Vec<Line> {
+    lines
+        .into_iter()
+        .filter(|line| !excluded.iter().any(|key| key == line.key()))
+        .filter(|line| allowed.is_empty() || allowed.iter().any(|key| key == line.key()))
+        .collect()
+}
+
 impl Default for Line {
     fn default() -> Self {
         Line {
             cost: u128::MAX,
             ..bldsa()
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_filter_tests {
+    use super::*;
+
+    fn keys(lines: &[Line]) -> Vec<&str> {
+        lines.iter().map(Line::key).collect()
+    }
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_allowed_means_no_restriction() {
+        let lines = vec![bldsa(), bda2(), tx()];
+        assert_eq!(keys(&retained_lines(lines, &[], &[])), ["bldsa", "bda2", "tx"]);
+    }
+
+    #[test]
+    fn allowed_keeps_only_the_listed_lines() {
+        let lines = vec![bldsa(), bda2(), tx(), alia()];
+        assert_eq!(
+            keys(&retained_lines(lines, &owned(&["bda2", "tx"]), &[])),
+            ["bda2", "tx"]
+        );
+    }
+
+    /// 冷却优先于白名单：一条既在白名单又在冷却里的线路必须被剔除。
+    #[test]
+    fn excluded_wins_over_allowed() {
+        let lines = vec![bda2(), tx()];
+        assert_eq!(
+            keys(&retained_lines(lines, &owned(&["bda2", "tx"]), &owned(&["bda2"]))),
+            ["tx"]
+        );
+    }
+
+    #[test]
+    fn an_allow_list_matching_nothing_yields_no_candidate() {
+        let lines = vec![bldsa()];
+        assert!(retained_lines(lines, &owned(&["bda2"]), &[]).is_empty());
     }
 }
 
