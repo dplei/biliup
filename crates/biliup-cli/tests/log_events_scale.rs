@@ -37,14 +37,16 @@ async fn queries_stay_inside_budget_while_the_writer_is_running() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("events.sqlite");
     let options = StoreOptions::new(&database);
-    let mut runtime = Runtime::start(
+    let mut runtime = Runtime::start_with_identity(
         "scale-test",
         "test",
         Options {
             enabled: true,
             ..Options::default()
         },
-        move || SqliteStore::open(options.clone()),
+        move |instance_id, process_run_id| {
+            SqliteStore::open(options.clone(), instance_id, process_run_id)
+        },
     )
     .unwrap();
     let emitter = runtime.emitter();

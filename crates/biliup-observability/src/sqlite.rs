@@ -2,7 +2,7 @@
 use crate::CaptureKind;
 use crate::{Commit, Consumer, Event, EventData, Level, StorageError, now_ms};
 use sqlx::{
-    Connection, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
+    Connection, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
@@ -12,6 +12,7 @@ use std::{
 
 const MIB: u64 = 1024 * 1024;
 const DAY: i64 = 86_400_000;
+const WRITER_LEASE_MS: i64 = 60_000;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone, Debug)]
@@ -84,11 +85,30 @@ pub struct SqliteStore {
     runtime: tokio::runtime::Runtime,
     connection: SqliteConnection,
     options: StoreOptions,
+    writer: Writer,
+}
+#[derive(Debug)]
+struct Writer {
+    instance_id: String,
+    process_run_id: String,
 }
 impl SqliteStore {
     /// Blocking, intended only inside Runtime's factory or an isolated maintenance process.
-    pub fn open(options: StoreOptions) -> Result<Self, StorageError> {
+    pub fn open(
+        options: StoreOptions,
+        instance_id: &str,
+        process_run_id: &str,
+    ) -> Result<Self, StorageError> {
         options.validate()?;
+        if !crate::sanitize::identifier(instance_id, 128)
+            || !crate::sanitize::identifier(process_run_id, 128)
+        {
+            return Err(StorageError::new("invalid_identity"));
+        }
+        let writer = Writer {
+            instance_id: instance_id.into(),
+            process_run_id: process_run_id.into(),
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -112,20 +132,24 @@ impl SqliteStore {
             storage_gate(&mut conn, &options).await?;
             sqlx::query("PRAGMA application_id=1112490579").execute(&mut conn).await.map_err(db_error)?;
             MIGRATOR.run(&mut conn).await.map_err(|_| StorageError::new("migration_failed"))?;
-            sqlx::query("UPDATE log_meta SET unclean_shutdowns=unclean_shutdowns+dirty, dirty=1 WHERE singleton=1")
-                .execute(&mut conn).await.map_err(db_error)?;
+            maintain(&mut conn, &options, &writer, now_ms()).await?;
             Ok::<_, StorageError>(conn)
         })?;
         Ok(Self {
             runtime,
             connection,
             options,
+            writer,
         })
     }
     /// Bounded maintenance can also be scheduled by the host when the writer is idle.
     pub fn maintain(&mut self) -> Result<(), StorageError> {
-        self.runtime
-            .block_on(maintain(&mut self.connection, &self.options, now_ms()))
+        self.runtime.block_on(maintain(
+            &mut self.connection,
+            &self.options,
+            &self.writer,
+            now_ms(),
+        ))
     }
     /// VACUUM INTO is a consistent SQLite snapshot including committed WAL contents. The destination
     /// must not exist; backups are explicit, not an automatic side effect of event capture.
@@ -164,10 +188,11 @@ impl Consumer for SqliteStore {
         }
         let options = &self.options;
         self.runtime.block_on(async {
-            maintain(&mut self.connection, options, now_ms()).await?;
+            maintain(&mut self.connection, options, &self.writer, now_ms()).await?;
             // Maintenance itself can append WAL frames, so recheck before the event transaction.
             storage_gate(&mut self.connection, options).await?;
             let mut tx = self.connection.begin().await.map_err(db_error)?;
+            touch_writer(&mut tx, &self.writer, now_ms()).await?;
             let meta = sqlx::query("SELECT event_bytes, diagnostic_bytes, event_count FROM log_meta WHERE singleton=1")
                 .fetch_one(&mut *tx).await.map_err(db_error)?;
             let mut event_bytes = meta.get::<i64,_>(0) as u64;
@@ -218,10 +243,16 @@ impl Consumer for SqliteStore {
     fn close(&mut self) -> Result<(), StorageError> {
         self.runtime.block_on(async {
             storage_gate(&mut self.connection, &self.options).await?;
-            sqlx::query("UPDATE log_meta SET dirty=0 WHERE singleton=1")
+            let closed = sqlx::query("UPDATE log_writer_run SET heartbeat_at_ms=MAX(heartbeat_at_ms,?), closed_at_ms=MAX(started_at_ms,?) WHERE process_run_id=? AND closed_at_ms IS NULL")
+                .bind(now_ms())
+                .bind(now_ms())
+                .bind(&self.writer.process_run_id)
                 .execute(&mut self.connection)
                 .await
                 .map_err(db_error)?;
+            if closed.rows_affected() != 1 {
+                return Err(StorageError::new("writer_run_closed"));
+            }
             sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                 .execute(&mut self.connection)
                 .await
@@ -259,10 +290,15 @@ async fn storage_gate(
 async fn maintain(
     conn: &mut SqliteConnection,
     options: &StoreOptions,
+    writer: &Writer,
     now: i64,
 ) -> Result<(), StorageError> {
     storage_gate(conn, options).await?;
     let mut tx = conn.begin().await.map_err(db_error)?;
+    touch_writer(&mut tx, writer, now).await?;
+    reap_stale_writers(&mut tx, writer, now).await?;
+    sqlx::query("DELETE FROM log_writer_run WHERE process_run_id IN (SELECT process_run_id FROM log_writer_run WHERE (closed_at_ms IS NOT NULL AND closed_at_ms < ?) OR (closed_at_ms IS NULL AND stale_detected_at_ms IS NOT NULL AND heartbeat_at_ms < ?) ORDER BY COALESCE(closed_at_ms,heartbeat_at_ms) LIMIT 64)")
+        .bind(now-90*DAY).bind(now-90*DAY).execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("DELETE FROM log_diagnostic WHERE event_uid IN (SELECT event_uid FROM log_diagnostic WHERE created_at_ms < ? ORDER BY created_at_ms LIMIT 64)")
         .bind(now-7*DAY).execute(&mut *tx).await.map_err(db_error)?;
     sqlx::query("DELETE FROM log_event WHERE id IN (SELECT id FROM log_event WHERE (level < 3 AND occurred_at_ms < ?) OR occurred_at_ms < ? ORDER BY id LIMIT 64)")
@@ -285,6 +321,48 @@ async fn maintain(
             .execute(&mut *tx).await.map_err(db_error)?;
     }
     tx.commit().await.map_err(db_error)?;
+    Ok(())
+}
+
+async fn touch_writer(
+    tx: &mut Transaction<'_, Sqlite>,
+    writer: &Writer,
+    now: i64,
+) -> Result<(), StorageError> {
+    let touched = sqlx::query("INSERT INTO log_writer_run(process_run_id,instance_id,started_at_ms,heartbeat_at_ms) VALUES(?,?,?,?) ON CONFLICT(process_run_id) DO UPDATE SET heartbeat_at_ms=MAX(log_writer_run.heartbeat_at_ms,excluded.heartbeat_at_ms) WHERE log_writer_run.closed_at_ms IS NULL AND log_writer_run.instance_id=excluded.instance_id")
+        .bind(&writer.process_run_id)
+        .bind(&writer.instance_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
+    if touched.rows_affected() != 1 {
+        return Err(StorageError::new("writer_run_closed"));
+    }
+    Ok(())
+}
+
+async fn reap_stale_writers(
+    tx: &mut Transaction<'_, Sqlite>,
+    writer: &Writer,
+    now: i64,
+) -> Result<(), StorageError> {
+    let reaped = sqlx::query("UPDATE log_writer_run SET stale_detected_at_ms=? WHERE process_run_id<>? AND closed_at_ms IS NULL AND heartbeat_at_ms<=? AND stale_detected_at_ms IS NULL")
+        .bind(now)
+        .bind(&writer.process_run_id)
+        .bind(now.saturating_sub(WRITER_LEASE_MS))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+    if reaped > 0 {
+        sqlx::query("UPDATE log_meta SET unclean_shutdowns=unclean_shutdowns+? WHERE singleton=1")
+            .bind(reaped as i64)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -586,7 +664,7 @@ mod tests {
     fn read_vm_deadline_releases_connection_for_next_query() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.sqlite");
-        let mut store = SqliteStore::open(StoreOptions::new(&path)).unwrap();
+        let mut store = SqliteStore::open(StoreOptions::new(&path), "test", "read-vm").unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

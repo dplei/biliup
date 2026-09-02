@@ -299,6 +299,17 @@ impl Runtime {
         options: Options,
         mut factory: impl FnMut() -> Result<C, StorageError> + Send + 'static,
     ) -> Result<Self, StorageError> {
+        Self::start_with_identity(instance, version, options, move |_, _| factory())
+    }
+
+    /// Like [`Runtime::start`], but gives a reconnecting consumer factory this Runtime's stable
+    /// `(instance_id, process_run_id)` pair.
+    pub fn start_with_identity<C: Consumer>(
+        instance: &str,
+        version: &str,
+        options: Options,
+        mut factory: impl FnMut(&str, &str) -> Result<C, StorageError> + Send + 'static,
+    ) -> Result<Self, StorageError> {
         options.validate()?;
         if !sanitize::identifier(instance, 128) || !sanitize::identifier(version, 64) {
             return Err(StorageError::new("invalid_identity"));
@@ -391,10 +402,12 @@ fn discard_queue(q: &mut Queue) {
 }
 fn worker_loop<C: Consumer>(
     shared: &Shared,
-    factory: &mut impl FnMut() -> Result<C, StorageError>,
+    factory: &mut impl FnMut(&str, &str) -> Result<C, StorageError>,
 ) {
     // Initialization/migrations happen even before the first event, off the caller's thread.
-    let mut consumer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut *factory)) {
+    let mut consumer = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        factory(&shared.instance, &shared.run)
+    })) {
         Ok(Ok(c)) => {
             shared.lock().health.state = "healthy".into();
             Some(c)
@@ -474,7 +487,7 @@ fn worker_loop<C: Consumer>(
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if consumer.is_none() {
-                    consumer = Some(factory()?);
+                    consumer = Some(factory(&shared.instance, &shared.run)?);
                 }
                 consumer.as_mut().unwrap().write(&batch)
             }))

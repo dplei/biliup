@@ -122,7 +122,7 @@ impl Shadow {
             return Err("too_many_capture_databases");
         }
         let options = StoreOptions::new(&key);
-        let runtime = Runtime::start(
+        let runtime = Runtime::start_with_identity(
             &config.instance,
             version,
             Options {
@@ -131,7 +131,9 @@ impl Shadow {
                 min_level: config.level,
                 ..Options::default()
             },
-            move || SqliteStore::open(options.clone()),
+            move |instance_id, process_run_id| {
+                SqliteStore::open(options.clone(), instance_id, process_run_id)
+            },
         )
         .map_err(|e| e.code)?;
         let shared = Arc::new(Shared {
@@ -204,8 +206,14 @@ pub fn health_snapshot() -> serde_json::Value {
 /// from a business callback: overlapping embedded calls may use different databases.
 pub fn current_emitter() -> Option<Emitter> {
     tracing::dispatcher::get_default(|dispatch| {
-        dispatch.downcast_ref::<CaptureLayer>().map(CaptureLayer::emitter)
-            .or_else(|| dispatch.downcast_ref::<Inherited>().map(|s| s.emitter.clone()))
+        dispatch
+            .downcast_ref::<CaptureLayer>()
+            .map(CaptureLayer::emitter)
+            .or_else(|| {
+                dispatch
+                    .downcast_ref::<Inherited>()
+                    .map(|s| s.emitter.clone())
+            })
     })
 }
 
