@@ -37,6 +37,14 @@ pub struct UploadProgress {
 }
 
 impl Parcel {
+    /// 本次 preupload 拿到的取回描述符。**必须在上传前后取走并持久化**：`auth` 事后无法
+    /// 重新申请，见 [`UposRecovery`](upos::UposRecovery)。
+    pub fn recovery(&self) -> upos::UposRecovery {
+        match &self.line {
+            Bucket::Upos(bucket) => bucket.recovery(),
+        }
+    }
+
     pub async fn upload<F, S, B>(
         self,
         client: StatelessClient,

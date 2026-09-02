@@ -426,6 +426,9 @@ async fn enqueue_segment(
         created_at: now,
         updated_at: now,
         normalized_file_path: None,
+        // 取回描述符只有真正跑过 preupload 才有，登记入队这一步拿不到。
+        upos_recovery_json: None,
+        upos_recovery_at: None,
         lifecycle_version: 1,
         // Legacy v1 rows predate the stable identity and must not be given a fabricated one.
         segment_id: None,
@@ -559,6 +562,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             normalized_file_path: None,
+            upos_recovery_json: None,
+            upos_recovery_at: None,
             lifecycle_version: 1,
             video_json: None,
             total_bytes: None,

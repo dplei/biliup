@@ -1960,6 +1960,15 @@ async fn upload_single_file(
     let uploader = match line.pre_upload(bilibili, video_file).await {
         Ok(uploader) => {
             upload_rate_gate::record_success(*rate_gate, pool).await;
+            // 取回描述符只在这一刻存在。序列化失败不阻断上传：丢的是灾后兜底，不是本次投稿。
+            if let Some(tx) = &activity_tx {
+                match serde_json::to_string(&uploader.recovery()) {
+                    Ok(descriptor) => {
+                        let _ = tx.send(UploadActivity::UposRecovery(descriptor));
+                    }
+                    Err(error) => warn!(?error, "序列化 UPOS 取回描述符失败"),
+                }
+            }
             uploader
         }
         Err(Kind::RateLimit { code: 601, message }) => {
@@ -2204,6 +2213,49 @@ enum UploadActivity {
     Progress(UploadProgress),
     /// 原片刚被标准化产物就地替换。收到即落标记，让崩溃窗口只有一次 rename 加一条 UPDATE。
     NormalizedInPlace,
+    /// preupload 刚拿到 UPOS 取回描述符（已序列化的 JSON）。走 activity 通道是因为拿到它的
+    /// `upload_single_file` 手上没有 `missing_id`，而 watchdog 循环两样都有。
+    /// **载荷含凭证，处理它的地方一律不许打日志。**
+    UposRecovery(String),
+}
+
+/// UPOS 取回描述符的保留期。
+///
+/// 站内异步转码的结论通常几小时内就有，主人的处理节奏是「问题出现后两日内解决」。
+/// 七天覆盖一个周末加余量；B 站那边的凭证多半更早就失效了，这里只负责不把死令牌留在库里。
+const UPOS_RECOVERY_TTL: chrono::Duration = chrono::Duration::days(7);
+
+/// 落下本次 preupload 的取回描述符，顺带把过期的清成 NULL。
+///
+/// 失败只记一条不带载荷的 warn：取回通道是灾后兜底，不该反过来把上传弄失败。
+///
+/// ponytail: 过期清理挂在写入路径上，没有独立的定时任务——新描述符出现的频率天然不低于
+/// 旧描述符过期的频率。真到了「长期不上传但要求库里干净」的场景再加周期任务。
+async fn record_upos_recovery(pool: &ConnectionPool, missing_id: i64, descriptor: &str) {
+    let now = chrono::Utc::now();
+    if let Err(error) = sqlx::query(
+        "UPDATE upload_missing_segment SET upos_recovery_json = ?1, upos_recovery_at = ?2 \
+         WHERE id = ?3",
+    )
+    .bind(descriptor)
+    .bind(now)
+    .bind(missing_id)
+    .execute(pool)
+    .await
+    {
+        // 只说失败，不说内容。
+        warn!(missing_id, ?error, "写入 UPOS 取回描述符失败");
+    }
+    if let Err(error) = sqlx::query(
+        "UPDATE upload_missing_segment SET upos_recovery_json = NULL, upos_recovery_at = NULL \
+         WHERE upos_recovery_at IS NOT NULL AND upos_recovery_at < ?1",
+    )
+    .bind(now - UPOS_RECOVERY_TTL)
+    .execute(pool)
+    .await
+    {
+        warn!(?error, "清理过期 UPOS 取回描述符失败");
+    }
 }
 
 /// 记下「原片已被标准化产物覆盖」，让这段的补传直接传它而不是再编码一遍。
@@ -2510,6 +2562,9 @@ async fn upload_enrolled_with_watchdog(
             AttemptEvent::ActivityClosed => activity_open = false,
             AttemptEvent::Activity(UploadActivity::NormalizedInPlace) => {
                 mark_audio_normalized(pool, missing_id).await;
+            }
+            AttemptEvent::Activity(UploadActivity::UposRecovery(descriptor)) => {
+                record_upos_recovery(pool, missing_id, &descriptor).await;
             }
             AttemptEvent::Activity(UploadActivity::QueueWaitStarted) => {
                 enter_phase(
@@ -4376,6 +4431,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             normalized_file_path: Some("/recordings/segment.flv".into()),
+            upos_recovery_json: None,
+            upos_recovery_at: None,
             lifecycle_version: 2,
             video_json: None,
             total_bytes: None,
@@ -4453,6 +4510,51 @@ mod tests {
                 .cloned()
                 .collect()
         }
+    }
+
+    /// 取回描述符必须真的落到行上，且写新的时候顺带把过期的清掉——TTL 没有独立定时任务，
+    /// 挂在写入路径上，这条测试就是那个安排的守卫。
+    #[tokio::test]
+    async fn upos_recovery_is_persisted_and_expired_rows_are_purged() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let now = chrono::Utc::now();
+        let stale = now - UPOS_RECOVERY_TTL - chrono::Duration::hours(1);
+        for (id, order, path) in [(70, 0, "/fresh.flv"), (71, 1, "/stale.flv")] {
+            sqlx::query(
+                "INSERT INTO upload_missing_segment \
+                 (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+                  segment_order, status, next_retry_at, created_at, updated_at, lifecycle_version) \
+                 VALUES (?1, 10, 20, 30, ?2, ?3, 'succeeded', ?4, ?4, ?4, 2)",
+            )
+            .bind(id)
+            .bind(path)
+            .bind(order)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // 71 的描述符早就该过期了。
+        sqlx::query(
+            "UPDATE upload_missing_segment SET upos_recovery_json = '{\"old\":1}', \
+             upos_recovery_at = ?1 WHERE id = 71",
+        )
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_upos_recovery(&pool, 70, r#"{"endpoint":"//up.example","upos_uri":"upos://x/y","auth":"tok"}"#).await;
+
+        let (fresh, expired): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT (SELECT upos_recovery_json FROM upload_missing_segment WHERE id = 70), \
+                    (SELECT upos_recovery_json FROM upload_missing_segment WHERE id = 71)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(fresh.unwrap().contains("upos://x/y"), "新描述符应当落到行上");
+        assert_eq!(expired, None, "超过 TTL 的描述符应当被清成 NULL");
     }
 
     /// A session nobody asked to submit is a decision with a reason, not silence; and a session

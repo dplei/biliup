@@ -174,6 +174,11 @@ pub struct UploadMissingSegment {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     /// 本次 attempt 为何落在 `current_line` 上：configured / manual / fallback / auto_probe。
     pub line_source: Option<String>,
+    /// UPOS 取回描述符（endpoint + upos_uri + auth）的 JSON。**含凭证，不得进日志/事件/告警。**
+    /// 只能在 preupload 时拿到，事后无法重新申请，见 migration 24 与 dplei/biliup#13。
+    pub upos_recovery_json: Option<String>,
+    /// 描述符写入时刻，TTL 到期清理用。
+    pub upos_recovery_at: Option<DateTime<Utc>>,
     pub last_chunk_index: Option<i64>,
     pub last_chunk_started_at: Option<DateTime<Utc>>,
     pub last_chunk_error: Option<String>,
