@@ -248,6 +248,8 @@ pub(crate) fn _main(args: &[String]) -> AppResult<()> {
                     limit,
                     studio: _,
                     submit,
+                    replace,
+                    execute,
                 } => {
                     append(
                         cli.user_cookie,
@@ -256,6 +258,8 @@ pub(crate) fn _main(args: &[String]) -> AppResult<()> {
                         line,
                         limit,
                         submit.unwrap_or(SubmitOption::App),
+                        replace,
+                        execute,
                         cli.proxy.as_deref(),
                     )
                     .await?
