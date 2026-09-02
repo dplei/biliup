@@ -237,6 +237,8 @@ pub struct ListResponse {
     /// The requested cursor fell inside the pruned range: this answer has a hole in it.
     gap: bool,
     unclean_shutdowns: u64,
+    active_writer_runs: u64,
+    unknown_writer_runs: u64,
     health: serde_json::Value,
     error: Option<String>,
 }
@@ -253,6 +255,8 @@ fn unavailable(availability: Availability, error: Option<String>) -> ListRespons
         pruned_through: 0,
         gap: false,
         unclean_shutdowns: 0,
+        active_writer_runs: 0,
+        unknown_writer_runs: 0,
         health: biliup_observability::shadow::health_snapshot(),
         error,
     }
@@ -304,6 +308,8 @@ pub async fn list_log_events(
         pruned_through: page.pruned_through,
         gap: page.gap,
         unclean_shutdowns: page.unclean_shutdowns,
+        active_writer_runs: page.active_writer_runs,
+        unknown_writer_runs: page.unknown_writer_runs,
         health: biliup_observability::shadow::health_snapshot(),
         error: None,
         events: page.events,

@@ -26,6 +26,8 @@ export interface FeedMeta {
 	prunedThrough: number;
 	gap: boolean;
 	uncleanShutdowns: number;
+	activeWriterRuns: number;
+	unknownWriterRuns: number;
 	health: HealthSnapshot | undefined;
 	error: string | null;
 }
@@ -37,6 +39,8 @@ const EMPTY_META: FeedMeta = {
 	prunedThrough: 0,
 	gap: false,
 	uncleanShutdowns: 0,
+	activeWriterRuns: 0,
+	unknownWriterRuns: 0,
 	health: undefined,
 	error: null,
 };
@@ -151,6 +155,8 @@ export function useLogEventFeed(filters: EventFilters, paused: boolean): Feed {
 					prunedThrough: data.pruned_through,
 					gap: data.gap,
 					uncleanShutdowns: data.unclean_shutdowns,
+					activeWriterRuns: data.active_writer_runs,
+					unknownWriterRuns: data.unknown_writer_runs,
 					health: data.health,
 					error: data.error,
 				});
