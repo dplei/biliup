@@ -85,10 +85,16 @@ setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)
 落点是**改现有 remux 那一步的几行**，不是新增一个流水线阶段：去掉无效的 `igndts`，
 加上 `setts`（`-bsf:a` 需要链式写成 `aac_adtstoasc,setts=...`）。
 
-**语义警告，必须用真实片段验**：`max()` 的效果是把回退的 2.6 秒**压掉**，即回退点之后
-的内容整体相对提前 2.6 秒。如果回退源自重连产生的时间重叠，这是正确语义；若成因不同则
-是错的。另外音视频两条流各自独立 clamp，两条流回退量不同会引入 A/V 偏差——issue 日志里
-是 2599ms vs 2624ms，差 25ms，可忽略，但要在真实片段上确认这个差值量级成立。
+**语义前提（03 已实测，结论比原本的担心更尖锐）**：`max()` 只在「回退量 ≪ 剩余内容
+时长」时正确。
+
+- 生产的实际形态是 **CDN 回放重叠内容**，clamp 把重复段压掉正是正确语义：总时长不变、
+  内容不丢、A/V **零漂移**，只在回退点留下约 0.1 秒的快进抖动。
+- 但**时间戳重置／回绕**（#13 的形态）下，clamp 会把回退点之后的全部真实内容压进几百
+  毫秒，而复检看不出来——它只看单调性。这条路径会静默上传坏片并删掉原片。
+
+所以 setts 必须配一道产出合理性校验才能上生产，见 [`steps/05`](./steps/05-guard-against-collapsed-output.md)。
+两条流独立 clamp 不引入漂移（`max()` 一旦追上就完全透明），issue 里那个 25ms 差值无害。
 
 ### 采纳：给重编码一个自带超时，超时按 `Unfixable` 降级
 
@@ -129,9 +135,13 @@ setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)
 
 见 [`steps/`](./steps/)：
 
-| # | 步骤 | 优先级 | 阻塞于 |
-| --- | --- | --- | --- |
-| 01 | [重编码自带超时，超时降级直传](./steps/01-reencode-internal-timeout.md) | P0 止血 | — |
-| 02 | [remux 接入 setts，去掉 igndts](./steps/02-setts-in-remux.md) | P0 | — |
-| 03 | [真实片段验证，并决定 x264 去留](./steps/03-verify-and-drop-reencode.md) | P0 | 02 |
-| 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 03 |
+| # | 步骤 | 优先级 | 阻塞于 | 状态 |
+| --- | --- | --- | --- | --- |
+| 01 | [重编码自带超时，超时降级直传](./steps/01-reencode-internal-timeout.md) | P0 止血 | — | ✅ resolved |
+| 02 | [remux 接入 setts，去掉 igndts](./steps/02-setts-in-remux.md) | P0 | — | ✅ resolved |
+| 03 | [验证 setts 语义，并决定 x264 去留](./steps/03-verify-and-drop-reencode.md) | P0 | 02 | ✅ resolved |
+| 05 | [守住「修复产物被压扁」的静默毁片路径](./steps/05-guard-against-collapsed-output.md) | **P0 阻塞发布** | 03 | ready-for-agent |
+| 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 05 | needs-info |
+
+> ⚠️ **05 落地之前不要发版**：02 引入的 setts 在时间戳回绕（#13 形态）下会静默产出坏片
+> 并删掉原片。03 的 Answer 有完整实测证据。
