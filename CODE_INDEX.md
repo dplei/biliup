@@ -139,8 +139,8 @@
 
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
-| `crates/biliup/src/uploader/line.rs` | 定义 B 站上传线路、健康过滤后的自动探测、pre-upload 与服务端确认分块进度。 | `Line`、`Probe::probe_excluding`、`Parcel::upload_with_observer`、`UploadProgress` |
-| `crates/biliup/src/uploader/line/upos.rs` | upos 协议的分块 PUT 实现：并发窗口、单请求超时与有限重试（每次失败带线路/分块号/耗时的结构化日志），最后汇总分片完成上传。 | `Upos::upload_stream`、`CHUNK_REQUEST_TIMEOUT`、`Upos::get_ret_video_info` |
+| `crates/biliup/src/uploader/line.rs` | 定义 B 站上传线路、健康过滤后的自动探测、pre-upload 与服务端确认分块进度。`Parcel::recovery()` 取走本次 preupload 的 UPOS 取回描述符，必须在 `upload()` 消耗 parcel 之前调用。 | `Line`、`Probe::probe_excluding`、`Parcel::upload_with_observer`、`Parcel::recovery`、`UploadProgress` |
+| `crates/biliup/src/uploader/line/upos.rs` | upos 协议的分块 PUT 实现：并发窗口、单请求超时与有限重试（每次失败带线路/分块号/耗时的结构化日志），最后汇总分片完成上传。另定义 `UposRecovery`（endpoint + upos_uri + auth）——上传完还能把源对象取回来所需的一切，**只能在 preupload 时拿到**，事后重新申请是 403。**含凭证，不得进日志/事件/告警。** 取回是否可行按线路而定：实测 tx/bda2/alia 的 GET 逐字节一致，bldsa 只给 HEAD 200、GET 403。 | `Upos::upload_stream`、`CHUNK_REQUEST_TIMEOUT`、`Upos::get_ret_video_info`、`UposRecovery`、`UposRecovery::object_url`、`Bucket::recovery` |
 
 ## 仓库维护
 
@@ -200,7 +200,7 @@
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/recovery_eligibility.rs`（`check_recovery_eligibility`）：补扫、静默补传和人工操作共用 finalized/source-missing/succeeded 的准入结果，防止 closed session 产生新任务。
 - `crates/biliup-cli/src/server/common/recovery_eligibility.rs` → `crates/biliup-cli/src/observe/audit.rs` → 事件 SQLite（`record_recovery_audit`、`replay_recovery_audits`、`operation_projected`）：业务审计事务先保存稳定 uid，提交后立即投影；importer 启动全量、周期最近窗口重放同一 uid，事件库唯一约束收敛重复，业务审计不依赖事件留存。
 - `crates/biliup-cli/src/server/common/lifecycle_backfill.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`session_completeness`）：回填的目标就是让历史会话的账本能被严格完整性闸门判为完整，冲突行则以未知状态持续阻塞投稿。
-- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`、`Parcel::upload_with_observer`）：恢复与自动模式把冷却线路排除在实际探测请求之外；上传返回的 `Video` 标题由上传文件名兜底，而喂进去的是响度标准化/时间戳修复的中间件，因此 `upload_single_file_with_repair` 必须用原始录像名覆盖分P标题。
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/line.rs`（`Probe::probe_excluding`、`Parcel::upload_with_observer`、`Parcel::recovery`）：恢复与自动模式把冷却线路排除在实际探测请求之外；上传返回的 `Video` 标题由上传文件名兜底，而喂进去的是响度标准化/时间戳修复的中间件，因此 `upload_single_file_with_repair` 必须用原始录像名覆盖分P标题。另外 preupload 一成功就把 UPOS 取回描述符经 `UploadActivity::UposRecovery` 送到 watchdog 循环落库——拿到它的 `upload_single_file` 手上没有 `missing_id`，而 watchdog 两样都有；落库列是 `upload_missing_segment.upos_recovery_json`，明文 + 写入时顺带清理超 TTL 的行（migration 24）。
 - `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/upload_line_health.rs`（`get_upload_line_health`）：健康接口与缺失列表读取同一份持久冷却状态。
 - `crates/biliup-cli/src/server/core/downloader/ffmpeg_downloader.rs` → `crates/biliup/src/downloader/util.rs`、`crates/biliup-cli/src/observe/external.rs`（`segment_created`、`segment_closed`、`segment_close_failed`、`command_failed`）：外部进程产出的分段复用自研写入路径的同一套事件字段；非 0/255 退出且未取消时才把退出码与有界 stderr 作为外部命令失败上报。
 - `crates/biliup-cli/src/server/core/downloader/stream_gears.rs` → `crates/biliup/src/downloader/util.rs`（`LifecycleFile::with_owner`、`SegmentIdentity`）：服务端把房间/场次/attempt 身份交给文件层，关闭回调再把同一 `segment_id` 放进 `SegmentInfo` 交给上传管道；FLV 有效帧头或 HLS 实收媒体才触发 reconnect，退避阶段只存缺口。
