@@ -287,6 +287,21 @@ impl UploadIdentity {
         }
     }
 
+    /// Owned snapshot for direct emitters whose attachments cannot travel through tracing fields.
+    pub fn context(&self) -> biliup_observability::Context {
+        biliup_observability::Context(
+            biliup_observability::Fields::new()
+                .with("task_id", text(&self.task_id))
+                .with("live_streamer_id", text(&self.live_streamer_id))
+                .with("streamer_info_id", text(&self.streamer_info_id))
+                .with("upload_session_id", text(&self.upload_session_id))
+                .with("segment_id", text(&self.segment_id))
+                .with("missing_id", text(&self.missing_id))
+                .with("upload_attempt_id", text(&self.upload_attempt_id))
+                .with("original_file", text(&self.original_file)),
+        )
+    }
+
     fn order(&self) -> u64 {
         self.segment_order.unwrap_or_default().max(0) as u64
     }

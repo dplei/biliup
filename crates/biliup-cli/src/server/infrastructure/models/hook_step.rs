@@ -153,6 +153,7 @@ impl HookStep {
                 stage: "hook_remux",
                 original_file: Some(src),
                 tee_stderr: true,
+                context: None,
             },
         )
         .await

@@ -4,6 +4,8 @@
 
 关联：#2（结构化日志）、#25（时间戳修复链路）
 
+Status: resolved
+
 > 本目录的 `steps/` 是实施步骤，不是 GitHub issue 编号。
 
 ## 一句话
@@ -114,7 +116,7 @@ runner 再放进 `ScanObserver`，最终由 `processing.command_failed` 原样�
 
 ## 实施步骤
 
-| # | 步骤 | 优先级 | 阻塞于 |
-| --- | --- | --- | --- |
-| 01 | [拆分时间戳修复的失败降级结果](./steps/01-fallback-outcome.md) | P0 | — |
-| 02 | [把上传身份传入外部命令失败事件](./steps/02-command-failure-context.md) | P0 | 01 |
+| # | 步骤 | 优先级 | 阻塞于 | 状态 |
+| --- | --- | --- | --- | --- |
+| 01 | [拆分时间戳修复的失败降级结果](./steps/01-fallback-outcome.md) | P0 | — | ✅ resolved |
+| 02 | [把上传身份传入外部命令失败事件](./steps/02-command-failure-context.md) | P0 | 01 | ✅ resolved |

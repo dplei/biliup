@@ -2,6 +2,7 @@ use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
+use biliup_observability::Context as EventContext;
 use error_stack::{ResultExt, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -897,12 +898,14 @@ async fn cleanup_orphaned_normalization_artifacts(directory: &Path) {
 
 pub struct SystemAudioFfmpeg {
     audio_bitrate: &'static str,
+    context: EventContext,
 }
 
 impl Default for SystemAudioFfmpeg {
     fn default() -> Self {
         Self {
             audio_bitrate: "192k",
+            context: EventContext::default(),
         }
     }
 }
@@ -911,6 +914,14 @@ impl SystemAudioFfmpeg {
     fn for_sample() -> Self {
         Self {
             audio_bitrate: "96k",
+            context: EventContext::default(),
+        }
+    }
+
+    pub fn with_context(context: EventContext) -> Self {
+        Self {
+            context,
+            ..Self::default()
         }
     }
 }
@@ -1018,7 +1029,7 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
             .args(["-map", "0:a:0", "-af", &filter, "-f", "null", "-"]);
         let (status, scan) = run_scanning_stderr(
             background(&mut command),
-            ScanObserver::quiet("loudnorm_measure", input),
+            ScanObserver::quiet("loudnorm_measure", input).with_context(&self.context),
         )
         .await
         .change_context(AppError::Custom(
@@ -1074,7 +1085,7 @@ impl AudioFfmpegRunner for SystemAudioFfmpeg {
         command.arg(output);
         let (status, scan) = run_scanning_stderr(
             &mut command,
-            ScanObserver::quiet("loudnorm_transcode", input),
+            ScanObserver::quiet("loudnorm_transcode", input).with_context(&self.context),
         )
         .await
         .change_context(AppError::Custom(
