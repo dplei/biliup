@@ -94,6 +94,15 @@ pub enum Commands {
         #[arg(long, default_value = "3")]
         limit: usize,
 
+        /// 替换该稿件的第 N 个分P（序号从 1 开始）而不是追加到末尾。
+        /// 只能配一个视频文件；不加 --execute 时只打印将要做的改动。
+        #[arg(long, value_name = "PART_INDEX")]
+        replace: Option<usize>,
+
+        /// 与 --replace 搭配：真正执行替换。不加时只预演，不上传也不改稿件。
+        #[arg(long)]
+        execute: bool,
+
         #[command(flatten)]
         studio: Studio,
     },

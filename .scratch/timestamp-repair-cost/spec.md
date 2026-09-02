@@ -146,9 +146,9 @@ x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO �
 | 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 05 | ⛔ wontfix |
 | 06 | [取回通道验证 + UPOS 凭证落库](./steps/06-macos-side-repair.md) | P2 | 05 | ✅ resolved |
 | 08 | [auto 探测优先挑有取回通道的线路](./steps/08-prefer-recoverable-lines.md) | P1 | 06 | ✅ resolved |
-| 07 | [macOS 侧取回—修复—回推工具](./steps/07-macos-recovery-tool.md) | P2 | 06 | ready-for-agent |
+| 07 | [macOS 侧取回—修复—回推（做成 skill）](./steps/07-macos-recovery-tool.md) | P2 | 06 | ✅ resolved |
 
-发版路径已经打通：01–05 全部 resolved，06/07 不阻塞发布。归档要等 07 有结论。
+发版路径已经打通。01–08 全部 resolved，只剩两条待时间验证的尾巴：UPOS 凭证的真实有效期（TTL 7 天是估的），以及 `segment-recover` skill 还没在真实故障上实战过。这两条都不阻塞发布，但归档要等它们有结论。
 
 06 顺带查明了一件 issue #13 没覆盖的事：**UPOS 取回通道是按线路存在的**——tx / bda2 / alia
 可以逐字节取回，`bldsa` 只给 HEAD 200、GET 403。08 据此把 auto 探测改成「优先只在可取回
