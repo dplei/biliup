@@ -23,6 +23,22 @@ use tracing::{info, warn};
 /// Implicit fallbacks, in order, after the operator's own choice. `bldsa` is deliberately absent:
 /// it is only ever used when explicitly configured.
 const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
+
+/// 上传完还能凭原始 `X-Upos-Auth` 把源对象整体 GET 回来的线路。
+///
+/// **取回通道是按线路存在的**：同一个 bucket、同一套 auth 机制，`bldsa` 只给 HEAD 200、
+/// GET 一律 403（2026-09-02 实测，GET / Range / query-param / 加 UA 都试过；守卫是
+/// `crates/biliup` 里那条 ignored 的 `upos_recovery_round_trip_by_line`）。
+///
+/// 这件事之所以要影响选路：预处理修不好的分段现在是「原片直传 + 告警 + 本地清理」，
+/// 而「需要重修时从 B 站把原片取回来」是清掉本地文件的前提。落在没有取回通道的线路上，
+/// 那个前提就不成立了。所以 auto 探测**优先只在这些线路里挑**，其余线路（含 `bldsa`）
+/// 只有在它们全部不可用时才兜底——宁可失去取回通道，也不能传不上去。
+///
+/// 这是**实测白名单，不是按厂商推断的**。要加线路，先跑那条 ignored 测试确认它的 GET
+/// 逐字节一致再往里加；跑之前挑没有录制的时段，真实上传会触发 601 账号级冷却。
+/// 显式配置的线路不受这里影响：主人点名要哪条就用哪条。
+const RECOVERABLE_LINES: [&str; 3] = ["bda2", "tx", "alia"];
 pub const AUTO: &str = "auto";
 
 /// Why the attempt ended up on this line.
@@ -266,13 +282,28 @@ pub async fn resolve_planned_line(
         .into_iter()
         .map(|row| row.line_key)
         .collect::<Vec<_>>();
-    let (line, failures) = Probe::probe_excluding_with_failures(client, &excluded)
-        .await
-        .map_err(|error| {
-            error_stack::Report::new(AppError::Custom(format!(
-                "no healthy upload line is currently available: {error}"
-            )))
-        })?;
+    // 先只在有灾后取回通道的线路里探测，见 `RECOVERABLE_LINES`。
+    let recoverable: Vec<String> = RECOVERABLE_LINES.iter().map(|key| key.to_string()).collect();
+    let probed = match Probe::probe_filtered_with_failures(client, &recoverable, &excluded).await {
+        Ok(probed) => probed,
+        Err(error) => {
+            // 传不上去比失去取回通道更严重，所以这里放开限制而不是失败。但要说清代价：
+            // 落在其它线路上的分段，事后拿不回源文件。
+            warn!(
+                ?error,
+                recoverable = ?RECOVERABLE_LINES,
+                "可取回线路全部不可用，放开限制重新探测；本次上传的分段将没有灾后取回通道"
+            );
+            Probe::probe_filtered_with_failures(client, &[], &excluded)
+                .await
+                .map_err(|error| {
+                    error_stack::Report::new(AppError::Custom(format!(
+                        "no healthy upload line is currently available: {error}"
+                    )))
+                })?
+        }
+    };
+    let (line, failures) = probed;
     let probe_failures = failures
         .into_iter()
         .map(|failure| ProbeFailure {

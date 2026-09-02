@@ -145,10 +145,12 @@ x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO �
 | 05 | [回退量闸门，并删掉 x264](./steps/05-guard-against-collapsed-output.md) | P0 | 03 | ✅ resolved |
 | 04 | [重型 ffmpeg 共享 permit](./steps/04-shared-ffmpeg-permit.md) | P1 条件 | 05 | ⛔ wontfix |
 | 06 | [取回通道验证 + UPOS 凭证落库](./steps/06-macos-side-repair.md) | P2 | 05 | ✅ resolved |
+| 08 | [auto 探测优先挑有取回通道的线路](./steps/08-prefer-recoverable-lines.md) | P1 | 06 | ✅ resolved |
 | 07 | [macOS 侧取回—修复—回推工具](./steps/07-macos-recovery-tool.md) | P2 | 06 | ready-for-agent |
 
 发版路径已经打通：01–05 全部 resolved，06/07 不阻塞发布。归档要等 07 有结论。
 
 06 顺带查明了一件 issue #13 没覆盖的事：**UPOS 取回通道是按线路存在的**——tx / bda2 / alia
-可以逐字节取回，`bldsa` 只给 HEAD 200、GET 403。而配置默认是 `AUTO`，探测可能落到 bldsa，
-那些分段没有取回通道。线路策略要不要收成白名单是 07 里留给主人的决策。
+可以逐字节取回，`bldsa` 只给 HEAD 200、GET 403。08 据此把 auto 探测改成「优先只在可取回
+线路里挑，其余兜底并告警」，让 05「本地不留档」的前提在新分段上稳定成立。08 之前上传的
+历史分段不受影响，可能仍落在没有取回通道的线路上。
