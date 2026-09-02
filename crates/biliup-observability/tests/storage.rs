@@ -556,6 +556,136 @@ fn wal_pinned_reader_blocks_growth_not_producer() {
 }
 
 #[test]
+fn multiwriter_child() {
+    let Some(path) = std::env::var_os("OBS_MULTIWRITER_DB") else {
+        return;
+    };
+    let role = std::env::var("OBS_MULTIWRITER_ROLE").unwrap();
+    let mut runtime = start(Path::new(&path));
+    let emitter = runtime.emitter();
+    assert!(emitter.submit(event(&emitter, "system.started", &role)));
+    wait(&emitter, |health| health.delivered == 1);
+    let run = emitter.process_run_id().to_string();
+    if role == "resident" {
+        println!("READY {run}");
+        use std::io::{BufRead, Write};
+        std::io::stdout().flush().unwrap();
+        assert_eq!(
+            std::io::stdin().lock().lines().next().unwrap().unwrap(),
+            "STOP"
+        );
+    }
+    let health = runtime.shutdown(Duration::from_secs(2));
+    println!(
+        "CLOSED {role} {run} {} {}",
+        health.storage_failures,
+        health.dropped.iter().sum::<u64>()
+    );
+}
+
+#[test]
+fn separate_process_writer_does_not_disturb_resident_writer() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multiprocess.sqlite");
+    let executable = std::env::current_exe().unwrap();
+    let mut resident = Command::new(&executable)
+        .args(["--exact", "multiwriter_child", "--nocapture"])
+        .env("OBS_MULTIWRITER_DB", &path)
+        .env("OBS_MULTIWRITER_ROLE", "resident")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = resident.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let receive = |prefix: &str| loop {
+        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if let Some(value) = line.strip_prefix(prefix) {
+            break value.to_string();
+        }
+    };
+    let ready = receive("READY ");
+
+    let short = Command::new(&executable)
+        .args(["--exact", "multiwriter_child", "--nocapture"])
+        .env("OBS_MULTIWRITER_DB", &path)
+        .env("OBS_MULTIWRITER_ROLE", "short")
+        .output()
+        .unwrap();
+    assert!(
+        short.status.success(),
+        "{}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+    let short_stdout = String::from_utf8(short.stdout).unwrap();
+    let closed: Vec<_> = short_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("CLOSED short "))
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    let short_run = closed[0].to_string();
+    assert_eq!(&closed[1..], ["0", "0"]);
+
+    let snapshot = rt().block_on(async {
+        let repo = Repository::open(&path).await.unwrap();
+        let page = repo
+            .query(&Query {
+                limit: 200,
+                ..Query::default()
+            })
+            .await
+            .unwrap();
+        repo.close().await;
+        let mut uids: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| event.data.event_uid.clone())
+            .collect();
+        let mut runs: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| event.data.process_run_id.clone())
+            .collect();
+        uids.sort();
+        uids.dedup();
+        runs.sort();
+        runs.dedup();
+        (
+            page.events.len(),
+            uids.len(),
+            runs,
+            page.active_writer_runs,
+            page.unknown_writer_runs,
+            page.unclean_shutdowns,
+        )
+    });
+
+    resident
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"STOP\n")
+        .unwrap();
+    assert_eq!(receive("CLOSED resident "), format!("{ready} 0 0"));
+    assert!(resident.wait().unwrap().success());
+    assert_ne!(ready, short_run);
+    let mut expected_runs = vec![ready, short_run];
+    expected_runs.sort();
+    assert_eq!(snapshot, (2, 2, expected_runs, 1, 0, 0));
+}
+
+#[test]
 fn kill_child() {
     let Some(path) = std::env::var_os("OBS_KILL_CHILD") else {
         return;
@@ -637,10 +767,14 @@ fn force_kill_retains_commit_and_reports_unclean_window() {
             .await
             .unwrap();
         assert_eq!(page.events.len(), 2);
-        assert!(page.unclean_shutdowns >= 1);
+        assert_eq!(page.unclean_shutdowns, 1);
+        assert_eq!(page.active_writer_runs, 1);
+        assert_eq!(page.unknown_writer_runs, 1);
         repo.close().await;
     });
-    restart.shutdown(Duration::from_secs(2));
+    let health = restart.shutdown(Duration::from_secs(2));
+    assert_eq!(health.storage_failures, 0);
+    assert_eq!(health.dropped, [0; 5]);
 }
 
 #[test]
