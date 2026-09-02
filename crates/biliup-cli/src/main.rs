@@ -103,6 +103,8 @@ async fn main() -> AppResult<()> {
                 limit,
                 studio: _,
                 submit,
+                replace,
+                execute,
             } => {
                 let video_path: Vec<_> = video_path.into_iter().map(expand_path).collect();
                 append(
@@ -112,6 +114,8 @@ async fn main() -> AppResult<()> {
                     line,
                     limit,
                     submit.unwrap_or(SubmitOption::App),
+                    replace,
+                    execute,
                     cli.proxy.as_deref(),
                 )
                 .await?

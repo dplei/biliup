@@ -254,6 +254,16 @@ pub async fn upload_by_config(
     Ok(())
 }
 
+/// 把 1 起的分P序号换算成 `studio.videos` 的下标，越界就说清楚稿件到底有几个分P。
+fn replace_index(part: usize, parts: usize) -> Result<usize, String> {
+    match part.checked_sub(1) {
+        Some(index) if index < parts => Ok(index),
+        _ => Err(format!(
+            "分P序号从 1 开始，这个稿件只有 {parts} 个分P，替换不了第 {part} 个"
+        )),
+    }
+}
+
 pub async fn append(
     user_cookie: PathBuf,
     vid: Vid,
@@ -261,6 +271,8 @@ pub async fn append(
     line: Option<UploadLine>,
     limit: usize,
     submit: SubmitOption,
+    replace: Option<usize>,
+    execute: bool,
     proxy: Option<&str>,
 ) -> AppResult<()> {
     let task = UploadTask::default();
@@ -275,10 +287,7 @@ pub async fn append(
         login_by_cookies(user_cookie, proxy).await,
         "authentication_failed",
     )?;
-    let mut uploaded_videos = task.check(
-        upload_with_task(&video_path, &bilibili, line, limit, &task).await,
-        "upload_failed",
-    )?;
+    // 稿件先取回来：替换要在**上传之前**校验分P序号并让人确认，序号写错时不该已经白传一遍。
     let mut studio = task.check(
         bilibili
             .studio_data(&vid, proxy)
@@ -286,7 +295,47 @@ pub async fn append(
             .change_context_lazy(|| AppError::Unknown),
         "target_lookup_failed",
     )?;
-    studio.videos.append(&mut uploaded_videos);
+    if let Some(part) = replace {
+        let index = replace_index(part, studio.videos.len())
+            .map_err(|message| AppError::Custom(message))?;
+        if video_path.len() != 1 {
+            return Err(AppError::Custom(format!(
+                "替换一个分P只能给一个文件，收到 {} 个",
+                video_path.len()
+            ))
+            .into());
+        }
+        let old = &studio.videos[index];
+        println!("稿件 {vid} 第 {part} 个分P：");
+        println!("  现在  title={:?} filename={}", old.title, old.filename);
+        println!("  换成  {}", video_path[0].display());
+        if !execute {
+            println!();
+            println!("这是预演：没有上传任何文件，也没有改动稿件。确认无误后加 --execute 再跑一次。");
+            return Ok(());
+        }
+    }
+    let mut uploaded_videos = task.check(
+        upload_with_task(&video_path, &bilibili, line, limit, &task).await,
+        "upload_failed",
+    )?;
+    match replace {
+        Some(part) => {
+            // 序号在上传前已经校验过，这里重算一次只是为了拿下标。
+            let index = replace_index(part, studio.videos.len())
+                .map_err(|message| AppError::Custom(message))?;
+            let replacement = uploaded_videos.remove(0);
+            println!(
+                "替换第 {part} 个分P：{} -> {}",
+                studio.videos[index].filename, replacement.filename
+            );
+            // 标题跟着老分P走：换的是坏掉的那个文件，不是这一P的身份。
+            let title = studio.videos[index].title.clone();
+            studio.videos[index] = replacement;
+            studio.videos[index].title = title;
+        }
+        None => studio.videos.append(&mut uploaded_videos),
+    }
     observe::submission_started(&task.submission, "append_ready");
     let result = async {
         Ok::<_, error_stack::Report<AppError>>(match submit {
@@ -309,7 +358,7 @@ pub async fn append(
             "unknown"
         },
         if result.is_ok() {
-            "appended"
+            if replace.is_some() { "part_replaced" } else { "appended" }
         } else {
             "request_failed"
         },
@@ -903,5 +952,25 @@ impl Stream for Progressbar {
             None => Poll::Ready(None),
             Some(s) => Poll::Ready(Some(Ok(s))),
         }
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::replace_index;
+
+    #[test]
+    fn part_numbers_are_one_based() {
+        assert_eq!(replace_index(1, 3), Ok(0));
+        assert_eq!(replace_index(3, 3), Ok(2));
+    }
+
+    /// 越界要说清楚稿件到底有几个分P——写错序号是这条流程最容易犯的错，
+    /// 而它作用在一个真实稿件上。
+    #[test]
+    fn out_of_range_says_how_many_parts_there_are() {
+        let error = replace_index(4, 3).unwrap_err();
+        assert!(error.contains("只有 3 个分P"), "{error}");
+        assert!(replace_index(0, 3).is_err(), "0 不是合法分P序号");
     }
 }
