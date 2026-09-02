@@ -1,6 +1,6 @@
 # Spec：多进程共享事件库的 writer 运行健康
 
-状态：已评估，待实现
+状态：已实现，待合并
 
 来源：[GitHub Issue #27](https://github.com/dplei/biliup/issues/27)
 
@@ -206,7 +206,7 @@ Repository 在读取 `log_meta` 的同一个只读事务中聚合这两个当前
 | --- | --- | --- | --- |
 | [01](steps/01-writer-run-lifecycle.md) | 稳定运行身份、migration、writer 注册/心跳/关闭/收割及存储回归 | — | resolved |
 | [02](steps/02-health-api-and-ui.md) | Repository/API 当前状态投影、前端类型与准确文案 | 01 | resolved |
-| [03](steps/03-multiprocess-verification.md) | 跨进程/强杀验收、文档、索引与回执 | 01、02 | ready-for-agent |
+| [03](steps/03-multiprocess-verification.md) | 跨进程/强杀验收、文档、索引与回执 | 01、02 | resolved |
 
 每轮只完成一个 step，回写对应文件后提交并停下。
 

@@ -1,8 +1,8 @@
 # 03 — 多进程共享库验收与回执
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02
-Implementation: not-started
+Implementation: `d72555b`
 
 来源：[spec](../spec.md)、[GitHub Issue #27](https://github.com/dplei/biliup/issues/27)。
 
@@ -40,3 +40,23 @@ Implementation: not-started
 ## Comments
 
 不使用生产事件库，不对运行中的服务制造强杀、锁库或 migration 演练。
+
+## Answer
+
+- 复用 observability 测试二进制增加真实 A/B 子进程验收：A 长驻、B 独立打开并写入后正常关闭；
+  查询确认两个唯一 UID 与 `process_run_id`、A 仍活跃、unknown/累计为 0，两个进程均无额外
+  dropped 或 storage failure。
+- 增强既有 TempDir 强杀测试：确定性推进 A 心跳过期后由 C 打开，精确确认已提交事件保留、
+  未提交事件不出现、历史未知窗口为 1，当前 unknown 为 1。
+- README 已改为支持同机多进程 WAL 共享、禁止网络盘/多机/新旧 writer 混跑，并把强杀语义修正
+  为“未确认正常关闭或心跳中断”；没有调整 busy timeout、WAL 或保留参数。
+- [验收回执](../verification.md) 映射 spec 的 10 个场景，全部由自动化测试或既有前端检查覆盖；
+  所有进程与数据库均为合成测试资源。
+
+## Verification
+
+- `cargo test -p biliup-observability`：30 passed，0 failed。
+- `cargo clippy -p biliup-observability --all-targets -- -D warnings`：通过。
+- `cargo fmt -p biliup-observability -- --check`：通过。
+- `python3 scripts/check_code_index.py`：通过（116 files，59 relationships）。
+- `git diff --check`：通过。
