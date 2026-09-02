@@ -48,14 +48,16 @@ fn main() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.sqlite");
     let options = StoreOptions::new(&path);
-    let mut runtime = Runtime::start(
+    let mut runtime = Runtime::start_with_identity(
         "synthetic",
         "acceptance-v1",
         Options {
             enabled: true,
             ..Options::default()
         },
-        move || SqliteStore::open(options.clone()),
+        move |instance_id, process_run_id| {
+            SqliteStore::open(options.clone(), instance_id, process_run_id)
+        },
     )
     .unwrap();
     let emitter = runtime.emitter();

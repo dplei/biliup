@@ -46,7 +46,7 @@ async fn call(uri: &str) -> axum::response::Response {
 
 fn write_events(path: &std::path::Path) {
     let options = StoreOptions::new(path);
-    let mut runtime = Runtime::start(
+    let mut runtime = Runtime::start_with_identity(
         "api-test",
         "test",
         Options {
@@ -54,7 +54,9 @@ fn write_events(path: &std::path::Path) {
             bridge: true,
             ..Options::default()
         },
-        move || SqliteStore::open(options.clone()),
+        move |instance_id, process_run_id| {
+            SqliteStore::open(options.clone(), instance_id, process_run_id)
+        },
     )
     .unwrap();
     let emitter = runtime.emitter();
