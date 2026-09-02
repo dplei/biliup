@@ -15,8 +15,11 @@
   仍属于 `refactor/`，不能因当前只有文档就选 `docs/` 或工具默认前缀。
 - 一个功能一个目录：`.scratch/<feature-slug>/`
 - spec 位于 `.scratch/<feature-slug>/spec.md`
-- 实现类 issue 一个 ticket 一个文件：`.scratch/<feature-slug>/issues/<NN>-<slug>.md`，从 `01` 开始编号——**不要**把所有 ticket 合并进单个文件
-- 每个 issue 文件顶部附近用一行 `Status:` 记录 triage 状态，取值为五个规范角色之一：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`
+- 实现步骤一个 step 一个文件：`.scratch/<feature-slug>/steps/<NN>-<slug>.md`，从 `01` 开始编号——**不要**把所有 step 合并进单个文件
+- 目录名用 `steps/`，正文里也称「step / 步骤」，**不要叫 issue**：这里的编号只在本目录内有意义，
+  和 `dplei/biliup` 的 GitHub issue 编号是两套东西，混用会让「#12」指代不明。
+  已经存在的 `issues/` 目录保持原样，不为改名去动正在推进的 effort
+- 每个 step 文件顶部附近用一行 `Status:` 记录 triage 状态，取值为五个规范角色之一：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`
 - 评论与讨论记录追加到文件末尾的 `## Comments` 标题下
 
 ## 完结后归档到 `.archive/`
@@ -28,7 +31,7 @@
 
 **同时满足才算完结**：
 
-- 目录里每个 issue 的 `Status:` 都是 `resolved` 或 `wontfix`；
+- 目录里每个 step 的 `Status:` 都是 `resolved` 或 `wontfix`；
 - spec / assessment 一类总览文件不再留有待办——`ready-for-human` 和 `needs-info`
   都表示还有人要做的事，不归档；
 - 代码已落到 `dev`，验证结论已写进目录内的文件。
@@ -54,8 +57,8 @@
 供 `/wayfinder` 使用。**map** 是一个文件，其下每个 ticket 一个**子**文件。
 
 - **Map**：`.scratch/<effort>/map.md` —— 包含 Notes / Decisions-so-far / Fog 正文。
-- **子 ticket**：`.scratch/<effort>/issues/NN-<slug>.md`，从 `01` 开始编号，正文写问题。`Type:` 行记录 ticket 类型（`research`/`prototype`/`grilling`/`task`）；`Status:` 行记录 `claimed`/`resolved`。
+- **子 step**：`.scratch/<effort>/steps/NN-<slug>.md`，从 `01` 开始编号，正文写问题。`Type:` 行记录 ticket 类型（`research`/`prototype`/`grilling`/`task`）；`Status:` 行记录 `claimed`/`resolved`。
 - **阻塞**：顶部附近写一行 `Blocked by: NN, NN`。当它列出的每个文件都变为 `resolved` 时，该 ticket 解除阻塞。
-- **Frontier**：扫描 `.scratch/<effort>/issues/`，找出未关闭、未被阻塞、未被认领的文件；编号最小者优先。
+- **Frontier**：扫描 `.scratch/<effort>/steps/`，找出未关闭、未被阻塞、未被认领的文件；编号最小者优先。
 - **认领**：开工前先把 `Status:` 设为 `claimed` 并保存。
 - **解决**：在 `## Answer` 标题下追加答案，把 `Status:` 设为 `resolved`，然后把一条 context 指针（要点 + 链接）追加到 `map.md` 的 Decisions-so-far。
