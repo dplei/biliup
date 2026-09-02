@@ -124,10 +124,16 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   unknown/`audit_reason_unknown`。启动时分页回放一次，运行中有界重放最近行；事件库按 UID 幂等，
   业务审计不会随普通事件保留策略删除，必要时可重新生成视图。它不是跨库原子提交承诺。
 - 预处理外部进程统一复用 `processing.command_failed`：stage 为 `loudnorm_measure`、
-  `loudnorm_transcode`、`timestamp_detect`、`timestamp_remux`、`timestamp_reencode`、`hook_remux`
-  或 `custom_hook`。非零退出带真实 `exit_code`；spawn/read/wait 失败没有退出码，不补造。
+  `loudnorm_transcode`、`timestamp_detect`、`timestamp_remux`、`hook_remux` 或 `custom_hook`。
+  非零退出带真实 `exit_code`；spawn/read/wait 失败没有退出码，不补造。
+  服务端上传的响度与时间戳预处理显式携带同一份 R/S/U/missing/UA 身份；样片与 hook 没有的
+  身份保持未知，不从路径或 span 补造。
   `ffmpeg_scan` 同时保留旧解析所需的 64KiB 尾部和独立附件的 8KiB 脱敏尾部；原先继承 stderr
-  的 remux/reencode/hook 路径继续 tee 到原输出，原先静默捕获的扫描/转码路径仍不新增旧行。
+  的 remux/hook 路径继续 tee 到原输出，原先静默捕获的扫描/转码路径仍不新增旧行。
+- 时间戳修复只有检测、setts remux 与复检三段：确认无异常记 `executed/no_anomaly`，修复成功
+  记 `executed/repaired`；检测、remux、复检的进程失败分别记 `fallback/detect_failed`、
+  `fallback/remux_failed`、`fallback/verification_failed`。回退超限、无法解析或修复后仍异常
+  保持 `failed/unfixable`。不存在已由 #25 删除的 `timestamp_reencode` / `reencode_failed`。
 - 弹幕、封面与非命令 hook 失败使用 `recording.auxiliary_failed` 或
   `processing.auxiliary_failed`，WARN/failed，stage 区分 start/stop/roll、下载/读取/渲染/上传和
   pre/downloaded hook；原因只用 `danmaku_failed`、`cover_failed`、`hook_failed`、`source_io`。

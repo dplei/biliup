@@ -1,6 +1,6 @@
 # 02 · 把上传身份传入外部命令失败事件
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01
 优先级：P0
 
@@ -54,3 +54,14 @@ Blocked by: 01
 
 - 不改查询 API、SQLite schema 或前端。
 - 不给自定义 hook、样片工具等没有上传账本身份的路径造 ID。
+
+## Answer
+
+- `UploadIdentity::context()` 复用已有字段生成 owned 快照；`ScanObserver` 只借用该快照，在直接
+  emitter 发事件前与文件上下文合并。上传身份里的稳定 `original_file` 优先，默认路径仍保持
+  原来的 basename 行为。
+- 服务端上传构造的响度与时间戳系统 runner 都携带同一身份；样片、测试与 hook 仍用空 context。
+- 受控非零退出测试通过真实 `UploadIdentity` 断言 `segment_id`、`upload_attempt_id` 与稳定文件名，
+  同时保留附件脱敏断言。
+- `cargo build --workspace` 通过；`cargo test -p biliup-cli --lib` 为 356 passed / 0 failed /
+  8 ignored。严格 clippy 被本批之外的既有告警挡住，本批未顺手清理。

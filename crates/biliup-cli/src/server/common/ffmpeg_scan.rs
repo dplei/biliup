@@ -85,6 +85,7 @@ pub struct ScanObserver<'a> {
     pub stage: &'a str,
     pub original_file: Option<&'a Path>,
     pub tee_stderr: bool,
+    pub context: Option<&'a EventContext>,
 }
 
 impl<'a> ScanObserver<'a> {
@@ -93,16 +94,26 @@ impl<'a> ScanObserver<'a> {
             stage,
             original_file: Some(original_file),
             tee_stderr: false,
+            context: None,
         }
+    }
+
+    pub fn with_context(mut self, context: &'a EventContext) -> Self {
+        self.context = Some(context);
+        self
     }
 }
 
-fn context(original_file: Option<&Path>) -> EventContext {
+fn context(observer: ScanObserver<'_>) -> EventContext {
     let mut fields = Fields::new();
-    if let Some(path) = original_file {
+    if let Some(path) = observer.original_file {
         fields.insert("original_file", path.display().to_string().into());
     }
-    EventContext(fields)
+    let file_context = EventContext(fields);
+    match observer.context {
+        Some(context) => file_context.child(context.0.clone()),
+        None => file_context,
+    }
 }
 
 fn report_failure(
@@ -113,7 +124,7 @@ fn report_failure(
     crate::observe::external::command_failed(
         observer.stage,
         "process_failed",
-        context(observer.original_file),
+        context(observer),
         capture.map(|capture| capture.finish(code)),
         code,
     );
@@ -278,11 +289,19 @@ mod tests {
         let _guard = tracing::subscriber::set_default(
             tracing_subscriber::registry().with(CaptureLayer::new(runtime.emitter()).filtered()),
         );
+        let context = crate::observe::UploadIdentity {
+            segment_id: Some("segment-test".into()),
+            upload_attempt_id: Some("attempt-test".into()),
+            original_file: Some("/private/stable-source.flv".into()),
+            ..Default::default()
+        }
+        .context();
         let mut command = Command::new("sh");
         command.args(["-c", "printf 'fatal: token=secret-value\\n' >&2; exit 7"]);
         let (status, _) = run_scanning_stderr(
             &mut command,
-            ScanObserver::quiet("controlled_scan", Path::new("/private/input.flv")),
+            ScanObserver::quiet("controlled_scan", Path::new("/private/input.flv"))
+                .with_context(&context),
         )
         .await
         .unwrap();
@@ -300,8 +319,16 @@ mod tests {
         assert_eq!(event.data().fields.get("stage").unwrap(), "controlled_scan");
         assert_eq!(event.data().fields.get("exit_code").unwrap(), 7);
         assert_eq!(
+            event.data().fields.get("segment_id").unwrap(),
+            "segment-test"
+        );
+        assert_eq!(
+            event.data().fields.get("upload_attempt_id").unwrap(),
+            "attempt-test"
+        );
+        assert_eq!(
             event.data().fields.get("original_file").unwrap(),
-            "input.flv"
+            "stable-source.flv"
         );
         let diagnostic = event.diagnostic().expect("stderr belongs in an attachment");
         assert!(diagnostic.total_bytes() > 0);
@@ -333,5 +360,14 @@ mod tests {
         assert!(!stderr_indicates_anomaly(
             "frame= 100 fps=25 time=00:00:04.00"
         ));
+    }
+
+    #[test]
+    fn observer_without_business_context_keeps_the_file() {
+        let context = context(ScanObserver::quiet(
+            "controlled_scan",
+            Path::new("/private/input.flv"),
+        ));
+        assert_eq!(context.0.get("original_file").unwrap(), "input.flv");
     }
 }

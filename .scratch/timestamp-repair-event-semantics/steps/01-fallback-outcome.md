@@ -1,6 +1,6 @@
 # 01 · 拆分时间戳修复的失败降级结果
 
-Status: ready-for-agent
+Status: resolved
 优先级：P0
 
 ## 目标
@@ -34,3 +34,11 @@ Status: ready-for-agent
 
 - 没有 `ReencodeFailed`：该路径已由 #25 删除。
 - 不持久化预处理结果；本 issue 修的是事件事实，不改变上传恢复状态机。
+
+## Answer
+
+- `RepairOutcome` 已增加 `Fallback(RepairFallbackReason)`，初次检测、remux、复检错误分别保留
+  `DetectFailed`、`RemuxFailed`、`VerificationFailed`。
+- 上传侧用一个穷尽 match 映射成 `fallback/detect_failed|remux_failed|verification_failed`；
+  `Clean`、`Repaired`、`Unfixable` 的既有映射和业务行为不变。
+- 三个 fake 失败出口与事件映射都有回归断言；全 crate 单测 356 passed / 0 failed / 8 ignored。

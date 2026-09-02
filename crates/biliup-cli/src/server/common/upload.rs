@@ -21,7 +21,9 @@ use crate::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     normalize_segment_path,
 };
-use crate::server::common::timestamp_repair::{RepairOutcome, SystemFfmpeg, normalize_timestamps};
+use crate::server::common::timestamp_repair::{
+    RepairFallbackReason, RepairOutcome, SystemFfmpeg, normalize_timestamps,
+};
 use crate::server::common::upload_line_health::{
     self, LineAvailability, UploadFailureKind, classify_kind, sanitize_error,
 };
@@ -1627,7 +1629,7 @@ async fn pipeline_upload_videos(
                     }
                     continue;
                 }
-                // durable，按 outcome 处理本地文件。三种 outcome 的本地清理是同一套：
+                // durable，按 outcome 处理本地文件。各 outcome 的本地清理是同一套：
                 // 原片都已经上传成功（`Unfixable` 走的是原片直传），差别只在要不要告警。
                 if matches!(outcome, RepairOutcome::Unfixable) {
                     error!(file = ?original_path, "时间戳无法安全修复，已按原片直传");
@@ -1703,10 +1705,11 @@ async fn upload_single_file_with_repair(
     let normalize_started = std::time::Instant::now();
     let normalization = if settings.enabled {
         crate::observe::processing_decided(identity, "audio_normalization", "executed", "enabled");
+        let ffmpeg = SystemAudioFfmpeg::with_context(identity.context());
         normalize_for_upload(
             original_path,
             settings.target_lufs,
-            &SystemAudioFfmpeg::default(),
+            &ffmpeg,
             settings.keep_original,
             settings.budget,
         )
@@ -1777,12 +1780,9 @@ async fn upload_single_file_with_repair(
     let repair_started = std::time::Instant::now();
     let outcome = if repair_enabled && !source_timestamps_clean {
         crate::observe::processing_decided(identity, "timestamp_repair", "executed", "scan_needed");
-        let outcome = normalize_timestamps(normalized_path, &SystemFfmpeg).await;
-        let (result, reason) = match &outcome {
-            RepairOutcome::Clean => ("executed", "no_anomaly"),
-            RepairOutcome::Repaired(_) => ("executed", "repaired"),
-            RepairOutcome::Unfixable => ("failed", "unfixable"),
-        };
+        let ffmpeg = SystemFfmpeg::with_context(identity.context());
+        let outcome = normalize_timestamps(normalized_path, &ffmpeg).await;
+        let (result, reason) = timestamp_repair_result(&outcome);
         let artifact = match &outcome {
             RepairOutcome::Repaired(fixed) => Some(fixed.display().to_string()),
             _ => None,
@@ -1905,6 +1905,22 @@ fn original_reason_code(
         DiskAdmissionDenied => "low_disk",
         DiskPressureAborted => "low_disk_aborted",
         NormalizationDisabled => "disabled",
+    }
+}
+
+fn timestamp_repair_result(outcome: &RepairOutcome) -> (&'static str, &'static str) {
+    match outcome {
+        RepairOutcome::Clean => ("executed", "no_anomaly"),
+        RepairOutcome::Repaired(_) => ("executed", "repaired"),
+        RepairOutcome::Fallback(reason) => (
+            "fallback",
+            match reason {
+                RepairFallbackReason::DetectFailed => "detect_failed",
+                RepairFallbackReason::RemuxFailed => "remux_failed",
+                RepairFallbackReason::VerificationFailed => "verification_failed",
+            },
+        ),
+        RepairOutcome::Unfixable => ("failed", "unfixable"),
     }
 }
 
@@ -4053,7 +4069,7 @@ pub async fn run_claimed_recovery(
                     &unfixable_alert("手动补投分段", &path),
                 );
             }
-            RepairOutcome::Clean => {}
+            RepairOutcome::Clean | RepairOutcome::Fallback(_) => {}
         }
 
         if let Some(session_id) = row.upload_session_id {
@@ -4339,6 +4355,23 @@ mod tests {
 
     fn test_config() -> Config {
         serde_yaml::from_str("{}").expect("default test config")
+    }
+
+    #[test]
+    fn timestamp_repair_fallbacks_never_claim_no_anomaly() {
+        for (reason, expected) in [
+            (RepairFallbackReason::DetectFailed, "detect_failed"),
+            (RepairFallbackReason::RemuxFailed, "remux_failed"),
+            (
+                RepairFallbackReason::VerificationFailed,
+                "verification_failed",
+            ),
+        ] {
+            assert_eq!(
+                timestamp_repair_result(&RepairOutcome::Fallback(reason)),
+                ("fallback", expected)
+            );
+        }
     }
 
     /// 分P标题取自原始录像，而不是上传时实际喂进去的那个文件。

@@ -2,6 +2,7 @@ use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
+use biliup_observability::Context as EventContext;
 use error_stack::{ResultExt, bail};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -30,14 +31,24 @@ pub enum Detection {
     Clean,
     /// 命中时间戳异常。`max_backward_ms` 是解析到的最大单次回退量；`None` 表示一条数值
     /// 都没解出来（ffmpeg 换了措辞），此时必须保守当作「超过上限」，绝不能当作 0。
-    Anomalous { max_backward_ms: Option<i64> },
+    Anomalous {
+        max_backward_ms: Option<i64>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepairOutcome {
     Clean,
     Repaired(PathBuf),
+    Fallback(RepairFallbackReason),
     Unfixable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairFallbackReason {
+    DetectFailed,
+    RemuxFailed,
+    VerificationFailed,
 }
 
 #[async_trait]
@@ -67,7 +78,7 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
         Ok(Detection::Anomalous { max_backward_ms }) => max_backward_ms,
         Err(e) => {
             warn!(file = ?path, "时间戳检测失败，降级直传原片: {e:?}");
-            return RepairOutcome::Clean;
+            return RepairOutcome::Fallback(RepairFallbackReason::DetectFailed);
         }
     };
 
@@ -112,14 +123,14 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
             Err(e) => {
                 warn!(file = ?dst, "修复后检测失败，降级直传原片: {e:?}");
                 let _ = tokio::fs::remove_file(&dst).await;
-                RepairOutcome::Clean
+                RepairOutcome::Fallback(RepairFallbackReason::VerificationFailed)
             }
         },
         Err(e) => {
             // 进程层面失败（如 ffmpeg 不可用）是环境问题不是媒体问题，不阻断上传。
             warn!(file = ?path, "时间戳重写进程失败，降级直传原片: {e:?}");
             let _ = tokio::fs::remove_file(&dst).await;
-            RepairOutcome::Clean
+            RepairOutcome::Fallback(RepairFallbackReason::RemuxFailed)
         }
     }
 }
@@ -129,7 +140,16 @@ const SETTS_MONOTONIC: &str = r"setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,P
 const SETTS_MONOTONIC_AFTER_ADTSTOASC: &str =
     r"aac_adtstoasc,setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)";
 
-pub struct SystemFfmpeg;
+#[derive(Default)]
+pub struct SystemFfmpeg {
+    context: EventContext,
+}
+
+impl SystemFfmpeg {
+    pub fn with_context(context: EventContext) -> Self {
+        Self { context }
+    }
+}
 
 #[async_trait]
 impl FfmpegRunner for SystemFfmpeg {
@@ -152,7 +172,7 @@ impl FfmpegRunner for SystemFfmpeg {
             .args(["-c", "copy", "-f", "null", "-"]);
         let (status, scan) = run_scanning_stderr(
             background(&mut command),
-            ScanObserver::quiet("timestamp_detect", path),
+            ScanObserver::quiet("timestamp_detect", path).with_context(&self.context),
         )
         .await
         .change_context(AppError::Custom("failed to spawn ffmpeg (detect)".into()))?;
@@ -226,6 +246,7 @@ impl FfmpegRunner for SystemFfmpeg {
                 stage: "timestamp_remux",
                 original_file: Some(src),
                 tee_stderr: true,
+                context: Some(&self.context),
             },
         )
         .await
@@ -250,9 +271,7 @@ impl FfmpegRunner for SystemFfmpeg {
         }
         Ok(())
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -381,18 +400,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn degrades_to_clean_when_detect_errors() {
-        let path = p("degrades_to_clean_when_detect_errors");
+    async fn falls_back_when_detect_errors() {
+        let path = p("falls_back_when_detect_errors");
         let f = FakeFfmpeg::new(vec![failed("ffmpeg missing")], true);
-        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Fallback(RepairFallbackReason::DetectFailed)
+        );
     }
 
     #[tokio::test]
-    async fn degrades_to_clean_when_remux_process_fails() {
+    async fn falls_back_when_remux_process_fails() {
         // 进程层面失败是环境问题，不阻断上传。
-        let path = p("degrades_to_clean_when_remux_process_fails");
+        let path = p("falls_back_when_remux_process_fails");
         let f = FakeFfmpeg::new(vec![anomalous(1_000)], false);
-        assert_eq!(normalize_timestamps(&path, &f).await, RepairOutcome::Clean);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Fallback(RepairFallbackReason::RemuxFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_verification_errors() {
+        let path = p("falls_back_when_verification_errors");
+        let f = FakeFfmpeg::new(vec![anomalous(1_000), failed("verify fail")], true);
+        assert_eq!(
+            normalize_timestamps(&path, &f).await,
+            RepairOutcome::Fallback(RepairFallbackReason::VerificationFailed)
+        );
+        assert!(!repaired_temp_path(&path).exists());
     }
 
     /// 造一段 `seconds` 秒的测试素材。
@@ -491,12 +527,15 @@ mod tests {
 
         assert!(
             matches!(
-                SystemFfmpeg.detect(&replay).await.expect("detect"),
+                SystemFfmpeg::default()
+                    .detect(&replay)
+                    .await
+                    .expect("detect"),
                 Detection::Anomalous { .. }
             ),
             "拼出来的样本应当检测到时间戳异常，否则这个测试什么也没验"
         );
-        let outcome = normalize_timestamps(&replay, &SystemFfmpeg).await;
+        let outcome = normalize_timestamps(&replay, &SystemFfmpeg::default()).await;
         assert!(
             matches!(outcome, RepairOutcome::Repaired(_)),
             "回放重叠应当由 setts 修好，实际 {outcome:?}"
@@ -520,7 +559,7 @@ mod tests {
         make_source(&good, 30).await;
         splice(&good, "25", "21.4", false, &reset).await;
 
-        let outcome = normalize_timestamps(&reset, &SystemFfmpeg).await;
+        let outcome = normalize_timestamps(&reset, &SystemFfmpeg::default()).await;
         assert_eq!(
             outcome,
             RepairOutcome::Unfixable,
@@ -539,12 +578,12 @@ mod tests {
         let good = std::env::temp_dir().join("tsr_good.mp4");
         make_source(&good, 2).await;
         assert_eq!(
-            SystemFfmpeg.detect(&good).await.expect("detect"),
+            SystemFfmpeg::default().detect(&good).await.expect("detect"),
             Detection::Clean,
             "正常文件不应报时间戳异常"
         );
         assert_eq!(
-            normalize_timestamps(&good, &SystemFfmpeg).await,
+            normalize_timestamps(&good, &SystemFfmpeg::default()).await,
             RepairOutcome::Clean
         );
         let _ = tokio::fs::remove_file(&good).await;
