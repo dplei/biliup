@@ -298,6 +298,11 @@ impl Segmentable {
     }
 
     pub fn set_time_position(&mut self, number: Duration) {
+        if number < self.time.start {
+            // 媒体时间轴回退（时间戳回绕）后 current 会永远小于 start，
+            // `elapsed_time` 恒为 0，本段将再也切不了片。重新锚定起点。
+            self.time.start = number;
+        }
         self.time.current = number
     }
 
@@ -598,6 +603,21 @@ mod tests {
         assert!(seg.size_needed());
 
         Ok(())
+    }
+
+    /// 时间戳回绕后 current 会永远小于 start，`elapsed_time` 恒为 0，本段将再也切不了片。
+    #[test]
+    fn a_backward_timeline_rearms_the_segment_start() {
+        let mut seg = Segmentable::new(Some(Duration::from_secs(10)), None);
+        seg.set_start_time(Duration::from_secs(1_000));
+        seg.set_time_position(Duration::from_secs(1_005));
+        assert!(!seg.time_needed());
+
+        // 上游时间轴回到 0，起点必须跟着回落
+        seg.set_time_position(Duration::ZERO);
+        assert!(!seg.time_needed());
+        seg.set_time_position(Duration::from_secs(10));
+        assert!(seg.time_needed(), "回绕后仍应按新基准正常切片");
     }
 
     #[test]
