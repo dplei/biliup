@@ -315,6 +315,10 @@ pub(crate) async fn parse_flv(
     let mut aac_sequence_header = None;
     let mut h264_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
     let mut prev_timestamp = 0;
+    // 本段起点是否已锚定。曾经用 `prev_timestamp == 0` 代替这个状态，但 `prev_timestamp`
+    // 是「上一批写出 tag 的最后一个时间戳」，抖音重发的 timestamp=0 Script tag 会让下一个
+    // 关键帧误判成「流刚初始化」，把 start 推到当前，定时分段从此失效（issue #32）。
+    let mut start_anchored = false;
     let mut create_new = false;
     loop {
         let tag_header_bytes = connection.read_frame(11).await?;
@@ -420,7 +424,10 @@ pub(crate) async fn parse_flv(
                 ..
             } => {
                 let timestamp = flv_tag.header.timestamp as u64;
-                if prev_timestamp == 0 && timestamp != 0 {
+                if !start_anchored {
+                    start_anchored = true;
+                    // 重连后 CDN 可能给延续的非零时间基准，首个关键帧必须成为起点，
+                    // 否则它会立刻满足时间条件。
                     segment.set_start_time(Duration::from_millis(timestamp));
                 }
                 segment.set_time_position(Duration::from_millis(timestamp));
@@ -762,6 +769,25 @@ mod tests {
         bytes
     }
 
+    /// 同一条流里反复重发 timestamp=0 的 onMetaData——抖音 CDN 的实际行为。
+    /// 每个关键帧前插一个，保证下一个关键帧看到的 `prev_timestamp` 是 0。
+    fn flv_with_repeated_metadata(keyframes: usize, payload: usize) -> Vec<u8> {
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..keyframes {
+            append_tag(&mut bytes, 18, &metadata, 0);
+            let mut frame = vec![0x17, 0x01, 0, 0, 0];
+            frame.resize(5 + payload, 0x41);
+            append_tag(&mut bytes, 9, &frame, (index as u32 + 1) * 1_000);
+        }
+        bytes
+    }
+
     fn complete_response(body: Vec<u8>) -> reqwest::Response {
         reqwest::Response::from(http::Response::new(reqwest::Body::from(body)))
     }
@@ -815,6 +841,34 @@ mod tests {
             "configured splits must be reported as split_limit: {reasons:?}"
         );
         assert_eq!(reasons.last(), Some(&"stream_end"));
+    }
+
+    /// 起点曾经用 `prev_timestamp == 0` 判断是否已初始化，而 `prev_timestamp` 是上一批写出
+    /// tag 的最后一个时间戳。重发的 timestamp=0 Script tag 会让每个关键帧都把 start 推到当前，
+    /// 定时分段永远不满足（issue #32：配置 30 分钟，实测单段录了 3 小时 16 分）。
+    #[tokio::test]
+    async fn repeated_zero_timestamp_metadata_does_not_postpone_the_timed_split() {
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory
+            .path()
+            .join("metadata-flood")
+            .display()
+            .to_string();
+
+        let mut connection = Connection::new(complete_response(flv_with_repeated_metadata(10, 16)));
+        connection.read_frame(9).await.unwrap();
+        let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
+        // 关键帧步进 1s，10 个关键帧覆盖 10s；3s 一刀应该切出 3 刀。
+        let segment = crate::downloader::util::Segmentable::new(Some(Duration::from_secs(3)), None);
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut connection, file, segment, &mut progress)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            progress.splits, 3,
+            "timestamp=0 的元数据重发不该重置本段计时起点"
+        );
     }
 
     /// The old per-tag DTS warning stays one to one; the native stream reports the first jump of
