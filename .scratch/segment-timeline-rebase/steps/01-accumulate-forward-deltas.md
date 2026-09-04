@@ -57,3 +57,29 @@ FLV 头 + onMetaData + 两个序列头，然后关键帧从 `32_891_256` 起每�
 
 - `cargo test -p biliup` 通过，`cargo clippy -p biliup` 无新增告警。
 - 新增的端到端用例在**改动前**必须失败（先跑一次确认它真的抓得住这个 bug），改动后通过。
+
+## 落地（已完成）
+
+`util.rs` 换模型 + 三条单测，`httpflv.rs` 加 fixture `flv_with_absolute_base_and_zero_keyframes`
+和端到端用例。四条新测试**在改动前全部失败**（端到端那条实测切了 10 刀、碎片遍地），改动后
+`cargo test -p biliup` 72 passed，`clippy` 无新增告警。
+
+**与 spec 的一处实质偏差：spec 里那个四行版本是错的，会在密集交替下翻回 #32。**
+
+spec 写的是「delta ≤ MAX_STEP 才累加，总是更新 `last`」。推演一遍 CDN 逐帧交替重发的输入
+`[0, B+1000, 0, B+2000, …]`：每个 delta 都跨基准、都超步长，`elapsed` 永远是 0，
+本段再也切不了片——正好是 issue #32 的故障。spec 只推演了「单发」，漏了「成批重发」。
+
+实际实现多两样东西：
+
+- **`pending_base`**：与当前基准不连续的时间戳先挂起，只有它上面**再出现一个连续的时间戳**
+  才落实为新基准，落实时只计入基准内部的那一步。这就是 issue 建议 1 的「要求新基准上出现
+  单调递增才落实回锚」，但不需要计数器和阈值 N，一个 `Option` 就够。
+- **`number == last` 直接返回**：时间戳没推进的重发 tag 既不带来时长，也不构成「当前基准
+  仍然有效」的证据。少了这一条，交替流里的 0 帧会把 `pending_base` 反复清掉，新基准永远
+  落实不了——`alternating_zero_keyframes_still_advance_the_clock` 就是钉这个的。
+
+不变量：**任何一次累加都 ≤ MAX_STEP**。跨基准的差值在任何路径上都进不了 `elapsed`，
+「一个 tag 撑出 9 小时」这类故障被结构性排除，而不是靠某个分支的条件挡住。
+
+`continuous_step` 抽成模块级自由函数（两处调用点共用同一判据），用严格 `>` 而不是 `>=`。

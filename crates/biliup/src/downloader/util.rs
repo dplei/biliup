@@ -186,11 +186,29 @@ pub struct Segmentable {
     size: Size,
 }
 
+/// 关键帧间隔正常在 10s 内，而段内合法空档的上限由停顿看门狗兜住（`httpflv` 的
+/// `DEFAULT_STALL_TIMEOUT`，默认 30s——再长就断连另起一段了）。超过这个步长的跳变是
+/// 上游换了时间基准，不是真的过了这么久。两个常量没有编译期耦合，改一个记得看另一个。
+const MAX_STEP: Duration = Duration::from_secs(30);
+
+/// 本段已录到的媒体时长。它是**连续前向增量的累加**，不是 `current - start` 的减法：
+/// 媒体时间轴不保证单调，CDN 重发的 timestamp=0 tag 会让减法瞬间得出小时量级（issue #35）。
 #[derive(Debug, Clone)]
 struct Time {
     expected: Option<Duration>,
-    start: Duration,
-    current: Duration,
+    elapsed: Duration,
+    /// 当前基准上最后一个被采纳的时间戳。
+    last: Option<Duration>,
+    /// 一个与当前基准不连续的时间戳。只有当它上面再出现一个连续的时间戳时才落实为新基准，
+    /// 单个离群 tag 因此拉不动本段计时。
+    pending_base: Option<Duration>,
+}
+
+/// 两个时间戳是否构成一次可信的推进。相等不算：重发的 tag 既不带来时长，
+/// 也不构成「这个基准仍然有效」的证据。
+fn continuous_step(from: Duration, to: Duration) -> Option<Duration> {
+    let delta = to.saturating_sub(from);
+    (to > from && delta <= MAX_STEP).then_some(delta)
 }
 
 #[derive(Debug, Clone)]
@@ -204,8 +222,9 @@ impl Segmentable {
         Self {
             time: Time {
                 expected: expected_time,
-                start: Duration::ZERO,
-                current: Duration::ZERO,
+                elapsed: Duration::ZERO,
+                last: None,
+                pending_base: None,
             },
             size: Size {
                 expected: expected_size,
@@ -229,7 +248,7 @@ impl Segmentable {
     }
 
     fn elapsed_time(&self) -> Duration {
-        self.time.current.saturating_sub(self.time.start)
+        self.time.elapsed
     }
 
     /// 检查单独的时间条件
@@ -294,20 +313,40 @@ impl Segmentable {
     }
 
     pub fn increase_time(&mut self, number: Duration) {
-        self.time.current += number
+        self.time.elapsed += number
     }
 
     pub fn set_time_position(&mut self, number: Duration) {
-        if number < self.time.start {
-            // 媒体时间轴回退（时间戳回绕）后 current 会永远小于 start，
-            // `elapsed_time` 恒为 0，本段将再也切不了片。重新锚定起点。
-            self.time.start = number;
+        let Some(last) = self.time.last else {
+            self.time.last = Some(number);
+            return;
+        };
+        if number == last {
+            return;
         }
-        self.time.current = number
+        if let Some(delta) = continuous_step(last, number) {
+            self.time.elapsed += delta;
+            self.time.last = Some(number);
+            self.time.pending_base = None;
+        } else if let Some(delta) = self
+            .time
+            .pending_base
+            .and_then(|base| continuous_step(base, number))
+        {
+            // 候选基准上出现了第二个连续的时间戳：上游确实换了基准，而不是单个 tag 抖动。
+            // 落实时只计入基准内部的那一步，跨基准的差值永远不进 elapsed。
+            self.time.elapsed += delta;
+            self.time.last = Some(number);
+            self.time.pending_base = None;
+        } else {
+            self.time.pending_base = Some(number);
+        }
     }
 
     pub fn set_start_time(&mut self, number: Duration) {
-        self.time.start = number
+        self.time.elapsed = Duration::ZERO;
+        self.time.last = Some(number);
+        self.time.pending_base = None;
     }
 
     pub fn increase_size(&mut self, number: u64) {
@@ -321,14 +360,16 @@ impl Segmentable {
     /// 重置计数器，通常在创建新分割后调用
     pub fn reset(&mut self) {
         self.size.current = 0;
-        self.time.start = self.time.current; // 保持当前时间位置，但重置起始点
+        // 只清本段时长；`last` 保留，下一段接着当前基准算增量。
+        self.time.elapsed = Duration::ZERO;
     }
 
     /// 完全重置所有状态
     pub fn full_reset(&mut self) {
         self.size.current = 0;
-        self.time.current = Duration::ZERO;
-        self.time.start = Duration::ZERO;
+        self.time.elapsed = Duration::ZERO;
+        self.time.last = None;
+        self.time.pending_base = None;
     }
 
     /// 格式化进度信息的通用方法
@@ -386,8 +427,9 @@ impl Default for Segmentable {
         Segmentable {
             time: Time {
                 expected: None,
-                start: Duration::ZERO,
-                current: Duration::ZERO,
+                elapsed: Duration::ZERO,
+                last: None,
+                pending_base: None,
             },
             size: Size {
                 expected: None,
@@ -618,6 +660,54 @@ mod tests {
         assert!(!seg.time_needed());
         seg.set_time_position(Duration::from_secs(10));
         assert!(seg.time_needed(), "回绕后仍应按新基准正常切片");
+    }
+
+    /// issue #35:重连后 CDN 重发 timestamp=0 的 tag,而正常帧带着绝对媒体时钟。
+    /// 单个离群时间戳不能把本段时长撑到小时量级。
+    #[test]
+    fn a_single_out_of_base_tag_does_not_inflate_elapsed() {
+        let base = Duration::from_millis(32_891_256);
+        let mut seg = Segmentable::new(Some(Duration::from_secs(3)), None);
+        seg.set_start_time(base);
+        seg.set_time_position(base + Duration::from_secs(1));
+        seg.set_time_position(Duration::ZERO);
+        seg.set_time_position(base + Duration::from_secs(2));
+
+        assert_eq!(seg.elapsed_time(), Duration::from_secs(2));
+        assert!(
+            !seg.time_needed(),
+            "单个 timestamp=0 不该让本段立刻满足时间条件"
+        );
+    }
+
+    /// CDN 会成批重发,0 与正常帧可能逐帧交替。此时本段计时仍必须沿主基准推进,
+    /// 否则就从「秒级乱切」翻回 issue #32 的「永远不切」。
+    #[test]
+    fn alternating_zero_keyframes_still_advance_the_clock() {
+        let base = Duration::from_millis(32_891_256);
+        let mut seg = Segmentable::new(Some(Duration::from_secs(3)), None);
+        seg.set_start_time(Duration::ZERO);
+        for step in 1..=10u64 {
+            seg.set_time_position(base + Duration::from_secs(step));
+            seg.set_time_position(Duration::ZERO);
+        }
+
+        assert!(
+            seg.elapsed_time() >= Duration::from_secs(8),
+            "主基准上的增量必须照常累加,实际 {:?}",
+            seg.elapsed_time()
+        );
+        assert!(seg.time_needed());
+    }
+
+    /// 超过一个关键帧间隔量级的前向跳变是换基准,不是真的过了这么久。
+    #[test]
+    fn a_gap_longer_than_max_step_is_not_counted() {
+        let mut seg = Segmentable::new(Some(Duration::from_secs(30)), None);
+        seg.set_start_time(Duration::from_secs(100));
+        seg.set_time_position(Duration::from_secs(400));
+        assert_eq!(seg.elapsed_time(), Duration::ZERO);
+        assert!(!seg.time_needed());
     }
 
     #[test]

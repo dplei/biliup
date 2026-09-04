@@ -788,6 +788,27 @@ mod tests {
         bytes
     }
 
+    /// 重连之后的抖音 FLV：正常帧带着绝对媒体时钟（约 9 小时），CDN 在其间反复重发
+    /// timestamp=0 的**关键帧**（#32 那条覆盖的是重发 Script tag，两者路径不同）。
+    fn flv_with_absolute_base_and_zero_keyframes(keyframes: usize, payload: usize) -> Vec<u8> {
+        const BASE: u32 = 32_891_256;
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..keyframes {
+            // CDN 重发的初始化关键帧：时间戳 0，负载只有几个字节
+            append_tag(&mut bytes, 9, &[0x17, 0x01, 0, 0, 0, 0x41], 0);
+            let mut frame = vec![0x17, 0x01, 0, 0, 0];
+            frame.resize(5 + payload, 0x41);
+            append_tag(&mut bytes, 9, &frame, BASE + (index as u32 + 1) * 1_000);
+        }
+        bytes
+    }
+
     fn complete_response(body: Vec<u8>) -> reqwest::Response {
         reqwest::Response::from(http::Response::new(reqwest::Body::from(body)))
     }
@@ -868,6 +889,53 @@ mod tests {
         assert_eq!(
             progress.splits, 3,
             "timestamp=0 的元数据重发不该重置本段计时起点"
+        );
+    }
+
+    /// issue #35：`elapsed` 曾是 `current - start`，一个 timestamp=0 的关键帧把 start 拉到 0，
+    /// 下一个带绝对时钟的关键帧立刻满足时间条件，切出十几秒、几百字节的碎片（随后被判无效删除）。
+    #[tokio::test]
+    async fn a_zero_timestamp_keyframe_does_not_shatter_the_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("rebase").display().to_string();
+        let captured = Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let mut connection = Connection::new(complete_response(
+            flv_with_absolute_base_and_zero_keyframes(10, 4_000),
+        ));
+        connection.read_frame(9).await.unwrap();
+        let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
+        // 正常帧步进 1s，10 帧覆盖 10s；3s 一刀。
+        let segment = crate::downloader::util::Segmentable::new(Some(Duration::from_secs(3)), None);
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut connection, file, segment, &mut progress)
+            .await
+            .unwrap();
+
+        assert!(
+            progress.splits <= 3,
+            "重发的 timestamp=0 关键帧不该触发额外切片，实测 {} 刀",
+            progress.splits
+        );
+        assert!(progress.splits >= 2, "配置的 3s 定时分段仍必须生效");
+
+        let events = captured.0.lock().unwrap().clone();
+        let shards: Vec<_> = events
+            .iter()
+            .filter(|fields| {
+                fields.get("event_name").map(String::as_str) == Some("recording.segment_closed")
+                    && fields.get("reason_code").map(String::as_str) == Some("split_limit")
+                    && fields
+                        .get("size_bytes")
+                        .and_then(|size| size.parse::<u64>().ok())
+                        .is_some_and(|size| size < 4_000)
+            })
+            .collect();
+        assert!(
+            shards.is_empty(),
+            "定时分段不该产出装不下一个关键帧的碎片：{shards:?}"
         );
     }
 
