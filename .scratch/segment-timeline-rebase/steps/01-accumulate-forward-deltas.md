@@ -1,5 +1,7 @@
 # 01 · 计时改为累加前向增量
 
+Status: resolved
+
 改 `crates/biliup/src/downloader/util.rs` 一个文件，`Segmentable` 的公开方法签名全部不变。
 
 ## 改什么
