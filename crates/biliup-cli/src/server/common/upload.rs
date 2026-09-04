@@ -2038,19 +2038,22 @@ async fn upload_single_file(
             return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
         }
     };
-    if let Err(error) = upload_line_health::record_success(pool, line_key).await {
+    let t = instant.elapsed().as_millis();
+    let mbps = total_size as f64 / 1000. / t as f64;
+    if let Err(error) =
+        upload_line_health::record_success(pool, line_key, mbps, chrono::Utc::now()).await
+    {
         warn!(
             ?error,
             line = line_key,
             "failed to clear upload line breaker after success"
         );
     }
-    let t = instant.elapsed().as_millis();
     info!(
         line = line_key,
         "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
         t as f64 / 1000.,
-        total_size as f64 / 1000. / t as f64
+        mbps
     );
     Ok(video)
 }
@@ -3392,8 +3395,14 @@ pub async fn upload_with_task(
                     instant.elapsed().as_millis() as u64,
                 );
             }
-            upload_line_health::record_success(pool, &line_key).await?;
             let t = instant.elapsed().as_millis();
+            upload_line_health::record_success(
+                pool,
+                &line_key,
+                total_size as f64 / 1000. / t as f64,
+                chrono::Utc::now(),
+            )
+            .await?;
             info!(
                 line = &line_key,
                 "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
@@ -4577,7 +4586,12 @@ mod tests {
         .await
         .unwrap();
 
-        record_upos_recovery(&pool, 70, r#"{"endpoint":"//up.example","upos_uri":"upos://x/y","auth":"tok"}"#).await;
+        record_upos_recovery(
+            &pool,
+            70,
+            r#"{"endpoint":"//up.example","upos_uri":"upos://x/y","auth":"tok"}"#,
+        )
+        .await;
 
         let (fresh, expired): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT (SELECT upos_recovery_json FROM upload_missing_segment WHERE id = 70), \
@@ -4586,7 +4600,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(fresh.unwrap().contains("upos://x/y"), "新描述符应当落到行上");
+        assert!(
+            fresh.unwrap().contains("upos://x/y"),
+            "新描述符应当落到行上"
+        );
         assert_eq!(expired, None, "超过 TTL 的描述符应当被清成 NULL");
     }
 
