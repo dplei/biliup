@@ -71,3 +71,26 @@ attempt 的进程内生效。
 
 - `cargo test -p biliup-cli` 通过。
 - 日志能看到 `watchdog=slow_transfer` 与窗口吞吐、已传比例，事后能复原判定过程。
+
+## 落地（已完成）
+
+`upload.rs`：`classify_transfer_rate` 纯函数 + `AttemptWatch` 三个新字段 + `Progress` 分支应用判据。
+`cargo test -p biliup-cli` 429 passed。
+
+三处与原计划的偏差：
+
+- **不加 `StaleReason::SlowTransfer`**。那个枚举是跨进程收割器的词汇，`classify_stale_lease`
+  不会产出这个变体，加进去只会多一条永不写库的 `as_error()` 字符串。归咎线路改为在调用处
+  显式传 `true`——判据只在 `Transferring` 期间生效，这一点由构造保证。
+- **抽出来的是失败出口的尾巴 `fail_attempt`，不是整个 `abort_attempt`**。三条判据的
+  `warn!` 字段本来就不一样（阶段超时要打 `deadline_secs`，判速要打窗口吞吐和已传比例），
+  合并会丢诊断信息。相同的是后面四步：归咎线路、写分块诊断、报 observability、返回 `Err`。
+  顺带把 `PhaseDeadline` 和 `TotalUploadTimeout` 两段重复也消掉了。
+- **窗口重置放进 `enter_phase`**，不是只在 `TransferStarted` 分支里做。`Progress` 分支有一条
+  防御性的补进阶段路径，两条入口共用 `enter_phase` 就不会漏。基线只在
+  `phase == Transferring` 时查一次库。
+
+**没写事件级测试。** 这个文件现有的 watchdog 测试全部直接驱动 `next_attempt_event`，没有能跑
+整个循环的 harness；补一个要造真 pool + `UploadContext` + 假 uploader。判据本身是纯函数且已
+五例覆盖，循环里剩下的是两行窗口赋值。要真跑通中止路径，step 03 的 dev 环境限速实跑比
+mock 更有说服力。

@@ -11,7 +11,7 @@ use tracing::warn;
 const TLS_COOLDOWN: Duration = Duration::hours(24);
 /// 本次实测吞吐低于「本机见过的最好线路」的这一分之一即判劣化。分母而非绝对值，是为了让
 /// 千兆机器和家宽机器共用一套阈值。
-const SLOW_RATIO: f64 = 4.0;
+pub(crate) const SLOW_RATIO: f64 = 4.0;
 const SLOW_COOLDOWN: Duration = Duration::minutes(30);
 pub const SLOW_THROUGHPUT: &str = "slow_throughput";
 const PROBE_LEASE: Duration = Duration::minutes(5);
@@ -235,6 +235,14 @@ pub async fn all_health(pool: &ConnectionPool) -> AppResult<Vec<UploadLineHealth
         .change_context(AppError::Unknown)
 }
 
+/// 本机见过的最好线路吞吐，是所有「慢」判据的分母。空库返回 `None`，此时判据整个关闭。
+pub async fn baseline_mbps(pool: &ConnectionPool) -> AppResult<Option<f64>> {
+    sqlx::query_scalar("SELECT MAX(avg_mbps) FROM upload_line_health")
+        .fetch_one(pool)
+        .await
+        .change_context(AppError::Unknown)
+}
+
 /// 记录一次成功传输。`mbps` 是纯网络阶段的实测吞吐；非正数或非有限值视为「没测到」，
 /// 此时行为与旧版逐字段一致（清零、清冷却、保留既有 EWMA）。
 ///
@@ -262,11 +270,7 @@ pub async fn record_success(
                 .flatten();
         // 判慢用本次实测值而不是 EWMA：一次劣化不该被历史稀释掉。
         avg_mbps = Some(previous.map_or(mbps, |old| old * 0.7 + mbps * 0.3));
-        let baseline: Option<f64> =
-            sqlx::query_scalar("SELECT MAX(avg_mbps) FROM upload_line_health")
-                .fetch_one(pool)
-                .await
-                .change_context(AppError::Unknown)?;
+        let baseline = baseline_mbps(pool).await?;
         // 基线为空是冷启动：一条样本都没有时任何判据都是瞎猜，整个关掉。
         if let Some(baseline) = baseline.filter(|value| mbps < value / SLOW_RATIO) {
             if strands_recoverable_lines(pool, line_key, now).await? {
