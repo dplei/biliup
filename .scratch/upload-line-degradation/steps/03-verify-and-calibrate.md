@@ -30,3 +30,18 @@ step 01、02 的阈值（`SLOW_RATIO = 4.0`、`SLOW_COOLDOWN = 30min`、`SLOW_WI
 阈值定稿后：`.scratch/upload-line-degradation/` → `.archive/`，补 `.archive/README.md` 一行，
 更新 `CODE_INDEX.md` 里 `upload_line_health.rs` / `upload.rs` 的职责摘要，跑
 `python3 scripts/check_code_index.py`。
+
+## 落地（dev 部分已完成）
+
+结果见 [`../verification.md`](../verification.md)。五项全过：冷启动只写 EWMA、判慢按 30 分钟
+冷却、950 MB 在第 90 秒 33% 处中止、497 MB 同速率过半后不中止、三条可取回线路只剩一条时
+安全阀只 warn。
+
+两处与本文计划的偏差：
+
+- **没用 `pf` 限速，改为抬高基线。** 判据是纯比值，抬基线 ≡ 压带宽，且不需要 sudo。
+- **「重试换线」没能在 dev 复现。** dev 配置把线路钉死（AUTO 在 30 Mbps 上行必然探测失败），
+  而显式线路不受冷却影响，换线无从触发。它走的是 selection 既有的 `active_cooldowns` →
+  `excluded` 通道，本次改动没有碰。
+
+阈值维持初值。**生产观察一周那一节仍未开始**，所以本 effort 继续留在 `.scratch/`。
