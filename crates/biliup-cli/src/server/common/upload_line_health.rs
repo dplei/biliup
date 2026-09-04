@@ -1,3 +1,4 @@
+use crate::server::common::upload_line_selection::RECOVERABLE_LINES;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use biliup::error::Kind;
@@ -5,8 +6,14 @@ use chrono::{DateTime, Duration, Utc};
 use error_stack::{Report, ResultExt};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use tracing::warn;
 
 const TLS_COOLDOWN: Duration = Duration::hours(24);
+/// 本次实测吞吐低于「本机见过的最好线路」的这一分之一即判劣化。分母而非绝对值，是为了让
+/// 千兆机器和家宽机器共用一套阈值。
+const SLOW_RATIO: f64 = 4.0;
+const SLOW_COOLDOWN: Duration = Duration::minutes(30);
+pub const SLOW_THROUGHPUT: &str = "slow_throughput";
 const PROBE_LEASE: Duration = Duration::minutes(5);
 const MAX_ERROR_LEN: usize = 512;
 
@@ -47,6 +54,7 @@ pub struct UploadLineHealth {
     pub cooldown_until: Option<DateTime<Utc>>,
     pub last_failure_kind: Option<String>,
     pub last_error: Option<String>,
+    pub avg_mbps: Option<f64>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -227,20 +235,90 @@ pub async fn all_health(pool: &ConnectionPool) -> AppResult<Vec<UploadLineHealth
         .change_context(AppError::Unknown)
 }
 
-pub async fn record_success(pool: &ConnectionPool, line_key: &str) -> AppResult<()> {
+/// 记录一次成功传输。`mbps` 是纯网络阶段的实测吞吐；非正数或非有限值视为「没测到」，
+/// 此时行为与旧版逐字段一致（清零、清冷却、保留既有 EWMA）。
+///
+/// 传完了但很慢同样是线路问题，所以这里会把慢线路按短冷却挂起——复用 `cooldown_until`，
+/// 选路侧不需要第二套排除逻辑。慢不是失败，`consecutive_failures` 保持 0，不去污染
+/// `ordinary_cooldown` 的失败梯度。
+pub async fn record_success(
+    pool: &ConnectionPool,
+    line_key: &str,
+    mbps: f64,
+    now: DateTime<Utc>,
+) -> AppResult<()> {
+    let measured = (mbps.is_finite() && mbps > 0.0).then_some(mbps);
+    let mut avg_mbps = None;
+    let mut cooldown_until = None;
+    let mut failure_kind = None;
+    let mut last_error = None;
+    if let Some(mbps) = measured {
+        let previous: Option<f64> =
+            sqlx::query_scalar("SELECT avg_mbps FROM upload_line_health WHERE line_key = ?")
+                .bind(line_key)
+                .fetch_optional(pool)
+                .await
+                .change_context(AppError::Unknown)?
+                .flatten();
+        // 判慢用本次实测值而不是 EWMA：一次劣化不该被历史稀释掉。
+        avg_mbps = Some(previous.map_or(mbps, |old| old * 0.7 + mbps * 0.3));
+        let baseline: Option<f64> =
+            sqlx::query_scalar("SELECT MAX(avg_mbps) FROM upload_line_health")
+                .fetch_one(pool)
+                .await
+                .change_context(AppError::Unknown)?;
+        // 基线为空是冷启动：一条样本都没有时任何判据都是瞎猜，整个关掉。
+        if let Some(baseline) = baseline.filter(|value| mbps < value / SLOW_RATIO) {
+            if strands_recoverable_lines(pool, line_key, now).await? {
+                warn!(
+                    line = line_key,
+                    mbps, baseline, "线路吞吐劣化，但冷却它会让可取回线路全部挂起，本次只更新均值"
+                );
+            } else {
+                cooldown_until = Some(now + SLOW_COOLDOWN);
+                failure_kind = Some(SLOW_THROUGHPUT);
+                last_error = Some(format!(
+                    "throughput {mbps:.2} MB/s < baseline {baseline:.2}/{SLOW_RATIO:.0} MB/s"
+                ));
+            }
+        }
+    }
     sqlx::query(
         "INSERT INTO upload_line_health \
-         (line_key, consecutive_failures, cooldown_until, last_failure_kind, last_error, updated_at) \
-         VALUES (?1, 0, NULL, NULL, NULL, ?2) \
-         ON CONFLICT(line_key) DO UPDATE SET consecutive_failures = 0, cooldown_until = NULL, \
-             last_failure_kind = NULL, last_error = NULL, updated_at = excluded.updated_at",
+         (line_key, consecutive_failures, cooldown_until, last_failure_kind, last_error, avg_mbps, updated_at) \
+         VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(line_key) DO UPDATE SET consecutive_failures = 0, \
+             cooldown_until = excluded.cooldown_until, last_failure_kind = excluded.last_failure_kind, \
+             last_error = excluded.last_error, \
+             avg_mbps = coalesce(excluded.avg_mbps, upload_line_health.avg_mbps), \
+             updated_at = excluded.updated_at",
     )
     .bind(line_key)
-    .bind(Utc::now())
+    .bind(cooldown_until)
+    .bind(failure_kind)
+    .bind(last_error)
+    .bind(avg_mbps)
+    .bind(now)
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
     Ok(())
+}
+
+/// 冷却一条慢线路的代价是它退出候选集；把可取回线路全冷却掉，选路会退回不受限探测，
+/// 落到没有灾后取回通道的线路上。传得慢比丢失取回通道轻，所以这里让路。
+async fn strands_recoverable_lines(
+    pool: &ConnectionPool,
+    line_key: &str,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    if !RECOVERABLE_LINES.contains(&line_key) {
+        return Ok(false);
+    }
+    let cooling = active_cooldowns(pool, now).await?;
+    Ok(RECOVERABLE_LINES
+        .iter()
+        .all(|key| *key == line_key || cooling.iter().any(|row| row.line_key == *key)))
 }
 
 /// Returns true only when this failure opened a fresh TLS breaker (used to de-duplicate alerts).
@@ -371,5 +449,84 @@ mod tests {
         .await
         .unwrap();
         assert!(all_health(&pool).await.unwrap().is_empty());
+    }
+
+    async fn row(pool: &ConnectionPool, line_key: &str) -> UploadLineHealth {
+        all_health(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.line_key == line_key)
+            .expect("线路缺行")
+    }
+
+    #[tokio::test]
+    async fn cold_start_records_average_without_judging() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        record_success(&pool, "tx", 2.3, now).await.unwrap();
+        let row = row(&pool, "tx").await;
+        assert_eq!(row.avg_mbps, Some(2.3));
+        assert!(row.cooldown_until.is_none());
+        assert!(row.last_failure_kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_transfer_cools_the_line_without_counting_as_failure() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        record_success(&pool, "tx", 26.0, now).await.unwrap();
+        record_success(&pool, "bda2", 2.3, now).await.unwrap();
+        let row = row(&pool, "bda2").await;
+        assert_eq!(row.cooldown_until, Some(now + SLOW_COOLDOWN));
+        assert_eq!(row.last_failure_kind.as_deref(), Some(SLOW_THROUGHPUT));
+        assert_eq!(row.consecutive_failures, 0);
+        assert!(row.last_error.unwrap().contains("2.30 MB/s"));
+    }
+
+    /// 8.55 对 26 的基线不判慢（26/4 = 6.5）。这是刻意的：先按 1/4 上线保不误伤，
+    /// 要不要收紧到 1/3 等生产数据说话。
+    #[tokio::test]
+    async fn moderate_slowdown_is_left_alone() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        record_success(&pool, "tx", 26.0, now).await.unwrap();
+        record_success(&pool, "bda2", 8.55, now).await.unwrap();
+        let row = row(&pool, "bda2").await;
+        assert!(row.cooldown_until.is_none());
+        assert_eq!(row.avg_mbps, Some(8.55));
+    }
+
+    #[tokio::test]
+    async fn last_recoverable_line_is_not_cooled_for_being_slow() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        record_success(&pool, "tx", 26.0, now).await.unwrap();
+        for line in ["bda2", "alia"] {
+            record_failure(&pool, line, UploadFailureKind::Transport, "boom", now)
+                .await
+                .unwrap();
+        }
+        record_success(&pool, "tx", 2.3, now).await.unwrap();
+        let row = row(&pool, "tx").await;
+        assert!(row.cooldown_until.is_none());
+        assert!(row.avg_mbps.unwrap() < 26.0);
+    }
+
+    #[tokio::test]
+    async fn unmeasured_success_keeps_the_old_clearing_semantics() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 4, 12, 0, 0).unwrap();
+        record_success(&pool, "tx", 26.0, now).await.unwrap();
+        record_failure(&pool, "tx", UploadFailureKind::Transport, "boom", now)
+            .await
+            .unwrap();
+        record_success(&pool, "tx", f64::NAN, now).await.unwrap();
+        let row = row(&pool, "tx").await;
+        assert!(row.cooldown_until.is_none());
+        assert!(row.last_failure_kind.is_none());
+        assert!(row.last_error.is_none());
+        assert_eq!(row.consecutive_failures, 0);
+        assert_eq!(row.avg_mbps, Some(26.0));
     }
 }

@@ -59,3 +59,18 @@ alter table upload_line_health add column avg_mbps REAL;
 - `cargo test -p biliup-cli upload_line_health` 通过。
 - 一次慢上传之后 `active_cooldowns` 里出现该线路，`plan_upload_line` 的 `skipped` 能渲染出
   `slow_throughput`（页面「下一条线路」列复用同一份数据，无需另改）。
+
+## 落地（已完成）
+
+`migrations/25_add_upload_line_throughput.sql` + `upload_line_health.rs` + 两处调用点。
+`cargo test -p biliup-cli` 全绿，新增 5 个测试按上面的清单一一对应。
+
+两处与原计划的偏差：
+
+- **签名是 `mbps: f64` 不是 `Option<f64>`**：全仓只有那两个调用点，都在传输后、都有实测值，
+  没有第三方会传 `None`。「没测到」的语义由 `mbps` 非有限或非正数表达（`t = 0` 会算出 `inf`，
+  这条路径必须留），行为与旧版逐字段一致，回归测试照写。
+- **多了 `now: DateTime<Utc>` 参数**：与 `record_failure` 对齐，冷却断言才能是确定值。
+
+安全阀落在 `strands_recoverable_lines`，只在 `line_key` 属于 `RECOVERABLE_LINES` 时生效；
+为此把 `RECOVERABLE_LINES` 从私有改成 `pub(crate)`。

@@ -38,7 +38,7 @@ const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
 /// 这是**实测白名单，不是按厂商推断的**。要加线路，先跑那条 ignored 测试确认它的 GET
 /// 逐字节一致再往里加；跑之前挑没有录制的时段，真实上传会触发 601 账号级冷却。
 /// 显式配置的线路不受这里影响：主人点名要哪条就用哪条。
-const RECOVERABLE_LINES: [&str; 3] = ["bda2", "tx", "alia"];
+pub(crate) const RECOVERABLE_LINES: [&str; 3] = ["bda2", "tx", "alia"];
 pub const AUTO: &str = "auto";
 
 /// Why the attempt ended up on this line.
