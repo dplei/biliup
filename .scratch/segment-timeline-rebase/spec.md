@@ -30,6 +30,12 @@ CDN 重发违反了这个假设，于是需要一个「回锚」补丁来兜住�
 
 ## 方案：把 elapsed 从「减法」换成「累加前向增量」
 
+> ⚠️ **下面这段代码是初稿，已被证伪，留作「当时怎么想的」。** 它只推演了「单发」，
+> 漏了 CDN **逐帧交替**重发（`[0, B+1000, 0, B+2000, …]`）——那种输入下每个增量都跨基准、
+> 都超步长，`elapsed` 永远是 0，本段再也切不了片，正好翻回 #32 的故障。
+> 实际落地的判据多了 `pending_base` 换基准确认与「时间戳未推进直接返回」两处，
+> 推演过程见 [step 01 的落地小节](steps/01-accumulate-forward-deltas.md)。
+
 ```rust
 struct Time { expected: Option<Duration>, elapsed: Duration, last: Option<Duration> }
 
