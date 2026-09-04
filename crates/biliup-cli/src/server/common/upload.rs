@@ -2361,6 +2361,10 @@ struct AttemptWatch {
     last_chunk_index: Option<usize>,
     chunk_started_at: chrono::DateTime<chrono::Utc>,
     last_activity: Instant,
+    /// 传输阶段开始时读一次的全库吞吐基线；`None` 时速率判据整个关闭。
+    baseline_mbps: Option<f64>,
+    window_started_at: Instant,
+    window_start_bytes: u64,
 }
 
 impl AttemptWatch {
@@ -2382,6 +2386,45 @@ impl AttemptWatch {
             self.persisted_bytes,
         )
     }
+}
+
+/// 短于此不判速：分片边界和 TCP 慢启动都会在更短的尺度上制造假的低谷。
+const SLOW_WINDOW: Duration = Duration::from_secs(90);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowVerdict {
+    /// 窗口还没攒够，或者已经过了止损点：什么都不做。
+    Continue,
+    /// 这一窗不慢，把窗口起点推进到当前点。滚动而非累计，开头一次卡顿才不会永久压低后面。
+    Roll,
+    Abort,
+}
+
+/// watchdog 的第二条判据：传输在动、但在爬。
+///
+/// 只在**已传不足一半**时中止。`Parcel::upload_with_observer` 没有断点续传，中止等于已传字节
+/// 全部作废；传过半再中止，重来的代价超过忍完剩下的部分。
+fn classify_transfer_rate(
+    baseline_mbps: Option<f64>,
+    window_elapsed: Duration,
+    window_bytes: u64,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+) -> SlowVerdict {
+    let Some(baseline) = baseline_mbps else {
+        return SlowVerdict::Continue;
+    };
+    if window_elapsed < SLOW_WINDOW {
+        return SlowVerdict::Continue;
+    }
+    let mbps = window_bytes as f64 / 1_000_000. / window_elapsed.as_secs_f64();
+    if mbps >= baseline / upload_line_health::SLOW_RATIO {
+        return SlowVerdict::Roll;
+    }
+    if uploaded_bytes >= total_bytes / 2 {
+        return SlowVerdict::Continue;
+    }
+    SlowVerdict::Abort
 }
 
 /// Deadline for a phase, given the source file size (preprocessing scales with it).
@@ -2433,6 +2476,9 @@ async fn upload_enrolled_with_watchdog(
         last_chunk_index: None,
         chunk_started_at: chrono::Utc::now(),
         last_activity: Instant::now(),
+        baseline_mbps: None,
+        window_started_at: Instant::now(),
+        window_start_bytes: 0,
     };
     let phase_deadline = tokio::time::sleep(watch.phase_deadline);
     let total = tokio::time::sleep(TOTAL_UPLOAD_TIMEOUT);
@@ -2534,21 +2580,17 @@ async fn upload_enrolled_with_watchdog(
                 );
                 // Only a stalled network transfer says anything about the upload line. Blaming
                 // the line for slow local ffmpeg is what cooled bda2 into the one-hour tier.
-                if reason.blames_upload_line() {
-                    record_watchdog_failure(context, UploadFailureKind::RequestTimeout, kind).await;
-                }
-                record_chunk_diagnostics(
+                return Err(fail_attempt(
                     pool,
+                    context,
+                    identity,
                     missing_id,
                     attempt_token,
-                    &format!("{kind}: {diagnostics}"),
+                    kind,
+                    reason.blames_upload_line(),
+                    &diagnostics,
                 )
-                .await;
-                // The watchdog is the failure here; the transfer itself never reported one.
-                crate::observe::upload_failed(identity, kind, &diagnostics);
-                return Err(error_stack::Report::new(AppError::Custom(format!(
-                    "{kind}: {diagnostics}"
-                ))));
+                .await);
             }
             AttemptEvent::TotalUploadTimeout => {
                 let diagnostics = watch.diagnostics(&context.line_key);
@@ -2560,23 +2602,17 @@ async fn upload_enrolled_with_watchdog(
                     diagnostics = %diagnostics,
                     "upload watchdog fired"
                 );
-                record_watchdog_failure(
-                    context,
-                    UploadFailureKind::RequestTimeout,
-                    "total_upload_timeout",
-                )
-                .await;
-                record_chunk_diagnostics(
+                return Err(fail_attempt(
                     pool,
+                    context,
+                    identity,
                     missing_id,
                     attempt_token,
-                    &format!("total_upload_timeout: {diagnostics}"),
+                    "total_upload_timeout",
+                    true,
+                    &diagnostics,
                 )
-                .await;
-                crate::observe::upload_failed(identity, "total_upload_timeout", &diagnostics);
-                return Err(error_stack::Report::new(AppError::Custom(format!(
-                    "total_upload_timeout: {diagnostics}"
-                ))));
+                .await);
             }
             AttemptEvent::ActivityClosed => activity_open = false,
             AttemptEvent::Activity(UploadActivity::NormalizedInPlace) => {
@@ -2686,9 +2722,86 @@ async fn upload_enrolled_with_watchdog(
                 // "chunk 41 on bda2 has been in flight for 700s" answerable after the fact.
                 watch.last_chunk_index = Some(progress.chunk_index);
                 watch.chunk_started_at = acknowledged_at;
+                // 上面的 reset 让「在动」永远算活着，于是爬行的线路能一直传到总超时。这是
+                // 第二条判据：动得太慢，且还没传过半，就趁早换线。
+                let window_elapsed = watch.window_started_at.elapsed();
+                let window_bytes = progress
+                    .uploaded_bytes
+                    .saturating_sub(watch.window_start_bytes);
+                match classify_transfer_rate(
+                    watch.baseline_mbps,
+                    window_elapsed,
+                    window_bytes,
+                    progress.uploaded_bytes,
+                    progress.total_bytes,
+                ) {
+                    SlowVerdict::Continue => {}
+                    SlowVerdict::Roll => {
+                        watch.window_started_at = Instant::now();
+                        watch.window_start_bytes = progress.uploaded_bytes;
+                    }
+                    SlowVerdict::Abort => {
+                        let diagnostics = watch.diagnostics(&context.line_key);
+                        let window_mbps = window_bytes as f64
+                            / 1_000_000.
+                            / window_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+                        warn!(
+                            missing_id,
+                            watchdog = "slow_transfer",
+                            window_secs = window_elapsed.as_secs(),
+                            window_mbps,
+                            baseline_mbps = watch.baseline_mbps,
+                            uploaded_bytes = progress.uploaded_bytes,
+                            total_bytes = progress.total_bytes,
+                            diagnostics = %diagnostics,
+                            "upload watchdog fired"
+                        );
+                        // 网络阶段的慢，归咎线路成立——判据只在 Transferring 期间生效。
+                        return Err(fail_attempt(
+                            pool,
+                            context,
+                            identity,
+                            missing_id,
+                            attempt_token,
+                            "slow_transfer",
+                            true,
+                            &diagnostics,
+                        )
+                        .await);
+                    }
+                }
             }
         }
     }
+}
+
+/// The one failure exit every watchdog verdict goes through: blame the line only when the
+/// evidence is network-phase, persist the chunk-scoped detail, tell observability, hand back
+/// the error. Three verdicts used to spell this out three times.
+#[allow(clippy::too_many_arguments)]
+async fn fail_attempt(
+    pool: &ConnectionPool,
+    context: &UploadContext,
+    identity: &crate::observe::UploadIdentity,
+    missing_id: i64,
+    attempt_token: &str,
+    kind: &'static str,
+    blames_upload_line: bool,
+    diagnostics: &str,
+) -> error_stack::Report<AppError> {
+    if blames_upload_line {
+        record_watchdog_failure(context, UploadFailureKind::RequestTimeout, kind).await;
+    }
+    record_chunk_diagnostics(
+        pool,
+        missing_id,
+        attempt_token,
+        &format!("{kind}: {diagnostics}"),
+    )
+    .await;
+    // The watchdog is the failure here; the transfer itself never reported one.
+    crate::observe::upload_failed(identity, kind, diagnostics);
+    error_stack::Report::new(AppError::Custom(format!("{kind}: {diagnostics}")))
 }
 
 /// Persist the chunk-scoped failure detail (which chunk, which line, how long, how many bytes
@@ -2733,6 +2846,15 @@ async fn enter_phase(
     watch.phase_deadline = phase_deadline_for(phase, source_bytes);
     watch.last_activity = Instant::now();
     watch.chunk_started_at = chrono::Utc::now();
+    watch.window_started_at = Instant::now();
+    watch.window_start_bytes = 0;
+    if phase == AttemptPhase::Transferring {
+        // 读一次就够，传输中不再查库。读不到基线时速率判据自动关闭。
+        watch.baseline_mbps = upload_line_health::baseline_mbps(pool)
+            .await
+            .inspect_err(|error| warn!(?error, missing_id, "读取线路吞吐基线失败"))
+            .unwrap_or_default();
+    }
     phase_deadline.reset(tokio::time::Instant::now() + watch.phase_deadline);
     let now = chrono::Utc::now();
     match attempt_lease::record_phase(pool, missing_id, attempt_token, phase, now).await {
@@ -5044,6 +5166,62 @@ mod tests {
             filename: name.to_string(),
             desc: String::new(),
         }
+    }
+
+    /// 基线 26 MB/s → 判慢门槛 6.5 MB/s（`SLOW_RATIO = 4.0`）。
+    const BASELINE: Option<f64> = Some(26.0);
+    const TOTAL: u64 = 10_000_000_000;
+
+    fn window_bytes(mbps: f64, elapsed: Duration) -> u64 {
+        (mbps * 1_000_000. * elapsed.as_secs_f64()) as u64
+    }
+
+    #[test]
+    fn transfer_rate_verdicts() {
+        // 冷启动：一条样本都没有时不判，任何输入都放行。
+        assert_eq!(
+            classify_transfer_rate(None, SLOW_WINDOW, window_bytes(0.1, SLOW_WINDOW), 0, TOTAL),
+            SlowVerdict::Continue
+        );
+        // 窗口没攒够时长，再慢也不判。
+        let short = Duration::from_secs(60);
+        assert_eq!(
+            classify_transfer_rate(BASELINE, short, window_bytes(2.3, short), 0, TOTAL),
+            SlowVerdict::Continue
+        );
+        // 爬，且只传了 20%：趁早换线。
+        assert_eq!(
+            classify_transfer_rate(
+                BASELINE,
+                SLOW_WINDOW,
+                window_bytes(2.3, SLOW_WINDOW),
+                TOTAL / 5,
+                TOTAL
+            ),
+            SlowVerdict::Abort
+        );
+        // 同样在爬，但已经传过半：中止等于全部作废，忍完剩下的更便宜。
+        assert_eq!(
+            classify_transfer_rate(
+                BASELINE,
+                SLOW_WINDOW,
+                window_bytes(2.3, SLOW_WINDOW),
+                TOTAL * 3 / 5,
+                TOTAL
+            ),
+            SlowVerdict::Continue
+        );
+        // 健康：推进窗口起点，开头一次卡顿不会永久压低后面的窗口。
+        assert_eq!(
+            classify_transfer_rate(
+                BASELINE,
+                SLOW_WINDOW,
+                window_bytes(26.0, SLOW_WINDOW),
+                TOTAL / 5,
+                TOTAL
+            ),
+            SlowVerdict::Roll
+        );
     }
 
     /// A heartbeat interval that will not fire during a short test.
