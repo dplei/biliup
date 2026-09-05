@@ -235,6 +235,7 @@ impl RouteHealthState {
         status: Option<&DownloadStatus>,
         connected_for: Duration,
         completed_configured_segment: bool,
+        productive_attempt: bool,
         now: Instant,
     ) -> HealthUpdate {
         if !self.enabled || matches!(status, Some(DownloadStatus::Cancelled)) {
@@ -270,7 +271,7 @@ impl RouteHealthState {
         }
 
         let record = self.routes.entry(key.clone()).or_default();
-        let recovered = if stable_attempt {
+        let recovered = if stable_attempt || productive_attempt {
             let storm_was_active = self.storm_alert_sent;
             self.storm_alert_sent = false;
             record.clear() || storm_was_active
@@ -503,12 +504,14 @@ mod tests {
             Some(&DownloadStatus::ReadTimeout { buffered: 1 }),
             Duration::from_secs(30),
             false,
+            false,
             now,
         );
         health.begin_attempt(stream);
         let update = health.observe_live_attempt(
             Some(&DownloadStatus::IncompleteFrame { buffered: 1 }),
             Duration::from_secs(30),
+            false,
             false,
             now + Duration::from_secs(31),
         );
@@ -595,6 +598,7 @@ mod tests {
             Some(&DownloadStatus::SegmentCompleted),
             Duration::from_secs(90),
             true,
+            false,
             now + Duration::from_secs(122),
         );
         let metrics = health.metrics_snapshot();
@@ -716,12 +720,13 @@ mod tests {
         )]);
         let mut health = RouteHealthState::new(true);
         health.begin_attempt(&stream);
-        let _ = health.observe_live_attempt(None, Duration::ZERO, false, now);
+        let _ = health.observe_live_attempt(None, Duration::ZERO, false, false, now);
         health.begin_attempt(&stream);
         assert!(matches!(
             health.observe_live_attempt(
                 None,
                 Duration::ZERO,
+                false,
                 false,
                 now + FAILURE_WINDOW + Duration::from_secs(1),
             ),
@@ -752,6 +757,7 @@ mod tests {
                 Some(&DownloadStatus::SegmentCompleted),
                 ROUTE_STABLE_THRESHOLD,
                 true,
+                false,
                 now + ROUTE_STABLE_THRESHOLD,
             ),
             HealthUpdate::Recovered { .. }
@@ -761,6 +767,39 @@ mod tests {
             health.select_route(&mut refreshed, now + ROUTE_STABLE_THRESHOLD, true),
             RouteSelection::Selected { .. }
         ));
+    }
+
+    #[test]
+    fn productive_short_eof_never_accumulates_failures() {
+        let now = Instant::now();
+        let stream = stream(vec![candidate(
+            "flv.example",
+            StreamProtocol::Flv,
+            "origin",
+            "h264",
+            "1080p",
+            0,
+        )]);
+        let mut health = RouteHealthState::new(true);
+
+        for attempt in 0..20 {
+            health.begin_attempt(&stream);
+            assert!(matches!(
+                health.observe_live_attempt(
+                    Some(&DownloadStatus::StreamEnded),
+                    Duration::from_secs(30),
+                    false,
+                    true,
+                    now + Duration::from_secs(attempt),
+                ),
+                HealthUpdate::Failure {
+                    failures: 1,
+                    circuit_opened: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(health.metrics_snapshot().routes[0].stable_attempts, 0);
     }
 
     #[test]
@@ -781,6 +820,7 @@ mod tests {
                 Some(&DownloadStatus::HttpStatus { status: 403 }),
                 Duration::ZERO,
                 false,
+                false,
                 now,
             ),
             HealthUpdate::AuthRefresh { .. }
@@ -790,6 +830,7 @@ mod tests {
             health.observe_live_attempt(
                 Some(&DownloadStatus::HttpStatus { status: 403 }),
                 Duration::ZERO,
+                false,
                 false,
                 now + Duration::from_secs(1),
             ),
@@ -815,6 +856,7 @@ mod tests {
                 Some(&DownloadStatus::Cancelled),
                 Duration::ZERO,
                 false,
+                false,
                 now,
             ),
             HealthUpdate::Unchanged
@@ -823,7 +865,7 @@ mod tests {
         let mut disabled = RouteHealthState::new(false);
         disabled.begin_attempt(&stream);
         assert_eq!(
-            disabled.observe_live_attempt(None, Duration::ZERO, false, now),
+            disabled.observe_live_attempt(None, Duration::ZERO, false, false, now),
             HealthUpdate::Unchanged
         );
     }
@@ -881,18 +923,33 @@ mod tests {
         ]);
         let mut health = RouteHealthState::new(true);
         health.begin_attempt(&stream);
-        let _ = health.observe_live_attempt(None, Duration::ZERO, false, now);
+        let _ = health.observe_live_attempt(None, Duration::ZERO, false, false, now);
         health.begin_attempt(&stream);
-        let first =
-            health.observe_live_attempt(None, Duration::ZERO, false, now + Duration::from_secs(1));
+        let first = health.observe_live_attempt(
+            None,
+            Duration::ZERO,
+            false,
+            false,
+            now + Duration::from_secs(1),
+        );
         assert!(matches!(first, HealthUpdate::Failure { alert: true, .. }));
         let _ = health.select_route(&mut stream, now + Duration::from_secs(2), true);
         health.begin_attempt(&stream);
-        let _ =
-            health.observe_live_attempt(None, Duration::ZERO, false, now + Duration::from_secs(3));
+        let _ = health.observe_live_attempt(
+            None,
+            Duration::ZERO,
+            false,
+            false,
+            now + Duration::from_secs(3),
+        );
         health.begin_attempt(&stream);
-        let second =
-            health.observe_live_attempt(None, Duration::ZERO, false, now + Duration::from_secs(4));
+        let second = health.observe_live_attempt(
+            None,
+            Duration::ZERO,
+            false,
+            false,
+            now + Duration::from_secs(4),
+        );
         assert!(matches!(second, HealthUpdate::Failure { alert: false, .. }));
 
         health.begin_attempt(&stream);
@@ -901,16 +958,28 @@ mod tests {
                 Some(&DownloadStatus::SegmentCompleted),
                 Duration::from_secs(60),
                 true,
+                false,
                 now + Duration::from_secs(5),
             ),
             HealthUpdate::Recovered { .. }
         ));
         health.begin_attempt(&stream);
-        let _ =
-            health.observe_live_attempt(None, Duration::ZERO, false, now + Duration::from_secs(6));
+        let _ = health.observe_live_attempt(
+            None,
+            Duration::ZERO,
+            false,
+            false,
+            now + Duration::from_secs(6),
+        );
         health.begin_attempt(&stream);
         assert!(matches!(
-            health.observe_live_attempt(None, Duration::ZERO, false, now + Duration::from_secs(7)),
+            health.observe_live_attempt(
+                None,
+                Duration::ZERO,
+                false,
+                false,
+                now + Duration::from_secs(7),
+            ),
             HealthUpdate::Failure { alert: true, .. }
         ));
     }

@@ -91,6 +91,7 @@ struct DownloadAttempt {
     result: AppResult<DownloadStatus>,
     connected_for: Duration,
     completed_configured_segment: bool,
+    productive_attempt: bool,
     /// 上游最后一个字节到连接判死之间的静默时长；只有 FLV 自研解析路径测得到。
     silent_for: Option<Duration>,
 }
@@ -113,6 +114,7 @@ pub struct SegmentEventProcessor {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct SegmentProcessingStats {
+    productive_segments: u64,
     valid_segments: u64,
     recoverable_short_segments: u64,
     recoverable_short_bytes: u64,
@@ -121,6 +123,14 @@ struct SegmentProcessingStats {
     invalid_segments: u64,
     segments_queued_for_upload: u64,
     upload_queue_peak_depth: usize,
+}
+
+impl SegmentProcessingStats {
+    fn record_validation(&mut self, validation: &MediaValidation) {
+        if !matches!(validation, MediaValidation::Invalid { .. }) {
+            self.productive_segments = self.productive_segments.saturating_add(1);
+        }
+    }
 }
 
 async fn persist_closed_session_intents(
@@ -182,7 +192,9 @@ impl SegmentEventProcessor {
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         // 删除决定只能发生在媒体内容探测之后；体积本身不再代表文件无效。
-        match self.file_validator.validate(&event.prev_file_path)? {
+        let validation = self.file_validator.validate(&event.prev_file_path)?;
+        self.stats.record_validation(&validation);
+        match validation {
             MediaValidation::Valid => {
                 self.stats.valid_segments += 1;
                 self.flush_pending_short_segments().await?;
@@ -1079,7 +1091,11 @@ impl DownloadTask {
                 result = attempt.result;
                 silent_for = attempt.silent_for;
                 info!("initialize_components completed: {url}");
-                Some((attempt.connected_for, attempt.completed_configured_segment))
+                Some((
+                    attempt.connected_for,
+                    attempt.completed_configured_segment,
+                    attempt.productive_attempt,
+                ))
             } else {
                 None
             };
@@ -1106,11 +1122,14 @@ impl DownloadTask {
                     confirmed_live = true;
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
                     offline_retry.record_live();
-                    if let Some((connected_for, completed_configured_segment)) = attempt {
+                    if let Some((connected_for, completed_configured_segment, productive_attempt)) =
+                        attempt
+                    {
                         let health_update = route_health.observe_live_attempt(
                             result.as_ref().ok(),
                             connected_for,
                             completed_configured_segment,
+                            productive_attempt,
                             Instant::now(),
                         );
                         match health_update {
@@ -1438,6 +1457,7 @@ impl DownloadTask {
         // 执行下载
         // let hook = processor.create_hook(danmaku_client.clone());
         let completed_configured_segment = Arc::new(AtomicBool::new(false));
+        let productive_segments_before = processor.stats.productive_segments;
         let completed_configured_segment_for_hook = completed_configured_segment.clone();
         let identity_for_hook = crate::observe::RecordingIdentity::server(
             ctx.worker_id(),
@@ -1528,6 +1548,7 @@ impl DownloadTask {
             result,
             connected_for,
             completed_configured_segment,
+            productive_attempt: processor.stats.productive_segments > productive_segments_before,
             silent_for: self.downloader.take_last_gap().map(|gap| gap.silent_for),
         }
     }
@@ -1828,7 +1849,8 @@ mod retry_state_tests {
 
 #[cfg(test)]
 mod short_segment_group_tests {
-    use super::{compatible_segment_groups, defer_recovery_batch};
+    use super::{SegmentProcessingStats, compatible_segment_groups, defer_recovery_batch};
+    use crate::server::common::util::{InvalidMediaReason, MediaValidation};
     use crate::server::core::downloader::SegmentInfo;
     use biliup::downloader::util::SegmentCloseReason;
     use std::fs;
@@ -1873,6 +1895,22 @@ mod short_segment_group_tests {
             recovery_source_paths: Vec::new(),
             enrollment: None,
         }
+    }
+
+    #[test]
+    fn productive_count_includes_short_media_but_not_header_only_files() {
+        let mut stats = SegmentProcessingStats::default();
+        stats.record_validation(&MediaValidation::RecoverableShort {
+            duration: Some(Duration::from_secs(1)),
+            first_media_timestamp_ms: Some(0),
+            last_media_timestamp_ms: Some(1_000),
+        });
+        assert_eq!(stats.productive_segments, 1);
+
+        stats.record_validation(&MediaValidation::Invalid {
+            reason: InvalidMediaReason::HeaderOnly,
+        });
+        assert_eq!(stats.productive_segments, 1);
     }
 
     #[test]
