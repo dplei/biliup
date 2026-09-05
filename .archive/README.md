@@ -24,6 +24,7 @@
 
 | 目录 | 内容 | 归档日期 | 完结依据 |
 | --- | --- | --- | --- |
+| [`segment-discard-observability/`](segment-discard-observability/) | 分段校验删除的原生结构化事件与稳定原因映射 | 2026-09-05 | 唯一 step `resolved`；[#38](https://github.com/dplei/biliup/pull/38) 已合入 `dev`，CLI 与 observability 回归通过 |
 | [`observability-multiwriter-health/`](observability-multiwriter-health/) | 多进程共享事件库的 writer 独立身份、租约健康投影与真实进程验收 | 2026-09-03 | 01–03 全部 `resolved`；[#31](https://github.com/dplei/biliup/pull/31) 已合入 `dev`，同机多进程与强杀 TempDir 验收通过 |
 | [`2026-08-27-upload-incident-round2/`](2026-08-27-upload-incident-round2/) | 上传事故第二轮：尝试阶段与租约收敛、异步恢复接口、线路选择、会话连续性等 9 个 ticket | 2026-08-29 | assessment `implemented`，01–09 全部 `resolved` |
 | [`audio-normalization/`](audio-normalization/) | 自动响度标准化与样片音量推子 | 2026-08-29 | spec 记「已实现并完成本机 FFmpeg 冒烟验收」，无待办 |
