@@ -28,7 +28,7 @@ wheel/Python 入口共用同一包装但未起进程实跑）。第六批已接 
 | C01 | system：进程启动/退出 | 哪个进程、版本、启动结果；退出是否正常，强杀没有结束事件不能伪造 | 入口输出、受控启动/退出结果 | 09、14 |
 | C02 | recording：开始/停止/关闭 | 哪个主播/录制场次、为什么开始/结束 | 旧录制输出、录制身份和租约结果 | 12 |
 | C03 | recording：分段创建/关闭/登记 | 稳定分段身份、原始文件、关闭原因、登记结果；登记前也能关联 | 分段生命周期、登记账本、合成切片 | 12、14（Streamlink/YtDlp/YtArchive 第九批已接，缺实跑样本） |
-| C04 | `recording.dts_backward` | 影响分段、前后时间值/单位、处理决定；汇总次数/首末/极值 | 旧 DTS 行、受控异常流 | 12 |
+| C04 | `recording.dts_backward` | 影响分段、前后时间值/单位、实际落盘值、处理决定；汇总次数/首末/极值 | 旧 DTS 行、受控异常流 | 12 |
 | C05 | recording：断流/重连/缺口 | 哪次连接、失败点、退避和恢复、估算缺口与不确定性 | 下载诊断、受控断流与双路交错 | 12 |
 | C06 | processing：预处理决定/结果 | 执行/跳过/降级原因、原分段与产物、失败详情 | 旧预处理输出、已知输入与退出码 | 13 |
 | C07 | upload：排队/开始/失败/完成 | 哪个上传会话/分段/attempt、线路决定、失败影响及后续恢复 | attempt 历史、旧上传输出、业务结果 | 13 |
@@ -59,7 +59,7 @@ S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt
 | C01 | system.started、system.stopped / 全入口 | process_run_id、app_version；CLI含T | executed/failed/cancelled；startup/shutdown | main.rs、server::_main、lib.rs局部作用域；Rust无显式启动行，不能以缺行推失败；S07 |
 | C02 | recording.started、recording.stopped / server及下载命令 | R或T、DA、reason_code | executed/cancelled/failed；live_detected/offline/user_cancel/lease_expired | download::start_download_workflow、monitor::check_room_once；多旧行→一状态变化；S01 |
 | C03 | recording.segment_created、recording.segment_closed、recording.segment_enrolled、recording.segment_discarded / 所有下载路径 | R或T、S；关闭含size_bytes、reason_code；登记后U/missing_id；丢弃含DA、size_bytes、threshold_bytes | executed/failed；split_limit/stream_end/unknown/enrollment_failed/below_filtering_threshold/empty_file/header_only/unsupported_format/malformed_container/no_media_track/probe_failed | LifecycleFile::create、SegmentEventProcessor、enroll_validated_segment；丢弃只在实际删除成功后发出，删除失败保留原文件；创建时尚无稳定S，是P3缺口；S03 |
-| C04 | recording.dts_backward / 原生HTTP-FLV | R或T、S、previous_ms/current_ms；汇总含count/first_ms/last_ms/max_backward_ms | executed；timestamp_backward | httpflv::parse_flv DTS警告；原文无S，初期1:1，启用汇总才N:1；S03 |
+| C04 | recording.dts_backward / 原生HTTP-FLV | R或T、S、previous_ms/current_ms/emitted_ms；汇总含count/first_ms/last_ms/max_backward_ms | executed；timestamp_backward/timestamp_jump_forward | httpflv::parse_flv 的重基点；原文无S，初期1:1，启用汇总才N:1；写盘侧重基后事件语义从「倒退待检查」变成「已重基」，emitted_ms 是实际落盘值，前跳换基准也走同一事件；S03 |
 | C05 | recording.disconnected、recording.retry_scheduled、recording.reconnected / 全下载 | R或T、DA；delay_ms/silent_ms/gap_ms（测不到gap可空） | failed/waiting/recovered；read_timeout/transport_error/stream_end | Connection::read_frame、StreamGears::start_download、download重试；外部进程无FLV gap测量，N:1；S02/S03 |
 | C05 | recording.hls_gap、recording.hls_discontinuity / 原生 HLS | R或T、DA、S、media_sequence；gap另含previous_media_sequence/missing_segments | executed；media_sequence_gap/hls_discontinuity | hls::download_inner 的旧 skipped/discontinuity 警告；序列缺口不是毫秒缺口，不连续指向新文件；S03 |
 | C06 | processing.decided、processing.completed / server上传预处理 | R、S、U、missing_id、UA；artifact_file可空、duration_ms可空 | executed/skipped/fallback/failed；disabled/no_audio/low_disk/probe_failed/invalid_output/detect_failed/remux_failed/verification_failed/unfixable | normalize_for_upload、normalize_timestamps、process_segment_event；时间戳进程失败是fallback而非no_anomaly，不同工具分别stage，N:1；S04 |

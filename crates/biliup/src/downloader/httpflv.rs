@@ -1,5 +1,5 @@
 use crate::downloader::flv_parser::{
-    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader,
+    AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader, TagType,
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
 use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
@@ -75,6 +75,7 @@ fn optional_ms(value: Option<u64>) -> i64 {
 struct DtsBackwardRollup {
     segment_id: String,
     original_file: String,
+    reason_code: &'static str,
     count: u64,
     first_ms: u64,
     last_ms: u64,
@@ -82,7 +83,14 @@ struct DtsBackwardRollup {
 }
 
 impl DtsBackwardRollup {
-    fn record(&mut self, file: &LifecycleFile<'_>, previous_ms: u64, current_ms: u64) {
+    fn record(
+        &mut self,
+        file: &LifecycleFile<'_>,
+        previous_ms: u64,
+        current_ms: u64,
+        emitted_ms: u64,
+        reason_code: &'static str,
+    ) {
         let segment_id = file
             .identity()
             .map(|identity| identity.segment_id.clone())
@@ -97,7 +105,8 @@ impl DtsBackwardRollup {
         if self.count == 1 {
             self.first_ms = current_ms;
             self.max_backward_ms = backward;
-            emit_dts_first(file, previous_ms, current_ms);
+            self.reason_code = reason_code;
+            emit_dts_first(file, previous_ms, current_ms, emitted_ms, reason_code);
         } else {
             self.max_backward_ms = self.max_backward_ms.max(backward);
         }
@@ -109,28 +118,167 @@ impl DtsBackwardRollup {
             emit_dts_summary(file, self);
         }
         self.count = 0;
+        self.reason_code = "";
         self.first_ms = 0;
         self.last_ms = 0;
         self.max_backward_ms = 0;
     }
 }
 
-fn emit_dts_first(file: &LifecycleFile<'_>, previous_ms: u64, current_ms: u64) {
+/// 段内允许的最大前跳。与 `util.rs` 的 `MAX_STEP` 同源同理由：段内的真实空档由停顿看门狗
+/// （默认 30s 不来字节就断连重连，重连会重进 `parse_flv`）兜住，超过它的前跳只可能是换基准。
+const REBASE_MAX_STEP_MS: i64 = 30_000;
+/// 换基准处给新基准留的名义间隔。取 10ms 是因为它小于任何真实帧间隔（60fps 约 16ms，
+/// 一帧 AAC 约 23ms），既保证同流严格递增，又不会在 CDN 逐帧交替重发时把时长撑长。
+const REBASE_NOMINAL_GAP_MS: i64 = 10;
+
+#[derive(Default, Clone, Copy)]
+struct StreamBase {
+    /// 本流已确认基准上的最后一个源时间戳
+    last_src: Option<i64>,
+    /// 本流最后写出的时间戳
+    last_emit: Option<i64>,
+    /// 已见过一次、还等第二个样本确认的候选新基准
+    pending: Option<i64>,
+}
+
+/// 写盘侧的时间戳重基。
+///
+/// CDN 在分段中途重发 script tag 并换时间基准（通常归零，偶尔大幅前跳）时，原样落盘的
+/// 时间戳会让下游解复用器按 32 位 wrap 展开成天文数字，转码据此拒稿（issue #13）。
+/// 这里在写出前统一套一层 `emit = src + offset`，`offset` 只在基准确认改变时更新。
+///
+/// 连续性判据按 **tag 类型分别** 维护：audio 与 video 交错送达，跨流比较会把每个合法交错的
+/// audio tag 误判成换基准，把音画同步打散；各自流内则本来就是单调的。修正量 `offset` 反过来
+/// 必须全局唯一，同基准内的相对关系（音画同步）才原样保留。
+#[derive(Default)]
+struct TimestampRebase {
+    offset: i64,
+    /// 已写出的最大时间戳。换基准时新基准接在它之后，不能用「上一个写出值」——
+    /// 合法交错本来就允许小于它。
+    high_water: i64,
+    streams: [StreamBase; 3],
+}
+
+struct Mapped {
+    emit: u32,
+    /// 本 tag 偏离了所在流的基准：`(该流上一个源时间戳, reason_code)`。
+    deviation: Option<(u64, &'static str)>,
+}
+
+/// `to` 是否仍落在以 `from` 为基准的同一条时间轴上。允许停在原地（CDN 重发同一时间戳），
+/// 不允许倒退，也不允许超过看门狗阈值的前跳。
+fn follows(from: i64, to: i64) -> bool {
+    to >= from && to - from <= REBASE_MAX_STEP_MS
+}
+
+impl TimestampRebase {
+    fn map(&mut self, tag_type: TagType, src: u32) -> Mapped {
+        let slot = match tag_type {
+            TagType::Audio => 0,
+            TagType::Video => 1,
+            TagType::Script => 2,
+        };
+        let src = src as i64;
+        let stream = self.streams[slot];
+        let mut deviation = None;
+        let emit = match stream.last_src {
+            // 本流的第一个 tag：没有判据可用，沿用当前基准。
+            None => {
+                self.streams[slot].last_src = Some(src);
+                src + self.offset
+            }
+            Some(last) if follows(last, src) => {
+                self.streams[slot].last_src = Some(src);
+                // 时钟停在原地不算推进，不能清掉待确认的新基准，否则 CDN 逐帧交替重发
+                // （`[0, B+1000, 0, B+2000, …]`）时新基准永远等不到第二个样本，整条时间轴
+                // 会被压成每帧 `REBASE_NOMINAL_GAP_MS`。`util.rs` 的 `set_time_position`
+                // 靠 `number == last` 提前返回拿到同一效果。
+                if src > last {
+                    self.streams[slot].pending = None;
+                }
+                src + self.offset
+            }
+            Some(last) => {
+                deviation = Some((
+                    last as u64,
+                    if src < last {
+                        "timestamp_backward"
+                    } else {
+                        "timestamp_jump_forward"
+                    },
+                ));
+                match stream.pending {
+                    // 连续两个样本落在同一条新时间轴上：确认换基准，把它接到已写出的最大值之后。
+                    Some(pending) if follows(pending, src) => {
+                        self.offset = self.high_water + REBASE_NOMINAL_GAP_MS - src;
+                        self.streams[slot].last_src = Some(src);
+                        self.streams[slot].pending = None;
+                        // 其它流也一起换了基准，但它们各自的新起点还没见过：清掉判据，让下一个
+                        // tag 直接落到新 offset 上，而不是再触发一次重基。
+                        for other in 0..self.streams.len() {
+                            if other != slot {
+                                self.streams[other].last_src = None;
+                                self.streams[other].pending = None;
+                            }
+                        }
+                        src + self.offset
+                    }
+                    // 首次偏离：还分不清是孤立噪声（重发的初始化帧）还是新基准，先接在已写出的
+                    // 最大值之后，`last_src` 不动，等下一个样本表态。
+                    _ => {
+                        self.streams[slot].pending = Some(src);
+                        self.high_water + REBASE_NOMINAL_GAP_MS
+                    }
+                }
+            }
+        };
+        // 同一个 tag 类型的输出必须严格递增；跨类型的小幅倒退是合法交错，不碰。
+        let emit = match self.streams[slot].last_emit {
+            Some(last_emit) => emit.max(last_emit + 1),
+            None => emit,
+        }
+        .clamp(0, u32::MAX as i64);
+        self.streams[slot].last_emit = Some(emit);
+        self.high_water = self.high_water.max(emit);
+        Mapped {
+            emit: emit as u32,
+            deviation,
+        }
+    }
+}
+
+/// 切段时重发的段首 prelude（onMetaData / sequence header）要带当前时间戳。沿用建档时的
+/// 旧值（常是 0）会在每次切段制造一次假的基准跳变。
+fn restamp(tag: &(TagHeader, Bytes, Bytes), timestamp: u32) -> (TagHeader, Bytes, Bytes) {
+    let mut header = tag.0;
+    header.timestamp = timestamp;
+    (header, tag.1.clone(), tag.2.clone())
+}
+
+fn emit_dts_first(
+    file: &LifecycleFile<'_>,
+    previous_ms: u64,
+    current_ms: u64,
+    emitted_ms: u64,
+    reason_code: &'static str,
+) {
     let owner = file.owner();
     warn!(
         target: EVENT_TARGET,
         event_name = "recording.dts_backward",
         outcome = "executed",
-        reason_code = "timestamp_backward",
+        reason_code,
         segment_id = segment_id(file),
         original_file = original_file(file),
         previous_ms,
         current_ms,
+        emitted_ms,
         live_streamer_id = owner.live_streamer_id(),
         streamer_info_id = owner.streamer_info_id(),
         task_id = owner.task_id(),
         download_attempt_id = owner.download_attempt_id(),
-        "检测到时间戳倒退，继续录制并标记待检查"
+        "检测到时间戳基准跳变，已重基后继续录制"
     );
 }
 
@@ -140,7 +288,7 @@ fn emit_dts_summary(file: &LifecycleFile<'_>, rollup: &DtsBackwardRollup) {
         target: EVENT_TARGET,
         event_name = "recording.dts_backward",
         outcome = "executed",
-        reason_code = "timestamp_backward",
+        reason_code = rollup.reason_code,
         segment_id = rollup.segment_id,
         original_file = rollup.original_file,
         count = rollup.count,
@@ -151,7 +299,7 @@ fn emit_dts_summary(file: &LifecycleFile<'_>, rollup: &DtsBackwardRollup) {
         streamer_info_id = owner.streamer_info_id(),
         task_id = owner.task_id(),
         download_attempt_id = owner.download_attempt_id(),
-        "本分段时间戳倒退汇总"
+        "本分段时间戳基准跳变汇总"
     );
 }
 
@@ -314,10 +462,11 @@ pub(crate) async fn parse_flv(
     let mut on_meta_data = None;
     let mut aac_sequence_header = None;
     let mut h264_sequence_header: Option<(TagHeader, Bytes, Bytes)> = None;
-    let mut prev_timestamp = 0;
-    // 本段起点是否已锚定。曾经用 `prev_timestamp == 0` 代替这个状态，但 `prev_timestamp`
-    // 是「上一批写出 tag 的最后一个时间戳」，抖音重发的 timestamp=0 Script tag 会让下一个
-    // 关键帧误判成「流刚初始化」，把 start 推到当前，定时分段从此失效（issue #32）。
+    // 写出前的时间戳重基。跨段保持，不在切段处复位：各段仍是「CDN 绝对时间轴 + 累计修正」。
+    let mut rebase = TimestampRebase::default();
+    // 本段起点是否已锚定。曾经用「上一批写出 tag 的最后一个时间戳是否为 0」代替这个状态，
+    // 但抖音重发的 timestamp=0 Script tag 会让下一个关键帧误判成「流刚初始化」，把 start
+    // 推到当前，定时分段从此失效（issue #32）。
     let mut start_anchored = false;
     let mut create_new = false;
     loop {
@@ -432,26 +581,29 @@ pub(crate) async fn parse_flv(
                 }
                 segment.set_time_position(Duration::from_millis(timestamp));
                 for (tag_header, flv_tag_data, previous_tag_size_bytes) in &flv_tags_cache {
-                    if tag_header.timestamp < prev_timestamp {
+                    let source_ms = tag_header.timestamp;
+                    let mapped = rebase.map(tag_header.tag_type, source_ms);
+                    if let Some((previous_ms, reason_code)) = mapped.deviation {
                         warn!(
-                            "Non-monotonous DTS in output stream; previous: {prev_timestamp}, current: {};",
-                            tag_header.timestamp
+                            "Non-monotonous DTS in output stream; previous: {previous_ms}, current: {source_ms}, written as {};",
+                            mapped.emit
                         );
                         dts_rollup.record(
                             &out.file,
-                            prev_timestamp as u64,
-                            tag_header.timestamp as u64,
+                            previous_ms,
+                            source_ms as u64,
+                            mapped.emit as u64,
+                            reason_code,
                         );
                     }
-                    out.write_tag(tag_header, flv_tag_data, previous_tag_size_bytes)?;
+                    let mut tag_header = *tag_header;
+                    tag_header.timestamp = mapped.emit;
+                    out.write_tag(&tag_header, flv_tag_data, previous_tag_size_bytes)?;
                     segment.increase_size((11 + tag_header.data_size + 4) as u64);
-                    progress
-                        .first_timestamp_ms
-                        .get_or_insert(tag_header.timestamp as u64);
-                    progress.last_timestamp_ms = Some(tag_header.timestamp as u64);
-                    // downloaded_size += (11 + tag_header.data_size + 4) as u64;
-                    prev_timestamp = tag_header.timestamp
-                    // println!("{downloaded_size}");
+                    // 进度记的是 CDN 的原始时间戳：它的用途是跨连接相减算缺口，和文件里写的
+                    // 重基后时间轴不是一回事（见 `FlvProgress` 的字段说明）。
+                    progress.first_timestamp_ms.get_or_insert(source_ms as u64);
+                    progress.last_timestamp_ms = Some(source_ms as u64);
                 }
                 flv_tags_cache.clear();
 
@@ -469,31 +621,26 @@ pub(crate) async fn parse_flv(
                     segment.set_start_time(Duration::from_millis(timestamp));
                     segment.set_size_position(9 + 4);
 
-                    let (meta_header, meta_bytes, previous_meta_tag_size) =
-                        on_meta_data.as_ref().expect("on_meta_data does not exist");
                     // onMetaData
-                    flv_tags_cache.push((
-                        *meta_header,
-                        meta_bytes.clone(),
-                        previous_meta_tag_size.clone(),
+                    flv_tags_cache.push(restamp(
+                        on_meta_data.as_ref().expect("on_meta_data does not exist"),
+                        tag_header.timestamp,
                     ));
                     // AACSequenceHeader
-                    let aac_sequence_header = aac_sequence_header
-                        .as_ref()
-                        .expect("aac_sequence_header does not exist");
-                    flv_tags_cache.push((
-                        aac_sequence_header.0,
-                        aac_sequence_header.1.clone(),
-                        aac_sequence_header.2.clone(),
+                    flv_tags_cache.push(restamp(
+                        aac_sequence_header
+                            .as_ref()
+                            .expect("aac_sequence_header does not exist"),
+                        tag_header.timestamp,
                     ));
                     if !create_new {
                         // H264SequenceHeader
-                        flv_tags_cache.push(
+                        flv_tags_cache.push(restamp(
                             h264_sequence_header
                                 .as_ref()
-                                .expect("h264_sequence_header does not exist")
-                                .clone(),
-                        );
+                                .expect("h264_sequence_header does not exist"),
+                            tag_header.timestamp,
+                        ));
                     }
                     info!("{} splitting.{segment:?}", out.file.file_name);
                     // Flush before the split so the summary still names the segment it counted.
@@ -953,14 +1100,14 @@ mod tests {
 
             file.create().unwrap();
             let first_id = file.identity().unwrap().segment_id.clone();
-            rollup.record(&file, 1_000, 400);
-            rollup.record(&file, 1_200, 900);
-            rollup.record(&file, 1_500, 100);
+            rollup.record(&file, 1_000, 400, 1_010, "timestamp_backward");
+            rollup.record(&file, 1_200, 900, 1_020, "timestamp_backward");
+            rollup.record(&file, 1_500, 100, 1_030, "timestamp_backward");
 
             // A split allocates a new identity; the counts must not leak across it.
             file.create().unwrap();
             let second_id = file.identity().unwrap().segment_id.clone();
-            rollup.record(&file, 2_000, 1_900);
+            rollup.record(&file, 2_000, 1_900, 2_010, "timestamp_backward");
             rollup.flush(&file);
             (first_id, second_id)
         });
@@ -978,6 +1125,7 @@ mod tests {
         assert_eq!(names[0]["segment_id"], first_id);
         assert_eq!(names[0]["previous_ms"], "1000");
         assert_eq!(names[0]["current_ms"], "400");
+        assert_eq!(names[0]["emitted_ms"], "1010", "事件要说清实际写出的值");
         assert!(!names[0].contains_key("count"));
 
         assert_eq!(names[1]["segment_id"], first_id);
@@ -990,6 +1138,224 @@ mod tests {
         assert_eq!(names[2]["previous_ms"], "2000");
         // A single jump in the new segment produces no summary of its own.
         assert!(!names[2].contains_key("count"));
+    }
+
+    /// 重基是 `parse_flv` 唯一改写落盘时间戳的地方，判据全在 `TimestampRebase` 里，
+    /// 所以这一组直接喂时间戳序列，不跑网络也不落文件。
+    mod rebase {
+        use super::super::{Mapped, TimestampRebase};
+        use crate::downloader::flv_parser::TagType;
+
+        fn video(rebase: &mut TimestampRebase, src: u32) -> u32 {
+            rebase.map(TagType::Video, src).emit
+        }
+
+        fn video_mapped(rebase: &mut TimestampRebase, src: u32) -> Mapped {
+            rebase.map(TagType::Video, src)
+        }
+
+        /// 回归底线：没有跳变时本改动必须是恒等映射。
+        #[test]
+        fn a_clean_stream_is_mapped_one_to_one() {
+            let mut rebase = TimestampRebase::default();
+            for src in [0, 40, 80, 120, 30_000, 30_040] {
+                assert_eq!(video(&mut rebase, src), src, "src {src}");
+            }
+        }
+
+        /// audio/video 交错送达时流内各自单调，判据按 tag 类型分开维护，
+        /// 因此两条流都保持恒等，相对关系原样保留。
+        #[test]
+        fn interleaved_audio_and_video_keep_their_own_timeline() {
+            let mut rebase = TimestampRebase::default();
+            let feed = [
+                (TagType::Video, 1_000u32),
+                (TagType::Audio, 980),
+                (TagType::Video, 1_040),
+                (TagType::Audio, 1_020),
+                (TagType::Video, 1_080),
+                (TagType::Audio, 1_060),
+            ];
+            for (tag_type, src) in feed {
+                let mapped = rebase.map(tag_type, src);
+                assert_eq!(mapped.emit, src, "{tag_type:?} {src}");
+                assert!(mapped.deviation.is_none(), "合法交错不该被判成基准跳变");
+            }
+        }
+
+        /// issue #13 的真实形态：段中途换基准后一直用新基准。
+        /// 跳变处只推进一个名义间隔，之后按真实增量累加。
+        #[test]
+        fn a_single_rebase_keeps_the_real_frame_intervals() {
+            let mut rebase = TimestampRebase::default();
+            for src in [98_000, 99_000, 100_000] {
+                video(&mut rebase, src);
+            }
+            let jump = video_mapped(&mut rebase, 0);
+            assert_eq!(jump.emit, 100_010);
+            assert_eq!(
+                jump.deviation,
+                Some((100_000, "timestamp_backward"))
+            );
+            assert_eq!(video(&mut rebase, 1_000), 100_020, "第二个样本确认新基准");
+            assert_eq!(video(&mut rebase, 2_000), 101_020);
+            assert_eq!(video(&mut rebase, 3_000), 102_020, "此后按真实增量累加");
+        }
+
+        /// 换基准不一定归零，也可能跳到更大的值——不能当成真的过了这么久。
+        #[test]
+        fn a_forward_jump_beyond_the_watchdog_is_a_rebase_too() {
+            let mut rebase = TimestampRebase::default();
+            video(&mut rebase, 1_000);
+            video(&mut rebase, 2_000);
+            let jump = video_mapped(&mut rebase, 3_600_000);
+            assert_eq!(jump.emit, 2_010);
+            assert_eq!(
+                jump.deviation.map(|(_, reason)| reason),
+                Some("timestamp_jump_forward")
+            );
+            assert_eq!(video(&mut rebase, 3_601_000), 2_020);
+            assert_eq!(video(&mut rebase, 3_602_000), 3_020);
+        }
+
+        /// spec 断言「交替重发下不需要二次确认」——推演结果是**反的**：没有 `pending`
+        /// 时每一帧都走不连续分支，10 秒内容会被压成 100 毫秒。这条测试锁住真实增量必须留下。
+        #[test]
+        fn alternating_resends_do_not_collapse_the_timeline() {
+            const BASE: u32 = 32_891_256;
+            let mut rebase = TimestampRebase::default();
+            let mut emits = Vec::new();
+            for index in 0..10u32 {
+                // CDN 重发的初始化关键帧：时间戳恒为 0
+                emits.push(video(&mut rebase, 0));
+                emits.push(video(&mut rebase, BASE + (index + 1) * 1_000));
+            }
+            assert!(
+                emits.windows(2).all(|pair| pair[0] < pair[1]),
+                "同一条流写出的时间戳必须严格递增：{emits:?}"
+            );
+            let span = emits.last().unwrap() - emits.first().unwrap();
+            assert!(
+                (8_000..12_000).contains(&span),
+                "10 帧 × 1s 的真实时长必须保住，实测 {span}ms：{emits:?}"
+            );
+        }
+
+        /// 孤立的一帧噪声不该改基准：下一帧回到原基准时，原基准继续。
+        #[test]
+        fn one_off_noise_does_not_move_the_base() {
+            let mut rebase = TimestampRebase::default();
+            video(&mut rebase, 1_000);
+            video(&mut rebase, 2_000);
+            assert_eq!(video(&mut rebase, 0), 2_010, "噪声接在已写出的最大值之后");
+            assert_eq!(video(&mut rebase, 3_000), 3_000, "基准没变，恒等映射继续");
+        }
+    }
+
+    /// 段中途换基准的完整码流：audio/video 交错、中途时间戳归零，并且跨越一次切段。
+    /// 落盘文件里每条流的时间戳都必须严格递增——这是 issue #13 里被 B 站转码拒稿的那个性质。
+    fn flv_with_a_mid_stream_base_change(frames: usize, payload: usize) -> Vec<u8> {
+        const BASE: u32 = 100_000;
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..frames {
+            let index = index as u32;
+            // 后半段 CDN 重发 script tag 并把基准换成从 0 起算
+            let timestamp = if (index as usize) < frames / 2 {
+                BASE + (index + 1) * 1_000
+            } else {
+                if index as usize == frames / 2 {
+                    append_tag(&mut bytes, 18, &metadata, 0);
+                }
+                (index + 1 - frames as u32 / 2) * 1_000
+            };
+            // audio 比 video 早 20ms 到：合法交错，不该被判成换基准
+            let mut audio = vec![0xaf, 0x01];
+            audio.resize(2 + payload / 4, 0x41);
+            append_tag(&mut bytes, 8, &audio, timestamp.saturating_sub(20));
+            let mut frame = vec![0x17, 0x01, 0, 0, 0];
+            frame.resize(5 + payload, 0x41);
+            append_tag(&mut bytes, 9, &frame, timestamp);
+        }
+        bytes
+    }
+
+    /// 按 FLV 结构走一遍落盘文件，返回 `(tag_type, timestamp)`。
+    fn written_tags(path: &std::path::Path) -> Vec<(u8, u32)> {
+        let data = std::fs::read(path).unwrap();
+        let mut offset = 13;
+        let mut tags = Vec::new();
+        while offset + 11 <= data.len() {
+            let size = u32::from_be_bytes([0, data[offset + 1], data[offset + 2], data[offset + 3]])
+                as usize;
+            let timestamp = u32::from_be_bytes([
+                data[offset + 7],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+            ]);
+            tags.push((data[offset], timestamp));
+            offset += 11 + size + 4;
+        }
+        tags
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_base_change_is_written_as_a_monotonous_timeline() {
+        let directory = tempfile::tempdir().unwrap();
+        // 同一秒内切段会撞同名文件，用纳秒占位符把两段分开
+        let template = directory.path().join("rebased-%f").display().to_string();
+        let captured = Captured::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+
+        let mut connection =
+            Connection::new(complete_response(flv_with_a_mid_stream_base_change(10, 4_000)));
+        connection.read_frame(9).await.unwrap();
+        let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
+        // 切一刀，顺带覆盖段首 prelude 重发
+        let segment = crate::downloader::util::Segmentable::new(None, Some(20_000));
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut connection, file, segment, &mut progress)
+            .await
+            .unwrap();
+
+        let mut files: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "flv"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 2, "本用例要覆盖切段，实测 {} 个文件", files.len());
+
+        for path in &files {
+            let tags = written_tags(path);
+            assert!(tags.len() > 3, "{path:?} 没写出内容");
+            for tag_type in [8u8, 9, 18] {
+                let stamps: Vec<_> = tags
+                    .iter()
+                    .filter(|(kind, _)| *kind == tag_type)
+                    .map(|(_, timestamp)| *timestamp)
+                    .collect();
+                assert!(
+                    stamps.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{path:?} 的 tag_type={tag_type} 时间戳不单调：{stamps:?}"
+                );
+            }
+        }
+
+        let events = captured.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|fields| {
+                fields.get("event_name").map(String::as_str) == Some("recording.dts_backward")
+            }),
+            "换基准仍然要留下事件，运维才知道文件被重基过"
+        );
     }
 
     /// 构造一个「先吐若干 chunk、之后永远不再产出」的响应。
@@ -1132,3 +1498,4 @@ mod tests {
         Ok(())
     }
 }
+
