@@ -1066,9 +1066,11 @@ impl DownloadTask {
 
         // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
-        let failover_enabled = platform == "douyin"
-            && ctx.config().douyin_route_failover.unwrap_or(false)
-            && route_health_enabled;
+        let failover_enabled = douyin_failover_enabled(
+            &stream.platform,
+            ctx.config().douyin_route_failover,
+            route_health_enabled,
+        );
         let mut can_download = true;
         let mut route_failure_count = 0_u32;
         let mut estimated_missing = Duration::ZERO;
@@ -1738,10 +1740,21 @@ async fn remove_blocked_new_streamer_info(ctx: &Context) {
     }
 }
 
+/// 抖音自动切线开关。平台判据用 `LiveStream::platform` 的机器值，
+/// 不用 `LivePlugin::name()` 的展示名（后者是 `Douyin`，比较永远为假）。
+fn douyin_failover_enabled(
+    platform: &str,
+    douyin_route_failover: Option<bool>,
+    route_health_enabled: bool,
+) -> bool {
+    platform == "douyin" && douyin_route_failover.unwrap_or(false) && route_health_enabled
+}
+
 #[cfg(test)]
 mod retry_state_tests {
     use super::{
-        OfflineRetryState, compose_stream_gap, exponential_backoff, persist_closed_session_intents,
+        OfflineRetryState, compose_stream_gap, douyin_failover_enabled, exponential_backoff,
+        persist_closed_session_intents,
     };
     use crate::server::infrastructure::connection_pool::{
         ConnectionManager, test_support::migrated_pool,
@@ -1749,6 +1762,17 @@ mod retry_state_tests {
     use chrono::{TimeZone, Utc};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn douyin_failover_needs_machine_platform_and_both_switches() {
+        assert!(douyin_failover_enabled("douyin", Some(true), true));
+        // 展示名不再参与判定，否则开关永远为假。
+        assert!(!douyin_failover_enabled("Douyin", Some(true), true));
+        assert!(!douyin_failover_enabled("douyin", Some(false), true));
+        assert!(!douyin_failover_enabled("douyin", None, true));
+        assert!(!douyin_failover_enabled("douyin", Some(true), false));
+        assert!(!douyin_failover_enabled("huya", Some(true), true));
+    }
 
     #[test]
     fn stream_gap_sums_the_silent_and_reconnect_halves() {
