@@ -1,6 +1,6 @@
 # 01 · 产出媒体后复位连续失败
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标
 
@@ -35,5 +35,16 @@ Status: ready-for-agent
 
 - `cargo test -p biliup-cli route_health --lib`
 - `cargo test -p biliup-cli --lib`
+
+## 回执
+
+- `SegmentEventProcessor` 直接复用 `FileValidator` 的结果累计 productive 分段；`Valid` 和
+  `RecoverableShort` 计入，`Invalid` 不计入。
+- `DownloadTask::download` 用 attempt 前后计数差值生成 `productive_attempt`；线路状态机用
+  `stable_attempt || productive_attempt` 清理旧失败串，但稳定尝试指标仍只认原有五分钟/完整分段判据。
+- 新增回归覆盖 20 轮 productive 短 EOF 每轮均为失败 1、不开熔断，以及短媒体推进计数、
+  header-only 不推进计数。
+- `cargo test -p biliup-cli route_health --lib`：通过（15 passed）。
+- `cargo test -p biliup-cli --lib`：通过（367 passed，8 ignored）。
 
 ## Comments
