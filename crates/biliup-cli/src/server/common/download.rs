@@ -8,7 +8,7 @@ use crate::server::common::segment_enrollment::{
 };
 use crate::server::common::upload::{SubmissionTrigger, UploaderMessage, spawn_session_submission};
 use crate::server::common::upload_session::{RequestSessionSubmit, request_session_submit};
-use crate::server::common::util::{FileValidator, MediaValidation};
+use crate::server::common::util::{FileValidator, InvalidMediaReason, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
 use crate::server::core::downloader::{
     DanmakuClient, DownloadStatus, DownloaderRuntime, SegmentEvent, SegmentInfo,
@@ -102,6 +102,7 @@ pub struct SegmentEventProcessor {
     uploader: Sender<UploaderMessage>,
     ctx: Context,
     file_validator: FileValidator,
+    filtering_threshold_bytes: u64,
     preserve_recoverable_short_segments: bool,
     recovery_batch_max_files: usize,
     recovery_retry_interval: Duration,
@@ -152,6 +153,7 @@ impl SegmentEventProcessor {
     /// 创建处理器
     pub fn new(uploader: Sender<UploaderMessage>, ctx: Context) -> Self {
         let config = ctx.config();
+        let filtering_threshold_bytes = config.filtering_threshold * 1000 * 1000;
         Self {
             channel: None,
             identity: crate::observe::RecordingIdentity::server(
@@ -160,7 +162,8 @@ impl SegmentEventProcessor {
                 &ctx.live_stream().name,
             ),
             uploader,
-            file_validator: FileValidator::new(config.filtering_threshold * 1000 * 1000, true),
+            file_validator: FileValidator::new(filtering_threshold_bytes, true),
+            filtering_threshold_bytes,
             preserve_recoverable_short_segments: config.preserve_recoverable_short_segments,
             recovery_batch_max_files: config.recoverable_short_batch_max_files.max(1),
             recovery_retry_interval: Duration::from_secs(
@@ -209,10 +212,15 @@ impl SegmentEventProcessor {
                     self.pending_short_segments.push(event);
                     Ok(())
                 } else {
-                    self.remove_invalid_segment(
-                        &event.prev_file_path,
+                    remove_invalid_segment(
+                        &self.identity,
+                        self.filtering_threshold_bytes,
+                        &event,
+                        file_bytes,
+                        "below_filtering_threshold",
                         "recoverable short segment rejected by rollback configuration",
-                    );
+                    )
+                    .await;
                     Ok(())
                 }
             }
@@ -226,7 +234,15 @@ impl SegmentEventProcessor {
                     attempt_id = event.attempt_id.as_deref().unwrap_or("untracked"),
                     "discarding invalid media segment"
                 );
-                self.remove_invalid_segment(&event.prev_file_path, &format!("{reason:?}"));
+                remove_invalid_segment(
+                    &self.identity,
+                    self.filtering_threshold_bytes,
+                    &event,
+                    file_bytes,
+                    invalid_media_reason_code(&reason),
+                    &format!("{reason:?}"),
+                )
+                .await;
                 Ok(())
             }
         }
@@ -558,23 +574,52 @@ impl SegmentEventProcessor {
             );
         }
     }
+}
 
-    fn remove_invalid_segment(&self, path: &std::path::Path, reason: &str) {
-        let path = path.to_owned();
-        let reason = reason.to_string();
-        tokio::spawn(async move {
-            match crate::server::infrastructure::models::hook_step::HookStep::remove_file(&[&path])
-                .await
-            {
-                Ok(()) => info!(file = %path.display(), reason, "removed invalid media segment"),
-                Err(error) => error!(
-                    file = %path.display(),
-                    reason,
-                    error = ?error,
-                    "failed to remove invalid media segment; original preserved"
-                ),
-            }
-        });
+fn invalid_media_reason_code(reason: &InvalidMediaReason) -> &'static str {
+    match reason {
+        InvalidMediaReason::Empty => "empty_file",
+        InvalidMediaReason::HeaderOnly => "header_only",
+        InvalidMediaReason::UnsupportedFormat(_) => "unsupported_format",
+        InvalidMediaReason::MalformedContainer(_) => "malformed_container",
+        InvalidMediaReason::NoMediaTrack => "no_media_track",
+        InvalidMediaReason::ProbeFailed(_) => "probe_failed",
+    }
+}
+
+async fn remove_invalid_segment(
+    identity: &crate::observe::RecordingIdentity,
+    threshold_bytes: u64,
+    event: &SegmentInfo,
+    size_bytes: u64,
+    reason_code: &str,
+    diagnostic_reason: &str,
+) {
+    let path = &event.prev_file_path;
+    match crate::server::infrastructure::models::hook_step::HookStep::remove_file(&[path]).await {
+        Ok(()) => {
+            crate::observe::segment_discarded(
+                identity,
+                event.segment_id.as_deref(),
+                event.attempt_id.as_deref(),
+                path,
+                size_bytes,
+                threshold_bytes,
+                reason_code,
+            );
+            info!(
+                original_file = %path.display(),
+                reason_code,
+                "removed invalid media segment"
+            );
+        }
+        Err(error) => error!(
+            original_file = %path.display(),
+            reason = diagnostic_reason,
+            reason_code,
+            error = ?error,
+            "failed to remove invalid media segment; original preserved"
+        ),
     }
 }
 
@@ -1877,5 +1922,154 @@ mod short_segment_group_tests {
         assert_eq!(value["state"], "Deferred");
         assert_eq!(value["files"].as_array().unwrap().len(), 2);
         assert_eq!(value["last_error"], "ffmpeg exited 254");
+    }
+}
+
+#[cfg(test)]
+mod segment_discard_tests {
+    use super::{invalid_media_reason_code, remove_invalid_segment};
+    use crate::observe::RecordingIdentity;
+    use crate::server::common::util::InvalidMediaReason;
+    use crate::server::core::downloader::SegmentInfo;
+    use biliup::downloader::util::SegmentCloseReason;
+    use biliup_observability::{
+        CaptureKind, CaptureLayer, Commit, Consumer, Event, Level, Options, Runtime, StorageError,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tracing_subscriber::prelude::*;
+
+    struct Memory(Arc<Mutex<Vec<Event>>>);
+    impl Consumer for Memory {
+        fn write(&mut self, batch: &[Event]) -> Result<Commit, StorageError> {
+            self.0.lock().unwrap().extend_from_slice(batch);
+            Ok(Commit::default())
+        }
+    }
+
+    fn segment(path: PathBuf) -> SegmentInfo {
+        SegmentInfo {
+            prev_file_path: path,
+            danmaku_file_path: None,
+            next_file_path: None,
+            segment_index: 3,
+            close_reason: SegmentCloseReason::TransportError,
+            attempt_id: Some("attempt-test".into()),
+            segment_id: Some("segment-test".into()),
+            recovery_source_paths: Vec::new(),
+            enrollment: None,
+        }
+    }
+
+    async fn collect_remove(path: &Path, size_bytes: u64) -> Vec<Event> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut runtime = Runtime::start(
+            "segment-discard-test",
+            "test",
+            Options {
+                enabled: true,
+                ..Options::default()
+            },
+            move || Ok(Memory(sink.clone())),
+        )
+        .unwrap();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CaptureLayer::new(runtime.emitter()).filtered()),
+        );
+        remove_invalid_segment(
+            &RecordingIdentity::server(7, 11, "test"),
+            100_000_000,
+            &segment(path.to_owned()),
+            size_bytes,
+            "header_only",
+            "HeaderOnly",
+        )
+        .await;
+        assert!(runtime.shutdown(Duration::from_secs(2)).closed);
+        events.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn invalid_reasons_have_stable_codes() {
+        let cases = [
+            (InvalidMediaReason::Empty, "empty_file"),
+            (InvalidMediaReason::HeaderOnly, "header_only"),
+            (
+                InvalidMediaReason::UnsupportedFormat("secret detail".into()),
+                "unsupported_format",
+            ),
+            (
+                InvalidMediaReason::MalformedContainer("secret detail".into()),
+                "malformed_container",
+            ),
+            (InvalidMediaReason::NoMediaTrack, "no_media_track"),
+            (
+                InvalidMediaReason::ProbeFailed("secret detail".into()),
+                "probe_failed",
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(invalid_media_reason_code(&reason), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_delete_emits_one_correlated_native_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discarded.flv");
+        std::fs::write(&path, b"header-only").unwrap();
+
+        let events = collect_remove(&path, 11).await;
+
+        assert!(!path.exists());
+        let discarded: Vec<_> = events
+            .iter()
+            .map(Event::data)
+            .filter(|data| data.event_name == "recording.segment_discarded")
+            .collect();
+        assert_eq!(discarded.len(), 1);
+        let discarded = discarded[0];
+        assert_eq!(discarded.capture_kind, CaptureKind::Native);
+        assert_eq!(discarded.level, Level::Warn);
+        assert_eq!(discarded.fields.get("outcome").unwrap(), "executed");
+        assert_eq!(discarded.fields.get("reason_code").unwrap(), "header_only");
+        assert_eq!(discarded.fields.get("live_streamer_id").unwrap(), "7");
+        assert_eq!(discarded.fields.get("streamer_info_id").unwrap(), "11");
+        assert_eq!(discarded.fields.get("segment_id").unwrap(), "segment-test");
+        assert_eq!(
+            discarded.fields.get("download_attempt_id").unwrap(),
+            "attempt-test"
+        );
+        assert_eq!(
+            discarded.fields.get("original_file").unwrap(),
+            "discarded.flv"
+        );
+        assert_eq!(
+            discarded.fields.get("size_bytes").unwrap().as_u64(),
+            Some(11)
+        );
+        assert_eq!(
+            discarded.fields.get("threshold_bytes").unwrap().as_u64(),
+            Some(100_000_000)
+        );
+        assert_eq!(discarded.fields.quality().rejected, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_delete_preserves_path_and_emits_no_discard_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kept.flv");
+        std::fs::create_dir(&path).unwrap();
+
+        let events = collect_remove(&path, 0).await;
+
+        assert!(path.exists());
+        assert!(
+            events
+                .iter()
+                .all(|event| event.data().event_name != "recording.segment_discarded")
+        );
     }
 }

@@ -39,6 +39,16 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   _ms/_secs/_bytes 为单位，不能不带单位地添加时长/大小。最终允许键由 Fields 单一入口维护。
   事件覆盖子 span，子覆盖父；on_record 更新未来事件，入队后快照不再变。
 
+### 分段校验丢弃增量
+
+- `recording.segment_discarded`：WARN、executed，只在校验后实际删除原文件成功时发出，携带
+  R、S、DA、`original_file`、`size_bytes`、`threshold_bytes`。删除失败保留原文件且不发成功事件。
+- `reason_code` 固定为 `below_filtering_threshold`、`empty_file`、`header_only`、
+  `unsupported_format`、`malformed_container`、`no_media_track` 或 `probe_failed`；探测错误正文
+  不进入结构化原因。删除由当前分段处理流程等待，不再交给 detached task。
+- 该事件只覆盖实际删除，不能与 created/enrolled 拼成场次计数等式：外部下载器、record-only、
+  短分段保留/合并路径的生命周期边界不同。
+
 ### P3/14 HLS 增量
 
 - 复用 R 或 T、DA 与文件层 S。独立 Rust/wheel/Python 下载在每次调用分配 task 和 DA；

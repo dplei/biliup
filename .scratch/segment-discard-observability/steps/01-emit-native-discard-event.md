@@ -1,6 +1,6 @@
 # 01 — 在共享删除边界发原生分段丢弃事件
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标
 
@@ -30,3 +30,19 @@ Status: ready-for-agent
 
 - 2026-09-05：分析确认 legacy 字段拒收来自有意的 allowlist，不在桥接层放宽。
 - 2026-09-05：拒绝场次计数等式；现有下载器与短分段恢复语义无法满足该不变量。
+
+## Answer
+
+已在共享删除边界完成实现：`SegmentEventProcessor` 保存本次阈值，两个淘汰分支都等待删除；
+只有删除成功才发 WARN `recording.segment_discarded`，携带 R/S/DA、basename、大小、阈值和稳定
+原因。删除失败保留原路径且不发成功事件。legacy 成功行改用 `original_file` / `reason_code`，
+allowlist 只增加数值字段 `threshold_bytes`，没有放宽未知字段。
+
+验证：
+
+- `cargo test -p biliup-cli segment_discard_tests --lib`：3 passed。
+- `cargo test -p biliup-cli --lib`：365 passed，8 ignored。
+- `cargo test -p biliup-observability`：30 passed。
+- `python3 scripts/check_code_index.py` 与 `git diff --check` 通过。
+
+未添加场次汇总、计数等式、配置项或依赖；这些都不属于本 issue 的最小正确修复。

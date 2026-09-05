@@ -223,6 +223,33 @@ pub fn segment_enrolled(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn segment_discarded(
+    identity: &RecordingIdentity,
+    segment_id: Option<&str>,
+    download_attempt_id: Option<&str>,
+    original_file: &std::path::Path,
+    size_bytes: u64,
+    threshold_bytes: u64,
+    reason_code: &str,
+) {
+    warn!(
+        target: EVENT_TARGET,
+        event_name = "recording.segment_discarded",
+        outcome = "executed",
+        reason_code,
+        live_streamer_id = identity.live_streamer_id(),
+        streamer_info_id = identity.streamer_info_id(),
+        task_id = identity.task_id(),
+        segment_id = segment_id.unwrap_or(""),
+        download_attempt_id = download_attempt_id.unwrap_or(""),
+        original_file = %original_file.display(),
+        size_bytes,
+        threshold_bytes,
+        "分段校验失败，已删除原文件"
+    );
+}
+
 /// Identity of one segment as it moves through preprocessing, upload, recovery and submission.
 /// Every field is what the caller actually knows; nothing here is inferred from a file name.
 #[derive(Debug, Clone, Default)]
