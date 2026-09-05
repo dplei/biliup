@@ -250,6 +250,57 @@ pub fn segment_discarded(
     );
 }
 
+/// One counted transport failure of the current stream route. The circuit state is encoded in
+/// `reason_code` instead of a boolean field, and the consecutive failure count reuses `count`.
+pub fn route_health_changed(
+    identity: &RecordingIdentity,
+    platform: &str,
+    host: &str,
+    failures: u32,
+    circuit_opened: bool,
+) {
+    warn!(
+        target: EVENT_TARGET,
+        event_name = "recording.route_health_changed",
+        outcome = "failed",
+        reason_code = if circuit_opened {
+            "circuit_opened"
+        } else {
+            "transport_failure"
+        },
+        platform,
+        host,
+        count = u64::from(failures),
+        live_streamer_id = identity.live_streamer_id(),
+        streamer_info_id = identity.streamer_info_id(),
+        task_id = identity.task_id(),
+        "拉流线路失败"
+    );
+}
+
+/// What the route selector decided after a failed attempt: switching, keeping the current route
+/// and why, or waiting out the cooldown. A loop without a route failure emits nothing.
+pub fn route_selected(
+    identity: &RecordingIdentity,
+    platform: &str,
+    host: &str,
+    outcome: &str,
+    reason_code: &str,
+) {
+    info!(
+        target: EVENT_TARGET,
+        event_name = "recording.route_selected",
+        outcome,
+        reason_code,
+        platform,
+        host,
+        live_streamer_id = identity.live_streamer_id(),
+        streamer_info_id = identity.streamer_info_id(),
+        task_id = identity.task_id(),
+        "线路选择结果"
+    );
+}
+
 /// Identity of one segment as it moves through preprocessing, upload, recovery and submission.
 /// Every field is what the caller actually knows; nothing here is inferred from a file name.
 #[derive(Debug, Clone, Default)]
