@@ -80,29 +80,31 @@ prev_timestamp = tag_header.timestamp
 在写出点把源时间戳映射一次，`emit = src + offset`；`offset` 只在确认基准不连续时更新：
 
 ```rust
+// 判据按 tag 类型分别维护，修正量 offset 全局唯一
 let src = tag_header.timestamp as i64;
-if let Some(last) = last_src {
-    let delta = src - last;
-    if delta < -INTERLEAVE_TOLERANCE || delta > MAX_STEP {
-        // 基准不连续：让新基准接到「已写出的最大值」之后一个名义间隔
-        offset = high_water + NOMINAL_GAP - src;
+if let Some(last) = stream.last_src {
+    if !follows(last, src) {
+        // 偏离本流基准：第二个样本确认之前只给占位值，不动 offset
+        ...
     }
 }
 let emit = (src + offset).max(0);
 ```
 
-### 三个判据各自兜什么
+> 实现落地时这段伪码有两处被推翻，以 step 01 的最终形态为准（下面两节已改写）。
 
-- **`INTERLEAVE_TOLERANCE`（小幅倒退容忍）**：写盘侧喂进来的是 audio/video **交错**的全部
-  tag，不是 `Segmentable` 那样只有关键帧。同一时刻的 audio 与 video tag 本来就可能小幅乱序，
-  这是合法交错，**不是换基准**。直接复用 `util.rs` 的 `continuous_step`（判据是严格
-  `to > from`）会把每个交错的 audio tag 都判成换基准，把音画同步彻底打散。这是本步最容易
-  踩的坑。
+### 判据各自兜什么
+
+- **连续性按 tag 类型分开判**（spec 初稿写的是「统一判据 + `INTERLEAVE_TOLERANCE` 容忍小幅
+  倒退」，实现时改掉了）。写盘侧喂进来的是 audio/video **交错**的全部 tag，不是 `Segmentable`
+  那样只有关键帧；但交错乱序只发生在**流之间**，每条流自己是单调的。所以把 `last_src`
+  按 tag 类型分开维护，交错就天然不进判据，比拍一个容忍阈值更准——阈值只要给到能兜住交错
+  （数百毫秒量级），就会同时放过 `recording_pilot.py` 注入的 300ms 同流倒退那类真异常。
 - **`MAX_STEP`（大幅前跳）**：换基准不一定归零，也可能跳到一个更大的值。取值与 `util.rs`
   的 `MAX_STEP`（30s）同源同理由：段内合法空档由停顿看门狗兜住（默认 30s 就断连重连，
   重连会重进 `parse_flv`），所以段内不可能存在超过它的真实空档。
 - **`offset` 全局唯一**：audio 与 video 必须用同一个 offset，同基准内的相对关系才不变，
-  音画同步天然保住。**不要按流分别维护。**
+  音画同步天然保住。**不要按流分别维护。**（判据分流、修正量不分流，两件事。）
 
 ### 为什么不选「强制切段」
 
@@ -111,20 +113,28 @@ tag` 在流量高的日子一天能出现几十上百次，逐次切段会产出
 `filtering_threshold` 被判无效删除（正是 #11 / #36 那条链路），拿修复换成片缺口不划算。
 offset 映射没有这个副作用，且段内单调后，上传侧那条昂贵的修复链路（#25）根本不会触发。
 
-### 交替重发不需要 `pending_base`
+### 交替重发仍然需要二次确认（初稿断言已被推翻）
 
-#35 落地时踩过 CDN **逐帧交替**重发（`[0, B+1000, 0, B+2000, …]`）的坑，为此加了
-`pending_base` 二次确认。本题不需要同样的机制：`Segmentable` 可以「不计入」某一步，而写盘
-必须给每个 tag 一个具体的输出值。交替输入下每帧都走不连续分支、每帧推进 `NOMINAL_GAP`，
-时间轴仍然单调，时长偏差有界。**推演必须在 step 01 里写下来并留测试，不能凭这段话默认成立。**
+初稿断言「本题不需要 #35 的 `pending_base`：交替输入下每帧推进 `NOMINAL_GAP`，时间轴仍然
+单调，时长偏差有界」。step 01 逐帧推演后**证伪**：单调确实保住了，但「时长偏差有界」是错的
+——`[0, B+1000, 0, B+2000, …]` 下每一帧都判成换基准，每帧只推进 `NOMINAL_GAP`，10 秒内容
+被压成 100 毫秒，整场录制会塌成几秒的文件。这比原来的坏时间戳更糟。
+
+所以写盘侧同样要二次确认：候选新基准先只拿一个占位值（接在已写出的最大值之后），
+`last_src` 不动，等下一个样本落在同一条新时间轴上才真的换 `offset`。还有一个和 `util.rs`
+同源的细节必须一起抄过来——**时钟停在原地（重发同一时间戳）不算推进，不能清掉待确认的候选
+基准**（`util.rs` 靠 `number == last` 提前返回拿到同样效果）。少了这一条，交替重发里的
+junk 帧会不断把候选基准清掉，新基准永远等不到第二个样本，时间轴照样塌。
+
+这两条都在 step 01 留了测试（`alternating_resends_do_not_collapse_the_timeline`）。
 
 ## 步骤
 
-| 步骤 | 内容 |
-|---|---|
-| [01](steps/01-rebase-written-timestamps.md) | 写盘侧统一 offset 重基（根因），含 `recording.dts_backward` 事件语义跟进 |
-| [02](steps/02-detect-anomaly-beyond-ffmpeg-text.md) | 检测器解析数值，堵掉「倒退被展开成单调大跳变」的漏检 |
-| [03](steps/03-lock-fallback-repair-path.md) | 给 fallback 必经修复加回归测试，锁住已有行为 |
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| [01](steps/01-rebase-written-timestamps.md) | 写盘侧统一 offset 重基（根因），含 `recording.dts_backward` 事件语义跟进 | **已完成** |
+| [02](steps/02-detect-anomaly-beyond-ffmpeg-text.md) | 检测器解析数值，堵掉「倒退被展开成单调大跳变」的漏检 | 待做 |
+| [03](steps/03-lock-fallback-repair-path.md) | 给 fallback 必经修复加回归测试，锁住已有行为 | 待做 |
 
 01 是根因，02 / 03 兜存量文件与防回退。**按 session 约定一轮一步。**
 
