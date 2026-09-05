@@ -94,7 +94,9 @@ pub(crate) fn field_kind(key: &str) -> Option<&'static str> {
         "original_file" | "artifact_file" => Some("file"),
         "message" => Some("message"),
         "error" => Some("error"),
-        "streamer_name" | "platform" | "stage" | "phase" | "line" | "command" => Some("text"),
+        "streamer_name" | "platform" | "stage" | "phase" | "line" | "command" | "host" => {
+            Some("text")
+        }
         "previous_ms"
         | "current_ms"
         | "first_ms"

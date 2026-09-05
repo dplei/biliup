@@ -1079,6 +1079,9 @@ impl DownloadTask {
         crate::observe::recording_started(&identity, "live_detected", None);
         loop {
             let mut silent_for = None;
+            // 只有判失败的一轮才发选择事件；正常循环不产生噪声。
+            let mut route_attempt_failed = false;
+            let mut failed_route_host = String::from("unknown");
             let attempt = if can_download {
                 route_health.begin_attempt(&stream);
                 let attempt = self
@@ -1152,6 +1155,16 @@ impl DownloadTask {
                                     codec = key.codec.as_deref().unwrap_or("unknown"),
                                     "stream is live but route transport failed"
                                 );
+                                route_attempt_failed = true;
+                                failed_route_host =
+                                    key.host.as_deref().unwrap_or("unknown").to_owned();
+                                crate::observe::route_health_changed(
+                                    &identity,
+                                    &stream.platform,
+                                    &failed_route_host,
+                                    failures,
+                                    circuit_opened,
+                                );
                                 if alert && failover_enabled {
                                     cookie_health::notify_alert(
                                         cookie_webhook.as_deref(),
@@ -1189,6 +1202,7 @@ impl DownloadTask {
                     stream = *next_stream;
                     // 上一次 download future 已返回并关闭 LifecycleFile；这里才改写候选，
                     // 下一轮必然重新创建媒体文件，不会在同一分段内混接 Host/协议/Codec。
+                    let has_candidates = !stream.stream_candidates.is_empty();
                     let selection =
                         route_health.select_route(&mut stream, Instant::now(), failover_enabled);
                     let (route_changed, selection_backoff) = match selection {
@@ -1204,6 +1218,20 @@ impl DownloadTask {
                                     "selected a different healthy stream route"
                                 );
                             }
+                            if let Some((outcome, reason_code)) = route_selection_event(
+                                route_attempt_failed,
+                                Some(changed),
+                                failover_enabled,
+                                has_candidates,
+                            ) {
+                                crate::observe::route_selected(
+                                    &identity,
+                                    &stream.platform,
+                                    key.host.as_deref().unwrap_or("unknown"),
+                                    outcome,
+                                    reason_code,
+                                );
+                            }
                             (changed, None)
                         }
                         RouteSelection::Unavailable { retry_after } => {
@@ -1213,6 +1241,20 @@ impl DownloadTask {
                                 retry_after = ?retry_after,
                                 "all refreshed stream routes are cooling down; checking again after backoff"
                             );
+                            if let Some((outcome, reason_code)) = route_selection_event(
+                                route_attempt_failed,
+                                None,
+                                failover_enabled,
+                                has_candidates,
+                            ) {
+                                crate::observe::route_selected(
+                                    &identity,
+                                    &stream.platform,
+                                    &failed_route_host,
+                                    outcome,
+                                    reason_code,
+                                );
+                            }
                             (false, Some(retry_after.min(RETRY_MAX_DELAY)))
                         }
                     };
@@ -1740,6 +1782,26 @@ async fn remove_blocked_new_streamer_info(ctx: &Context) {
     }
 }
 
+/// 失败后的选择结论 → 稳定的 `(outcome, reason_code)`。`changed` 为 `None` 表示所有候选都在冷却；
+/// 上一轮没有判失败时返回 `None`，调用端不发事件。
+fn route_selection_event(
+    previous_attempt_failed: bool,
+    changed: Option<bool>,
+    failover_enabled: bool,
+    has_candidates: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !previous_attempt_failed {
+        return None;
+    }
+    Some(match changed {
+        None => ("waiting", "all_routes_cooling"),
+        Some(true) => ("fallback", "route_changed"),
+        Some(false) if !failover_enabled => ("skipped", "failover_disabled"),
+        Some(false) if !has_candidates => ("skipped", "no_candidate"),
+        Some(false) => ("skipped", "current_route_retained"),
+    })
+}
+
 /// 抖音自动切线开关。平台判据用 `LiveStream::platform` 的机器值，
 /// 不用 `LivePlugin::name()` 的展示名（后者是 `Douyin`，比较永远为假）。
 fn douyin_failover_enabled(
@@ -2132,6 +2194,138 @@ mod segment_discard_tests {
             events
                 .iter()
                 .all(|event| event.data().event_name != "recording.segment_discarded")
+        );
+    }
+}
+
+#[cfg(test)]
+mod route_event_tests {
+    use super::route_selection_event;
+    use crate::observe::RecordingIdentity;
+    use biliup_observability::{
+        CaptureKind, CaptureLayer, Commit, Consumer, Event, Level, Options, Runtime, StorageError,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tracing_subscriber::prelude::*;
+
+    struct Memory(Arc<Mutex<Vec<Event>>>);
+    impl Consumer for Memory {
+        fn write(&mut self, batch: &[Event]) -> Result<Commit, StorageError> {
+            self.0.lock().unwrap().extend_from_slice(batch);
+            Ok(Commit::default())
+        }
+    }
+
+    fn collect(emit: impl FnOnce(&RecordingIdentity)) -> Vec<Event> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut runtime = Runtime::start(
+            "route-event-test",
+            "test",
+            Options {
+                enabled: true,
+                ..Options::default()
+            },
+            move || Ok(Memory(sink.clone())),
+        )
+        .unwrap();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CaptureLayer::new(runtime.emitter()).filtered()),
+        );
+        emit(&RecordingIdentity::server(7, 11, "test"));
+        assert!(runtime.shutdown(Duration::from_secs(2)).closed);
+        events.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn circuit_failure_is_a_native_event_with_host_and_count() {
+        let events = collect(|identity| {
+            crate::observe::route_health_changed(identity, "douyin", "pull-flv.example", 2, true);
+        });
+        let failure = events
+            .iter()
+            .map(Event::data)
+            .find(|data| data.event_name == "recording.route_health_changed")
+            .expect("route health event");
+        assert_eq!(failure.capture_kind, CaptureKind::Native);
+        assert_eq!(failure.level, Level::Warn);
+        assert_eq!(failure.fields.get("outcome").unwrap(), "failed");
+        assert_eq!(failure.fields.get("reason_code").unwrap(), "circuit_opened");
+        assert_eq!(failure.fields.get("platform").unwrap(), "douyin");
+        assert_eq!(failure.fields.get("host").unwrap(), "pull-flv.example");
+        assert_eq!(failure.fields.get("count").unwrap().as_u64(), Some(2));
+        assert_eq!(failure.fields.get("live_streamer_id").unwrap(), "7");
+        assert_eq!(failure.fields.quality().rejected, 0);
+    }
+
+    #[test]
+    fn plain_failure_keeps_the_transport_reason() {
+        let events = collect(|identity| {
+            crate::observe::route_health_changed(identity, "douyin", "pull-flv.example", 1, false);
+        });
+        let failure = events
+            .iter()
+            .map(Event::data)
+            .find(|data| data.event_name == "recording.route_health_changed")
+            .expect("route health event");
+        assert_eq!(
+            failure.fields.get("reason_code").unwrap(),
+            "transport_failure"
+        );
+        assert_eq!(failure.fields.quality().rejected, 0);
+    }
+
+    #[test]
+    fn selection_event_carries_the_chosen_host() {
+        let events = collect(|identity| {
+            crate::observe::route_selected(
+                identity,
+                "douyin",
+                "pull-hls.example",
+                "fallback",
+                "route_changed",
+            );
+        });
+        let selected = events
+            .iter()
+            .map(Event::data)
+            .find(|data| data.event_name == "recording.route_selected")
+            .expect("route selected event");
+        assert_eq!(selected.capture_kind, CaptureKind::Native);
+        assert_eq!(selected.fields.get("outcome").unwrap(), "fallback");
+        assert_eq!(selected.fields.get("reason_code").unwrap(), "route_changed");
+        assert_eq!(selected.fields.get("host").unwrap(), "pull-hls.example");
+        assert_eq!(selected.fields.quality().rejected, 0);
+    }
+
+    #[test]
+    fn a_loop_without_route_failure_emits_no_selection_event() {
+        assert_eq!(route_selection_event(false, Some(true), true, true), None);
+        assert_eq!(route_selection_event(false, None, true, true), None);
+    }
+
+    #[test]
+    fn selection_reasons_are_stable() {
+        assert_eq!(
+            route_selection_event(true, Some(true), true, true),
+            Some(("fallback", "route_changed"))
+        );
+        assert_eq!(
+            route_selection_event(true, Some(false), true, true),
+            Some(("skipped", "current_route_retained"))
+        );
+        assert_eq!(
+            route_selection_event(true, Some(false), false, true),
+            Some(("skipped", "failover_disabled"))
+        );
+        assert_eq!(
+            route_selection_event(true, Some(false), true, false),
+            Some(("skipped", "no_candidate"))
+        );
+        assert_eq!(
+            route_selection_event(true, None, true, true),
+            Some(("waiting", "all_routes_cooling"))
         );
     }
 }

@@ -1,6 +1,6 @@
 # 03 · 发出可查询的线路失败与选择事件
 
-Status: ready-for-agent
+Status: resolved
 
 Blocked by: 01, 02
 
@@ -41,5 +41,21 @@ Blocked by: 01, 02
 
 - `cargo test -p biliup-cli --lib`
 - `cargo test -p biliup-observability`
+
+## 回执
+
+- `observe.rs` 新增 `route_health_changed`（WARN、`outcome=failed`，熔断编码进 `reason_code`，
+  连续失败数走 `count`）与 `route_selected`（INFO，稳定 `outcome`/`reason_code`），两者都携带
+  录制身份、`platform`、`host`。
+- `model.rs` allowlist 只新增 `host` 文本字段；未为 protocol/quality/codec 扩张契约。
+- `download.rs` 保留全部 legacy 日志；`HealthUpdate::Failure` 记下失败标记与 Host 后发健康事件，
+  选择结论由纯函数 `route_selection_event(previous_attempt_failed, changed, failover_enabled,
+  has_candidates)` 映射为稳定二元组，未扩张 `RouteSelection` 枚举；上一轮未判失败时返回 `None`，
+  正常循环不发选择事件。
+- 新增 `route_event_tests`：熔断事件断言 `capture_kind=Native`、`reason_code=circuit_opened`、
+  `count`、`host` 与 `fields.quality.rejected == 0`；另覆盖 `transport_failure`、`route_changed`
+  事件字段，以及五种选择 reason 与「无失败不发事件」。
+- `cargo test -p biliup-cli --lib`：通过（373 passed，8 ignored）。
+- `cargo test -p biliup-observability`：通过（18 passed）。
 
 ## Comments
