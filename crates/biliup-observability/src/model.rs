@@ -105,6 +105,7 @@ pub(crate) fn field_kind(key: &str) -> Option<&'static str> {
         | "silent_ms"
         | "gap_ms"
         | "size_bytes"
+        | "threshold_bytes"
         | "confirmed_bytes"
         | "updated_at_ms"
         | "total_bytes"
