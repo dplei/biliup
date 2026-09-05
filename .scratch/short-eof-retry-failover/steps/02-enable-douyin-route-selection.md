@@ -1,6 +1,6 @@
 # 02 · 让抖音候选真正进入线路选择
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标
 
@@ -28,5 +28,14 @@ Status: ready-for-agent
 
 - `cargo test -p biliup-cli route_health --lib`
 - `cargo test -p biliup-cli --lib`
+
+## 回执
+
+- `failover_enabled` 改由私有的 `douyin_failover_enabled(&stream.platform, ..)` 计算，平台判据用机器值
+  `douyin`；`plugin.name()` 的展示名不再参与判定。`LivePlugin::name()`、`RouteKey` 与候选排序均未改动。
+- 新增调用端开关回归 `douyin_failover_needs_machine_platform_and_both_switches`：机器值开启、展示名
+  `Douyin` 为假、任一配置开关关闭为假、其他平台为假。
+- `cargo test -p biliup-cli route_health --lib`：通过（15 passed）。
+- `cargo test -p biliup-cli --lib`：通过（368 passed，8 ignored）。
 
 ## Comments
