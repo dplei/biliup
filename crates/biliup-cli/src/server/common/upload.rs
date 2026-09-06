@@ -1739,15 +1739,8 @@ async fn upload_single_file_with_repair(
                 .min(u64::MAX as u128) as u64,
         );
     }
-    // 标准化的测量遍已经完整 demux 过原片并顺带做了时间戳诊断；原片干净时产物也干净，
-    // 不必再为它单独跑一遍整片扫描。诊断缺失或原片异常时照常走完整的检测/修复链路。
-    let source_timestamps_clean = matches!(
-        normalization,
-        NormalizationOutcome::Normalized {
-            source_timestamps_clean: true,
-            ..
-        }
-    );
+    // 判据要在 `normalization` 被 match 消费之前取。
+    let (repair_decision, repair_reason) = timestamp_repair_decision(repair_enabled, &normalization);
     // 就地替换的形态没有临时件要善后，上传路径就是原片路径；只有 `keep_original` 会
     // 产出需要清理的临时件。
     let normalization_artifact = match normalization {
@@ -1778,8 +1771,8 @@ async fn upload_single_file_with_repair(
         .map(TempArtifact::path)
         .unwrap_or(original_path);
     let repair_started = std::time::Instant::now();
-    let outcome = if repair_enabled && !source_timestamps_clean {
-        crate::observe::processing_decided(identity, "timestamp_repair", "executed", "scan_needed");
+    let outcome = if repair_decision == "executed" {
+        crate::observe::processing_decided(identity, "timestamp_repair", repair_decision, repair_reason);
         let ffmpeg = SystemFfmpeg::with_context(identity.context());
         let outcome = normalize_timestamps(normalized_path, &ffmpeg).await;
         let (result, reason) = timestamp_repair_result(&outcome);
@@ -1797,17 +1790,8 @@ async fn upload_single_file_with_repair(
         );
         outcome
     } else {
-        crate::observe::processing_decided(
-            identity,
-            "timestamp_repair",
-            "skipped",
-            if repair_enabled {
-                "source_clean"
-            } else {
-                "disabled"
-            },
-        );
-        if repair_enabled {
+        crate::observe::processing_decided(identity, "timestamp_repair", repair_decision, repair_reason);
+        if repair_reason == "source_clean" {
             info!(
                 timestamp_repair = "skipped",
                 file = %original_path.display(),
@@ -1905,6 +1889,33 @@ fn original_reason_code(
         DiskAdmissionDenied => "low_disk",
         DiskPressureAborted => "low_disk_aborted",
         NormalizationDisabled => "disabled",
+    }
+}
+
+/// 上传前要不要跑时间戳扫描，以及事件里怎么说：`(outcome, reason_code)`。
+///
+/// 规则的本质是「**归一化没产出，就没有『源已验干净』这个结论可用**」——
+/// `source_timestamps_clean` 是响度测量那一遍顺带扫出来的，`Original` 分支根本没跑那一遍。
+/// 所以对 `Original` 的**每一个** reason 都必须扫，不是只对 `TranscodeFailed` 打补丁。
+///
+/// 这条规则原本只是 `8b78a14` / `80494a5` 顺带的结果，没有测试锁住；只要有人给 `Original`
+/// 分支补一个「乐观默认」，最需要修复的那批文件就会悄悄绕过修复链路（issue #13 建议 2 描述的
+/// 正是这个状态）。判据抽出来是为了让它可断言。
+fn timestamp_repair_decision(
+    repair_enabled: bool,
+    normalization: &NormalizationOutcome,
+) -> (&'static str, &'static str) {
+    if !repair_enabled {
+        return ("skipped", "disabled");
+    }
+    match normalization {
+        // 标准化的测量遍已经完整 demux 过原片并顺带做了时间戳诊断；原片干净时产物也干净
+        //（标准化只是 `-c copy` 搬视频流 + 重编音频），不必再为它单独跑一遍整片扫描。
+        NormalizationOutcome::Normalized {
+            source_timestamps_clean: true,
+            ..
+        } => ("skipped", "source_clean"),
+        _ => ("executed", "scan_needed"),
     }
 }
 
@@ -4477,6 +4488,7 @@ pub async fn retry_missing_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::common::audio_normalization::{LoudnessMeasurement, OriginalReason};
     use crate::server::common::segment_enrollment::{
         EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
         normalize_segment_path,
@@ -4503,6 +4515,104 @@ mod tests {
                 ("fallback", expected)
             );
         }
+    }
+
+    /// 归一化没产出时，「源已验干净」这个结论根本不存在——`Original` 的**每一个** reason
+    /// 都必须进时间戳扫描。
+    ///
+    /// 这条路径恰好是最需要修复的那批文件走的：`TranscodeFailed` 意味着响度标准化没跑成，
+    /// 而 `source_timestamps_clean` 是标准化的测量遍顺带扫出来的。issue #13 的建议 2 描述的
+    /// 就是这里被绕过的状态；它现在成立只是 `8b78a14` / `80494a5` 的顺带结果，本用例负责
+    /// 锁住它，别让谁给 `Original` 补一个「乐观默认」。
+    #[test]
+    fn every_normalization_fallback_still_scans_timestamps() {
+        for reason in every_original_reason() {
+            assert_eq!(
+                timestamp_repair_decision(true, &NormalizationOutcome::Original { reason }),
+                ("executed", "scan_needed"),
+                "{reason:?} 走的是归一化没产出的路径，没有『源已验干净』可用"
+            );
+        }
+    }
+
+    /// 归一化跑成了但测量遍说源脏，同样要扫；只有明确验干净才允许跳过。
+    #[test]
+    fn only_a_verified_clean_source_skips_the_scan() {
+        assert_eq!(
+            timestamp_repair_decision(true, &normalized(true)),
+            ("skipped", "source_clean")
+        );
+        assert_eq!(
+            timestamp_repair_decision(true, &normalized(false)),
+            ("executed", "scan_needed"),
+            "诊断说脏或拿不到诊断时不能跳过"
+        );
+    }
+
+    /// 关掉开关时跳过的理由必须是 `disabled`，不能借用 `source_clean` ——
+    /// 那会让「没扫」看起来像「扫过且干净」。
+    #[test]
+    fn a_disabled_repair_says_so() {
+        assert_eq!(
+            timestamp_repair_decision(false, &normalized(false)),
+            ("skipped", "disabled")
+        );
+        assert_eq!(
+            timestamp_repair_decision(
+                false,
+                &NormalizationOutcome::Original {
+                    reason: OriginalReason::TranscodeFailed
+                }
+            ),
+            ("skipped", "disabled")
+        );
+    }
+
+    fn normalized(source_timestamps_clean: bool) -> NormalizationOutcome {
+        NormalizationOutcome::Normalized {
+            form: NormalizedForm::ReplacedOriginal,
+            measurement: LoudnessMeasurement {
+                input_i: -18.0,
+                input_lra: 7.0,
+                input_tp: -2.0,
+                input_thresh: -28.0,
+                target_offset: 0.0,
+            },
+            source_timestamps_clean,
+        }
+    }
+
+    /// 新增 `OriginalReason` 时下面那个 match 会编译不过：把它补进清单，
+    /// 别让新 reason 默认落到「跳过扫描」那一侧还没人发现。
+    fn every_original_reason() -> Vec<OriginalReason> {
+        fn exhaustive(reason: OriginalReason) {
+            match reason {
+                OriginalReason::MissingOrEmpty
+                | OriginalReason::NoAudio
+                | OriginalReason::ProbeFailed
+                | OriginalReason::MeasureFailed
+                | OriginalReason::InvalidMeasurement
+                | OriginalReason::TranscodeFailed
+                | OriginalReason::InvalidOutput
+                | OriginalReason::DiskAdmissionDenied
+                | OriginalReason::DiskPressureAborted
+                | OriginalReason::NormalizationDisabled => (),
+            }
+        }
+        let all = vec![
+            OriginalReason::MissingOrEmpty,
+            OriginalReason::NoAudio,
+            OriginalReason::ProbeFailed,
+            OriginalReason::MeasureFailed,
+            OriginalReason::InvalidMeasurement,
+            OriginalReason::TranscodeFailed,
+            OriginalReason::InvalidOutput,
+            OriginalReason::DiskAdmissionDenied,
+            OriginalReason::DiskPressureAborted,
+            OriginalReason::NormalizationDisabled,
+        ];
+        all.iter().copied().for_each(exhaustive);
+        all
     }
 
     /// 分P标题取自原始录像，而不是上传时实际喂进去的那个文件。
