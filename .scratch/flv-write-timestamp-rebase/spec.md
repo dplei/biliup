@@ -134,7 +134,7 @@ junk 帧会不断把候选基准清掉，新基准永远等不到第二个样本
 |---|---|---|
 | [01](steps/01-rebase-written-timestamps.md) | 写盘侧统一 offset 重基（根因），含 `recording.dts_backward` 事件语义跟进 | **已完成** |
 | [02](steps/02-detect-anomaly-beyond-ffmpeg-text.md) | 检测器解析数值，堵掉「倒退被展开成单调大跳变」的漏检 | **已完成** |
-| [03](steps/03-lock-fallback-repair-path.md) | 给 fallback 必经修复加回归测试，锁住已有行为 | 待做 |
+| [03](steps/03-lock-fallback-repair-path.md) | 给 fallback 必经修复加回归测试，锁住已有行为 | **已完成** |
 
 01 是根因，02 / 03 兜存量文件与防回退。**按 session 约定一轮一步。**
 
