@@ -66,6 +66,109 @@ fn leading_number(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
+/// 相邻包时间戳的异常前跳阈值。与录制侧 `TimestampRebase` 的 `REBASE_MAX_STEP_MS` 讲同一套
+/// 故事：段内的真实空档由停顿看门狗（默认 30s 不来字节就断连重连）兜住，超过它的前跳只可能
+/// 是基准跳变。两侧用同一个数，才不会出现「录制侧认为是跳变、上传侧认为正常」的夹缝。
+pub const MAX_PACKET_STEP_MS: i64 = 30_000;
+
+/// 逐行消费 ffprobe 的 `stream_index,dts_time` 输出，找相邻包之间的异常大幅前跳。
+///
+/// 存在的理由是一个**确定性**漏检：源文件里的 32 位时间戳倒退可能已经被解复用器展开成一个
+/// 单调的巨大前跳，展开之后 muxer 无话可说，`stderr_indicates_anomaly` 的五个串一个都不会
+/// 出现（实测：video DTS 从 0 跳到 4.29e9 秒的样本，`-c copy -f null -` 报 0 条异常行）。
+/// 这条判据只看数值，不看措辞。
+///
+/// 每条流各自比对：audio 与 video 交错送达，跨流相减必然出负数。
+#[derive(Default)]
+pub struct PacketJumpScan {
+    /// `(stream_index, 上一个 dts 毫秒)`。流的条数是个位数，线性查找即可。
+    last: Vec<(i64, i64)>,
+    /// 超过阈值的最大单次前跳，`None` 表示没有一次越线。
+    pub max_forward_jump_ms: Option<i64>,
+    /// 读到的包数，用来区分「没有跳变」和「根本没读到包」。
+    pub packets: u64,
+}
+
+impl PacketJumpScan {
+    /// 喂一行 `stream_index,dts_time`。认不出的行（`N/A`、空行、ffprobe 的其它输出）直接跳过：
+    /// 这条判据是给已有文本判据兜底的，宁可少判，不能因为一行怪东西就把好片判成坏片。
+    pub fn push_line(&mut self, line: &str) {
+        let Some((index, dts)) = line.trim().split_once(',') else {
+            return;
+        };
+        let (Ok(index), Ok(seconds)) = (index.parse::<i64>(), dts.trim().parse::<f64>()) else {
+            return;
+        };
+        if !seconds.is_finite() {
+            return;
+        }
+        let dts_ms = (seconds * 1_000.0) as i64;
+        self.packets += 1;
+        match self.last.iter_mut().find(|(stream, _)| *stream == index) {
+            Some((_, previous)) => {
+                let jump = dts_ms - *previous;
+                if jump > MAX_PACKET_STEP_MS {
+                    self.max_forward_jump_ms =
+                        Some(self.max_forward_jump_ms.map_or(jump, |seen| seen.max(jump)));
+                }
+                *previous = dts_ms;
+            }
+            None => self.last.push((index, dts_ms)),
+        }
+    }
+}
+
+/// 跑一个 ffprobe 包扫描并流式消费它的 stdout。
+///
+/// 输出是每包一行，一场长录像有几十万行，所以只维护流状态，不留全量。
+pub async fn run_packet_jump_scan(
+    command: &mut Command,
+    observer: ScanObserver<'_>,
+) -> std::io::Result<(ExitStatus, PacketJumpScan)> {
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            report_failure(observer, None, None);
+            return Err(error);
+        }
+    };
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut scan = PacketJumpScan::default();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line).await {
+            Ok(read) => read,
+            Err(error) => {
+                report_failure(observer, None, None);
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        scan.push_line(&String::from_utf8_lossy(&line));
+    }
+    let status = match child.wait().await {
+        Ok(status) => status,
+        Err(error) => {
+            report_failure(observer, None, None);
+            return Err(error);
+        }
+    };
+    if !status.success() {
+        report_failure(observer, None, status.code());
+    }
+    Ok((status, scan))
+}
+
 pub struct StderrScan {
     /// stderr 的尾部窗口。
     pub tail: String,
@@ -220,6 +323,78 @@ fn trim_to_tail(buffer: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 单调的巨大前跳——32 位倒退被解复用器展开后的形态。文本判据在这种输入上一条都不报。
+    #[test]
+    fn a_monotonous_giant_jump_is_an_anomaly() {
+        let mut scan = PacketJumpScan::default();
+        for line in [
+            "0,0.000000",
+            "1,0.010000",
+            "0,0.066000",
+            "1,0.033000",
+            // CDN 换基准：单调，但一步跨了 49.7 天
+            "0,4294007.933000",
+            "1,4294007.900000",
+            "0,4294008.000000",
+        ] {
+            scan.push_line(line);
+        }
+        assert_eq!(scan.packets, 7);
+        assert_eq!(scan.max_forward_jump_ms, Some(4_294_007_867));
+    }
+
+    /// audio/video 交错时跨流相减必然出负数，所以判据必须按流分开——这里两条流各自单调，
+    /// 只是交错送达，不该报。
+    #[test]
+    fn interleaved_streams_are_compared_separately() {
+        let mut scan = PacketJumpScan::default();
+        for line in [
+            "0,10.000000",
+            "1,9.980000",
+            "0,10.040000",
+            "1,10.020000",
+            "0,10.080000",
+        ] {
+            scan.push_line(line);
+        }
+        assert_eq!(scan.max_forward_jump_ms, None);
+    }
+
+    /// 真回退归文本判据管，这条判据只认前跳，不重复报也不越权。
+    #[test]
+    fn a_backward_step_is_not_this_judgement() {
+        let mut scan = PacketJumpScan::default();
+        for line in ["0,12.000000", "0,8.000000", "0,12.100000"] {
+            scan.push_line(line);
+        }
+        assert_eq!(scan.max_forward_jump_ms, None);
+    }
+
+    /// 阈值上恰好等于 `MAX_PACKET_STEP_MS` 不算跳变，多 1 毫秒才算。
+    #[test]
+    fn the_threshold_is_exclusive() {
+        let mut at_limit = PacketJumpScan::default();
+        at_limit.push_line("0,0.000000");
+        at_limit.push_line("0,30.000000");
+        assert_eq!(at_limit.max_forward_jump_ms, None);
+
+        let mut over_limit = PacketJumpScan::default();
+        over_limit.push_line("0,0.000000");
+        over_limit.push_line("0,30.001000");
+        assert_eq!(over_limit.max_forward_jump_ms, Some(30_001));
+    }
+
+    /// 认不出的行不能把好片判坏：跳过即可。
+    #[test]
+    fn unreadable_lines_are_skipped() {
+        let mut scan = PacketJumpScan::default();
+        for line in ["0,N/A", "", "side_data|", "0,0.000000", "0,0.040000"] {
+            scan.push_line(line);
+        }
+        assert_eq!(scan.packets, 2);
+        assert_eq!(scan.max_forward_jump_ms, None);
+    }
 
     #[test]
     fn parses_the_muxer_form() {
