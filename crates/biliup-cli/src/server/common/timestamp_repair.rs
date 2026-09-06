@@ -1,4 +1,6 @@
-use crate::server::common::ffmpeg_scan::{ScanObserver, run_scanning_stderr};
+use crate::server::common::ffmpeg_scan::{
+    MAX_PACKET_STEP_MS, ScanObserver, run_packet_jump_scan, run_scanning_stderr,
+};
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
 use async_trait::async_trait;
@@ -100,7 +102,8 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
         None => {
             error!(
                 file = ?path,
-                "检测到时间戳异常但解析不出回退量，保守标记 Unfixable 并直传原片"
+                "检测到时间戳异常但回退量未知（措辞未识别，或异常形态本就不是回退），\
+                 保守标记 Unfixable 并直传原片"
             );
             return RepairOutcome::Unfixable;
         }
@@ -149,6 +152,45 @@ impl SystemFfmpeg {
     pub fn with_context(context: EventContext) -> Self {
         Self { context }
     }
+
+    /// 用 ffprobe 的包时间戳做数值判据，返回超过阈值的最大前跳。
+    ///
+    /// 只在文本判据判干净之后才跑：命中文本判据时已经知道文件有问题，也已经有回退量，
+    /// 没必要再读一遍整片。健康文件因此多付一遍解复用（实测与现有 `-c copy -f null -`
+    /// 同量级）。
+    ///
+    /// ffprobe 本身跑不起来时**返回 `None` 而不是报错**：这一层是给文本判据兜底的加法，
+    /// 把它的环境故障升级成 `DetectFailed` 会让没装 ffprobe 的机器上每个文件都降级，
+    /// 比漏掉这条判据更糟。
+    async fn detect_packet_jump(&self, path: &Path) -> Option<i64> {
+        let mut command = Command::new("ffprobe");
+        command
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "packet=stream_index,dts_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path);
+        match run_packet_jump_scan(
+            background(&mut command),
+            ScanObserver::quiet("timestamp_packet_scan", path).with_context(&self.context),
+        )
+        .await
+        {
+            Ok((status, scan)) if status.success() => scan.max_forward_jump_ms,
+            Ok((status, _)) => {
+                warn!(file = ?path, ?status, "ffprobe 包扫描非零退出，本条判据跳过");
+                None
+            }
+            Err(e) => {
+                warn!(file = ?path, "ffprobe 包扫描无法执行，本条判据跳过: {e:?}");
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -188,6 +230,22 @@ impl FfmpegRunner for SystemFfmpeg {
                 "ffmpeg detect exited non-zero ({status}) for {}",
                 path.display()
             )));
+        }
+        // 文本判据没话说不等于文件干净：源里的 32 位倒退可能已经被解复用器展开成一个单调的
+        // 巨大前跳，展开之后 muxer 一条警告都不会打（实测 0 条）。这是确定性漏检，再用包
+        // 时间戳的数值兜一层。
+        if let Some(jump_ms) = self.detect_packet_jump(path).await {
+            warn!(
+                file = ?path,
+                jump_ms,
+                limit_ms = MAX_PACKET_STEP_MS,
+                "相邻包时间戳异常大幅前跳，判为时间戳异常"
+            );
+            // 前跳不是回退：setts 的 clamp 修不了它（它本来就单调），回退量也无从谈起。
+            // 按既有约定交给 `None` 分支保守处理，走同一套分档，不自成一路。
+            return Ok(Detection::Anomalous {
+                max_backward_ms: None,
+            });
         }
         Ok(Detection::Clean)
     }
@@ -567,6 +625,66 @@ mod tests {
         );
         assert!(!repaired_temp_path(&reset).exists());
         for path in [&good, &reset] {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    /// 把 `from_ms` 之后的所有 FLV tag 时间戳整体前移 `jump_ms`。
+    ///
+    /// 产出的是**单调**时间轴，只是一步跨了几十天——32 位倒退被解复用器展开之后就是这个
+    /// 形状。样本用代码生成而不是入库一个二进制片，改判据时能直接调参数复现。
+    async fn jump_timestamps(src: &Path, from_ms: u32, jump_ms: u32, dst: &Path) {
+        let mut data = tokio::fs::read(src).await.expect("read source");
+        let mut offset = 13; // FLV 头 9 字节 + 第一个 previous tag size 4 字节
+        let mut moved = 0;
+        while offset + 11 <= data.len() {
+            let size = u32::from_be_bytes([0, data[offset + 1], data[offset + 2], data[offset + 3]])
+                as usize;
+            let timestamp = u32::from_be_bytes([
+                data[offset + 7],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+            ]);
+            if timestamp >= from_ms {
+                let jumped = timestamp.wrapping_add(jump_ms);
+                data[offset + 4] = ((jumped >> 16) & 0xff) as u8;
+                data[offset + 5] = ((jumped >> 8) & 0xff) as u8;
+                data[offset + 6] = (jumped & 0xff) as u8;
+                data[offset + 7] = ((jumped >> 24) & 0xff) as u8;
+                moved += 1;
+            }
+            offset += 11 + size + 4;
+        }
+        assert!(moved > 0, "样本里没有可前移的 tag，这个用例什么也没验");
+        tokio::fs::write(dst, data).await.expect("write jumped");
+    }
+
+    /// issue #13 评论指出的漏检形态：时间轴单调，muxer 一条警告都不打（实测 0 条），
+    /// 旧的纯文本判据会判 Clean 让坏片原样上传。数值判据必须把它认出来。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_detects_a_monotonous_giant_jump() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_jump_source.flv");
+        let jumped = dir.join("tsr_jump.flv");
+        make_source(&good, 8).await;
+        jump_timestamps(&good, 4_000, 4_294_000_000, &jumped).await;
+
+        assert_eq!(
+            SystemFfmpeg::default().detect(&jumped).await.expect("detect"),
+            Detection::Anomalous {
+                max_backward_ms: None
+            },
+            "单调大跳变必须被判为异常；前跳没有回退量，按约定交给 None 分支保守处理"
+        );
+        assert_eq!(
+            normalize_timestamps(&jumped, &SystemFfmpeg::default()).await,
+            RepairOutcome::Unfixable,
+            "前跳不是 setts 能修的形态，必须在动手之前拦住"
+        );
+        assert!(!repaired_temp_path(&jumped).exists());
+        for path in [&good, &jumped] {
             let _ = tokio::fs::remove_file(path).await;
         }
     }
