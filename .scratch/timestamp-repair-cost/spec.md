@@ -104,9 +104,10 @@ setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)
 01 先给它加了自带超时止血，05 把它整个删掉了。setts 按构造保证产物单调，闸门又挡住了
 它修不了的形态，第 2 级永远不会被触发——留着只是一条随时可能又烧 30 分钟 CPU 的死路。
 
-`RepairOutcome::Unfixable` 的语义随之收敛为「修不了 → 原片直传 + 告警」，且**本地不留档**：
-原片已经上传成功，需要重修时凭上传凭证从 B 站 OS 库取回，在性能更好的机器上做
-（见 [`steps/06`](./steps/06-macos-side-repair.md)），录制盘不再长期压一份等人工。
+`RepairOutcome::Unfixable` 的语义随之收敛为「修不了 → 原片直传 + 告警」，且**本地不留档**。
+凭上传描述符可以尝试从 B 站 OS 库取回原片，在性能更好的机器上重修
+（见 [`steps/06`](./steps/06-macos-side-repair.md)），但后续生产验证确认凭证可能早于数据库的
+7 天清理 TTL 失效；描述符非空只代表曾经保存过取回材料，不保证当前仍能取回。
 
 ### 不采纳：重型 ffmpeg 共享 permit
 
@@ -124,6 +125,19 @@ x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO �
 - **loudnorm 单遍 `fast_dynamic`（issue 的 D 节）**：独立优化，与本次上传失败无因果关系。
   要做就单开一条线，不混进这个 effort。
 - **写入侧治本**：留在 #13。它不解决存量坏文件。
+
+## 生产验证后的后续
+
+生产已经出现 `Detection::Anomalous { max_backward_ms: None }`，但现有证据不足以修改解析器：
+
+- 当扫描进程正常退出、只有内容命中异常时，`run_scanning_stderr` 不保存诊断附件；真正触发
+  `None` 的 ffmpeg stderr 已丢失。
+- 录制侧的 DTS 告警不是 `detect()` 的输入，不能拿它代替真实 stderr 写解析规则。
+- 原片按成功路径清理后，已保存的 UPOS 凭证也可能在数据库 TTL 到期前失效，无法保证事后复现。
+
+因此拆成三个独立交付：先让未知措辞在下次出现时留下有界脱敏证据（09）；同步修正
+`segment-recover` 对“描述符存在”的错误承诺（10）；解析器修改等真实输入到手后再做（11）。
+09 与 10 当前可直接实现，11 明确保持 `needs-info`，不猜 ffmpeg 的输出。
 
 ## 期望终局
 
@@ -147,10 +161,15 @@ x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO �
 | 06 | [取回通道验证 + UPOS 凭证落库](./steps/06-macos-side-repair.md) | P2 | 05 | ✅ resolved |
 | 08 | [auto 探测优先挑有取回通道的线路](./steps/08-prefer-recoverable-lines.md) | P1 | 06 | ✅ resolved |
 | 07 | [macOS 侧取回—修复—回推（做成 skill）](./steps/07-macos-recovery-tool.md) | P2 | 06 | ✅ resolved |
+| 09 | [为无法解析的时间戳异常保存诊断附件](./steps/09-capture-unparsed-timestamp-diagnostics.md) | P0 | — | 🟡 ready-for-agent |
+| 10 | [修正取回通道有效性的 skill 判据](./steps/10-correct-recovery-validity-semantics.md) | P1 | — | 🟡 ready-for-agent |
+| 11 | [按真实生产措辞修复回退量解析器](./steps/11-parse-production-timestamp-wording.md) | P0 | 09 + 新样本 | 🔵 needs-info |
 
-发版路径已经打通。01–08 全部 resolved，只剩两条待时间验证的尾巴：UPOS 凭证的真实有效期（TTL 7 天是估的），以及 `segment-recover` skill 还没在真实故障上实战过。这两条都不阻塞发布，但归档要等它们有结论。
+原实施批次 01–08 已全部 resolved。生产验证补出了两条新事实：未知解析措辞没有留证据，且
+UPOS 凭证的实际可用期不能由 7 天数据库 TTL 推断。09–11 完成前本 effort 继续留在
+`.scratch/`，不归档。
 
 06 顺带查明了一件 issue #13 没覆盖的事：**UPOS 取回通道是按线路存在的**——tx / bda2 / alia
 可以逐字节取回，`bldsa` 只给 HEAD 200、GET 403。08 据此把 auto 探测改成「优先只在可取回
-线路里挑，其余兜底并告警」，让 05「本地不留档」的前提在新分段上稳定成立。08 之前上传的
-历史分段不受影响，可能仍落在没有取回通道的线路上。
+线路里挑，其余兜底并告警」，提高新分段具备取回通道的概率。它只能保证线路能力，不能延长
+临时凭证的有效期；08 之前上传的历史分段也可能落在没有取回通道的线路上。
