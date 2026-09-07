@@ -57,7 +57,7 @@ options，服务端也允许显式 downloader 配置；因此它们必须继续�
 | 日志存储自身故障 | observability health snapshot、受限 stderr | `no_persistence`（普通事件） | queue/storage/commit 故障由独立健康源回答；写入器不能把自身故障无条件回写同一队列 |
 | HTTP/平台提取与协议 DEBUG | live extractor、danmaku protocol、代理/header/url 输出 | `no_persistence` | 常含签名 URL、token、header 或高频协议细节；只持久化上层稳定结果，原文不进入事件库 |
 | 投稿/登录原始响应 | `biliup::uploader::{bilibili,credential}`，上层 submission/auth 事件 | `no_persistence` | 远端响应可能含账号/稿件标识；成功、失败、不确定由类型化事件回答，不保存原响应全文 |
-| FFmpeg/loudnorm/timestamp/custom hook | `DiagnosticCapture` + `processing.command_failed` | `native_covered`；完整输出 `explicitly_unsupported` | 只保存 8 KiB 有界脱敏附件、总字节和截断信息；不承诺完整 stdout/stderr 归档 |
+| FFmpeg/loudnorm/timestamp/custom hook | `DiagnosticCapture` + `processing.command_failed`；未知时间戳措辞另发 `processing.diagnostic_captured` | `native_covered`；完整输出 `explicitly_unsupported` | 命令失败只保存 8 KiB 有界脱敏尾部；exit 0 的未知时间戳异常只保存命中且解析失败的行；不承诺完整 stdout/stderr 归档 |
 | Streamlink 命令/分段 | `streamlink.rs` + `processing.command_failed` | `native_covered`；逐行 `[streamlink] …` 输出 `retain_bridge` | S/DA、关闭原因与退出诊断已原生；`--hls-duration` 下退出码 0 区分不出「切到上限」与「刚好同时下播」，与 ffmpeg 同口径 |
 | YtDlp/YtArchive 命令/产物 | `ytdlp.rs` + `processing.command_failed` | `native_covered`；`运行: …`、清理告警 `retain_bridge` | 只发 `segment_closed`；完整 stdout/stderr 仍 `explicitly_unsupported`，错误正文换成有界脱敏摘要 |
 | danmaku 后台任务终止 | `danmaku/src/client.rs` 的退出观察回调 + `recording.auxiliary_failed` | `native_covered`；旧 `Recorder error` 行 `retain_bridge` | 恰好上报一次，含 panic/取消；原因只从错误类型映射，不解析文本，事件不带原文 |

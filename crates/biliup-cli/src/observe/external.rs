@@ -39,6 +39,28 @@ pub fn command_failed(
     });
 }
 
+/// An ffmpeg scan succeeded as a process but exposed a timestamp anomaly whose wording cannot be
+/// interpreted safely. Only the matching lines travel in the bounded diagnostic attachment.
+pub fn timestamp_anomaly_unparsed(stage: &str, context: Context, diagnostic: Diagnostic) {
+    let Some(emitter) = current_emitter() else {
+        return;
+    };
+    emitter.emit_with(Level::Warn, || {
+        let mut draft = Draft::new(
+            "processing.diagnostic_captured",
+            "时间戳异常无法解析，诊断详情已按限额采集",
+        );
+        draft.context = context;
+        draft.fields = Fields::new()
+            .with("stage", stage)
+            .with("outcome", "unknown")
+            .with("reason_code", "timestamp_anomaly_unparsed")
+            .with("total_bytes", diagnostic.total_bytes());
+        draft.diagnostic = Some(diagnostic);
+        draft
+    });
+}
+
 /// Native marker for auxiliary subsystems which are not OS commands. Raw third-party errors stay
 /// in the unchanged legacy output; the event only carries a stable stage and reason.
 pub fn auxiliary_failed(

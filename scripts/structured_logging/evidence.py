@@ -42,6 +42,7 @@ REQUIRED = {
  "recording.segment_enrolled": ["segment_id", "original_file"],
  "processing.decided": ["segment_id", "original_file", "reason_code", "outcome"],
  "processing.completed": ["segment_id", "original_file", "reason_code", "outcome"],
+ "processing.diagnostic_captured": ["original_file", "stage", "reason_code", "outcome"],
  "upload.started": [["segment_id", "upload_attempt_id"], ["task_id", "original_file", "segment_order", "upload_attempt_id"]],
  "upload.failed": [["segment_id", "upload_attempt_id", "outcome", "reason_code"], ["task_id", "original_file", "segment_order", "upload_attempt_id", "outcome", "reason_code"]],
  "upload.completed": [["segment_id", "upload_attempt_id", "outcome"], ["task_id", "original_file", "segment_order", "upload_attempt_id", "outcome"]],
