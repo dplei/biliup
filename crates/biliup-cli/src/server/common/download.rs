@@ -87,6 +87,26 @@ fn exponential_backoff(failure_count: u32) -> Duration {
         .min(RETRY_MAX_DELAY)
 }
 
+fn emit_retry_after_attempt(
+    identity: &crate::observe::RecordingIdentity,
+    confirmed_live: bool,
+    backoff: Duration,
+    attempt_id: Option<&str>,
+) {
+    if !backoff.is_zero() {
+        crate::observe::retry_scheduled(
+            identity,
+            if confirmed_live {
+                "transport_error"
+            } else {
+                "offline"
+            },
+            backoff.as_millis().min(u64::MAX as u128) as u64,
+            attempt_id,
+        );
+    }
+}
+
 struct DownloadAttempt {
     result: AppResult<DownloadStatus>,
     connected_for: Duration,
@@ -1082,6 +1102,12 @@ impl DownloadTask {
             // 只有判失败的一轮才发选择事件；正常循环不产生噪声。
             let mut route_attempt_failed = false;
             let mut failed_route_host = String::from("unknown");
+            // `check_stream` 会用下一轮的流覆盖 `stream`；退避必须保留本轮实际下载的身份。
+            let triggering_attempt_id = if can_download {
+                stream.attempt_id.clone()
+            } else {
+                None
+            };
             let attempt = if can_download {
                 route_health.begin_attempt(&stream);
                 let attempt = self
@@ -1365,18 +1391,12 @@ impl DownloadTask {
             }
 
             info!("Retrying download in {:?}...", backoff);
-            if !backoff.is_zero() {
-                crate::observe::retry_scheduled(
-                    &identity,
-                    if confirmed_live {
-                        "transport_error"
-                    } else {
-                        "offline"
-                    },
-                    backoff.as_millis().min(u64::MAX as u128) as u64,
-                    None,
-                );
-            }
+            emit_retry_after_attempt(
+                &identity,
+                confirmed_live,
+                backoff,
+                triggering_attempt_id.as_deref(),
+            );
             if !backoff.is_zero() {
                 tokio::select! {
                     _ = self.token.cancelled() => {
@@ -2200,7 +2220,7 @@ mod segment_discard_tests {
 
 #[cfg(test)]
 mod route_event_tests {
-    use super::route_selection_event;
+    use super::{emit_retry_after_attempt, route_selection_event};
     use crate::observe::RecordingIdentity;
     use biliup_observability::{
         CaptureKind, CaptureLayer, Commit, Consumer, Event, Level, Options, Runtime, StorageError,
@@ -2274,6 +2294,27 @@ mod route_event_tests {
             "transport_failure"
         );
         assert_eq!(failure.fields.quality().rejected, 0);
+    }
+
+    #[test]
+    fn retries_keep_the_attempt_that_triggered_each_backoff() {
+        let events = collect(|identity| {
+            emit_retry_after_attempt(identity, true, Duration::from_secs(2), Some("attempt-a"));
+            emit_retry_after_attempt(identity, true, Duration::from_secs(4), Some("attempt-b"));
+        });
+        let retries: Vec<_> = events
+            .iter()
+            .map(Event::data)
+            .filter(|data| data.event_name == "recording.retry_scheduled")
+            .collect();
+
+        assert_eq!(retries.len(), 2);
+        for (event, attempt_id) in retries.into_iter().zip(["attempt-a", "attempt-b"]) {
+            assert_eq!(event.fields.get("download_attempt_id").unwrap(), attempt_id);
+            assert_eq!(event.fields.get("outcome").unwrap(), "waiting");
+            assert_eq!(event.fields.get("reason_code").unwrap(), "transport_error");
+            assert_eq!(event.fields.quality().rejected, 0);
+        }
     }
 
     #[test]

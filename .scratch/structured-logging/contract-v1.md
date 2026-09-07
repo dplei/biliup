@@ -61,6 +61,9 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - `recording.disconnected` 的 HLS 错误边界带 stage=hls、R/T/DA、failed；原因由类型映射为
   invalid_playlist/http_error/read_timeout/source_io/transport_error，不解析自由错误文本。
   当时不可可靠取得的 S、时长保持未知。它说明本次下载未完成，不能据此推断直播下播。
+- C05 的 DA 按实际连接归属：`recording.disconnected` 与随后
+  `recording.retry_scheduled` 都指向触发退避的已结束 attempt；
+  `recording.reconnected` 指向真正建立的新连接 attempt，不能提前用它标记退避。
 - 服务端已知 HLS 后缀直接解析列表；未知后缀保留原有 FLV 探测回落。HLS 只有完整收到至少
   一个非空媒体片段才触发已有 reconnect 上下文，不因读到列表头就恢复；不制造 FLV 静默测量。
   配置切片及取消继续复用文件层；取消原因须在下载 future 被释放前写入 close handle。

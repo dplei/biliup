@@ -1,6 +1,6 @@
 # 01 · 保留触发退避的下载 attempt
 
-Status: ready-for-agent
+Status: resolved
 
 来源：[spec](../spec.md)、[dplei/biliup#28](https://github.com/dplei/biliup/issues/28)
 
@@ -46,6 +46,19 @@ python3 scripts/check_code_index.py
 
 ## 回执
 
-实施后在此记录实际改动、测试结果及与 spec 的偏差，再把 `Status` 改为 `resolved`。
+- `DownloadTask::execute` 在每轮实际下载前保存当前 `stream.attempt_id`；直播复查刷新候选后，
+  `recording.retry_scheduled` 仍使用这份触发退避的旧快照。未执行下载的冷却轮次保持未知。
+- 原有退避条件和原因映射收进局部 `emit_retry_after_attempt`，事件捕获回归连续发出
+  `attempt-a` / `attempt-b`，逐条断言 DA、`waiting`、`transport_error` 与零 rejected 字段。
+- C05 契约、覆盖清单和 `CODE_INDEX.md` 已同步。未新增字段、迁移、配置或跨平台 ID 分配。
+- `cargo test -p biliup-cli retries_keep_the_attempt_that_triggered_each_backoff --lib`：1 passed。
+- `cargo test -p biliup-cli --lib`：382 passed，9 ignored，0 failed。
+- `rustfmt --edition 2024 --check crates/biliup-cli/src/server/common/download.rs`、
+  `git diff --check`、`python3 scripts/check_code_index.py`：通过。
+- `cargo fmt --all -- --check` 仍会报告本分支开工前已有的其他文件格式差异；本轮没有顺手改动。
 
 ## Comments
+
+未搭建完整数据库、Monitor 和真实等待 fixture；按 spec 的后备方案复用了现有内存事件采集器，
+只抽出退避发射边界。attempt 快照本身保留在实际循环中，与下载是否执行使用同一个 `can_download`
+判据。
