@@ -7,7 +7,7 @@
 
 | skill | 干什么 | 什么时候用 |
 | --- | --- | --- |
-| [`segment-recover`](../../.claude/skills/segment-recover/SKILL.md) | 把已经传上 B 站、但时间戳坏掉的分段取回本机，修好，换回原稿件的那一个分P | B 站审核说某个分P时间戳跳变；本地原片已经按流程删掉了 |
+| [`segment-recover`](../../.claude/skills/segment-recover/SKILL.md) | 用已保存的凭证尝试取回已经上传、但时间戳坏掉的分段，成功后修好并换回原稿件的那一个分P | B 站审核说某个分P时间戳跳变；本地原片已经按流程删掉了 |
 | [`cover-background`](../../.claude/skills/cover-background/SKILL.md) | 把一张原图调成压得住白字的 1146×717 封面背景 | 手上有张图想当封面底图，但不知道该压暗/模糊多少 |
 
 根目录还有一个 [`SKILL.md`](../../SKILL.md)，那是给**别人**用的——教 agent 怎么安装和
@@ -65,13 +65,16 @@ agent 把渲染出的样图读进来真的看；`segment-recover` 强制 agent �
 - **稿件与分P**：`av`/`BV` 号，加上坏掉的是第几个分P（B 站页面上的 P1/P2/P3）。
 - **取回描述符**：生产库里
   `select upos_recovery_json from upload_missing_segment where id = <missing_id>;`
-  的结果，含 `endpoint` / `upos_uri` / `auth` 三个字段。**7 天 TTL，过期会被清成 NULL。**
+  的结果，含 `endpoint` / `upos_uri` / `auth` 三个字段。数据库 7 天后会清理它，但这只是
+  敏感字段的保留上限；描述符非空不代表临时凭证仍有效。
 - **原始大小**：同一行的 `total_bytes`，用来验证下载完整。
 
-两条已知的止损线，省得白忙：
+已知的止损线，省得白忙：
 
 - `endpoint` 是 **`bldsa`** 的分段**拿不回来**。那条线路只让 `HEAD` 过，`GET` 一律 403。
   （上传选路现在会优先避开这类线路，但更早传上去的历史分段仍可能落在上面。）
-- 描述符是 NULL，或者那次上传发生在凭证落库这个功能之前 → 没有取回通道。
+- 描述符是 NULL，或者那次上传发生在凭证落库这个功能之前 → 没有可尝试的取回材料。
+- 描述符非空也只表示可以尝试；实际 GET 返回 403 且三个字段完整时 → 凭证已失效或对象不可
+  访问，停止，不继续修复或回推。只有 GET 成功且下载字节数等于 `total_bytes` 才能继续。
 
 `auth` 是凭证：**不要写进任何会提交的文件，不要贴进 commit / PR / issue。**

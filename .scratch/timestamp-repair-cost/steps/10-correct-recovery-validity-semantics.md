@@ -1,6 +1,6 @@
 # 10 · 修正取回通道有效性的 skill 判据
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: —
 优先级：P1——避免 agent 因描述符非空而错误承诺原片仍可取回
 
@@ -33,6 +33,14 @@ Blocked by: —
 - 不新增定时 HEAD/GET 探测；真正使用时的 GET 已是最权威且最少的一次请求。
 - 不把一次生产观测猜成固定的 N 小时有效期。
 - 不改上传线路白名单；线路能力与临时凭证寿命是两件事。
+
+## Answer
+
+两份 `segment-recover` skill 已同步收紧判据：描述符非空只能授权一次实际 GET 尝试，GET 403
+且字段完整时按凭证失效或对象不可访问停止；只有 GET 成功且下载字节数等于 `total_bytes` 才
+继续修复。`docs/agents/skills.md` 已同步，06/07 的历史记录保留原文并追加后续验证指针。
+
+数据库 7 天清理 TTL、上传线路白名单与取回实现均未改动；目前没有证据支持猜测固定凭证寿命。
 
 ## Comments
 
