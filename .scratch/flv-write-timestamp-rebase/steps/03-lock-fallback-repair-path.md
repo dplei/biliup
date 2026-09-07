@@ -1,5 +1,7 @@
 # 03 给 fallback 必经修复加回归测试
 
+Status: resolved
+
 最便宜的一步，纯防回退，不改行为。
 
 ## 现状
