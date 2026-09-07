@@ -98,6 +98,9 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
   和主动取消都不是外部命令失败。含 URL/凭据线索的行整值脱敏，因此尾部常见 `[REDACTED]`。
 - 该事件经本次调用的采集器直接写出（附件无法走 tracing 字段），只取当前 dispatch 上的
   采集器，不搜索全局运行，也不从业务回调里初始化存储。
+- `processing.diagnostic_captured`：WARN、unknown/`timestamp_anomaly_unparsed`，表示 ffmpeg
+  正常退出但时间戳异常措辞无法安全解析；只把命中且解析失败的行放进有界脱敏附件，带
+  `stage` 与可用的上传身份，不复制第三方输出到事件字段，也不冒充命令失败。
 
 ### P3/14 入口生命周期与凭据健康增量
 

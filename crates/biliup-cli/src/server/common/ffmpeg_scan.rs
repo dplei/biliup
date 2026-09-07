@@ -254,6 +254,7 @@ pub async fn run_scanning_stderr(
     let stderr = child.stderr.take().expect("stderr piped");
     let mut reader = BufReader::new(stderr);
     let mut diagnostic = DiagnosticCapture::new();
+    let mut unparsed_anomalies = DiagnosticCapture::new();
     let mut legacy_stderr = tokio::io::stderr();
     let mut line = Vec::new();
     let mut scan = StderrScan {
@@ -286,8 +287,12 @@ pub async fn run_scanning_stderr(
             scan.timestamp_anomaly = true;
             scan.anomaly_lines += 1;
             if let Some(backward) = parse_backward_ms(&text) {
-                scan.max_backward_ms =
-                    Some(scan.max_backward_ms.map_or(backward, |seen| seen.max(backward)));
+                scan.max_backward_ms = Some(
+                    scan.max_backward_ms
+                        .map_or(backward, |seen| seen.max(backward)),
+                );
+            } else {
+                unparsed_anomalies.push(&line);
             }
         }
         scan.tail.push_str(&text);
@@ -305,6 +310,12 @@ pub async fn run_scanning_stderr(
     };
     if !status.success() {
         report_failure(observer, Some(diagnostic), status.code());
+    } else if scan.timestamp_anomaly && scan.max_backward_ms.is_none() {
+        crate::observe::external::timestamp_anomaly_unparsed(
+            observer.stage,
+            context(observer),
+            unparsed_anomalies.finish(status.code()),
+        );
     }
     Ok((status, scan))
 }
@@ -433,7 +444,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn nonzero_scan_emits_bounded_native_diagnostic() {
+    async fn scans_emit_only_relevant_native_diagnostics() {
         use biliup_observability::{
             CaptureKind, CaptureLayer, Commit, Consumer, Event, Options, Runtime, StorageError,
         };
@@ -471,11 +482,51 @@ mod tests {
             ..Default::default()
         }
         .context();
+
         let mut command = Command::new("sh");
-        command.args(["-c", "printf 'fatal: token=secret-value\\n' >&2; exit 7"]);
+        command.args([
+            "-c",
+            "printf 'ordinary token=not-captured\\nInvalid timestamp in stream 0\\nInvalid timestamp token=secret-value\\n' >&2",
+        ]);
         let (status, _) = run_scanning_stderr(
             &mut command,
-            ScanObserver::quiet("controlled_scan", Path::new("/private/input.flv"))
+            ScanObserver::quiet("unknown_scan", Path::new("/private/input.flv"))
+                .with_context(&context),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: 11990 >= 8356\\n' >&2",
+        ]);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver::quiet("parsed_scan", Path::new("/private/input.flv"))
+                .with_context(&context),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'frame=100 fps=25\\n' >&2"]);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver::quiet("clean_scan", Path::new("/private/input.flv"))
+                .with_context(&context),
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'fatal: token=failed-secret\\n' >&2; exit 7"]);
+        let (status, _) = run_scanning_stderr(
+            &mut command,
+            ScanObserver::quiet("failed_scan", Path::new("/private/input.flv"))
                 .with_context(&context),
         )
         .await
@@ -484,15 +535,21 @@ mod tests {
         assert!(runtime.shutdown(Duration::from_secs(2)).closed);
 
         let events = events.lock().unwrap();
-        let event = events
+        let diagnostics = events
             .iter()
-            .find(|event| {
+            .filter(|event| {
                 event.data().capture_kind == CaptureKind::Native
-                    && event.data().event_name == "processing.command_failed"
+                    && event.data().event_name == "processing.diagnostic_captured"
             })
-            .expect("nonzero external command must emit one native event");
-        assert_eq!(event.data().fields.get("stage").unwrap(), "controlled_scan");
-        assert_eq!(event.data().fields.get("exit_code").unwrap(), 7);
+            .collect::<Vec<_>>();
+        assert_eq!(diagnostics.len(), 1);
+        let event = diagnostics[0];
+        assert_eq!(event.data().fields.get("stage").unwrap(), "unknown_scan");
+        assert_eq!(event.data().fields.get("outcome").unwrap(), "unknown");
+        assert_eq!(
+            event.data().fields.get("reason_code").unwrap(),
+            "timestamp_anomaly_unparsed"
+        );
         assert_eq!(
             event.data().fields.get("segment_id").unwrap(),
             "segment-test"
@@ -505,10 +562,28 @@ mod tests {
             event.data().fields.get("original_file").unwrap(),
             "stable-source.flv"
         );
-        let diagnostic = event.diagnostic().expect("stderr belongs in an attachment");
+        let diagnostic = event
+            .diagnostic()
+            .expect("unparsed anomaly belongs in an attachment");
         assert!(diagnostic.total_bytes() > 0);
         assert!(!diagnostic.tail().contains("secret-value"));
         assert!(diagnostic.tail().contains("[REDACTED]"));
+        assert!(diagnostic.tail().contains("Invalid timestamp"));
+        assert!(!diagnostic.tail().contains("ordinary"));
+
+        let failures = events
+            .iter()
+            .filter(|event| {
+                event.data().capture_kind == CaptureKind::Native
+                    && event.data().event_name == "processing.command_failed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        let event = failures[0];
+        assert_eq!(event.data().fields.get("stage").unwrap(), "failed_scan");
+        assert_eq!(event.data().fields.get("exit_code").unwrap(), 7);
+        let diagnostic = event.diagnostic().expect("stderr belongs in an attachment");
+        assert!(!diagnostic.tail().contains("failed-secret"));
     }
 
     #[test]

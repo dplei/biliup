@@ -161,7 +161,7 @@ x264 一删，预处理里的时间戳工作只剩一次顺序读写，是 IO �
 | 06 | [取回通道验证 + UPOS 凭证落库](./steps/06-macos-side-repair.md) | P2 | 05 | ✅ resolved |
 | 08 | [auto 探测优先挑有取回通道的线路](./steps/08-prefer-recoverable-lines.md) | P1 | 06 | ✅ resolved |
 | 07 | [macOS 侧取回—修复—回推（做成 skill）](./steps/07-macos-recovery-tool.md) | P2 | 06 | ✅ resolved |
-| 09 | [为无法解析的时间戳异常保存诊断附件](./steps/09-capture-unparsed-timestamp-diagnostics.md) | P0 | — | 🟡 ready-for-agent |
+| 09 | [为无法解析的时间戳异常保存诊断附件](./steps/09-capture-unparsed-timestamp-diagnostics.md) | P0 | — | ✅ resolved |
 | 10 | [修正取回通道有效性的 skill 判据](./steps/10-correct-recovery-validity-semantics.md) | P1 | — | 🟡 ready-for-agent |
 | 11 | [按真实生产措辞修复回退量解析器](./steps/11-parse-production-timestamp-wording.md) | P0 | 09 + 新样本 | 🔵 needs-info |
 

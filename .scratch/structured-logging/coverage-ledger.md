@@ -70,6 +70,7 @@ S=segment_id+original_file；U=upload_session_id；DA/UA=download/upload_attempt
 | C11 | auth.health_changed、auth.operation_failed / server/登录CLI/嵌入 | platform、stage；T可空 | failed/recovered；authentication_failed/authentication_recovered | cookie_health::record_error/record_success、Python login helpers（无局部subscriber，继承宿主）；不写账号、cookie路径；S10 |
 | C12 | audit.operation_projected / server | 业务表持久 event_uid、stage；R随审计存在，文件只作辅助 | failed/skipped/unknown；source_missing/session_finalized/audit_reason_unknown | record_recovery_audit为权威；先落业务表、启动/近期有界重放，事件库按UID幂等；旧文本可能无独立对应；N:1；S05/S07 |
 | C13 | processing.command_failed / 外部工具 | stage、exit_code（spawn/信号退出可空）、附件由event_uid关联；服务端上传预处理带R、S、U、missing_id、UA，其余入口S可空 | failed；process_failed | ffmpeg_scan、响度/时间戳预处理、hook命令；显式Context、不借ambient span，64KiB业务尾部与8KiB脱敏附件分开，旧输出口径保留；S10 |
+| C13 | processing.diagnostic_captured / ffmpeg 时间戳扫描 | stage、original_file、附件由event_uid关联；服务端上传预处理带R、S、U、missing_id、UA | unknown；timestamp_anomaly_unparsed | ffmpeg_scan 正常退出但所有异常命中行都解不出回退量；附件只收命中行并复用8KiB脱敏上限，不冒充命令失败；S10 |
 | C13 | recording.auxiliary_failed、processing.auxiliary_failed / server | stage、R可用时必带；错误正文不进字段 | failed；danmaku_failed/cover_failed/hook_failed/source_io，弹幕后台终止另用 danmaku_output/connection/protocol/internal_failed 与 danmaku_aborted | 弹幕start/stop/roll 与 danmaku_runtime、直播/投稿封面和非命令hook；旧错误行保留，当前真实平台失败样本待补；S10 |
 | C14 | 独立health（可投影system.storage_recovered） / 全入口 | queue_depth/bytes、dropped分级、storage_failures、last_commit_ms、committed_id | unknown/recovered；storage_unavailable/queue_full | 旧无统一来源；强杀范围未知；S09 |
 

@@ -1,6 +1,6 @@
 # 09 · 为无法解析的时间戳异常保存诊断附件
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: —
 优先级：P0——没有这条证据链，解析器再次误判后仍无法定位真实措辞
 
@@ -39,6 +39,20 @@ Blocked by: —
 - 不添加 `Non-monotonous` 等猜测性字符串。
 - 不改 10 秒安全闸门，也不把 `None` 当成 0。
 - 不为了附件另建一套日志存储。
+
+## Answer
+
+- `run_scanning_stderr` 新增第二个 `DiagnosticCapture`，只接收命中异常模式但
+  `parse_backward_ms` 返回 `None` 的行。exit 0 且整次没有任何可解析回退量时，发
+  `processing.diagnostic_captured`（unknown/`timestamp_anomaly_unparsed`）；非零退出仍只发
+  `processing.command_failed`。
+- 新事件复用 `observe::external` 的当前采集器边界与上传 `Context`，附件继续走现有 8 KiB
+  限额和逐行脱敏；事件字段不含 stderr，未新增表或 migration。
+- 单个回归测试覆盖 unknown/parseable/clean/nonzero 四条路径，确认只产生一条未知诊断、身份
+  正确、普通 stderr 不混入附件且 secret 被脱敏。
+- `cargo test -p biliup-cli --lib ffmpeg_scan`：14 passed；`cargo test -p biliup-cli`：全绿。
+- `cargo fmt --all -- --check` 仍被 `dev` 基线中本任务之外的既有格式差异阻塞；本次新增片段已按
+  rustfmt 输出调整，未顺手格式化无关文件。
 
 ## Comments
 
