@@ -49,10 +49,11 @@ Step 01 实现、上述自动验证通过并落到 `dev` 后：
   预上传场景都不写 `upload_line_health`；随后同一测试确认保留的传输失败记录仍会写入线路健康。
 - `recovery_skips_normalization_for_an_already_replaced_recording` 继续证明持久标记让补传跳过 loudnorm；
   两个服务端调用点继续只调用同一个 `pre_upload_with_retry`。
-- `cargo test -p biliup-cli` 与 `python3 scripts/check_code_index.py` 通过。effort 已可 review；归档必须等
-  PR 合并进入 `dev` 后执行，本分支不提前移动 `.scratch/`。
+- `cargo test -p biliup-cli` 与 `python3 scripts/check_code_index.py` 通过；[#45](https://github.com/dplei/biliup/pull/45)
+  已合入 `dev`，归档前置条件全部满足。
 
 ## Comments
 
+- 2026-09-08：PR 已合并，自动验收足以覆盖本次状态转换，不再等待真实网络抖动。
 - 2026-09-08：删除对生产三场观察、缓存磁盘峰值和复用稿件音质抽查的要求；新方案无长寿命缓存，
   合成故障足以覆盖本次行为。

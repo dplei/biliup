@@ -1,6 +1,6 @@
 # Spec：`pre_upload` 瞬时失败不再终结整个上传 attempt
 
-Status: ready-for-review
+Status: complete
 
 来源：[`dplei/biliup#4`](https://github.com/dplei/biliup/issues/4)
 
@@ -129,6 +129,8 @@ bucket 之前还没有连接实际上传线路。因此 DNS、连接、超时、
 
 ## Comments
 
+- 2026-09-08：[#45](https://github.com/dplei/biliup/pull/45) 已合入 `dev`，自动验证全部通过，effort
+  满足归档条件。
 - 2026-09-08：Step 01 已实现；两个服务端入口共用 typed transient retry，gate 在每次真实请求后收口，
   预上传失败不再写入具体线路 breaker。完整故障注入与归档仍留给 Step 06。
 - 2026-09-08：Step 02 复核关闭；默认原地替换与 `audio_normalized_at` 已覆盖跨 attempt 复用，未新增
