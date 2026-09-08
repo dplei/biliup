@@ -64,6 +64,21 @@ impl Default for Runtime {
 static RUNTIME: LazyLock<Mutex<Runtime>> = LazyLock::new(|| Mutex::new(Runtime::default()));
 static CHANGED: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+#[cfg(test)]
+pub(crate) async fn reset_for_test(expired_cooldown: bool) {
+    let mut runtime = RUNTIME.lock().await;
+    *runtime = Runtime::default();
+    runtime.loaded = true;
+    if expired_cooldown {
+        runtime.state = UploadGateState::CoolingDown {
+            until: Utc::now() - ChronoDuration::seconds(1),
+            strikes: 1,
+        };
+    }
+    drop(runtime);
+    CHANGED.notify_waiters();
+}
+
 async fn load_once(pool: &ConnectionPool) -> AppResult<()> {
     let mut runtime = RUNTIME.lock().await;
     if runtime.loaded {

@@ -1979,32 +1979,55 @@ async fn pre_upload_with_retry(
     settings: UploadRateGateSettings,
     pool: &ConnectionPool,
 ) -> AppResult<(Parcel, u64, String)> {
+    retry_pre_upload_requests(settings, pool, || {
+        let video_file = VideoFile::new(video_path).change_context(AppError::Unknown)?;
+        let total_size = video_file.total_size;
+        let file_name = video_file.file_name.clone();
+        Ok(async move {
+            line.pre_upload(bilibili, video_file)
+                .await
+                .map(|uploader| (uploader, total_size, file_name))
+        })
+    })
+    .await
+}
+
+async fn retry_pre_upload_requests<T, F, Fut>(
+    settings: UploadRateGateSettings,
+    pool: &ConnectionPool,
+    mut make_request: F,
+) -> AppResult<T>
+where
+    F: FnMut() -> AppResult<Fut>,
+    Fut: Future<Output = Result<T, Kind>>,
+{
     biliup::retry_with_config(
-        || async {
-            let video_file = VideoFile::new(video_path).change_context(AppError::Unknown)?;
-            let total_size = video_file.total_size;
-            let file_name = video_file.file_name.clone();
-            upload_rate_gate::before_pre_upload(settings, pool).await?;
-            match line.pre_upload(bilibili, video_file).await {
-                Ok(uploader) => {
-                    upload_rate_gate::record_success(settings, pool).await;
-                    Ok((uploader, total_size, file_name))
-                }
-                Err(error @ Kind::RateLimit { code: 601, .. }) => {
-                    let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
-                    let message = error.to_string();
-                    Err(error_stack::Report::new(error).change_context(AppError::Custom(
-                        format!(
-                            "Bilibili pre_upload rate limited ({message}); global cooldown until {until}"
-                        ),
-                    )))
-                }
-                Err(error) => {
-                    upload_rate_gate::record_non_rate_limit_failure(settings).await;
-                    let summary = sanitize_error(&format!("{error:?}"));
-                    Err(error_stack::Report::new(error).change_context(AppError::Custom(
-                        format!("Bilibili pre_upload failed: {summary}"),
-                    )))
+        || {
+            let request = make_request();
+            async move {
+                let request = request?;
+                upload_rate_gate::before_pre_upload(settings, pool).await?;
+                match request.await {
+                    Ok(value) => {
+                        upload_rate_gate::record_success(settings, pool).await;
+                        Ok(value)
+                    }
+                    Err(error @ Kind::RateLimit { code: 601, .. }) => {
+                        let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
+                        let message = error.to_string();
+                        Err(error_stack::Report::new(error).change_context(AppError::Custom(
+                            format!(
+                                "Bilibili pre_upload rate limited ({message}); global cooldown until {until}"
+                            ),
+                        )))
+                    }
+                    Err(error) => {
+                        upload_rate_gate::record_non_rate_limit_failure(settings).await;
+                        let summary = sanitize_error(&format!("{error:?}"));
+                        Err(error_stack::Report::new(error).change_context(AppError::Custom(
+                            format!("Bilibili pre_upload failed: {summary}"),
+                        )))
+                    }
                 }
             }
         },
@@ -4515,9 +4538,36 @@ mod tests {
     };
     use crate::server::infrastructure::connection_pool::ConnectionManager;
     use chrono::{DateTime, TimeZone, Utc};
+    use std::sync::atomic::AtomicUsize;
+
+    static PRE_UPLOAD_RETRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn test_config() -> Config {
         serde_yaml::from_str("{}").expect("default test config")
+    }
+
+    fn pre_upload_test_settings() -> UploadRateGateSettings {
+        UploadRateGateSettings {
+            enabled: true,
+            min_request_interval: Duration::ZERO,
+            initial_cooldown: Duration::from_secs(60),
+            max_cooldown: Duration::from_secs(60),
+        }
+    }
+
+    async fn refused_pre_upload_request() -> Result<(), Kind> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        Err(error.into())
     }
 
     #[test]
@@ -4552,6 +4602,110 @@ mod tests {
         })
         .change_context(AppError::Unknown);
         assert!(!is_retryable_pre_upload(&rate_limit));
+    }
+
+    #[tokio::test]
+    async fn pre_upload_retries_transient_requests_and_releases_probe() {
+        let _lock = PRE_UPLOAD_RETRY_TEST_LOCK.lock().await;
+        let (_directory, pool) = deferred_test_pool().await;
+        tokio::time::pause();
+        let settings = pre_upload_test_settings();
+
+        upload_rate_gate::reset_for_test(false).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = attempts.clone();
+        retry_pre_upload_requests(settings, &pool, move || {
+            let should_fail = counted.fetch_add(1, Ordering::SeqCst) < 2;
+            Ok(async move {
+                if should_fail {
+                    refused_pre_upload_request().await
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let gate = upload_rate_gate::snapshot().await;
+        assert_eq!(gate.pre_upload_count, 3);
+        assert_eq!(gate.state, "ready");
+        assert!(
+            upload_line_health::all_health(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        upload_rate_gate::reset_for_test(true).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let error = retry_pre_upload_requests(settings, &pool, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(async { refused_pre_upload_request().await })
+        })
+        .await
+        .unwrap_err();
+        assert!(is_retryable_pre_upload(&error));
+        assert_eq!(attempts.load(Ordering::SeqCst), PRE_UPLOAD_RETRIES + 1);
+        let gate = upload_rate_gate::snapshot().await;
+        assert_eq!(gate.pre_upload_count, (PRE_UPLOAD_RETRIES + 1) as u64);
+        assert_eq!(gate.state, "ready", "failed probe must release the gate");
+        assert!(
+            upload_line_health::all_health(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        upload_rate_gate::reset_for_test(false).await;
+    }
+
+    #[tokio::test]
+    async fn final_pre_upload_failures_do_not_retry_or_touch_line_health() {
+        let _lock = PRE_UPLOAD_RETRY_TEST_LOCK.lock().await;
+        let (_directory, pool) = deferred_test_pool().await;
+        let settings = pre_upload_test_settings();
+
+        for failure in ["http", "certificate", "rate_limit"] {
+            upload_rate_gate::reset_for_test(false).await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counted = attempts.clone();
+            let result = retry_pre_upload_requests(settings, &pool, move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(std::future::ready(Err::<(), Kind>(match failure {
+                    "http" => Kind::Custom("Failed to pre_upload with HTTP 503".into()),
+                    "certificate" => Kind::Custom("invalid peer certificate".into()),
+                    "rate_limit" => Kind::RateLimit {
+                        code: 601,
+                        message: "limited".into(),
+                    },
+                    _ => unreachable!(),
+                })))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "{failure}");
+            assert_eq!(upload_rate_gate::snapshot().await.pre_upload_count, 1);
+            assert!(
+                upload_line_health::all_health(&pool)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        record_line_kind_failure(
+            &pool,
+            "tx",
+            None,
+            &Kind::Custom("chunk transport failed".into()),
+        )
+        .await;
+        assert_eq!(
+            upload_line_health::all_health(&pool).await.unwrap().len(),
+            1
+        );
+        upload_rate_gate::reset_for_test(false).await;
     }
 
     #[test]

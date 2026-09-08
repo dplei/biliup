@@ -1,6 +1,6 @@
 # Spec：`pre_upload` 瞬时失败不再终结整个上传 attempt
 
-Status: ready-for-agent
+Status: ready-for-review
 
 来源：[`dplei/biliup#4`](https://github.com/dplei/biliup/issues/4)
 
@@ -115,7 +115,7 @@ bucket 之前还没有连接实际上传线路。因此 DNS、连接、超时、
 | [03](./steps/03-keep-and-reuse-artifact.md) | 失败缓存与命中复用 | wontfix | 被 #14 的原地替换与账本标记取代 |
 | [04](./steps/04-artifact-cache-reaping.md) | 缓存回收 | wontfix | 不再创建长寿命缓存 |
 | [05](./steps/05-local-dns-failure-kind.md) | `LocalResolution` 类型 | wontfix | 改为所有预上传失败都不写线路 breaker |
-| [06](./steps/06-end-to-end-verification.md) | 自动回归与 dev 验收 | ready-for-agent | 01 |
+| [06](./steps/06-end-to-end-verification.md) | 自动回归与 dev 验收 | resolved | 01 |
 
 ## 6. 整体验收
 
@@ -137,5 +137,8 @@ bucket 之前还没有连接实际上传线路。因此 DNS、连接、超时、
   失败缓存，`keep_original` 继续保持短命临时件语义。
 - 2026-09-08：Step 04 复核关闭；没有长寿命缓存生产者，现有 `TempArtifact` 与孤儿 `.part` 清扫已
   覆盖短命中间件，不新增无目标的周期 reaper。
+- 2026-09-08：Step 05 复核关闭；预上传失败已整体脱离 UPOS 线路 breaker，不新增依赖错误文案的
+  `LocalResolution` 分类。
+- 2026-09-08：Step 06 自动验证完成，effort 进入 review；合并到 `dev` 后再按仓库流程归档。
 - 2026-09-08：按最新 `dev` 重审。PR #14 已让默认链路在标准化成功后原地替换并持久标记，原来的
   指纹缓存、缓存保留和回收设计全部撤销；剩余改动收敛为服务端 `pre_upload` 有界重试与归因修正。
