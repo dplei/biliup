@@ -110,12 +110,12 @@ bucket 之前还没有连接实际上传线路。因此 DNS、连接、超时、
 
 | # | 内容 | 状态 | 依赖 |
 | --- | --- | --- | --- |
-| [01](./issues/01-preupload-transient-retry.md) | 两个服务端调用点共用有界重试与正确 gate 收口 | ready-for-agent | — |
-| [02](./issues/02-fingerprint-artifact-naming.md) | 内容指纹命名 | wontfix | 被 #14 的原地替换取代 |
-| [03](./issues/03-keep-and-reuse-artifact.md) | 失败缓存与命中复用 | wontfix | 被 #14 的原地替换与账本标记取代 |
-| [04](./issues/04-artifact-cache-reaping.md) | 缓存回收 | wontfix | 不再创建长寿命缓存 |
-| [05](./issues/05-local-dns-failure-kind.md) | `LocalResolution` 类型 | wontfix | 改为所有预上传失败都不写线路 breaker |
-| [06](./issues/06-end-to-end-verification.md) | 自动回归与 dev 验收 | ready-for-agent | 01 |
+| [01](./steps/01-preupload-transient-retry.md) | 两个服务端调用点共用有界重试与正确 gate 收口 | resolved | — |
+| [02](./steps/02-fingerprint-artifact-naming.md) | 内容指纹命名 | wontfix | 被 #14 的原地替换取代 |
+| [03](./steps/03-keep-and-reuse-artifact.md) | 失败缓存与命中复用 | wontfix | 被 #14 的原地替换与账本标记取代 |
+| [04](./steps/04-artifact-cache-reaping.md) | 缓存回收 | wontfix | 不再创建长寿命缓存 |
+| [05](./steps/05-local-dns-failure-kind.md) | `LocalResolution` 类型 | wontfix | 改为所有预上传失败都不写线路 breaker |
+| [06](./steps/06-end-to-end-verification.md) | 自动回归与 dev 验收 | ready-for-agent | 01 |
 
 ## 6. 整体验收
 
@@ -129,5 +129,7 @@ bucket 之前还没有连接实际上传线路。因此 DNS、连接、超时、
 
 ## Comments
 
+- 2026-09-08：Step 01 已实现；两个服务端入口共用 typed transient retry，gate 在每次真实请求后收口，
+  预上传失败不再写入具体线路 breaker。完整故障注入与归档仍留给 Step 06。
 - 2026-09-08：按最新 `dev` 重审。PR #14 已让默认链路在标准化成功后原地替换并持久标记，原来的
   指纹缓存、缓存保留和回收设计全部撤销；剩余改动收敛为服务端 `pre_upload` 有界重试与归因修正。
