@@ -1,7 +1,6 @@
 # 06 — 回归验证与收尾
 
-Status: ready-for-agent
-Blocked by: 01
+Status: resolved
 
 ## 目的
 
@@ -32,7 +31,7 @@ python3 scripts/check_code_index.py
 
 不再要求检查长期缓存占用或复用后音质：本方案没有缓存，上传的就是 #14 已校验并原地替换的文件。
 
-## 收尾
+## 合并后收尾
 
 Step 01 实现、上述自动验证通过并落到 `dev` 后：
 
@@ -40,6 +39,18 @@ Step 01 实现、上述自动验证通过并落到 `dev` 后：
 2. 把 01、06 标为 `resolved`；
 3. 将整个 effort 移入 `.archive/` 并登记 `.archive/README.md`；
 4. 在公开 PR/issue 文案中只保留脱敏后的故障链和验证结论。
+
+## Answer
+
+- `pre_upload_retries_transient_requests_and_releases_probe` 用本地拒绝连接合成 typed transport：前两次
+  失败、第三次成功时 request 与 gate 均计数 3；从到期冷却进入 probe 后连续失败耗尽 3 次重试，
+  最终共请求 4 次且 gate 回到 `ready`。
+- `final_pre_upload_failures_do_not_retry_or_touch_line_health` 证明 HTTP、证书和 601 均只请求一次，所有
+  预上传场景都不写 `upload_line_health`；随后同一测试确认保留的传输失败记录仍会写入线路健康。
+- `recovery_skips_normalization_for_an_already_replaced_recording` 继续证明持久标记让补传跳过 loudnorm；
+  两个服务端调用点继续只调用同一个 `pre_upload_with_retry`。
+- `cargo test -p biliup-cli` 与 `python3 scripts/check_code_index.py` 通过。effort 已可 review；归档必须等
+  PR 合并进入 `dev` 后执行，本分支不提前移动 `.scratch/`。
 
 ## Comments
 
