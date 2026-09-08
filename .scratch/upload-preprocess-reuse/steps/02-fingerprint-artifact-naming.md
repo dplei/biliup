@@ -18,6 +18,15 @@ PR #14 已把默认形态改成“校验通过后原子替换原片”，失败�
 只有未来取消默认原地替换，同时又有实测证明跨进程重复 loudnorm 是主要成本时，再单独设计持久缓存；
 不能只因为 `audio_normalization_keep_original=true` 这个逃生门存在就预建。
 
+## Answer
+
+- `normalize_for_upload` 在默认模式校验产物后通过 `TempArtifact::commit_replacing` 原子替换原片，返回
+  `NormalizedForm::ReplacedOriginal`；没有独立成品需要命名。
+- 上传管道在替换完成后立即发送 `UploadActivity::NormalizedInPlace` 并写入
+  `upload_missing_segment.audio_normalized_at`；补传据此跳过第二次 loudnorm。
+- 随机 `.part` 名只服务于同一次转码的隔离与异常清扫，不升级为跨 attempt 缓存键。因此本 step 无
+  代码改动，维持 `wontfix`。
+
 ## Comments
 
 - 2026-09-08：被 PR #14 的原地替换方案取代。
