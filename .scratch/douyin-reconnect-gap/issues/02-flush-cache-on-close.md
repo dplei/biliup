@@ -1,6 +1,6 @@
 # 02 — 连接收尾时刷出缓存，保住分段后那一小段
 
-Status: ready-for-agent
+Status: wontfix
 
 ## 背景
 
@@ -103,3 +103,14 @@ Status: ready-for-agent
   `RecoverableShort` 的判据是 `size < min_size`（默认 100 MB，
   [`util.rs:430`](../../../crates/biliup-cli/src/server/common/util.rs)），两者都不看时长。
   刷出的 ~2.6 MB 片段会稳定落在 `RecoverableShort`，收益成立。
+
+## Comments
+
+### 2026-09-08 复核：本 effort 不实现
+
+单独刷出缓存只能把 `HeaderOnly` 变成一个约一个 GOP 的短片段；当前单短片段会进入延后恢复，
+不会自动拼入下一条正常分段。为这点内容扩展跨连接相邻片段合并，会把一个停顿/重连问题扩大成
+恢复管线改造。
+
+先用 `01`/`04` 压缩真正未收到的时间。只有后续成片验收明确要求保住最后一个 GOP，且已有安全的
+相邻片段合并能力时，才重新开启本 step。

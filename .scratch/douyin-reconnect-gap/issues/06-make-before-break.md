@@ -1,6 +1,6 @@
 # 06 — make-before-break：双读换连接
 
-Status: **wontfix**（2026-08-29 结项，被 `07` 取代）
+Status: wontfix
 
 ## 为什么不做
 
