@@ -1,6 +1,6 @@
 # 03 — 缺口统计口径修正与可观测
 
-Status: implemented / 待生产验收（2026-08-29）
+Status: ready-for-human
 
 ## 背景
 
@@ -91,3 +91,11 @@ total_gap_ms=    两者之和
 第 3 条的「健康接口与补传页展示」没做。`stream_gap_count` 与新口径的
 `estimated_missing_ms` 已进结构化日志，页面挂载点等口径在生产上验准之后再说——
 先展示一个还没验过的数字没有意义。
+
+## Comments
+
+### 2026-09-08 复核
+
+`total_gap_ms` 当前精确表示 `silent_ms + check_stream 耗时 + backoff`，不包含下一条连接从发起请求
+到首个媒体字节/首个落盘 tag 的时间，因此仍是估计值。验收时以相邻连接首尾媒体时间戳之差为
+真值；误差达标前不扩 API/UI。

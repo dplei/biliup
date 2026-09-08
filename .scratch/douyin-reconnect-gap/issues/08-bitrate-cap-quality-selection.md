@@ -1,6 +1,6 @@
 # 08 — 码率上限选档：把「主播推多少就录多少」变成「最多录 X Mbps」
 
-Status: ready-for-agent
+Status: wontfix
 
 与缺口问题无直接依赖，可独立发布。收益确定（资源可控），且**可能顺带影响断连根因**——见末节。
 
@@ -109,3 +109,10 @@ Status: ready-for-agent
 但这尚未验证：2026-08-29 的实测中，23.2 Mbps 的 origin 与 8.8 Mbps 的 uhd
 **双双跑满 2400 秒未断**，两者都没被掐，因此这一轮无法区分。
 本 ticket 的收益应按「资源可控」计算；断连能否顺带解决，等 [`05`](./05-upstream-lifetime-experiment.md) 的结论。
+
+## Comments
+
+### 2026-09-08 复核：移出 issue #5
+
+码率上限解决的是资源控制；当前没有同源证据证明它能修复断流缺口。若仍需要该能力，应单独建立
+GitHub issue 和 effort，以它自己的收益与验收标准推进，不再作为 issue #5 的实现步骤。
