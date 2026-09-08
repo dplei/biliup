@@ -61,8 +61,7 @@ use biliup::client::StatelessClient;
 use biliup::credential::login_by_cookies;
 use biliup::error::Kind;
 use biliup::uploader::VideoFile;
-use biliup::uploader::line::Line;
-use biliup::uploader::line::UploadProgress;
+use biliup::uploader::line::{Line, Parcel, UploadProgress};
 use biliup::uploader::util::SubmitOption;
 use error_stack::ResultExt;
 use futures::StreamExt;
@@ -1954,6 +1953,67 @@ fn segment_part_title(original_path: &Path) -> Option<String> {
 /// B 站分P标题字符上限。
 const PART_TITLE_MAX_CHARS: usize = 80;
 
+const PRE_UPLOAD_RETRIES: usize = 3;
+
+fn is_retryable_pre_upload_failure(kind: UploadFailureKind) -> bool {
+    matches!(
+        kind,
+        UploadFailureKind::ConnectTimeout
+            | UploadFailureKind::RequestTimeout
+            | UploadFailureKind::Transport
+    )
+}
+
+fn is_retryable_pre_upload(error: &error_stack::Report<AppError>) -> bool {
+    let Some(kind @ (Kind::Reqwest(_) | Kind::ReqwestMiddleware(_))) = error.downcast_ref::<Kind>()
+    else {
+        return false;
+    };
+    is_retryable_pre_upload_failure(classify_kind(kind))
+}
+
+async fn pre_upload_with_retry(
+    video_path: &Path,
+    bilibili: &BiliBili,
+    line: &Line,
+    settings: UploadRateGateSettings,
+    pool: &ConnectionPool,
+) -> AppResult<(Parcel, u64, String)> {
+    biliup::retry_with_config(
+        || async {
+            let video_file = VideoFile::new(video_path).change_context(AppError::Unknown)?;
+            let total_size = video_file.total_size;
+            let file_name = video_file.file_name.clone();
+            upload_rate_gate::before_pre_upload(settings, pool).await?;
+            match line.pre_upload(bilibili, video_file).await {
+                Ok(uploader) => {
+                    upload_rate_gate::record_success(settings, pool).await;
+                    Ok((uploader, total_size, file_name))
+                }
+                Err(error @ Kind::RateLimit { code: 601, .. }) => {
+                    let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
+                    let message = error.to_string();
+                    Err(error_stack::Report::new(error).change_context(AppError::Custom(
+                        format!(
+                            "Bilibili pre_upload rate limited ({message}); global cooldown until {until}"
+                        ),
+                    )))
+                }
+                Err(error) => {
+                    upload_rate_gate::record_non_rate_limit_failure(settings).await;
+                    let summary = sanitize_error(&format!("{error:?}"));
+                    Err(error_stack::Report::new(error).change_context(AppError::Custom(
+                        format!("Bilibili pre_upload failed: {summary}"),
+                    )))
+                }
+            }
+        },
+        PRE_UPLOAD_RETRIES,
+        Some(is_retryable_pre_upload),
+    )
+    .await
+}
+
 async fn upload_single_file(
     file_path: &Path,
     context: &UploadContext,
@@ -1980,36 +2040,17 @@ async fn upload_single_file(
             .to_str()
     );
     info!("线路选择：{line:?}");
-    let video_file = VideoFile::new(video_path).change_context(AppError::Unknown)?;
-    let total_size = video_file.total_size;
-    let file_name = video_file.file_name.clone();
-    upload_rate_gate::before_pre_upload(*rate_gate, pool).await?;
-    let uploader = match line.pre_upload(bilibili, video_file).await {
-        Ok(uploader) => {
-            upload_rate_gate::record_success(*rate_gate, pool).await;
-            // 取回描述符只在这一刻存在。序列化失败不阻断上传：丢的是灾后兜底，不是本次投稿。
-            if let Some(tx) = &activity_tx {
-                match serde_json::to_string(&uploader.recovery()) {
-                    Ok(descriptor) => {
-                        let _ = tx.send(UploadActivity::UposRecovery(descriptor));
-                    }
-                    Err(error) => warn!(?error, "序列化 UPOS 取回描述符失败"),
-                }
+    let (uploader, total_size, file_name) =
+        pre_upload_with_retry(video_path, bilibili, line, *rate_gate, pool).await?;
+    // 取回描述符只在这一刻存在。序列化失败不阻断上传：丢的是灾后兜底，不是本次投稿。
+    if let Some(tx) = &activity_tx {
+        match serde_json::to_string(&uploader.recovery()) {
+            Ok(descriptor) => {
+                let _ = tx.send(UploadActivity::UposRecovery(descriptor));
             }
-            uploader
+            Err(error) => warn!(?error, "序列化 UPOS 取回描述符失败"),
         }
-        Err(Kind::RateLimit { code: 601, message }) => {
-            let until = upload_rate_gate::record_rate_limited(*rate_gate, pool).await?;
-            return Err(error_stack::Report::new(AppError::Custom(format!(
-                "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
-            ))));
-        }
-        Err(error) => {
-            upload_rate_gate::record_non_rate_limit_failure(*rate_gate).await;
-            record_line_kind_failure(pool, line_key, health_webhook.as_deref(), &error).await;
-            return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
-        }
-    };
+    }
 
     let instant = Instant::now();
     if let Some(tx) = &activity_tx {
@@ -3444,52 +3485,31 @@ pub async fn upload_with_task(
                 .change_context_lazy(|| AppError::Unknown)?;
             println!("{:?}", canonical_path.to_str());
             info!("{line:?}");
-            let video_file = VideoFile::new(video_path)
-                .inspect_err(|_| {
-                    if let Some(identity) = &identity {
-                        crate::observe::upload_failed(identity, "source_io", "无法读取上传文件");
-                    }
-                })
-                .change_context_lazy(|| AppError::Unknown)?;
-            let total_size = video_file.total_size;
-            let file_name = video_file.file_name.clone();
             let settings = UploadRateGateSettings::from(config);
-            upload_rate_gate::before_pre_upload(settings, pool)
-                .await
-                .inspect_err(|_| {
-                    if let Some(identity) = &identity {
-                        crate::observe::upload_failed(identity, "rate_gate_unavailable", "无法读取上传准入状态");
+            let (uploader, total_size, file_name) =
+                match pre_upload_with_retry(video_path, &bilibili, &line, settings, pool).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if let Some(identity) = &identity {
+                            if error.downcast_ref::<std::io::Error>().is_some() {
+                                crate::observe::upload_failed(
+                                    identity,
+                                    "source_io",
+                                    "无法读取上传文件",
+                                );
+                            } else if let Some(kind) = error.downcast_ref::<Kind>() {
+                                crate::observe::standalone::failed(identity, kind);
+                            } else {
+                                crate::observe::upload_failed(
+                                    identity,
+                                    "rate_gate_unavailable",
+                                    "无法完成预上传准入",
+                                );
+                            }
+                        }
+                        return Err(error);
                     }
-                })?;
-            let uploader = match line.pre_upload(&bilibili, video_file).await {
-                Ok(uploader) => {
-                    upload_rate_gate::record_success(settings, pool).await;
-                    uploader
-                }
-                Err(Kind::RateLimit { code: 601, message }) => {
-                    if let Some(identity) = &identity {
-                        crate::observe::upload_failed(identity, "rate_limited", "预上传被限流");
-                    }
-                    let until = upload_rate_gate::record_rate_limited(settings, pool).await?;
-                    return Err(error_stack::Report::new(AppError::Custom(format!(
-                        "Bilibili pre_upload rate limited (601: {message}); global cooldown until {until}"
-                    ))));
-                }
-                Err(error) => {
-                    if let Some(identity) = &identity {
-                        crate::observe::standalone::failed(identity, &error);
-                    }
-                    upload_rate_gate::record_non_rate_limit_failure(settings).await;
-                    record_line_kind_failure(
-                        pool,
-                        &line_key,
-                        config.cookie_health_webhook.as_deref(),
-                        &error,
-                    )
-                    .await;
-                    return Err(error_stack::Report::new(error).change_context(AppError::Unknown));
-                }
-            };
+                };
 
             let instant = Instant::now();
             if let Some(identity) = &identity {
@@ -4498,6 +4518,40 @@ mod tests {
 
     fn test_config() -> Config {
         serde_yaml::from_str("{}").expect("default test config")
+    }
+
+    #[test]
+    fn pre_upload_retry_policy_excludes_local_and_final_errors() {
+        for kind in [
+            UploadFailureKind::ConnectTimeout,
+            UploadFailureKind::RequestTimeout,
+            UploadFailureKind::Transport,
+        ] {
+            assert!(is_retryable_pre_upload_failure(kind));
+        }
+        for kind in [
+            UploadFailureKind::CertificateExpired,
+            UploadFailureKind::CertificateInvalid,
+            UploadFailureKind::HttpStatus,
+            UploadFailureKind::RateLimit601,
+        ] {
+            assert!(!is_retryable_pre_upload_failure(kind));
+        }
+
+        let local = error_stack::Report::new(Kind::IO(std::io::Error::other(
+            "dns error text on a local file failure",
+        )))
+        .change_context(AppError::Unknown);
+        assert!(
+            !is_retryable_pre_upload(&local),
+            "formatted text must not turn a local error into a network retry"
+        );
+        let rate_limit = error_stack::Report::new(Kind::RateLimit {
+            code: 601,
+            message: "limited".to_string(),
+        })
+        .change_context(AppError::Unknown);
+        assert!(!is_retryable_pre_upload(&rate_limit));
     }
 
     #[test]

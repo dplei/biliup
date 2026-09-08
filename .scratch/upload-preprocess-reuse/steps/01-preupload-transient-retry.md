@@ -1,6 +1,6 @@
 # 01 — 服务端 `pre_upload` 瞬时网络失败有界重试
 
-Status: ready-for-agent
+Status: resolved
 
 ## 背景
 
@@ -52,6 +52,16 @@ helper 可以返回 uploader 及调用方后续日志所需的文件大小/文�
 ```bash
 cargo test -p biliup-cli
 ```
+
+## Answer
+
+- 在 `upload.rs` 增加私有 `pre_upload_with_retry`，两个服务端入口共用；固定最多重试 3 次，每轮重新
+  打开文件并重新经过 rate gate。
+- predicate 只接受 typed `ConnectTimeout`、`RequestTimeout`、`Transport`；601、HTTP、证书、文件 IO
+  与 gate 数据库错误不重试。每次请求先收口 gate，再决定是否继续。
+- 删除两处预上传错误对 `upload_line_health` 的写入；实际分块上传的 breaker 记录保持不变。
+- 新增策略回归 `pre_upload_retry_policy_excludes_local_and_final_errors`；`cargo test -p biliup-cli` 全部
+  通过。请求次数、probe 释放与 breaker 不变性的故障注入留在 Step 06 集中验证。
 
 ## Comments
 
