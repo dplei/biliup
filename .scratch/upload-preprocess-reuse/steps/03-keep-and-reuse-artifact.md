@@ -18,6 +18,15 @@ loudnorm，已经得到原 ticket 想要的“失败后复用”，且不需要�
 实现 Step 01 时保持现有 `recovery_skips_normalization_for_an_already_replaced_recording` 一类回归通过；
 不要改变 `audio_normalized_at` 的含义或 `keep_original` 的清理语义。
 
+## Answer
+
+- 默认模式下，校验后的标准化产物已经原子替换原片；`NormalizedInPlace` 活动在上传结果之前写入
+  `audio_normalized_at`，上传失败不会丢失复用标记。
+- 自动补传和人工/换线补传都通过 `audio_normalization_needed` 读取该标记并跳过 loudnorm，直接复用
+  原路径上的标准化文件。
+- `keep_original=true` 仍按显式逃生门语义使用 `TempArtifact`，上传失败即清理；不为非默认模式增加
+  持久缓存。因此本 step 无代码改动，维持 `wontfix`。
+
 ## Comments
 
 - 2026-09-08：被 PR #14 的原地替换与持久标记取代。
