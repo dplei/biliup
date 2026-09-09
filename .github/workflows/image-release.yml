@@ -1,0 +1,130 @@
+# 手动触发的镜像构建与发布。
+#
+# 与本机构建的区别只有一个：runner 本身就是 amd64，不经 QEMU 模拟，
+# Rust 编译不再有 5~10 倍的模拟开销。
+#
+# 镜像地址、账号、口令全部走 repository secrets，本文件不出现任何仓库地址：
+#
+#   REGISTRY_IMAGE     完整镜像路径 <registry-host>/<namespace>/<repo>
+#   REGISTRY_USERNAME  registry 账号
+#   REGISTRY_PASSWORD  registry 口令
+#
+# 版本号取自 Cargo.toml 的 workspace.package.version，不手输，避免与仓库内版本不一致。
+
+name: Build and publish image
+
+on:
+  workflow_dispatch:
+    inputs:
+      alias:
+        description: '别名 tag 后缀，如 overrideedit（留空则只推 latest 与版本号）'
+        required: false
+        type: string
+      push:
+        description: '冒烟通过后推送到 registry（关掉可只做构建验证）'
+        type: boolean
+        default: true
+      force:
+        description: '目标版本号 tag 已存在时仍继续（默认阻止，避免覆盖已发布版本）'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本号并拼出 tag
+        id: meta
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+          ALIAS: ${{ inputs.alias }}
+        run: |
+          set -euo pipefail
+          test -n "$IMAGE" || { echo "::error::secret REGISTRY_IMAGE 未配置"; exit 1; }
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          test -n "$version" || { echo "::error::没能从 Cargo.toml 读到 workspace.package.version"; exit 1; }
+          {
+            echo "version=$version"
+            echo "registry=${IMAGE%%/*}"
+            echo "tag_version=$IMAGE:$version"
+            echo "tag_latest=$IMAGE:latest"
+            if [ -n "$ALIAS" ]; then echo "tag_alias=$IMAGE:$version-$ALIAS"; fi
+          } >> "$GITHUB_OUTPUT"
+          echo "本次版本号：$version${ALIAS:+（别名后缀 $ALIAS）}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.meta.outputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      # 版本号 tag 一旦发布就不该被覆盖：远端已存在说明这个号已经用过，
+      # 多半是忘了 bump Cargo.toml。历史上为此白构建过一次。
+      - name: 检查版本号 tag 是否已被占用
+        if: ${{ !inputs.force }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${{ steps.meta.outputs.tag_version }}" >/dev/null 2>&1; then
+            echo "::error::版本 ${{ steps.meta.outputs.version }} 在 registry 上已存在。先 bump Cargo.toml，或用 force 选项覆盖。"
+            exit 1
+          fi
+
+      - name: 构建（amd64 原生，先只 load 到本地待冒烟）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tag_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 容器冒烟
+        run: |
+          set -euo pipefail
+          img='${{ steps.meta.outputs.tag_version }}'
+          test "$(docker run --rm --entrypoint uname "$img" -m)" = x86_64
+          docker run --rm "$img" --version | grep -F 'biliup-cli ${{ steps.meta.outputs.version }}'
+          docker run --rm --entrypoint python3 "$img" -c 'import stream_gears, quickjs'
+          docker run --rm --entrypoint sh "$img" -c \
+            'ffmpeg -version >/dev/null && ffprobe -version >/dev/null && ffmpeg -hide_banner -filters 2>/dev/null | grep -q " loudnorm "'
+
+      - name: 推送
+        if: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          docker tag '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_latest }}'
+          docker push '${{ steps.meta.outputs.tag_version }}'
+          docker push '${{ steps.meta.outputs.tag_latest }}'
+          if [ -n '${{ steps.meta.outputs.tag_alias }}' ]; then
+            docker tag '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_alias }}'
+            docker push '${{ steps.meta.outputs.tag_alias }}'
+          fi
+
+      # 三个 tag 必须落在同一 digest、同一仓库名。本机发版踩过 zsh 把 :latest
+      # 吃成参数修饰符、推到相邻仓库且 exit 0 的坑，这里一并核对掉。
+      - name: 核对远端 digest 与仓库名
+        if: ${{ inputs.push }}
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+        run: |
+          set -euo pipefail
+          for tag in '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_latest }}' '${{ steps.meta.outputs.tag_alias }}'; do
+            [ -n "$tag" ] || continue
+            out=$(docker buildx imagetools inspect "$tag")
+            name=$(printf '%s\n' "$out" | sed -n 's/^Name: *//p')
+            digest=$(printf '%s\n' "$out" | sed -n 's/^Digest: *//p')
+            echo "$name -> $digest"
+            test "${name%:*}" = "$IMAGE"
+            printf '%s\n' "$digest" >> /tmp/digests
+          done
+          test "$(sort -u /tmp/digests | wc -l)" -eq 1
+          echo "三个 tag 同一 digest：$(head -1 /tmp/digests)"
