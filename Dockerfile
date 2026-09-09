@@ -4,19 +4,30 @@ FROM node:lts AS webui-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
+# 依赖清单先单独进来：npm install 这层只在依赖变化时失效，不跟着源码改动重跑。
+# node_modules/ 已在 .dockerignore 里，后面的 COPY . 不会覆盖这层装好的依赖。
+COPY package.json package-lock.json /biliup/
+
+RUN set -eux; \
+	cd /biliup; \
+	npm install;
+
 COPY . /biliup
 
+# 守卫仍在 WORKDIR 之前，此时 cwd 是 /，rm -rf /biliup 才安全。
+# clone 模式下整个目录被换掉，上面那层依赖也就没了，得就地补装。
 RUN set -eux; \
 	\
 	if [ ! -f /biliup/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
+	cd /biliup; \
+	npm install; \
 	fi;
 
 WORKDIR /biliup
 
 RUN set -eux; \
-	npm install; \
 	npm run build;
 
 
@@ -25,13 +36,17 @@ FROM rust:latest AS wheel-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
-COPY . /biliup
-
+# 工具链与源码无关：放在 COPY 之前，源码一改不再重装整套 apt 包与 maturin。
 RUN set -eux; \
 	\
 	apt-get update; \
 	apt-get install -y --no-install-recommends python3-pip g++ patchelf; \
-	pip3 install maturin --break-system-packages; \
+	pip3 install maturin --break-system-packages;
+
+COPY . /biliup
+
+RUN set -eux; \
+	\
 	if [ ! -f /biliup/biliup.spec ]; then \
 	rm -rf /biliup; \
 	git clone --depth 1 --branch "$branch_name" "$repo_url" /biliup; \
@@ -64,17 +79,8 @@ ENV LC_ALL="C.UTF-8"
 EXPOSE 19159/tcp
 VOLUME /opt
 
-# 需要遵守 wheel 文件名规范（产物从 cache mount 外的 /wheels 取，见 wheel-builder 注释）
-COPY --from=wheel-builder /wheels/* /tmp/
-
-RUN set -eux; \
-	\
-	whl=$(ls /tmp/biliup*.whl); \
-	pip3 install --no-cache-dir "$whl"; \
-	# pip3 install --no-cache-dir "$whl[quickjs]"; \
-	pip3 cache purge; \
-	rm -rf /tmp/*;
-
+# 系统依赖、ffmpeg 与 quickjs 都跟 wheel 无关，放在 COPY --from 之前：
+# wheel 每次发版必变，排在它后面会让这一层跟着失效、每次重下 126MB 的 ffmpeg。
 RUN set -eux; \
 	\
 	savedAptMark="$(apt-mark showmanual)"; \
@@ -138,6 +144,17 @@ RUN set -eux; \
 		/var/tmp/* \
 		/var/log/* \
 	;
+
+# 需要遵守 wheel 文件名规范（产物从 cache mount 外的 /wheels 取，见 wheel-builder 注释）
+COPY --from=wheel-builder /wheels/* /tmp/
+
+RUN set -eux; \
+	\
+	whl=$(ls /tmp/biliup*.whl); \
+	pip3 install --no-cache-dir "$whl"; \
+	# pip3 install --no-cache-dir "$whl[quickjs]"; \
+	pip3 cache purge; \
+	rm -rf /tmp/*;
 
 WORKDIR /opt
 
