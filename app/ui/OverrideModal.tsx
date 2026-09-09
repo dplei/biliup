@@ -315,8 +315,14 @@ const OverrideModal: React.FC<TemplateModalProps> = ({ children, entity, onOk })
       }
 
       const overrideConfig: Record<string, any> = { ...textOverride }
+      // 平台面板会灌入整份旧 override；未变化的旧值不能反过来覆盖顶部 JSON 的显式修改。
       Object.keys(values).forEach(key => {
-        if (key !== 'override_text' && !entityFields.has(key) && values[key] !== undefined) {
+        if (
+          key !== 'override_text' &&
+          !entityFields.has(key) &&
+          values[key] !== undefined &&
+          values[key] !== (entity?.override as Record<string, any>)?.[key]
+        ) {
           overrideConfig[key] = values[key] === '' ? null : values[key]
         }
       })
