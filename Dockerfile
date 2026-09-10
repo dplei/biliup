@@ -4,9 +4,10 @@
 # 6 / 16 / 13 天就会重建一次，任意一个变都会作废下游全部层缓存——1.3.23 那次就是 node:lts
 # 在两次发版之间更新，把本该命中的热构建打回全量冷构建。
 #
-# 更新方式（想跟进上游安全补丁时手动跑，建议每月一次）：
+# 这三行**不用手动维护**：`.github/workflows/refresh-base-digests.yml` 每天解析一次上游
+# digest，有变化就先构建+冒烟验证、通过了才提交回 dev。要立刻跟进就手动触发那个 workflow。
+# 真要手工改，取值方式是：
 #   docker buildx imagetools inspect node:lts --format '{{.Manifest.Digest}}'
-# 拿到新 digest 换掉下面对应的一行即可；三行可以分别更新，不必同时。
 # Build biliup's web-ui
 FROM node:lts@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0 AS webui-builder
 ARG repo_url=https://github.com/biliup/biliup
