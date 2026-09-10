@@ -4000,7 +4000,7 @@ pub async fn claim_manual_recovery(
     if row.status == "source_missing" && Path::new(&row.file_path).is_file() {
         sqlx::query(
             "UPDATE upload_missing_segment SET status = 'failed', next_retry_at = ?1, \
-             last_error = 'source file reappeared; manual recovery requested', updated_at = ?1 \
+             last_error = NULL, updated_at = ?1 \
              WHERE id = ?2 AND status = 'source_missing'",
         )
         .bind(claim_now)
@@ -4010,6 +4010,7 @@ pub async fn claim_manual_recovery(
         .change_context(AppError::Unknown)?;
         row.status = "failed".to_string();
         row.next_retry_at = claim_now;
+        row.last_error = None;
     }
     if row.lifecycle_version == 2 && matches!(row.status.as_str(), "pending" | "failed") {
         sqlx::query(
@@ -5901,6 +5902,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_claim_clears_resolved_source_missing_error() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "reappeared.flv").await;
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (10, ?1, 'test')")
+            .bind("https://example.invalid/live/room")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE upload_missing_segment SET status = 'source_missing', \
+             last_error = 'source file was missing' WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let config = Config {
+            lines: "alia".to_string(),
+            ..Config::default()
+        };
+
+        let RecoveryClaim::Claimed(claim) =
+            claim_manual_recovery(&config, &pool, enrollment.missing_id, None)
+                .await
+                .unwrap()
+        else {
+            panic!("a reappeared source must be claimable");
+        };
+        drop(claim);
+
+        let (status, last_error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, last_error FROM upload_missing_segment WHERE id = ?")
+                .bind(enrollment.missing_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "uploading");
+        assert_eq!(last_error, None);
     }
 
     /// Stopping is not retrying. The page needs a way to release a wedged task and then decide,
