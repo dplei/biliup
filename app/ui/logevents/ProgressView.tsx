@@ -78,9 +78,6 @@ const STATUS_TEXT: Record<string, string> = {
 	succeeded: '已完成',
 };
 
-/** 只有真正失败的行才用危险色；`last_error` 在正常流程里也会存进度说明。 */
-const FAILED_STATUS = ['failed', 'source_missing'];
-
 interface Props {
 	/** 跳到事件视图；failuresOnly 时只留下警告和错误。 */
 	onJump: (key: AssocField, value: string, failuresOnly: boolean) => void;
@@ -235,11 +232,11 @@ export default function ProgressView({ onJump, instanceId }: Props) {
 								</div>
 								{row.last_error ? (
 									<Typography.Text
-										type={FAILED_STATUS.includes(row.status) ? 'danger' : 'tertiary'}
+										type="danger"
 										size="small"
 										style={{ wordBreak: 'break-all' }}
 									>
-										{FAILED_STATUS.includes(row.status) ? '最近错误' : '最近记录'}：{row.last_error}
+										最近错误：{row.last_error}
 									</Typography.Text>
 								) : null}
 							</div>

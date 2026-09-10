@@ -63,6 +63,7 @@ pub fn mark_retry_failure(row: &mut UploadMissingSegment, error: String, now: Da
 
 pub fn mark_retry_success(row: &mut UploadMissingSegment, now: DateTime<Utc>) {
     row.status = "succeeded".to_string();
+    row.last_error = None;
     row.updated_at = now;
 }
 
@@ -82,13 +83,6 @@ pub fn is_due_for_silent_recovery(
 
 pub fn can_delete_missing_segment(status: &str) -> bool {
     matches!(status, "pending" | "failed")
-}
-
-pub fn reset_for_manual_retry(row: &mut UploadMissingSegment, now: DateTime<Utc>) {
-    row.status = "failed".to_string();
-    row.last_error = Some("manual retry requested from uploading state".to_string());
-    row.next_retry_at = now;
-    row.updated_at = now;
 }
 
 /// One `uploading` row, in the shape the stale verdict needs.
@@ -1004,26 +998,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_reset_turns_uploading_into_due_failed_row() {
-        let mut row = missing_row();
-        row.status = "uploading".to_string();
-        row.attempts = 7;
-        row.next_retry_at = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 13, 0, 0).unwrap();
-        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
-
-        reset_for_manual_retry(&mut row, now);
-
-        assert_eq!(row.status, "failed");
-        assert_eq!(row.attempts, 7);
-        assert_eq!(
-            row.last_error.as_deref(),
-            Some("manual retry requested from uploading state")
-        );
-        assert_eq!(row.next_retry_at, now);
-        assert_eq!(row.updated_at, now);
-    }
-
-    #[test]
     fn inserts_missing_video_at_recorded_zero_based_order() {
         let mut videos = vec![video("p1"), video("p2"), video("p4")];
 
@@ -1086,6 +1060,7 @@ mod tests {
         let mut row = missing_row();
         row.status = "uploading".to_string();
         row.attempts = 2;
+        row.last_error = Some("previous attempt failed".to_string());
         let now = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 12, 5, 0).unwrap();
 
         mark_retry_success(&mut row, now);
@@ -1093,7 +1068,46 @@ mod tests {
         assert_eq!(row.status, "succeeded");
         assert_eq!(row.attempts, 2);
         assert_eq!(row.segment_order, 2);
+        assert_eq!(row.last_error, None);
         assert_eq!(row.updated_at, now);
+    }
+
+    #[tokio::test]
+    async fn migration_clears_only_succeeded_last_errors() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE upload_missing_segment (status TEXT NOT NULL, last_error TEXT);\
+             INSERT INTO upload_missing_segment VALUES ('succeeded', 'old failure');\
+             INSERT INTO upload_missing_segment VALUES ('failed', 'current failure');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/26_clear_succeeded_missing_segment_errors.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, last_error FROM upload_missing_segment ORDER BY status DESC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("succeeded".to_string(), None),
+                ("failed".to_string(), Some("current failure".to_string())),
+            ]
+        );
     }
 
     #[test]
