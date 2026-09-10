@@ -1,6 +1,14 @@
 # syntax=docker/dockerfile:1
+#
+# 三个基础镜像都钉到 digest。滚动 tag（node:lts / rust:latest / python:3.13-slim）平均每
+# 6 / 16 / 13 天就会重建一次，任意一个变都会作废下游全部层缓存——1.3.23 那次就是 node:lts
+# 在两次发版之间更新，把本该命中的热构建打回全量冷构建。
+#
+# 更新方式（想跟进上游安全补丁时手动跑，建议每月一次）：
+#   docker buildx imagetools inspect node:lts --format '{{.Manifest.Digest}}'
+# 拿到新 digest 换掉下面对应的一行即可；三行可以分别更新，不必同时。
 # Build biliup's web-ui
-FROM node:lts AS webui-builder
+FROM node:lts@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0 AS webui-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
@@ -32,7 +40,7 @@ RUN set -eux; \
 
 
 # Build biliup's python wheel
-FROM rust:latest AS wheel-builder
+FROM rust:latest@sha256:bf5a9aa29062a6cb03c49bd59a46eb55e3cc770caf598a221a7866e500be3082 AS wheel-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
@@ -70,7 +78,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 
 # Deploy Biliup
-FROM python:3.13-slim AS biliup
+FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS biliup
 
 ENV TZ="Asia/Shanghai"
 ENV LANG="C.UTF-8"
