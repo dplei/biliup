@@ -22,6 +22,16 @@
 - 每个 step 文件顶部附近用一行 `Status:` 记录 triage 状态，取值为五个规范角色之一：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`
 - 评论与讨论记录追加到文件末尾的 `## Comments` 标题下
 
+## PR 正文不要用 `Closes` 关键字
+
+`Closes #N` / `Fixes #N` / `Resolves #N` 会在**合并瞬间**自动关闭 issue，而本仓库的关闭条件是
+**生产验证通过**，不是代码合并。被自动关闭的 issue 会整个跳过 `awaiting-verification` 这一步：
+标签没打、验收清单没贴，`.scratch/` 也就失去了「暂不归档」的依据。
+
+正文里写 `Refs #N`，或者直接写「修复见 #N」。
+
+已经踩过两次（#39 与 #7），两次都得 reopen、补标签、补清单。
+
 ## 完结后归档到 `.archive/`
 
 `.scratch/` 只放**还在推进**的 effort。一项工作彻底完结时，把整个

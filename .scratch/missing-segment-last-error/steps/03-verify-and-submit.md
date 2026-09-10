@@ -33,14 +33,17 @@ Blocked by: 01, 02
 - 把 01、02、03 的 `Status` 和验证结果写回各 step。
 - 若本轮理解新增了有导航价值的约束，更新 `CODE_INDEX.md` 并运行
   `python3 scripts/check_code_index.py`。
-- 分阶段提交实现与验证，创建以 `dev` 为 base 的 PR，正文关联并关闭 issue #7。
+- 分阶段提交实现与验证，创建以 `dev` 为 base 的 PR，正文关联 issue #7——
+  **但不要用 `Closes`/`Fixes`/`Resolves` 关键字**，本仓库生产验完才关，见
+  [`docs/agents/issue-tracker.md`](../../../docs/agents/issue-tracker.md)。
 - PR/commit/公开文档只写代码契约与脱敏验证结论，不写部署或生产数据细节。
 
 ## 完成标准
 
 - 所有检查通过，工作区干净。
 - PR 的 head 为 `fix/issue7-260910-103945`、base 为 `dev`。
-- issue #7 由 PR 关联，合并后再按仓库流程归档 `.scratch/missing-segment-last-error/`。
+- issue #7 由 PR 关联；合并**不等于**关闭，要等生产验收通过才关，
+  `.scratch/missing-segment-last-error/` 在那之前不归档。
 
 ## Comments
 
@@ -53,3 +56,6 @@ Blocked by: 01, 02
 - migration 不变量由 `migration_clears_only_succeeded_last_errors` 在临时 SQLite 中验证。
 - PR：[#47](https://github.com/dplei/biliup/pull/47)（base `dev`，head
   `fix/issue7-260910-103945`，`Closes #7`）。
+
+- ⚠️ 本轮实际提交时正文写了 `Closes #7`，合并瞬间自动关闭了 issue。已 reopen、补 
+  `awaiting-verification` 标签与六条可判定的观察清单；约定同时写进了 `docs/agents/issue-tracker.md`。
