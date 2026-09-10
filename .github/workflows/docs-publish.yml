@@ -6,7 +6,6 @@ on:
       - master 
     paths:
       - docs/**
-  pull_request:
   
 jobs:
   build:

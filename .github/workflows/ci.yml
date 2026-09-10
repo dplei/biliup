@@ -12,7 +12,9 @@ on:
       - master
     tags:
       - '*'
-  pull_request:
+  # 本 fork 的部署只用 linux/amd64 的容器镜像，PR 上跑这套矩阵产出的 wheel 一个都用不到，
+  # 却会占满免费账户 20 个并发 job 的额度、把发版用的镜像构建挤到队列后面。
+  # 需要全矩阵时手动 workflow_dispatch。
   workflow_dispatch:
 
 permissions:
