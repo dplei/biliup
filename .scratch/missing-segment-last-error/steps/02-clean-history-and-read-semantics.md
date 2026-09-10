@@ -1,6 +1,6 @@
 # 02 · 清理历史成功行并统一读取语义
 
-Status: ready-for-agent
+Status: complete
 
 Blocked by: 01
 
@@ -45,3 +45,8 @@ failed、source_missing 或 deleting 行。
 
 ## Comments
 
+- migration 26 只将 `status = 'succeeded'` 的非空 `last_error` 置空，回归测试确认 failed
+  行诊断保留。
+- `ProgressView` 不再把 `last_error` 解释为正常记录，有值时统一显示为“最近错误”。
+- `./node_modules/.bin/next lint` 通过；仅有登录页既有 `<img>` 警告。本机 `pnpm lint` 的
+  依赖状态检查会先因未批准的 `@parcel/watcher` build script 退出，未进入 lint；未修改仓库或用户的批准策略。

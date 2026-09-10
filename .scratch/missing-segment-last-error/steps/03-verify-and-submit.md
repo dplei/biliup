@@ -1,6 +1,6 @@
 # 03 · 验证、回写与提交 PR
 
-Status: ready-for-agent
+Status: complete
 
 Blocked by: 01, 02
 
@@ -44,3 +44,12 @@ Blocked by: 01, 02
 
 ## Comments
 
+- 已审计 `upload_missing_segment.last_error` 的当前写入点：非空写入均为上传初始化、
+  segment processor、attempt、源文件缺失或删除失败的真实诊断；健康接口仍只依赖
+  `status` 与 stale lease。
+- `cargo test -p biliup-cli` 完整复跑通过（386 unit passed、9 ignored，全部 integration/doc
+  tests 通过）。首跑一条既有并发 enrollment 用例短暂落入 outbox，单独复跑及第二次
+  全量复跑均通过。
+- migration 不变量由 `migration_clears_only_succeeded_last_errors` 在临时 SQLite 中验证。
+- PR：[#47](https://github.com/dplei/biliup/pull/47)（base `dev`，head
+  `fix/issue7-260910-103945`，`Closes #7`）。

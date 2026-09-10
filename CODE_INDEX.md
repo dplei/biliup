@@ -89,7 +89,7 @@
 | `app/ui/logevents/useUrlFilters.ts` | 页面状态与地址栏同步（History API，不用 `useSearchParams`，静态导出下不引入 Suspense 边界）。 | `useUrlState`、`decodeState`、`encodeState` |
 | `app/ui/logevents/FilterBar.tsx` | 级别快速筛选（带其余条件下的命中数）、业务类型/主播/时间/关键词，以及折叠的来源、事件名、运行实例与关联字段。 | `FilterBar`、`StreamerOption` |
 | `app/ui/logevents/EventRow.tsx` | 一条事件的行与行内详情：级别颜色/图标/文字、摘要、身份与技术字段分层、按需取原始诊断、场次/会话/分段跳转。 | `EventRow`、`Detail`、`RawDiagnostic` |
-| `app/ui/logevents/ProgressView.tsx` | 运行进度：复用 `/v1/status`、`/v1/uploads/missing`、`/v1/uploads/sessions/pending` 三个业务快照，无已知总量只显示阶段，过期快照单独标注，补传入口共用带按钮外观的导航链接。 | `ProgressView`、`workerState`、`RecoveryLink` |
+| `app/ui/logevents/ProgressView.tsx` | 运行进度：复用 `/v1/status`、`/v1/uploads/missing`、`/v1/uploads/sessions/pending` 三个业务快照，无已知总量只显示阶段，过期快照单独标注，`last_error` 只按错误诊断显示，补传入口共用带按钮外观的导航链接。 | `ProgressView`、`workerState`、`RecoveryLink` |
 | `app/ui/logevents/ProgressView.module.css` | 进度页补传链接的局部主题样式，统一普通/已访问颜色，提供悬停、按下与键盘焦点反馈。 | `recoveryLink` |
 | `app/ui/plugins/developer.tsx` | 开发者日志设置表单，编辑旧 `LOGGING` 配置及后端动态日志过滤使用的 `loggers_level`。 | `Developer` |
 | `crates/biliup-cli/src/server/infrastructure/connection_pool.rs` | 创建固定 SQLite 类型的业务连接池（上限 2）并执行业务 migrations，另提供测试用迁移后临时库。 | `ConnectionPool`、`ConnectionManager::new_pool`、`test_support::migrated_pool` |
@@ -136,7 +136,7 @@
 | `crates/biliup-cli/src/server/common/process_priority.rs` | 给上传前的 ffmpeg 预处理子进程设置后台 nice 与 IO 优先级，使其让路给网页请求；录制与用户 hook 不降级。 | `background`、`background_std` |
 | `crates/biliup-cli/src/server/router.rs` | 组装主要 v1 业务 HTTP 路由和静态文件服务；认证与日志 WebSocket 另由应用启动层挂载。 | `router`、`static_file_router` |
 | `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失补传/待投稿五态与人工恢复、上传健康和页面整场上传；页面响应返回观测 task，跨后台上传/投稿传递，首文件主播反查只用于模板。分段补传只 claim，按会话恢复持久化授权后异步唤醒投稿协调器。 | `post_uploads`、`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`get_missing_upload_attempts` |
-| `crates/biliup-cli/src/server/common/missing_segment.rs` | 缺失分段的补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与重试延迟。⚠️ `upload_missing_segment` 是**补救账本**而非全量分段账本——走正常上传路径的会话在表中没有任何行，「无行」是健康状态；查询前先读 [`scripts/README.md`](./scripts/README.md#consistency-auditsh)。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment` |
+| `crates/biliup-cli/src/server/common/missing_segment.rs` | 分段补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与 v1 重试状态转换。`upload_missing_segment` 的 v1 行是失败/补救队列，v2 行是所有已验证分段的持久账本；当前健康以 `status` 为准，`last_error` 只存真实失败诊断，成功转换必须清空它。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment`、`mark_retry_success` |
 
 ## 上传核心
 
@@ -230,7 +230,7 @@
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/audio_normalization.rs`、`timestamp_repair.rs`（`normalize_for_upload`、`normalize_timestamps`）：预处理顺序是先标准化、后时间戳检测，检测的对象是标准化产物而不是原片。标准化的测量遍已经完整 demux 过原片并顺带扫了时间戳，原片干净时 `upload_single_file_with_repair` 跳过对产物的整片扫描；诊断缺失或原片异常时照常走完整的检测/修复链路。判据抽在 `timestamp_repair_decision`：**归一化没产出就没有「源已验干净」这个结论可用**，`Original` 的每一个 reason 都必须扫（有回归测试锁住，别给它补乐观默认）。两个系统 runner 都从本次 `UploadIdentity` 构造显式 context，`processing.command_failed` 与完成事件按同一分段/attempt 关联。
 - `crates/biliup-cli/src/server/common/ffmpeg_scan.rs` → `crates/biliup-cli/src/observe/external.rs`（`timestamp_anomaly_unparsed`）：扫描成功但所有异常命中行都无法解析时，把仅含这些行的有界脱敏附件连同显式上传身份直接交给当前采集器。
 - `crates/biliup-cli/src/server/common/audio_normalization.rs`、`timestamp_repair.rs`、`download.rs` → `crates/biliup-cli/src/server/common/process_priority.rs`（`background`）：预处理与分段恢复合并的 ffmpeg 一律降到后台优先级；`core/downloader` 的录制进程和用户自定义 hook 刻意不走这里。
-- `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/missing_segment.rs`（`missing_segment_health`）：健康接口按状态实时计数 + 识别尚未被 60 秒自愈周期收敛的 stale uploading 行，不必等后台任务打日志才能观测。
+- `crates/biliup-cli/src/server/api/endpoints.rs` → `crates/biliup-cli/src/server/common/missing_segment.rs`（`missing_segment_health`）：健康接口按 `status` 实时计数 + 识别尚未被 60 秒自愈周期收敛的 stale uploading 行，不以 `last_error` 是否非空判健康。
 
 - `crates/biliup-cli/src/main.rs`、`crates/stream-gears/src/server.rs` → `crates/biliup-cli/src/uploader.rs`（`upload_by_command`、`upload_by_config`、`append`）：Rust/wheel CLI 复用同一独立上传链，task 在调用层分配并传至每次尝试。
 - `crates/stream-gears/src/lib.rs` → `crates/stream-gears/src/uploader.rs`（`upload`）：Python 函数在局部 subscriber/runtime 内执行上传编排，每次调用持有独立 task。

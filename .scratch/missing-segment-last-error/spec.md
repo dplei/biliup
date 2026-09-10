@@ -47,9 +47,9 @@
 
 | step | 内容 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| [01](steps/01-enforce-write-contract.md) | 收口成功与正常迁移的写入语义 | — | ready-for-agent |
-| [02](steps/02-clean-history-and-read-semantics.md) | 清理历史成功行并统一读取侧语义 | 01 | ready-for-agent |
-| [03](steps/03-verify-and-submit.md) | 全量验证、回写并提交 PR | 01、02 | ready-for-agent |
+| [01](steps/01-enforce-write-contract.md) | 收口成功与正常迁移的写入语义 | — | complete |
+| [02](steps/02-clean-history-and-read-semantics.md) | 清理历史成功行并统一读取侧语义 | 01 | complete |
+| [03](steps/03-verify-and-submit.md) | 全量验证、回写并提交 PR | 01、02 | complete |
 
 ## 完成标准
 
@@ -57,4 +57,3 @@
 - 当前代码中没有正常状态说明写入 `upload_missing_segment.last_error`。
 - migration 只影响 `succeeded` 行，失败行诊断原样保留。
 - Rust 测试和前端检查通过，PR 以 `dev` 为 base 并关联 issue #7。
-

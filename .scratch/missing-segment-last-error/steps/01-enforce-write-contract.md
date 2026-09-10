@@ -1,6 +1,6 @@
 # 01 · 收口 `last_error` 写入契约
 
-Status: ready-for-agent
+Status: complete
 
 ## 目标
 
@@ -32,3 +32,8 @@ Status: ready-for-agent
 
 ## Comments
 
+- `mark_retry_success` 现在会清空旧错误，v1 的自动与人工恢复共用该契约。
+- source-missing 源文件重现时先清空已解决的错误，再进入 claim；无生产调用者的
+  `reset_for_manual_retry` 及其孤立测试已删除。
+- 验证：`cargo test -p biliup-cli missing_segment`（22 passed）和
+  `cargo test -p biliup-cli manual_claim_clears_resolved_source_missing_error`（1 passed）。
