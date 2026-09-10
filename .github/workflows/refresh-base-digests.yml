@@ -1,0 +1,92 @@
+# 基础镜像 digest 自动跟进。
+#
+# Dockerfile 把 node:lts / rust:latest / python:3.13-slim 钉到了 digest（见该文件头部注释），
+# 好处是层缓存稳定，代价是不再自动跟进上游重建。这个 workflow 补上那个代价：每天解析一次这三个
+# tag 当前指向的 digest，有变化就**先构建验证、通过了才提交**——顺序反过来的话，坏掉的基础镜像
+# 会一直躺在 dev 上，直到下次发版才暴露。
+#
+# 构建这一步同时把缓存填进 dev scope，所以 digest 更新后的第一次发版仍然是热构建。
+#
+# 滚动 tag 的实测重建间隔：node:lts 约 6 天、python:3.13-slim 约 13 天、rust:latest 约 16 天，
+# 所以平均每周会有一到两次提交。没有变化时整个 job 几秒钟就结束。
+
+name: Refresh base image digests
+
+on:
+  schedule:
+    # UTC 20:00 = 北京时间次日 04:00，避开日常发版时段
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析并更新 digest
+        id: refresh
+        run: |
+          set -euo pipefail
+          changed=""
+          # 只认已经钉住的行；没钉的 FROM 不归这里管
+          while IFS= read -r ref; do
+            image="${ref%@*}"
+            old="${ref#*@}"
+            new=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')
+            if [ "$new" != "$old" ]; then
+              sed -i "s|${image}@${old}|${image}@${new}|g" Dockerfile
+              echo "::notice::$image  ${old:0:19} -> ${new:0:19}"
+              changed="${changed}${changed:+, }${image}"
+            fi
+          done < <(grep -oE '^FROM [^ ]+@sha256:[0-9a-f]{64}' Dockerfile | sed 's/^FROM //')
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          [ -n "$changed" ] || echo "三个基础镜像都没变，无事可做"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.refresh.outputs.changed != ''
+
+      # 新 digest 必须先证明能构建。这一步失败则整个 job 失败，Dockerfile 不会被提交，
+      # dev 上留着的仍是上一组已知可用的 digest。
+      - name: 构建验证
+        if: steps.refresh.outputs.changed != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: biliup:digest-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 容器冒烟
+        if: steps.refresh.outputs.changed != ''
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
+          test "$(docker run --rm --entrypoint uname biliup:digest-check -m)" = x86_64
+          docker run --rm biliup:digest-check --version | grep -F "biliup-cli $version"
+          docker run --rm --entrypoint python3 biliup:digest-check -c 'import stream_gears, quickjs'
+          docker run --rm --entrypoint sh biliup:digest-check -c \
+            'ffmpeg -version >/dev/null && ffprobe -version >/dev/null && ffmpeg -hide_banner -filters 2>/dev/null | grep -q " loudnorm "'
+
+      - name: 提交
+        if: steps.refresh.outputs.changed != ''
+        env:
+          CHANGED: ${{ steps.refresh.outputs.changed }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Dockerfile
+          git commit -m 'build: refresh base image digests' \
+                     -m "$CHANGED" \
+                     -m '构建与冒烟已通过。由 refresh-base-digests workflow 自动提交。'
+          git push
