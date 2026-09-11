@@ -1,6 +1,6 @@
 # 01 · 门禁 quiet 判定与降级
 
-依赖：无。状态：pending。
+依赖：无。状态：代码与单测完成；dev 实录验证与 PR 待做。
 
 ## 改动点
 
@@ -31,3 +31,15 @@
 
 - PR 正文写根因为「下播边界竞态 + 首轮阻塞必告警」，附改动前后各一段日志。
 - 不写 `Closes #48`；合并后按 issue-tracker 流程打 `awaiting-verification`。
+
+## 回执（2026-09-11）
+
+- `upload_session.rs`：`BLOCKED_RECHECK_INTERVAL` 迁入并 `pub`；`SessionCompleteness::is_in_flight_only`；
+  `claim_complete_session` 读 `submit_requested_at` 判 quiet，quiet 时 UPDATE 用 `CASE WHEN` 保留
+  `blocked_signature`；`SubmitClaim::Blocked` 新增 `quiet`。
+- `upload.rs`：Blocked 分支 quiet → `info!` 且不 `notify_alert`，日志多一个 `quiet` 字段，消息文本不变；
+  `stop_missing_segment_attempt` 无 token 行 CAS 到 `failed`，退避与 v2 释放一致（10 分钟）。
+- `submission_scheduler.rs`：改 import 常量。
+- 单测 4 个新增（quiet→loud 边界、actionable 永不 quiet、结构性 reason/无 intent 不 quiet、
+  无 token 行可强停），`cargo test -p biliup-cli` 390 passed。
+- 未做：dev 环境实录一场验证 INFO 日志与无 webhook。

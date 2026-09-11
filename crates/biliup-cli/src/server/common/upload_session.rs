@@ -154,12 +154,24 @@ pub struct SessionCompleteness {
     pub blocking_fingerprints: Vec<String>,
 }
 
+/// A blocked session is not re-scanned for this long; also the grace window after stream end
+/// during which an in-flight-only block is treated as the expected tail-segment race.
+pub const BLOCKED_RECHECK_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
+
 impl SessionCompleteness {
     pub fn is_complete(&self) -> bool {
         self.total_expected > 0
             && self.total_expected == self.succeeded
             && self.valid_videos == self.succeeded
             && self.reasons.is_empty()
+    }
+
+    /// Every blocker is a row someone is still working on (`pending`/`uploading`); nothing an
+    /// operator could act on yet. `reasons` then holds only the generic "not succeeded" entry.
+    pub fn is_in_flight_only(&self) -> bool {
+        self.pending + self.uploading > 0
+            && self.failed + self.source_missing + self.deleting + self.unknown == 0
+            && self.reasons.len() == 1
     }
 
     pub fn incomplete_count(&self) -> i64 {
@@ -202,6 +214,9 @@ pub enum SubmitClaim {
         changed: bool,
         /// Cumulative count of blocked submit attempts for this session (`upload_session.blocked_count`).
         blocked_count: i64,
+        /// In-flight-only block within [`BLOCKED_RECHECK_INTERVAL`] of the submit request: the
+        /// expected stream-end race with the tail segment, not worth a warning or an alert.
+        quiet: bool,
     },
     AlreadyClaimed,
     DiscardedEmpty,
@@ -551,17 +566,23 @@ pub async fn claim_complete_session(
     let now = Utc::now();
     if !completeness.is_complete() {
         let signature = completeness.signature()?;
-        let previous = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT blocked_signature FROM upload_session WHERE id = ?1",
+        let row = sqlx::query(
+            "SELECT blocked_signature, submit_requested_at FROM upload_session WHERE id = ?1",
         )
         .bind(session_row_id)
         .fetch_one(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
+        let previous = row.get::<Option<String>, _>("blocked_signature");
+        let requested_at = row.get::<Option<DateTime<Utc>>, _>("submit_requested_at");
         let changed = previous.as_deref() != Some(signature.as_str());
+        let quiet = completeness.is_in_flight_only()
+            && requested_at.is_some_and(|requested| now - requested < BLOCKED_RECHECK_INTERVAL);
+        // A quiet block leaves `blocked_signature` untouched so the first loud recheck still
+        // sees `changed` and raises the alert this pass swallowed.
         let blocked_count = sqlx::query_scalar::<_, i64>(
             "UPDATE upload_session SET submit_state = 'blocked_missing_segments', \
-             last_submit_error = ?1, blocked_signature = ?2, \
+             last_submit_error = ?1, blocked_signature = CASE WHEN ?5 THEN blocked_signature ELSE ?2 END, \
              blocked_count = blocked_count + 1, updated_at = ?3 WHERE id = ?4 \
              RETURNING blocked_count",
         )
@@ -569,6 +590,7 @@ pub async fn claim_complete_session(
         .bind(signature)
         .bind(now)
         .bind(session_row_id)
+        .bind(quiet)
         .fetch_one(&mut *tx)
         .await
         .change_context(AppError::Unknown)?;
@@ -577,6 +599,7 @@ pub async fn claim_complete_session(
             completeness,
             changed,
             blocked_count,
+            quiet,
         });
     }
 
@@ -1425,12 +1448,10 @@ mod tests {
             discard_empty_session(&pool, 70).await.unwrap(),
             EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasRemoteIdentity)
         );
-        sqlx::query(
-            "UPDATE upload_session SET bvid = NULL, videos_json = '[{}]' WHERE id = 70",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE upload_session SET bvid = NULL, videos_json = '[{}]' WHERE id = 70")
+            .execute(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             discard_empty_session(&pool, 70).await.unwrap(),
             EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::HasVideos)
@@ -1533,6 +1554,116 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Vec<Video>>(&stored).unwrap().len(),
             2
+        );
+    }
+
+    async fn blocked_signature(pool: &ConnectionPool) -> Option<String> {
+        sqlx::query_scalar("SELECT blocked_signature FROM upload_session WHERE id = 70")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Right after stream end the tail segment is still in flight; that first block is the
+    /// expected race and must stay quiet, without consuming the `changed` edge the later loud
+    /// recheck relies on.
+    #[tokio::test]
+    async fn in_flight_only_block_is_quiet_inside_recheck_window_then_loud() {
+        let (_directory, pool) = completeness_pool().await;
+        insert_ledger(
+            &pool,
+            1,
+            0,
+            "succeeded",
+            "/one.flv",
+            Some(&Video::new("one")),
+        )
+        .await;
+        insert_ledger(&pool, 2, 1, "uploading", "/two.flv", None).await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+
+        let SubmitClaim::Blocked {
+            quiet,
+            changed,
+            blocked_count,
+            ..
+        } = claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("uploading row must block")
+        };
+        assert!(quiet);
+        assert!(changed);
+        assert_eq!(blocked_count, 1);
+        assert_eq!(blocked_signature(&pool).await, None);
+
+        // Same ledger, but the submit request is now older than the recheck window.
+        sqlx::query("UPDATE upload_session SET submit_requested_at = ?1 WHERE id = 70")
+            .bind(Utc::now() - BLOCKED_RECHECK_INTERVAL - chrono::Duration::seconds(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let SubmitClaim::Blocked { quiet, changed, .. } =
+            claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("uploading row must still block")
+        };
+        assert!(!quiet);
+        assert!(
+            changed,
+            "the swallowed first alert must fire on the loud recheck"
+        );
+        assert!(blocked_signature(&pool).await.is_some());
+
+        let SubmitClaim::Blocked { quiet, changed, .. } =
+            claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("uploading row must still block")
+        };
+        assert!(!quiet);
+        assert!(!changed, "an unchanged blocking set alerts once");
+    }
+
+    #[tokio::test]
+    async fn actionable_rows_are_never_quiet() {
+        for status in ["failed", "source_missing", "deleting", "mystery"] {
+            let (_directory, pool) = completeness_pool().await;
+            insert_ledger(&pool, 1, 0, "uploading", "/one.flv", None).await;
+            insert_ledger(&pool, 2, 1, status, &format!("/{status}.flv"), None).await;
+            request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+            let SubmitClaim::Blocked { quiet, changed, .. } =
+                claim_complete_session(&pool, 70).await.unwrap()
+            else {
+                panic!("{status} must block")
+            };
+            assert!(!quiet, "{status} is actionable");
+            assert!(changed);
+            assert!(blocked_signature(&pool).await.is_some());
+        }
+    }
+
+    /// Structural ledger problems (order gaps, duplicates) are actionable even when every row
+    /// is still in flight; and a claim without a submit request has no stream-end boundary.
+    #[tokio::test]
+    async fn structural_reasons_and_missing_request_are_not_quiet() {
+        let (_directory, pool) = completeness_pool().await;
+        insert_ledger(&pool, 1, 0, "uploading", "/one.flv", None).await;
+        insert_ledger(&pool, 2, 5, "pending", "/two.flv", None).await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+        let SubmitClaim::Blocked { quiet, .. } = claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("order gap must block")
+        };
+        assert!(!quiet);
+
+        let (_directory, pool) = completeness_pool().await;
+        insert_ledger(&pool, 1, 0, "uploading", "/one.flv", None).await;
+        let SubmitClaim::Blocked { quiet, .. } = claim_complete_session(&pool, 70).await.unwrap()
+        else {
+            panic!("uploading row must block")
+        };
+        assert!(
+            !quiet,
+            "no submit request means no boundary to be quiet about"
         );
     }
 

@@ -796,26 +796,40 @@ pub async fn reconcile_session_submission(
             completeness,
             changed,
             blocked_count,
+            quiet,
         } => {
-            warn!(
-                session = session_row_id,
-                incomplete = completeness.incomplete_count(),
-                pending = completeness.pending,
-                uploading = completeness.uploading,
-                failed = completeness.failed,
-                source_missing = completeness.source_missing,
-                deleting = completeness.deleting,
-                blocked_count,
-                reasons = ?completeness.reasons,
-                "session submit blocked by incomplete lifecycle ledger"
-            );
+            // Right after stream end the tail segment is usually still uploading; that block is
+            // expected and resolves itself on `SegmentPersisted`. Only a block that outlives the
+            // recheck window, or one with an actionable row, deserves WARN + alert.
+            macro_rules! blocked_event {
+                ($level:ident) => {
+                    $level!(
+                        session = session_row_id,
+                        incomplete = completeness.incomplete_count(),
+                        pending = completeness.pending,
+                        uploading = completeness.uploading,
+                        failed = completeness.failed,
+                        source_missing = completeness.source_missing,
+                        deleting = completeness.deleting,
+                        blocked_count,
+                        quiet,
+                        reasons = ?completeness.reasons,
+                        "session submit blocked by incomplete lifecycle ledger"
+                    )
+                };
+            }
+            if quiet {
+                blocked_event!(info);
+            } else {
+                blocked_event!(warn);
+            }
             crate::observe::submission_decided(
                 &submission,
                 "waiting",
                 "pending_segments",
                 completeness.incomplete_count().max(0) as u64,
             );
-            if changed {
+            if changed && !quiet {
                 notify_alert(
                     config.cookie_health_webhook.as_deref(),
                     "投稿已暂停：存在未完成分段",
@@ -1739,7 +1753,8 @@ async fn upload_single_file_with_repair(
         );
     }
     // 判据要在 `normalization` 被 match 消费之前取。
-    let (repair_decision, repair_reason) = timestamp_repair_decision(repair_enabled, &normalization);
+    let (repair_decision, repair_reason) =
+        timestamp_repair_decision(repair_enabled, &normalization);
     // 就地替换的形态没有临时件要善后，上传路径就是原片路径；只有 `keep_original` 会
     // 产出需要清理的临时件。
     let normalization_artifact = match normalization {
@@ -1771,7 +1786,12 @@ async fn upload_single_file_with_repair(
         .unwrap_or(original_path);
     let repair_started = std::time::Instant::now();
     let outcome = if repair_decision == "executed" {
-        crate::observe::processing_decided(identity, "timestamp_repair", repair_decision, repair_reason);
+        crate::observe::processing_decided(
+            identity,
+            "timestamp_repair",
+            repair_decision,
+            repair_reason,
+        );
         let ffmpeg = SystemFfmpeg::with_context(identity.context());
         let outcome = normalize_timestamps(normalized_path, &ffmpeg).await;
         let (result, reason) = timestamp_repair_result(&outcome);
@@ -1789,7 +1809,12 @@ async fn upload_single_file_with_repair(
         );
         outcome
     } else {
-        crate::observe::processing_decided(identity, "timestamp_repair", repair_decision, repair_reason);
+        crate::observe::processing_decided(
+            identity,
+            "timestamp_repair",
+            repair_decision,
+            repair_reason,
+        );
         if repair_reason == "source_clean" {
             info!(
                 timestamp_repair = "skipped",
@@ -4413,7 +4438,30 @@ pub async fn stop_missing_segment_attempt(
         return Ok(StopAttemptOutcome::NotRunning { status: row.status });
     }
     let Some(token) = row.attempt_token.clone() else {
-        return Ok(StopAttemptOutcome::NotRunning { status: row.status });
+        // No token means no lease and no registered attempt to cancel: a legacy manual recovery
+        // whose process died, or a row the reaper refuses to touch. Force it to `failed` so the
+        // operator can retry or delete instead of editing the database by hand.
+        let now = now_utc();
+        let released = sqlx::query(
+            "UPDATE upload_missing_segment SET status = 'failed', last_error = ?1, \
+             next_retry_at = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = 'uploading' AND attempt_token IS NULL",
+        )
+        .bind(sanitize_error(&format!(
+            "{reason}: forced a lease-less uploading row to failed"
+        )))
+        // Same backoff as a released v2 lease: stopping must not smuggle in a retry.
+        .bind(now + chrono::Duration::minutes(10))
+        .bind(now)
+        .bind(missing_id)
+        .execute(pool)
+        .await
+        .change_context(AppError::Unknown)?;
+        return Ok(if released.rows_affected() == 1 {
+            StopAttemptOutcome::Stopped
+        } else {
+            StopAttemptOutcome::NotRunning { status: row.status }
+        });
     };
     let cancellation = cancel_registered_attempt(missing_id, &token).await;
     if matches!(cancellation, CancelAttemptResult::TimedOut) {
@@ -5984,6 +6032,50 @@ mod tests {
                 .await
                 .unwrap(),
             StopAttemptOutcome::NotRunning { .. }
+        ));
+    }
+
+    /// A legacy manual recovery marks its row `uploading` without a lease; if that process dies the
+    /// reaper skips the row and nothing else can touch it. Stop must still get it to `failed`.
+    #[tokio::test]
+    async fn stopping_a_lease_less_uploading_row_forces_it_to_failed() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (id, live_streamer_id, streamer_info_id, file_path, segment_order, status, \
+              next_retry_at, created_at, updated_at, lifecycle_version) \
+             VALUES (901, 10, 20, '/legacy.flv', 0, 'uploading', ?1, ?1, ?1, 1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = stop_missing_segment_attempt(&pool, 901, "operator stop")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, StopAttemptOutcome::Stopped));
+
+        let (status, last_error, next_retry): (
+            String,
+            Option<String>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT status, last_error, next_retry_at FROM upload_missing_segment WHERE id = 901",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert!(last_error.unwrap().contains("operator stop"));
+        assert!(next_retry > now, "stopping is not retrying");
+
+        assert!(matches!(
+            stop_missing_segment_attempt(&pool, 901, "operator stop")
+                .await
+                .unwrap(),
+            StopAttemptOutcome::NotRunning { status } if status == "failed"
         ));
     }
 

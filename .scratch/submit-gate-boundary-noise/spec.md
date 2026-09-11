@@ -88,7 +88,7 @@ AND status NOT IN ('succeeded') GROUP BY status`。为 0 则 B 不做；非 0 �
 
 | step | 内容 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| [01](steps/01-quiet-boundary-block.md) | 门禁 quiet 判定 + 日志/告警降级 + 无 token `uploading` 行可强停（C） + 测试 | — | pending |
+| [01](steps/01-quiet-boundary-block.md) | 门禁 quiet 判定 + 日志/告警降级 + 无 token `uploading` 行可强停（C） + 测试 | — | complete（待 dev 实录验证） |
 
 ## 完成标准
 
