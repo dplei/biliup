@@ -8,6 +8,7 @@
 use crate::server::common::upload::{
     SessionSubmissionOutcome, SubmissionTrigger, reconcile_session_submission,
 };
+use crate::server::common::upload_session::BLOCKED_RECHECK_INTERVAL;
 use crate::server::config::Config;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
@@ -20,7 +21,6 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const BLOCKED_RECHECK_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
 const MAX_CONCURRENT_SUBMISSIONS: usize = 2;
 const MAX_SCAN_CANDIDATES: i64 = 128;
 
