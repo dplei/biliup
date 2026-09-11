@@ -12,6 +12,10 @@
     在 `upload_session.rs` 旁边复用同一常量，不要写第二个 10 分钟字面量。
 - `crates/biliup-cli/src/server/common/upload.rs` Blocked 分支：`quiet` → `info!` 且不
   `notify_alert`；否则维持原样。日志字段集合不变，方便现有指纹继续聚类。
+- `upload.rs` `stop_missing_segment_attempt`：`attempt_token` 为 None 时不再返回 `NotRunning`，
+  改为 CAS `status='uploading' AND attempt_token IS NULL` → `failed`（写 `last_error`、
+  `next_retry_at`、`updated_at`），成功返回 `Stopped`，`rows_affected == 0` 才返回 `NotRunning`。
+  不碰 `fail_enrolled_attempt_with_outcome`（它的 WHERE 限定 v2 + token，语义不同）。
 - 11 处 `claim_complete_session` 调用/匹配点里多数是测试，按编译错误逐个补 `quiet` 字段。
 
 ## 测试
@@ -19,6 +23,8 @@
 - `upload_session.rs` 测试模块：按 spec「完成标准」前两条各写一个用例，用现有的内存
   sqlite 夹具造 `upload_session` + `upload_missing_segment` 行，直接断言返回值与
   `blocked_signature` 列。
+- `upload.rs` 测试模块：插一条 v1 无 token `uploading` 行，`stop_missing_segment_attempt` 返回
+  `Stopped` 且行为 `failed`；再调一次返回 `NotRunning{status:"failed"}`。
 - `cargo test -p biliup-cli` 全绿。
 
 ## 回执
