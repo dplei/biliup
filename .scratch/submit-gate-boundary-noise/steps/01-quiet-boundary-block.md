@@ -1,6 +1,6 @@
 # 01 · 门禁 quiet 判定与降级
 
-依赖：无。状态：代码与单测完成；dev 实录验证与 PR 待做。
+依赖：无。状态：complete（代码、单测、dev 实录均完成）。
 
 ## 改动点
 
@@ -42,4 +42,10 @@
 - `submission_scheduler.rs`：改 import 常量。
 - 单测 4 个新增（quiet→loud 边界、actionable 永不 quiet、结构性 reason/无 intent 不 quiet、
   无 token 行可强停），`cargo test -p biliup-cli` 390 passed。
-- 未做：dev 环境实录一场验证 INFO 日志与无 webhook。
+- dev 实录（2026-09-11，抖音一场，`segment_time=00:02:00`，webhook 指向本机监听）：
+  - 首段上传完成后立即暂停录制 → 尾段入账为 `pending` 的同一秒，`DownloadClosed` 门禁打
+    `INFO … pending=1 uploading=0 … blocked_count=1 quiet=true`，本机 webhook 监听无 POST；
+  - 30 秒后尾段 `upload attempt completed` → `SegmentPersisted` → `outcome=Submitted`，
+    会话 `finalized/ok_with_aid`，`blocked_count=1`，`blocked_signature IS NULL`（quiet 未写签名）；
+  - 对照：库里遗留的一个 `source_missing=1` 会话在 StartupScan 仍打 `WARN … quiet=false` 并
+    尝试 webhook（监听收到一次 POST），actionable 路径行为未变。
