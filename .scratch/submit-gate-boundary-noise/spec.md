@@ -57,15 +57,38 @@ webhook 告警；真正值得人看的阻塞（有 `failed`/`source_missing`/`de
 - 不在 `SegmentPersisted`/`finish()` 里预判「还有兄弟行在飞就不 kick」：同上，调度器那一路
   绕不开，判定必须落在门禁本身。
 - 不改 stale lease 口径、不改 10 分钟复查间隔。
-- 评论里的 B（`inspect_completeness` 不过滤 `lifecycle_version`，而回收器只扫 v2；legacy
-  手动恢复会写无 token 的 `uploading`）与 C（无 token 的 `uploading` 行停不掉也删不掉）
-  是独立缺口，与本次日志无关，**另开 issue**，不并入本分支。
+- 不做评论里的 B（v1 行无自动收敛）。评估见下。
+
+## 评论里的 B、C 改动量评估
+
+**C（无 token 的 `uploading` 行没有人工出口）——小，并入 step 01。**
+`stop_missing_segment_attempt`（`upload.rs:4401`）遇到 `attempt_token IS NULL` 直接返回
+`NotRunning`；补一条 CAS 即可：`UPDATE ... SET status='failed', last_error=?, next_retry_at=?
+WHERE id=? AND status='uploading' AND attempt_token IS NULL` → `Stopped`。无注册 attempt 可取消，
+所以不走 `cancel_registered_attempt`。约 12 行 + 1 个单测，HTTP 入口 `endpoints.rs:1242` 不用动。
+若遇到的是进程内仍在跑的 legacy 上传，完成时 `mark_retry_success` + `update_all_fields` 会整行
+覆写回 `succeeded`，强停不会造成状态损坏。
+
+**B（v1 `uploading` 行无自动收敛）——不小，不并入。**
+根因是 legacy 手动恢复路径把 `uploading` 当 claim 用但没有 lease：不写 token、不注册 attempt、
+上传中不心跳，进程死掉就留下无人认领的行；`ensure_missing_segment_session` 还会把它绑进一个
+session，门禁于是能看到它。三种修法都不是几行：
+- 回收器按 `updated_at` 年龄回收无心跳行 = 恢复被刻意废掉的「五分钟一刀切」，会把合法的长
+  传切成重复上传；
+- legacy 路径改走 `claim_enrolled_attempt` = 手动恢复时临场做 v1→v2 升格，而这正是
+  `lifecycle_backfill` 用一整套去重/冲突规则才敢做的事；
+- 给 legacy 路径补心跳 = 在已标记淘汰的代码上再加一套 lease。
+
+C 落地后 B 的卡死有了人工出口（停 → `failed` → 重试或删除），紧迫性下降。是否值得做自动收敛，
+先在生产只读核一下还有没有非终态 v1 行：
+`SELECT status, COUNT(*) FROM upload_missing_segment WHERE lifecycle_version = 1
+AND status NOT IN ('succeeded') GROUP BY status`。为 0 则 B 不做；非 0 再另开 issue。
 
 ## 拆解
 
 | step | 内容 | 依赖 | 状态 |
 | --- | --- | --- | --- |
-| [01](steps/01-quiet-boundary-block.md) | 门禁 quiet 判定 + 日志/告警降级 + 测试 | — | pending |
+| [01](steps/01-quiet-boundary-block.md) | 门禁 quiet 判定 + 日志/告警降级 + 无 token `uploading` 行可强停（C） + 测试 | — | pending |
 
 ## 完成标准
 
@@ -74,4 +97,6 @@ webhook 告警；真正值得人看的阻塞（有 `failed`/`source_missing`/`de
 - 单测：任一 `failed`/`source_missing` 行 → 无论时间都 `quiet:false`，`changed` 行为与现状一致。
 - dev 环境实录一场短直播，下播日志里门禁那条为 `INFO`，无「投稿已暂停」webhook，
   会话最终 `finalized` 且有 aid。
+- 单测：`lifecycle_version=1`、`status=uploading`、`attempt_token IS NULL` 的行调 `stop_missing_segment_attempt`
+  → `Stopped`，行变 `failed` 且 `last_error` 含 reason；`attempt_token` 非空的行行为不变。
 - issue 严重度按「预期行为 + 告警噪音」下调。
