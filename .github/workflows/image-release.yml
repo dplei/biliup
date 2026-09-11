@@ -10,6 +10,13 @@
 #   REGISTRY_PASSWORD  registry 口令
 #
 # 版本号取自 Cargo.toml 的 workspace.package.version，不手输，避免与仓库内版本不一致。
+#
+# 阶段拆成独立 job，Actions 左栏按 job 显示进度：
+#   读取版本号 → 构建 → 冒烟 → 推送 → 核对
+# 镜像在 job 之间用 artifact 传递（docker save + zstd），不经 registry，
+# 所以冒烟没过的镜像永远不会出现在 registry 上，push=false 时也不会留下半成品 tag。
+# 含 secret 的 job output 会被 Actions 丢弃，所以 job 之间只传版本号，
+# 各 job 自己用 REGISTRY_IMAGE 拼 tag。
 
 name: Build and publish image
 
@@ -30,15 +37,17 @@ on:
         default: false
 
 jobs:
-  build:
+  meta:
+    name: 读取版本号并检查 tag
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 读取版本号并拼出 tag
-        id: meta
+      - name: 读取版本号
+        id: version
         env:
           IMAGE: ${{ secrets.REGISTRY_IMAGE }}
           ALIAS: ${{ inputs.alias }}
@@ -48,20 +57,20 @@ jobs:
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
             | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)
           test -n "$version" || { echo "::error::没能从 Cargo.toml 读到 workspace.package.version"; exit 1; }
-          {
-            echo "version=$version"
-            echo "registry=${IMAGE%%/*}"
-            echo "tag_version=$IMAGE:$version"
-            echo "tag_latest=$IMAGE:latest"
-            if [ -n "$ALIAS" ]; then echo "tag_alias=$IMAGE:$version-$ALIAS"; fi
-          } >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "本次版本号：$version${ALIAS:+（别名后缀 $ALIAS）}"
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: 取 registry host
+        id: reg
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/login-action@v3
         with:
-          registry: ${{ steps.meta.outputs.registry }}
+          registry: ${{ steps.reg.outputs.host }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
@@ -69,56 +78,140 @@ jobs:
       # 多半是忘了 bump Cargo.toml。历史上为此白构建过一次。
       - name: 检查版本号 tag 是否已被占用
         if: ${{ !inputs.force }}
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "${{ steps.meta.outputs.tag_version }}" >/dev/null 2>&1; then
-            echo "::error::版本 ${{ steps.meta.outputs.version }} 在 registry 上已存在。先 bump Cargo.toml，或用 force 选项覆盖。"
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "::error::版本 $VERSION 在 registry 上已存在。先 bump Cargo.toml，或用 force 选项覆盖。"
             exit 1
           fi
 
-      - name: 构建（amd64 原生，先只 load 到本地待冒烟）
+  build:
+    name: 构建
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建（amd64 原生，只 load 到本地）
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ steps.meta.outputs.tag_version }}
+          tags: biliup:candidate
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: 导出镜像
+        run: docker save biliup:candidate | zstd -T0 -o image.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  smoke:
+    name: 冒烟
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: 载入镜像
+        run: zstd -dc image.tar.zst | docker load
+
       - name: 容器冒烟
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          img='${{ steps.meta.outputs.tag_version }}'
+          img=biliup:candidate
           test "$(docker run --rm --entrypoint uname "$img" -m)" = x86_64
-          docker run --rm "$img" --version | grep -F 'biliup-cli ${{ steps.meta.outputs.version }}'
+          docker run --rm "$img" --version | grep -F "biliup-cli $VERSION"
           docker run --rm --entrypoint python3 "$img" -c 'import stream_gears, quickjs'
           docker run --rm --entrypoint sh "$img" -c \
             'ffmpeg -version >/dev/null && ffprobe -version >/dev/null && ffmpeg -hide_banner -filters 2>/dev/null | grep -q " loudnorm "'
 
-      - name: 推送
-        if: ${{ inputs.push }}
+  push:
+    name: 推送
+    needs: [meta, smoke]
+    if: ${{ inputs.push }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: 载入镜像
+        run: zstd -dc image.tar.zst | docker load
+
+      - name: 取 registry host
+        id: reg
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.reg.outputs.host }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: 打 tag 并推送
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          ALIAS: ${{ inputs.alias }}
         run: |
           set -euo pipefail
-          docker tag '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_latest }}'
-          docker push '${{ steps.meta.outputs.tag_version }}'
-          docker push '${{ steps.meta.outputs.tag_latest }}'
-          if [ -n '${{ steps.meta.outputs.tag_alias }}' ]; then
-            docker tag '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_alias }}'
-            docker push '${{ steps.meta.outputs.tag_alias }}'
-          fi
+          for tag in "$IMAGE:$VERSION" "$IMAGE:latest" ${ALIAS:+"$IMAGE:$VERSION-$ALIAS"}; do
+            docker tag biliup:candidate "$tag"
+            docker push "$tag"
+          done
+
+  verify:
+    name: 核对 digest
+    needs: [meta, push]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 取 registry host
+        id: reg
+        env:
+          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.reg.outputs.host }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       # 三个 tag 必须落在同一 digest、同一仓库名。本机发版踩过 zsh 把 :latest
       # 吃成参数修饰符、推到相邻仓库且 exit 0 的坑，这里一并核对掉。
       - name: 核对远端 digest 与仓库名
-        if: ${{ inputs.push }}
         env:
           IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          ALIAS: ${{ inputs.alias }}
         run: |
           set -euo pipefail
-          for tag in '${{ steps.meta.outputs.tag_version }}' '${{ steps.meta.outputs.tag_latest }}' '${{ steps.meta.outputs.tag_alias }}'; do
-            [ -n "$tag" ] || continue
+          for tag in "$IMAGE:$VERSION" "$IMAGE:latest" ${ALIAS:+"$IMAGE:$VERSION-$ALIAS"}; do
             out=$(docker buildx imagetools inspect "$tag")
             name=$(printf '%s\n' "$out" | sed -n 's/^Name: *//p')
             digest=$(printf '%s\n' "$out" | sed -n 's/^Digest: *//p')
@@ -127,4 +220,4 @@ jobs:
             printf '%s\n' "$digest" >> /tmp/digests
           done
           test "$(sort -u /tmp/digests | wc -l)" -eq 1
-          echo "三个 tag 同一 digest：$(head -1 /tmp/digests)"
+          echo "全部 tag 同一 digest：$(head -1 /tmp/digests)"
