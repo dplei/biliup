@@ -78,7 +78,7 @@ export default function Home() {
     // 未绑定投稿模板：不录制，额外显示「缺少投稿」标签提示去绑定。
     const missingUpload =
       live.upload_streamers_id == null ? (
-        <Tag color="orange" style={{ marginLeft: 4 }}>
+        <Tag color="orange">
           缺少投稿
         </Tag>
       ) : null
@@ -89,7 +89,7 @@ export default function Home() {
     }
     const recordingTag =
       live.status === 'Working' && live.recording_quality ? (
-        <Tag color="light-blue" style={{ marginLeft: 4 }}>
+        <Tag color="light-blue">
           {(qualityName[live.recording_quality] ?? live.recording_quality)} 录制中
         </Tag>
       ) : null
@@ -97,11 +97,11 @@ export default function Home() {
     if (live.recording_lease?.state === 'scheduled') {
       const expiry = new Date(live.recording_lease.expires_at)
       const label = `${String(expiry.getMonth() + 1).padStart(2, '0')}-${String(expiry.getDate()).padStart(2, '0')} ${String(expiry.getHours()).padStart(2, '0')}:${String(expiry.getMinutes()).padStart(2, '0')}`
-      leaseTag = <Tag color="light-blue" style={{ marginLeft: 4 }}>录制至 {label}</Tag>
+      leaseTag = <Tag color="light-blue">录制至 {label}</Tag>
     } else if (live.recording_lease?.state === 'grace_current_session') {
-      leaseTag = <Tag color="orange" style={{ marginLeft: 4 }}>已到期 · 本场结束后暂停</Tag>
+      leaseTag = <Tag color="orange">已到期 · 本场结束后暂停</Tag>
     } else if (live.recording_lease?.state === 'expired_paused') {
-      leaseTag = <Tag color="pink" style={{ marginLeft: 4 }}>已到期暂停</Tag>
+      leaseTag = <Tag color="pink">已到期暂停</Tag>
     }
     return {
       ...handleEntityPostprocessor(live),
@@ -245,67 +245,69 @@ export default function Home() {
                 <Card
                   shadows="hover"
                   style={{
-                    // maxWidth: 360,
                     margin: '9px 0px',
                     width: '100%',
-                    // flexGrow: 1,
                   }}
-                  bodyStyle={
-                    {
-                      // display: 'flex',
-                      // alignItems: 'center',
-                      // justifyContent: 'space-between'
-                    }
-                  }
+                  bodyStyle={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    minHeight: 168,
+                  }}
                 >
                   <div
                     style={{
-                      position: 'absolute',
-                      right: 20,
-                      top: 9,
-                      maxWidth: 'calc(100% - 40px)',
                       display: 'flex',
-                      flexWrap: 'wrap',
-                      justifyContent: 'flex-end',
-                      gap: 4,
+                      alignItems: 'flex-start',
+                      gap: 8,
                     }}
                   >
-                    {item.statusTag}
-                  </div>
-
-                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      {item.upload_status === "Pending" ? <Badge count={<IconUpload />}> </Badge> : null}
-
                     <h3
                       style={{
+                        flex: 1,
+                        minWidth: 0,
+                        margin: 0,
                         color: 'var(--semi-color-text-0)',
                         fontWeight: 500,
-                        maxWidth: '80%',
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
                       }}
                     >
-                      {item.remark}
+                      {item.remark || '未命名直播间'}
                     </h3>
-
+                    {item.upload_status === 'Pending' ? <Badge count={<IconUpload />}> </Badge> : null}
                   </div>
 
-                  <Text style={{ width: '101%' }} ellipsis={{ showTooltip: true }} type="tertiary">
+                  <Text
+                    style={{ width: '100%', marginTop: 6 }}
+                    ellipsis={{ showTooltip: true }}
+                    type="tertiary"
+                  >
                     {item.url}
                   </Text>
 
                   <div
                     style={{
-                      margin: '0',
                       display: 'flex',
-                      padding: '0 0 32px 0px',
-                      justifyContent: 'flex-end',
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      gap: 6,
+                      marginTop: 14,
+                    }}
+                  >
+                    {item.statusTag}
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 'auto',
+                      paddingTop: 12,
+                      borderTop: '1px solid var(--semi-color-border)',
                     }}
                   >
                     <ButtonGroup
                       theme="borderless"
-                      style={{ position: 'absolute', right: 20, bottom: 15 }}
+                      style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}
                     >
                       <TemplateModal onOk={handleUpdate} entity={item}>
                         <Button theme="borderless" icon={<IconEdit2Stroked />}></Button>
