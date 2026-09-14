@@ -305,9 +305,6 @@ export default function Home() {
                         alignItems: 'center',
                         gap: 6,
                         marginTop: 12,
-                        padding: '8px 10px',
-                        borderRadius: 'var(--semi-border-radius-medium)',
-                        backgroundColor: 'var(--semi-color-fill-0)',
                       }}
                     >
                       <IconCalendarClockStroked style={{ color: 'var(--semi-color-text-2)' }} />
