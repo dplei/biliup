@@ -46,9 +46,11 @@ export const CheckStreamButton: React.FC<CheckStreamButtonProps> = ({ streamer }
                 onClick={handleCheck}
                 loading={loading}
                 icon={<IconPulse />}
-                theme="borderless"
+                theme="light"
                 aria-label="立即检查直播流"
-            />
+            >
+                检查
+            </Button>
         </Tooltip>
     );
 };

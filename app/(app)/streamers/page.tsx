@@ -1,13 +1,13 @@
 'use client'
 import {
     Layout,
-    Nav,
     Button,
     Tag,
     Typography,
     Popconfirm,
     Notification,
-    Card, Dropdown, Badge,
+    Card,
+    Dropdown,
 } from '@douyinfe/semi-ui'
 import {
     IconHelpCircle,
@@ -15,10 +15,13 @@ import {
     IconVideoListStroked,
     IconEdit2Stroked,
     IconDeleteStroked,
-    IconWrench, IconTreeTriangleDown, IconPause, IconPlay, IconLock, IconUpload,
+    IconWrench,
+    IconUpload,
+    IconMoreStroked,
+    IconCalendarClockStroked,
 } from '@douyinfe/semi-icons'
 import { List, ButtonGroup } from '@douyinfe/semi-ui'
-import React, { useState } from 'react'
+import React from 'react'
 import useStreamers from '../../lib/use-streamers'
 import TemplateModal from '../../ui/TemplateModal'
 import OverrideModal from '../../ui/OverrideModal'
@@ -56,7 +59,7 @@ export default function Home() {
     }
     return values
   }
-  const data: LiveStreamerEntity[] | undefined = streamers?.map(live => {
+  const data: (LiveStreamerEntity & { leaseInfo?: React.ReactNode })[] | undefined = streamers?.map(live => {
     let statusTag
     switch (live.status) {
       case 'Working':
@@ -90,18 +93,22 @@ export default function Home() {
     const recordingTag =
       live.status === 'Working' && live.recording_quality ? (
         <Tag color="light-blue">
-          {(qualityName[live.recording_quality] ?? live.recording_quality)} 录制中
+          {(qualityName[live.recording_quality] ?? live.recording_quality)}录制
         </Tag>
       ) : null
-    let leaseTag = null
+    const uploadTag =
+      live.upload_status === 'Pending' ? (
+        <Tag color="blue" prefixIcon={<IconUpload />}>上传中</Tag>
+      ) : null
+    let leaseInfo = null
     if (live.recording_lease?.state === 'scheduled') {
       const expiry = new Date(live.recording_lease.expires_at)
       const label = `${String(expiry.getMonth() + 1).padStart(2, '0')}-${String(expiry.getDate()).padStart(2, '0')} ${String(expiry.getHours()).padStart(2, '0')}:${String(expiry.getMinutes()).padStart(2, '0')}`
-      leaseTag = <Tag color="light-blue">录制至 {label}</Tag>
+      leaseInfo = <Text type="secondary">录制至 {label}</Text>
     } else if (live.recording_lease?.state === 'grace_current_session') {
-      leaseTag = <Tag color="orange">已到期 · 本场结束后暂停</Tag>
+      leaseInfo = <Text type="warning">已到期 · 本场结束后暂停</Text>
     } else if (live.recording_lease?.state === 'expired_paused') {
-      leaseTag = <Tag color="pink">已到期暂停</Tag>
+      leaseInfo = <Text type="danger">已到期暂停</Text>
     }
     return {
       ...handleEntityPostprocessor(live),
@@ -109,10 +116,11 @@ export default function Home() {
         <>
           {statusTag}
           {recordingTag}
+          {uploadTag}
           {missingUpload}
-          {leaseTag}
         </>
       ),
+      leaseInfo,
     }
   })
 
@@ -236,8 +244,8 @@ export default function Home() {
               sm: 24,
               md: 12,
               lg: 8,
-              xl: 6,
-              xxl: 4,
+              xl: 8,
+              xxl: 6,
             }}
             dataSource={data}
             renderItem={item => (
@@ -251,87 +259,102 @@ export default function Home() {
                   bodyStyle={{
                     display: 'flex',
                     flexDirection: 'column',
-                    minHeight: 168,
+                    minHeight: 184,
+                    padding: 20,
                   }}
                 >
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: 8,
-                    }}
-                  >
-                    <h3
-                      style={{
-                        flex: 1,
-                        minWidth: 0,
-                        margin: 0,
-                        color: 'var(--semi-color-text-0)',
-                        fontWeight: 500,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {item.remark || '未命名直播间'}
-                    </h3>
-                    {item.upload_status === 'Pending' ? <Badge count={<IconUpload />}> </Badge> : null}
-                  </div>
-
-                  <Text
-                    style={{ width: '100%', marginTop: 6 }}
-                    ellipsis={{ showTooltip: true }}
-                    type="tertiary"
-                  >
-                    {item.url}
-                  </Text>
-
                   <div
                     style={{
                       display: 'flex',
                       flexWrap: 'wrap',
                       alignItems: 'center',
                       gap: 6,
-                      marginTop: 14,
                     }}
                   >
                     {item.statusTag}
                   </div>
 
+                  <h3
+                    style={{
+                      minWidth: 0,
+                      margin: '14px 0 0',
+                      color: 'var(--semi-color-text-0)',
+                      fontSize: 20,
+                      lineHeight: '28px',
+                      fontWeight: 600,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {item.remark || '未命名直播间'}
+                  </h3>
+
+                  <Text
+                    style={{ width: '100%', minWidth: 0, marginTop: 4 }}
+                    ellipsis={{ showTooltip: true }}
+                    type="tertiary"
+                  >
+                    {item.url}
+                  </Text>
+
+                  {item.leaseInfo ? (
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        marginTop: 12,
+                        padding: '8px 10px',
+                        borderRadius: 'var(--semi-border-radius-medium)',
+                        backgroundColor: 'var(--semi-color-fill-0)',
+                      }}
+                    >
+                      <IconCalendarClockStroked style={{ color: 'var(--semi-color-text-2)' }} />
+                      {item.leaseInfo}
+                    </div>
+                  ) : null}
+
                   <div
                     style={{
                       marginTop: 'auto',
-                      paddingTop: 12,
-                      borderTop: '1px solid var(--semi-color-border)',
+                      paddingTop: 16,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
                     }}
                   >
-                    <ButtonGroup
-                      theme="borderless"
-                      style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}
-                    >
-                      <TemplateModal onOk={handleUpdate} entity={item}>
-                        <Button theme="borderless" icon={<IconEdit2Stroked />}></Button>
-                      </TemplateModal>
-                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
+                    <ButtonGroup theme="light">
                       <CheckStreamButton streamer={item} />
-                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
                       <PauseButton streamer={item}/>
-                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
-                      <Popconfirm
-                        title="确定是否要删除？"
-                        content="此操作将不可逆"
-                        onConfirm={async () => await onConfirm(item.id)}
-                        // onCancel={onCancel}
-                      >
-                        <Button theme="borderless" icon={<IconDeleteStroked />}></Button>
-                      </Popconfirm>
-                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
-                      <OverrideModal onOk={handleUpdate} entity={item}>
-                        <Button theme="borderless" icon={<IconWrench />}></Button>
-                      </OverrideModal>
-                      <span className="semi-button-group-line semi-button-group-line-borderless semi-button-group-line-primary"></span>
-                      <RecordingLeaseButton streamer={item} />
                     </ButtonGroup>
+                    <Dropdown
+                      trigger="click"
+                      position="bottomRight"
+                      render={
+                        <Dropdown.Menu>
+                            <TemplateModal onOk={handleUpdate} entity={item}>
+                              <Dropdown.Item icon={<IconEdit2Stroked />}>编辑主播</Dropdown.Item>
+                            </TemplateModal>
+                            <OverrideModal onOk={handleUpdate} entity={item}>
+                              <Dropdown.Item icon={<IconWrench />}>配置覆写</Dropdown.Item>
+                            </OverrideModal>
+                            <RecordingLeaseButton streamer={item}>
+                              <Dropdown.Item icon={<IconCalendarClockStroked />}>录制期限</Dropdown.Item>
+                            </RecordingLeaseButton>
+                            <Dropdown.Divider />
+                            <Popconfirm
+                              title="确定是否要删除？"
+                              content="此操作将不可逆"
+                              onConfirm={async () => await onConfirm(item.id)}
+                            >
+                              <Dropdown.Item type="danger" icon={<IconDeleteStroked />}>删除</Dropdown.Item>
+                            </Popconfirm>
+                        </Dropdown.Menu>
+                      }
+                    >
+                      <Button theme="borderless" icon={<IconMoreStroked />} aria-label="更多操作" />
+                    </Dropdown>
                   </div>
                 </Card>
 
