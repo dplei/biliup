@@ -39,7 +39,7 @@ export const PauseButton: React.FC<PauseButtonProps> = ({
 
     return (
         <Tooltip content={disabled ? '录制期限已到期，请先延期或清除期限' : isResume ? '恢复录制' : '暂停录制'}>
-            <Button disabled={disabled} onClick={handlePause} icon={isResume ? <IconPlay />: <IconPause />} theme="light" aria-label={isResume ? '恢复录制' : '暂停录制'}>
+            <Button disabled={disabled} onClick={handlePause} icon={isResume ? <IconPlay />: <IconPause />} theme="borderless" type={isResume ? 'primary' : 'warning'} aria-label={isResume ? '恢复录制' : '暂停录制'}>
                 {isResume ? '恢复' : '暂停'}
             </Button>
         </Tooltip>

@@ -321,7 +321,7 @@ export default function Home() {
                       justifyContent: 'space-between',
                     }}
                   >
-                    <ButtonGroup theme="light">
+                    <ButtonGroup theme="borderless">
                       <CheckStreamButton streamer={item} />
                       <PauseButton streamer={item}/>
                     </ButtonGroup>
@@ -350,7 +350,7 @@ export default function Home() {
                         </Dropdown.Menu>
                       }
                     >
-                      <Button theme="borderless" icon={<IconMoreStroked />} aria-label="更多操作" />
+                      <Button type="tertiary" theme="borderless" icon={<IconMoreStroked />} aria-label="更多操作" />
                     </Dropdown>
                   </div>
                 </Card>
