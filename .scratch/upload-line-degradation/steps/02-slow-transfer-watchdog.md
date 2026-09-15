@@ -39,15 +39,16 @@ issue 建议 4 想用「复用已上传分片」消掉这个代价，那是 UPOS
   ) -> SlowVerdict
   ```
 - `AttemptEvent::Activity(Progress)` 分支里调它。`Abort` 走**已有**的失败出口，与
-  `AttemptEvent::PhaseDeadline` 同形：`record_watchdog_failure(context, RequestTimeout,
+  `AttemptEvent::PhaseDeadline` 同形：`record_watchdog_failure(context, SlowTransfer,
   "slow_transfer")` + `record_chunk_diagnostics` + `observe::upload_failed` + 返回 `Err`。
   不新增出口分支，把 `PhaseDeadline` 那段抽成一个 `async fn abort_attempt(kind, ...)` 复用。
 - `AttemptEvent::Activity(TransferStarted)` 分支里读基线、初始化窗口。
 
 **为什么中止走 `record_watchdog_failure`（即真失败梯度）而不是 step 01 的慢冷却**：这一次
 attempt 是真的被打断了、需要重试，与「传完了但慢」不是一回事。`RequestTimeout` 的
-`ordinary_cooldown` 从 1 分钟起步。这里原先认为重试会在冷却期间换线；issue #52 的生产反馈
-证明生命周期行要 10 分钟后才重试，届时 1 分钟冷却早已结束。修正见 step 04。
+`ordinary_cooldown` 从 1 分钟起步。这里原先把它记成 `RequestTimeout`，认为重试会在冷却期间换线；
+issue #52 的生产反馈证明生命周期行要 10 分钟后才重试，届时 1 分钟冷却早已结束。Step 04 已改为
+独立的 `SlowTransfer` 并复用 30 分钟慢线路冷却。
 
 ### `attempt_lease.rs`
 

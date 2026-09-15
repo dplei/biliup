@@ -27,8 +27,10 @@ alter table upload_line_health add column avg_mbps REAL;
     慢不是失败，不该污染 `ordinary_cooldown` 的失败梯度。
   - 安全阀：判慢后、写库前查一次 `active_cooldowns`，若加上本条会让 `RECOVERABLE_LINES` 三条
     全部处于冷却，则放弃冷却，只 `warn!` + 照常更新 EWMA。理由见 spec。
-- `UploadFailureKind` **不加变体**。`slow_throughput` 只作为 `last_failure_kind` 的字符串值存在：
+- 成功但慢的 `slow_throughput` **不加 `UploadFailureKind` 变体**，只作为
+  `last_failure_kind` 的字符串值存在：
   它不参与错误分类，加进枚举会让 `classify_*` 的穷尽匹配凭空多一个永不命中的分支。
+  Step 04 后续增加的是 watchdog 真正中止 attempt 时使用的 `SlowTransfer`，两者语义不同。
 
 ### `upload.rs`
 

@@ -59,11 +59,12 @@ RFC3339**；程序自己写的行没有这个问题（全部经 sqlx 绑定）�
 ## 生产反馈：自动换线条件未成立
 
 [issue #52](https://github.com/dplei/biliup/issues/52) 的只读日志核对暴露了遗漏：
-`slow_transfer` 中止后线路只冷却 1 分钟，失败行却要 10 分钟后才到期。真实自动补传启动时，
+`slow_transfer` 中止后线路原先只冷却 1 分钟，失败行却要 10 分钟后才到期。真实自动补传启动时，
 `active_cooldowns` 已经看不到原线路，因此「走既有通道即可换线」的结论不成立。
 
 issue 所附观察窗口短于首次重试退避，不能证明失败行已经永久卡死；代码中也确实存在常驻的
-due-row scanner。需要修的是冷却与重试的时间关系，而不是投稿门禁或补传调度器。后续见
+due-row scanner。需要修的是冷却与重试的时间关系，而不是投稿门禁或补传调度器。Step 04 已复用
+30 分钟冷却，并由组合测试从真实失败行读取到期时刻，确认选路跳过原线路；见
 [`steps/04-align-slow-retry-cooldown.md`](./steps/04-align-slow-retry-cooldown.md)。
 
 ## 阈值校准
