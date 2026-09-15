@@ -244,8 +244,8 @@ export default function Home() {
               sm: 24,
               md: 12,
               lg: 8,
-              xl: 8,
-              xxl: 6,
+              xl: 6,
+              xxl: 4,
             }}
             dataSource={data}
             renderItem={item => (
@@ -253,14 +253,13 @@ export default function Home() {
                 <Card
                   shadows="hover"
                   style={{
-                    margin: '9px 0px',
                     width: '100%',
                   }}
                   bodyStyle={{
                     display: 'flex',
                     flexDirection: 'column',
-                    minHeight: 184,
-                    padding: 20,
+                    minHeight: 140,
+                    padding: 16,
                   }}
                 >
                   <div
@@ -277,10 +276,10 @@ export default function Home() {
                   <h3
                     style={{
                       minWidth: 0,
-                      margin: '14px 0 0',
+                      margin: '8px 0 0',
                       color: 'var(--semi-color-text-0)',
-                      fontSize: 20,
-                      lineHeight: '28px',
+                      fontSize: 18,
+                      lineHeight: '24px',
                       fontWeight: 600,
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
@@ -304,7 +303,7 @@ export default function Home() {
                         display: 'flex',
                         alignItems: 'center',
                         gap: 6,
-                        marginTop: 12,
+                        marginTop: 8,
                       }}
                     >
                       <IconCalendarClockStroked style={{ color: 'var(--semi-color-text-2)' }} />
@@ -315,7 +314,7 @@ export default function Home() {
                   <div
                     style={{
                       marginTop: 'auto',
-                      paddingTop: 16,
+                      paddingTop: 8,
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'space-between',
