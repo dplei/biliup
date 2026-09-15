@@ -24,6 +24,7 @@ pub enum UploadFailureKind {
     CertificateInvalid,
     ConnectTimeout,
     RequestTimeout,
+    SlowTransfer,
     HttpStatus,
     RateLimit601,
     Transport,
@@ -36,6 +37,7 @@ impl UploadFailureKind {
             Self::CertificateInvalid => "certificate_invalid",
             Self::ConnectTimeout => "connect_timeout",
             Self::RequestTimeout => "request_timeout",
+            Self::SlowTransfer => "slow_transfer",
             Self::HttpStatus => "http_status",
             Self::RateLimit601 => "rate_limit_601",
             Self::Transport => "transport",
@@ -353,6 +355,8 @@ pub async fn record_failure(
     let cooldown_until = now
         + if kind.is_tls() {
             TLS_COOLDOWN
+        } else if kind == UploadFailureKind::SlowTransfer {
+            SLOW_COOLDOWN
         } else {
             ordinary_cooldown(failures)
         };
@@ -453,6 +457,55 @@ mod tests {
         .await
         .unwrap();
         assert!(all_health(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_failure_outlives_first_retry_without_changing_ordinary_backoff() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap();
+
+        record_failure(
+            &pool,
+            "alia",
+            UploadFailureKind::SlowTransfer,
+            "slow_transfer",
+            now,
+        )
+        .await
+        .unwrap();
+        let slow = row(&pool, "alia").await;
+        assert_eq!(slow.cooldown_until, Some(now + SLOW_COOLDOWN));
+        assert_eq!(slow.last_failure_kind.as_deref(), Some("slow_transfer"));
+        assert!(matches!(
+            acquire_line(&pool, "alia", now + Duration::minutes(10))
+                .await
+                .unwrap(),
+            LineAvailability::Cooling { .. }
+        ));
+        assert_eq!(
+            acquire_line(&pool, "alia", now + SLOW_COOLDOWN)
+                .await
+                .unwrap(),
+            LineAvailability::Available
+        );
+
+        for (attempt, minutes) in [(1, 1), (2, 5), (3, 15), (4, 60)] {
+            record_failure(
+                &pool,
+                "tx",
+                UploadFailureKind::RequestTimeout,
+                "timeout",
+                now,
+            )
+            .await
+            .unwrap();
+            let ordinary = row(&pool, "tx").await;
+            assert_eq!(ordinary.consecutive_failures, attempt);
+            assert_eq!(
+                ordinary.cooldown_until,
+                Some(now + Duration::minutes(minutes))
+            );
+        }
     }
 
     async fn row(pool: &ConnectionPool, line_key: &str) -> UploadLineHealth {

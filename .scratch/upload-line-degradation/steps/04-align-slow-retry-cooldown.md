@@ -1,12 +1,12 @@
 # 04 · 让慢传输冷却覆盖自动补传
 
-Status: ready-for-agent
+Status: completed
 
 来源：[issue #52](https://github.com/dplei/biliup/issues/52)
 
 ## 根因
 
-`upload_enrolled_with_watchdog` 把 `slow_transfer` 作为 `UploadFailureKind::RequestTimeout` 记录。
+`upload_enrolled_with_watchdog` 原先把 `slow_transfer` 作为 `UploadFailureKind::RequestTimeout` 记录。
 `record_failure` 对第一次普通失败只冷却线路 1 分钟；`fail_enrolled_attempt` 却固定把生命周期行的
 `next_retry_at` 设为 10 分钟后。due-row scanner 真正领取补传时，原线路已不在冷却中，选路器可能
 再次选回它。
@@ -25,7 +25,7 @@ Status: ready-for-agent
 
 ## 顺带澄清诊断
 
-`chunk=... chunk_elapsed_secs=...` 目前描述的是最近一次已确认进度，不是并发窗口里真正卡住的
+旧的 `chunk=... chunk_elapsed_secs=...` 描述的是最近一次已确认进度，不是并发窗口里真正卡住的
 分片；在触发 `slow_transfer` 的同一条进度回调中，它自然可能显示 0 秒。UPOS 层已经逐请求记录
 `chunk_index`、`attempt`、`elapsed_ms` 和错误，足够定位具体请求。不要为 watchdog 再造一套并发
 分片跟踪器；只需把聚合诊断字段改成不声称它找到了“卡住的分片”的措辞。
@@ -37,6 +37,15 @@ Status: ready-for-agent
   跳过原线路。
 - 回归：普通 request timeout 仍使用 1/5/15/60 分钟梯度；30 分钟后慢线路重新可选。
 - `cargo test -p biliup-cli`。
+
+## 落地
+
+- `UploadFailureKind::SlowTransfer` 使用既有 `SLOW_COOLDOWN`；普通超时梯度不变。
+- watchdog 失败出口改为显式接收线路失败类别，只有慢速判据传 `SlowTransfer`。
+- 组合测试从真实 v2 attempt 失败行读出 10 分钟后的 `next_retry_at`，再用持久冷却快照选线，
+  确认跳过原线路；健康单测同时覆盖 30 分钟恢复与普通 1/5/15/60 梯度。
+- 聚合诊断和缺失分段页面改称“最近确认分块 / 距确认时长”；数据库字段保持兼容，不做迁移。
+- `cargo test -p biliup-cli` 通过。
 
 ## 不做
 

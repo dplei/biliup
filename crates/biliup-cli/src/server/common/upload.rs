@@ -2281,7 +2281,7 @@ async fn persist_attempt_progress(
     missing_id: i64,
     attempt_token: &str,
     progress: UploadProgress,
-    chunk_started_at: chrono::DateTime<chrono::Utc>,
+    acknowledged_at: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<bool> {
     let uploaded_bytes = i64::try_from(progress.uploaded_bytes).unwrap_or(i64::MAX);
     let total_bytes = i64::try_from(progress.total_bytes).unwrap_or(i64::MAX);
@@ -2299,7 +2299,7 @@ async fn persist_attempt_progress(
     .bind(total_bytes)
     .bind(now)
     .bind(chunk_index)
-    .bind(chunk_started_at)
+    .bind(acknowledged_at)
     .bind(missing_id)
     .bind(attempt_token)
     .execute(pool)
@@ -2459,7 +2459,7 @@ struct AttemptWatch {
     phase_deadline: Duration,
     persisted_bytes: u64,
     last_chunk_index: Option<usize>,
-    chunk_started_at: chrono::DateTime<chrono::Utc>,
+    last_acknowledged_at: chrono::DateTime<chrono::Utc>,
     last_activity: Instant,
     /// 传输阶段开始时读一次的全库吞吐基线；`None` 时速率判据整个关闭。
     baseline_mbps: Option<f64>,
@@ -2468,19 +2468,20 @@ struct AttemptWatch {
 }
 
 impl AttemptWatch {
-    /// The diagnostic tail appended to every watchdog `last_error`: which chunk was in flight, on
-    /// which line, for how long, and how many bytes the remote had actually acknowledged.
+    /// The diagnostic tail appended to every watchdog `last_error`: the most recently
+    /// acknowledged chunk, its age, the line, and the acknowledged byte count. Concurrent UPOS
+    /// requests mean this does not identify which in-flight chunk is stalled.
     fn diagnostics(&self, line_key: &str) -> String {
         let chunk = self
             .last_chunk_index
             .map(|index| index.to_string())
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "phase={} line={} chunk={} chunk_elapsed_secs={} acknowledged_bytes={}",
+            "phase={} line={} last_acknowledged_chunk={} seconds_since_acknowledgement={} acknowledged_bytes={}",
             self.phase.as_str(),
             line_key,
             chunk,
-            (chrono::Utc::now() - self.chunk_started_at)
+            (chrono::Utc::now() - self.last_acknowledged_at)
                 .num_seconds()
                 .max(0),
             self.persisted_bytes,
@@ -2574,7 +2575,7 @@ async fn upload_enrolled_with_watchdog(
         phase_deadline: phase_deadline_for(AttemptPhase::Preprocessing, source_bytes),
         persisted_bytes: 0,
         last_chunk_index: None,
-        chunk_started_at: chrono::Utc::now(),
+        last_acknowledged_at: chrono::Utc::now(),
         last_activity: Instant::now(),
         baseline_mbps: None,
         window_started_at: Instant::now(),
@@ -2687,7 +2688,9 @@ async fn upload_enrolled_with_watchdog(
                     missing_id,
                     attempt_token,
                     kind,
-                    reason.blames_upload_line(),
+                    reason
+                        .blames_upload_line()
+                        .then_some(UploadFailureKind::RequestTimeout),
                     &diagnostics,
                 )
                 .await);
@@ -2709,7 +2712,7 @@ async fn upload_enrolled_with_watchdog(
                     missing_id,
                     attempt_token,
                     "total_upload_timeout",
-                    true,
+                    Some(UploadFailureKind::RequestTimeout),
                     &diagnostics,
                 )
                 .await);
@@ -2818,10 +2821,10 @@ async fn upload_enrolled_with_watchdog(
                         "upload chunk acknowledged"
                     );
                 }
-                // The next chunk starts where this one was acknowledged; that pair is what makes
-                // "chunk 41 on bda2 has been in flight for 700s" answerable after the fact.
+                // UPOS uploads chunks concurrently; this is the latest acknowledgement, not the
+                // identity or start time of whichever request may currently be stalled.
                 watch.last_chunk_index = Some(progress.chunk_index);
-                watch.chunk_started_at = acknowledged_at;
+                watch.last_acknowledged_at = acknowledged_at;
                 // 上面的 reset 让「在动」永远算活着，于是爬行的线路能一直传到总超时。这是
                 // 第二条判据：动得太慢，且还没传过半，就趁早换线。
                 let window_elapsed = watch.window_started_at.elapsed();
@@ -2864,7 +2867,7 @@ async fn upload_enrolled_with_watchdog(
                             missing_id,
                             attempt_token,
                             "slow_transfer",
-                            true,
+                            Some(UploadFailureKind::SlowTransfer),
                             &diagnostics,
                         )
                         .await);
@@ -2886,11 +2889,11 @@ async fn fail_attempt(
     missing_id: i64,
     attempt_token: &str,
     kind: &'static str,
-    blames_upload_line: bool,
+    line_failure_kind: Option<UploadFailureKind>,
     diagnostics: &str,
 ) -> error_stack::Report<AppError> {
-    if blames_upload_line {
-        record_watchdog_failure(context, UploadFailureKind::RequestTimeout, kind).await;
+    if let Some(line_failure_kind) = line_failure_kind {
+        record_watchdog_failure(context, line_failure_kind, kind).await;
     }
     record_chunk_diagnostics(
         pool,
@@ -2945,7 +2948,7 @@ async fn enter_phase(
     watch.phase = phase;
     watch.phase_deadline = phase_deadline_for(phase, source_bytes);
     watch.last_activity = Instant::now();
-    watch.chunk_started_at = chrono::Utc::now();
+    watch.last_acknowledged_at = chrono::Utc::now();
     watch.window_started_at = Instant::now();
     watch.window_start_bytes = 0;
     if phase == AttemptPhase::Transferring {
@@ -4631,6 +4634,7 @@ mod tests {
         for kind in [
             UploadFailureKind::CertificateExpired,
             UploadFailureKind::CertificateInvalid,
+            UploadFailureKind::SlowTransfer,
             UploadFailureKind::HttpStatus,
             UploadFailureKind::RateLimit601,
         ] {
@@ -6204,6 +6208,52 @@ mod tests {
         assert_eq!(selected.key, "alia");
         assert_eq!(selected.source, LineSource::Configured);
         assert_eq!(selected.skip_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn first_retry_skips_the_line_aborted_for_slow_transfer() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "slow-retry.flv").await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap();
+        let token = claim_enrolled_attempt(&pool, &enrollment, "alia", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+        upload_line_health::record_failure(
+            &pool,
+            "alia",
+            UploadFailureKind::SlowTransfer,
+            "slow_transfer",
+            now,
+        )
+        .await
+        .unwrap();
+        fail_enrolled_attempt(
+            &pool,
+            enrollment.missing_id,
+            &token,
+            "slow_transfer".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+        let retry_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT next_retry_at FROM upload_missing_segment WHERE id = ?")
+                .bind(enrollment.missing_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let plan = plan_upload_line(
+            "alia",
+            None,
+            &cooling_lines(&pool, retry_at).await.unwrap(),
+            retry_at,
+        );
+
+        assert_eq!(retry_at, now + chrono::Duration::minutes(10));
+        assert_eq!(plan.chosen, "bda2");
+        assert_eq!(plan.source, LineSource::Fallback);
+        assert!(plan.skipped[0].contains("alia: slow_transfer"));
     }
 
     #[tokio::test]

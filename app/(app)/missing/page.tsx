@@ -518,9 +518,9 @@ export default function MissingRecovery() {
             {record.last_chunk_index != null && (
               <div>
                 <Text type="tertiary" size="small">
-                  当前分块 #{record.last_chunk_index}
+                  最近确认分块 #{record.last_chunk_index}
                   {record.last_chunk_started_at
-                    ? ` · 已 ${fmtDuration((now - new Date(record.last_chunk_started_at).getTime()) / 1000)}`
+                    ? ` · 距今 ${fmtDuration((now - new Date(record.last_chunk_started_at).getTime()) / 1000)}`
                     : ''}
                 </Text>
               </div>
@@ -978,7 +978,7 @@ function AttemptHistoryPanel({ missingId }: { missingId: number }) {
             <Text type="tertiary" size="small">
               止步于 {PHASE_META[attempt.phase_reached ?? '']?.text ?? attempt.phase_reached ?? '—'}
               {attempt.uploaded_bytes > 0 ? ` · 已确认 ${fmtBytes(attempt.uploaded_bytes)}` : ''}
-              {attempt.last_chunk_index != null ? ` · 分块 #${attempt.last_chunk_index}` : ''}
+              {attempt.last_chunk_index != null ? ` · 最近确认分块 #${attempt.last_chunk_index}` : ''}
             </Text>
             {attempt.error && (
               <Text
