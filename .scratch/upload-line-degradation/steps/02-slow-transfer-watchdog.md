@@ -1,5 +1,7 @@
 # 02 · Transferring 阶段的滑窗速率判据
 
+Status: resolved
+
 补 issue #17 的缺口 1：让 watchdog 抓得住「爬」，不只是「断」。依赖 step 01 的 `avg_mbps` 基线。
 
 ## 判据

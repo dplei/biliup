@@ -1,5 +1,7 @@
 # 03 · dev 实跑与阈值校准
 
+Status: ready-for-human
+
 step 01、02 的阈值（`SLOW_RATIO = 4.0`、`SLOW_COOLDOWN = 30min`、`SLOW_WINDOW = 90s`、
 前半段保护线 50%）都是从一次实测反推的初值，必须在真实链路上确认「不误伤」比「抓得准」更优先。
 

@@ -1,6 +1,6 @@
 # 04 · 让慢传输冷却覆盖自动补传
 
-Status: completed
+Status: resolved
 
 来源：[issue #52](https://github.com/dplei/biliup/issues/52)
 
