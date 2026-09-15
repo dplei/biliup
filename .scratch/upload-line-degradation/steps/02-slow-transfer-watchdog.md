@@ -46,7 +46,8 @@ issue 建议 4 想用「复用已上传分片」消掉这个代价，那是 UPOS
 
 **为什么中止走 `record_watchdog_failure`（即真失败梯度）而不是 step 01 的慢冷却**：这一次
 attempt 是真的被打断了、需要重试，与「传完了但慢」不是一回事。`RequestTimeout` 的
-`ordinary_cooldown` 从 1 分钟起步，重试会换线，符合预期。
+`ordinary_cooldown` 从 1 分钟起步。这里原先认为重试会在冷却期间换线；issue #52 的生产反馈
+证明生命周期行要 10 分钟后才重试，届时 1 分钟冷却早已结束。修正见 step 04。
 
 ### `attempt_lease.rs`
 

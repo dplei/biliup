@@ -1,6 +1,7 @@
 # 上传线路劣化的感知与降级
 
-对应 [issue #17](https://github.com/dplei/biliup/issues/17)。发起时版本 1.3.11，issue 提出时 1.3.3——
+对应 [issue #17](https://github.com/dplei/biliup/issues/17)，生产反馈见
+[issue #52](https://github.com/dplei/biliup/issues/52)。发起时版本 1.3.11，issue 提出时 1.3.3——
 期间三个缺口一个都没被动过，唯一改过选路的 `57ab74b` 是为「原片能取回」加白名单，与本题无关。
 
 ## 问题
@@ -53,9 +54,26 @@ issue 建议 4（中止后复用已传分片）**不做**，理由是实测过�
 | [01](steps/01-throughput-in-line-health.md) | 吞吐入库 + 慢即短冷却（缺口 2、3） | — |
 | [02](steps/02-slow-transfer-watchdog.md) | Transferring 阶段滑窗速率判据，持续劣化就中止（缺口 1） | 01 的基线列 |
 | [03](steps/03-verify-and-calibrate.md) | dev 环境实跑 + 生产日志校准阈值 | 01、02 |
+| [04](steps/04-align-slow-retry-cooldown.md) | 让 `slow_transfer` 的线路冷却覆盖首次自动补传时点 | 02、03 的生产反馈 |
 
 step 01 单独上线就已经能让「慢完一次，接下来半小时不选它」成立；02 是把「这一次就别等它爬完」
 补上。两步都不改上传协议，回滚只需回滚 migration 之后的代码路径。
+
+## issue #52 分析结论
+
+issue 对「失败行会永久保留、没有自动重试」的判断不成立：attempt 失败会释放 lease、把生命周期
+行置为 `failed`，并安排 10 分钟后的 `next_retry_at`；服务启动时的 due-row scanner 每 60 秒扫描
+一次，到期后会自动领取补传。issue 所附日志窗口止于首次重试时点之前，不能据此
+判断任务已永久卡死。
+
+真实缺陷是两个既有时间尺度互相抵消：`slow_transfer` 通过 `UploadFailureKind::RequestTimeout` 进入
+普通失败梯度，首次只冷却线路 1 分钟；生命周期行却要 10 分钟后才能重试。到补传发生时线路已恢复
+可选，配置线路会直接再次选中，AUTO 也可能重新探测命中它。因此现有「中止后重试换线」结论缺少
+成立条件，持续劣化时确实可能反复中止并一直挡住投稿。
+
+投稿门禁不是根因：存在未成功分段时直接投稿会制造缺 P 稿件，`persist_segment` 已会在补传成功后
+重新唤醒投稿协调器。也不需要新增有界重试；停止重试只会把 `failed` 行永久留下。最小修复见 step
+04：复用已有 30 分钟慢线路冷却，让 10 分钟后的首次补传必然避开刚被判慢的线路。
 
 ## 不做
 
