@@ -11,6 +11,10 @@
    `upload_line_health`。显式配置和真实传输共用这张熔断表，无法区分「探测误判」与「这条线路
    实际上传失败」，所以用户改成显式线路后仍会被冷却挡回 AUTO。
 
+Issue 后续实测又确认第三个独立根因：数据库迁移到出口能力不同的机器后，持久化的
+`avg_mbps` 仍代表旧机器，`slow_throughput` 会把新机器上的正常成功传输误判为线路劣化。
+该项不混入已合并的探测修复，见 [step 02](steps/02-reset-throughput-baseline.md)。
+
 ## 最小方案
 
 - POST 探测体按服务端 `probe.post` 生成；缺失或非法时使用 0.1 MB，远端异常大值最多沿用旧版
@@ -31,3 +35,8 @@
 - 单测锁住服务端 0.1 MB 提示、非法值回退和 10 MB 上限。
 - 单测锁住显式线路忽略 `probe_failure`，同时保留真实传输冷却回退。
 - `cargo test -p biliup` 与相关 `biliup-cli` 测试通过。
+
+## 后续步骤
+
+- [01](steps/01-fix-probe-and-explicit-line.md)：探测体积与探测失败冷却隔离，已合入 `dev`，待真实链路验收。
+- [02](steps/02-reset-throughput-baseline.md)：消除跨机器持久基线误判，待实现。
