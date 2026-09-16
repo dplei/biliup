@@ -2171,7 +2171,7 @@ async fn record_line_probe_failure(
     match upload_line_health::record_failure(
         pool,
         line_key,
-        UploadFailureKind::Transport,
+        UploadFailureKind::Probe,
         &summary,
         now,
     )
