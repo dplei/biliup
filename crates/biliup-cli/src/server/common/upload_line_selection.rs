@@ -11,7 +11,7 @@
 //! only for `auto`). Because the plan is pure, the API can show the page the same decision the
 //! uploader will make, without any network I/O.
 
-use crate::server::common::upload_line_health::{self, LineAvailability};
+use crate::server::common::upload_line_health::{self, LineAvailability, UploadFailureKind};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use biliup::uploader::line;
@@ -40,6 +40,11 @@ const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
 /// 显式配置的线路不受这里影响：主人点名要哪条就用哪条。
 pub(crate) const RECOVERABLE_LINES: [&str; 3] = ["bda2", "tx", "alia"];
 pub const AUTO: &str = "auto";
+
+fn ignores_probe_cooldown(source: LineSource, reason: Option<&str>) -> bool {
+    matches!(source, LineSource::Configured | LineSource::Manual)
+        && reason == Some(UploadFailureKind::Probe.as_str())
+}
 
 /// Why the attempt ended up on this line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +210,14 @@ pub fn plan_upload_line(
                 };
             }
             Some(cool) => {
+                if index == 0 && ignores_probe_cooldown(preferred_source, cool.reason.as_deref()) {
+                    return LinePlan {
+                        chosen: candidate.clone(),
+                        source: preferred_source,
+                        candidates,
+                        skipped,
+                    };
+                }
                 let remaining = (cool.until - now).num_seconds().max(0);
                 let reason = cool.reason.as_deref().unwrap_or("cooldown");
                 skipped.push(format!("{candidate}: {reason}（剩余 {remaining} 秒）"));
@@ -254,7 +267,8 @@ pub async fn cooling_lines(
 
 /// Turn a plan into a usable line. `auto` probes, excluding cooling lines; everything else is a
 /// direct construction guarded by one last `acquire_line` so a cooldown that started between the
-/// plan and here still takes effect.
+/// plan and here still takes effect. An explicit choice may bypass only AUTO probe failures; real
+/// transfer failures remain authoritative.
 pub async fn resolve_planned_line(
     pool: &ConnectionPool,
     client: &reqwest::Client,
@@ -262,20 +276,25 @@ pub async fn resolve_planned_line(
 ) -> AppResult<(SelectedLine, Vec<ProbeFailure>)> {
     if plan.chosen != AUTO
         && let Some(line) = explicit_upload_line(&plan.chosen)
-        && matches!(
-            upload_line_health::acquire_line(pool, &plan.chosen, Utc::now()).await?,
-            LineAvailability::Available
-        )
     {
-        return Ok((
-            SelectedLine {
-                line,
-                key: plan.chosen.clone(),
-                source: plan.source,
-                plan,
-            },
-            Vec::new(),
-        ));
+        let available =
+            match upload_line_health::acquire_line(pool, &plan.chosen, Utc::now()).await? {
+                LineAvailability::Available => true,
+                LineAvailability::Cooling { reason, .. } => {
+                    ignores_probe_cooldown(plan.source, reason.as_deref())
+                }
+            };
+        if available {
+            return Ok((
+                SelectedLine {
+                    line,
+                    key: plan.chosen.clone(),
+                    source: plan.source,
+                    plan,
+                },
+                Vec::new(),
+            ));
+        }
     }
     let excluded = upload_line_health::active_cooldowns(pool, Utc::now())
         .await?
@@ -414,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_line_overrides_configuration_but_still_yields_to_cooldown() {
+    fn a_manual_line_overrides_configuration_but_still_yields_to_real_cooldown() {
         let honored = plan_upload_line("bda2", Some("tx"), &HashMap::new(), now());
         assert_eq!(honored.chosen, "tx");
         assert_eq!(honored.source, LineSource::Manual);
@@ -422,6 +441,32 @@ mod tests {
         let cooled = plan_upload_line("bda2", Some("tx"), &cooling(&[("tx", "transport")]), now());
         assert_eq!(cooled.chosen, "bda2");
         assert_eq!(cooled.source, LineSource::Fallback);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_line_ignores_probe_cooldown_without_clearing_the_database() {
+        use crate::server::infrastructure::connection_pool::test_support::migrated_pool;
+
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc::now();
+        upload_line_health::record_failure(
+            &pool,
+            "tx",
+            UploadFailureKind::Probe,
+            "probe timed out",
+            now,
+        )
+        .await
+        .unwrap();
+        let plan = plan_upload_line("tx", None, &cooling_lines(&pool, now).await.unwrap(), now);
+
+        let (selected, failures) = resolve_planned_line(&pool, &reqwest::Client::new(), plan)
+            .await
+            .unwrap();
+
+        assert_eq!(selected.key, "tx");
+        assert_eq!(selected.source, LineSource::Configured);
+        assert!(failures.is_empty());
     }
 
     #[test]

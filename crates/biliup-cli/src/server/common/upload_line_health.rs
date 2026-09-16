@@ -27,6 +27,7 @@ pub enum UploadFailureKind {
     SlowTransfer,
     HttpStatus,
     RateLimit601,
+    Probe,
     Transport,
 }
 
@@ -40,6 +41,7 @@ impl UploadFailureKind {
             Self::SlowTransfer => "slow_transfer",
             Self::HttpStatus => "http_status",
             Self::RateLimit601 => "rate_limit_601",
+            Self::Probe => "probe_failure",
             Self::Transport => "transport",
         }
     }

@@ -169,6 +169,8 @@ const PROBE_INDEX_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_LINE_TIMEOUT: Duration = Duration::from_secs(4);
 const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_CONCURRENCY: usize = 4;
+const DEFAULT_PROBE_POST_MB: f64 = 0.1;
+const MAX_PROBE_POST_MB: f64 = 10.0;
 
 impl Probe {
     pub async fn probe(client: &reqwest::Client) -> Result<Line> {
@@ -278,11 +280,18 @@ impl Probe {
         if !probe["get"].is_null() {
             client.get(url)
         } else {
-            client
-                .post(url)
-                .body(vec![0; (1024. * 1024. * 10.) as usize]) // 10MB chunk
+            client.post(url).body(vec![0; probe_post_bytes(probe)])
         }
     }
+}
+
+fn probe_post_bytes(probe: &serde_json::Value) -> usize {
+    let mb = probe["post"]
+        .as_f64()
+        .filter(|mb| mb.is_finite() && *mb > 0.0)
+        .unwrap_or(DEFAULT_PROBE_POST_MB)
+        .min(MAX_PROBE_POST_MB);
+    (mb * 1024.0 * 1024.0) as usize
 }
 
 enum Bucket {
@@ -664,5 +673,24 @@ mod tests {
         assert_eq!(selected.key(), "bda2");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].line_key, "bldsa");
+    }
+
+    #[test]
+    fn probe_body_follows_server_hint_with_bounded_fallback() {
+        let hinted = probe_post_bytes(&serde_json::json!({"post": 0.1}));
+        assert_eq!(hinted, (0.1 * 1024.0 * 1024.0) as usize);
+        assert!(hinted * PROBE_CONCURRENCY < 512 * 1024);
+        assert_eq!(
+            probe_post_bytes(&serde_json::json!({})),
+            (DEFAULT_PROBE_POST_MB * 1024.0 * 1024.0) as usize
+        );
+        assert_eq!(
+            probe_post_bytes(&serde_json::json!({"post": -1})),
+            (DEFAULT_PROBE_POST_MB * 1024.0 * 1024.0) as usize
+        );
+        assert_eq!(
+            probe_post_bytes(&serde_json::json!({"post": 1000})),
+            (MAX_PROBE_POST_MB * 1024.0 * 1024.0) as usize
+        );
     }
 }
