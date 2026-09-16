@@ -140,6 +140,7 @@ struct SegmentProcessingStats {
     recoverable_short_bytes: u64,
     merged_recovery_outputs: u64,
     deferred_recovery_batches: u64,
+    lone_short_segments_uploaded: u64,
     invalid_segments: u64,
     segments_queued_for_upload: u64,
     upload_queue_peak_depth: usize,
@@ -308,10 +309,25 @@ impl SegmentEventProcessor {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending_short_segments);
-        for compatible_group in compatible_segment_groups(pending) {
-            for chunk in compatible_group.chunks(self.recovery_batch_max_files) {
-                let group = chunk.to_vec();
-                if group.len() > 1 {
+        for plan in plan_short_segment_flush(pending, self.recovery_batch_max_files) {
+            match plan {
+                ShortSegmentFlushPlan::UploadLone(mut event) => {
+                    // 只有一个短片段时没有合并对象；此刻处理器正握着正确的顺序位置（下一个
+                    // Valid 尚未入队，或 session 正在收尾），直接作为独立分 P 入队，不再 defer
+                    // 到一张没有消费者的表里。
+                    let bytes = std::fs::metadata(&event.prev_file_path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    self.stats.lone_short_segments_uploaded += 1;
+                    info!(
+                        file = %event.prev_file_path.display(),
+                        file_bytes = bytes,
+                        close_reason = ?event.close_reason,
+                        "enqueueing lone recoverable short segment as its own part"
+                    );
+                    self.enqueue_validated(&mut event, bytes).await?;
+                }
+                ShortSegmentFlushPlan::Merge(group) => {
                     match merge_compatible_segments(&group, &self.file_validator) {
                         Ok(merged) => {
                             self.stats.merged_recovery_outputs += 1;
@@ -329,7 +345,6 @@ impl SegmentEventProcessor {
                                 .map(|metadata| metadata.len())
                                 .unwrap_or(0);
                             self.enqueue_validated(&mut merged, bytes).await?;
-                            continue;
                         }
                         Err(error) => {
                             let (batch_id, manifest) = defer_recovery_batch(
@@ -346,23 +361,22 @@ impl SegmentEventProcessor {
                                 file_count = group.len(),
                                 "failed to merge recoverable segments; deferred batch without uploading originals"
                             );
-                            continue;
                         }
                     }
                 }
-                let (batch_id, manifest) = defer_recovery_batch(
-                    &group,
-                    "media parameters are not compatible with an adjacent recovery group",
-                    self.recovery_retry_interval,
-                )?;
-                self.stats.deferred_recovery_batches += 1;
-                self.queue_deferred_batch_record(&batch_id, &manifest);
-                warn!(
-                    recovery_batch_id = batch_id,
-                    manifest = %manifest.display(),
-                    file_count = group.len(),
-                    "recoverable segment deferred without immediate upload"
-                );
+                ShortSegmentFlushPlan::Defer { group, reason } => {
+                    let (batch_id, manifest) =
+                        defer_recovery_batch(&group, &reason, self.recovery_retry_interval)?;
+                    self.stats.deferred_recovery_batches += 1;
+                    self.queue_deferred_batch_record(&batch_id, &manifest);
+                    warn!(
+                        recovery_batch_id = batch_id,
+                        manifest = %manifest.display(),
+                        file_count = group.len(),
+                        reason,
+                        "recoverable segment deferred without immediate upload"
+                    );
+                }
             }
         }
         Ok(())
@@ -653,6 +667,47 @@ async fn remove_invalid_segment(
             "failed to remove invalid media segment; original preserved"
         ),
     }
+}
+
+enum ShortSegmentFlushPlan {
+    UploadLone(SegmentInfo),
+    Merge(Vec<SegmentInfo>),
+    Defer {
+        group: Vec<SegmentInfo>,
+        reason: String,
+    },
+}
+
+/// 决定一批待处理短片段各自的去向。单独一个片段没有合并对象，直接作为独立分 P 上传；
+/// 多个片段按媒体参数分组后合并，落单的组（参数不同或无法取键）才 defer。
+fn plan_short_segment_flush(
+    pending: Vec<SegmentInfo>,
+    max_files: usize,
+) -> Vec<ShortSegmentFlushPlan> {
+    let total = pending.len();
+    if total == 1 {
+        return pending
+            .into_iter()
+            .map(ShortSegmentFlushPlan::UploadLone)
+            .collect();
+    }
+    let mut plans = Vec::new();
+    for group in compatible_segment_groups(pending) {
+        for chunk in group.chunks(max_files) {
+            let group = chunk.to_vec();
+            if group.len() > 1 {
+                plans.push(ShortSegmentFlushPlan::Merge(group));
+            } else {
+                plans.push(ShortSegmentFlushPlan::Defer {
+                    group,
+                    reason: format!(
+                        "single segment cannot form a merge group ({total} pending, incompatible or unkeyed)"
+                    ),
+                });
+            }
+        }
+    }
+    plans
 }
 
 fn compatible_segment_groups(events: Vec<SegmentInfo>) -> Vec<Vec<SegmentInfo>> {
@@ -1436,6 +1491,7 @@ impl DownloadTask {
             recoverable_short_bytes = processor.stats.recoverable_short_bytes,
             merged_recovery_outputs = processor.stats.merged_recovery_outputs,
             deferred_recovery_batches = processor.stats.deferred_recovery_batches,
+            lone_short_segments_uploaded = processor.stats.lone_short_segments_uploaded,
             invalid_segments = processor.stats.invalid_segments,
             segments_queued_for_upload = processor.stats.segments_queued_for_upload,
             upload_queue_peak_depth = processor.stats.upload_queue_peak_depth,
@@ -1955,7 +2011,10 @@ mod retry_state_tests {
 
 #[cfg(test)]
 mod short_segment_group_tests {
-    use super::{SegmentProcessingStats, compatible_segment_groups, defer_recovery_batch};
+    use super::{
+        SegmentProcessingStats, ShortSegmentFlushPlan, compatible_segment_groups,
+        defer_recovery_batch, plan_short_segment_flush,
+    };
     use crate::server::common::util::{InvalidMediaReason, MediaValidation};
     use crate::server::core::downloader::SegmentInfo;
     use biliup::downloader::util::SegmentCloseReason;
@@ -2043,6 +2102,52 @@ mod short_segment_group_tests {
         let groups = compatible_segment_groups(vec![event(first, 0), event(second, 1)]);
         assert_eq!(groups.len(), 2);
         assert!(groups.iter().all(|group| group.len() == 1));
+    }
+
+    #[test]
+    fn lone_pending_short_segment_is_uploaded_not_deferred() {
+        let dir = tempdir().unwrap();
+        let only = dir.path().join("only.flv");
+        fs::write(&only, flv_fixture(1)).unwrap();
+        let plans = plan_short_segment_flush(vec![event(only.clone(), 0)], 60);
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(
+            &plans[0],
+            ShortSegmentFlushPlan::UploadLone(event) if event.prev_file_path == only
+        ));
+    }
+
+    #[test]
+    fn incompatible_pending_segments_defer_with_honest_reason() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.flv");
+        let second = dir.path().join("second.flv");
+        fs::write(&first, flv_fixture(1)).unwrap();
+        fs::write(&second, flv_fixture(2)).unwrap();
+        let plans = plan_short_segment_flush(vec![event(first, 0), event(second, 1)], 60);
+        assert_eq!(plans.len(), 2);
+        for plan in &plans {
+            match plan {
+                ShortSegmentFlushPlan::Defer { group, reason } => {
+                    assert_eq!(group.len(), 1);
+                    assert!(reason.contains("cannot form a merge group"), "{reason}");
+                    assert!(reason.contains("2 pending"), "{reason}");
+                }
+                _ => panic!("expected defer"),
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_pending_segments_are_planned_for_merge() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.flv");
+        let second = dir.path().join("second.flv");
+        fs::write(&first, flv_fixture(1)).unwrap();
+        fs::write(&second, flv_fixture(1)).unwrap();
+        let plans = plan_short_segment_flush(vec![event(first, 0), event(second, 1)], 60);
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(&plans[0], ShortSegmentFlushPlan::Merge(group) if group.len() == 2));
     }
 
     #[test]
