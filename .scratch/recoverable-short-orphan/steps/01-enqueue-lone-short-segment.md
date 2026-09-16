@@ -28,3 +28,9 @@
 
 - `cargo test -p biliup-cli download`
 - dev 环境按 spec 验收第 2 条实跑一次。
+
+## 进度
+
+- 2026-09-16 已实现并提交（`041c7b8`，分支 `fix/issue54-260916-095401`）：`plan_short_segment_flush`
+  + 三个单测通过，`docs/short-segment-recovery.md`、`CODE_INDEX.md` 已更新。
+- 待办：dev 环境实录验证（spec 验收第 2 条），然后 `gh pr create --base dev`。
