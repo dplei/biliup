@@ -140,6 +140,13 @@ struct StreamBase {
     last_emit: Option<i64>,
     /// 已见过一次、还等第二个样本确认的候选新基准
     pending: Option<i64>,
+    /// 本流当前的修正量。同一基准内各流相同；某流确认换基准后，其它流通过 `adopt` 跟上。
+    offset: i64,
+    /// 兄弟流刚确认的新 offset，等本流自己也偏离旧基准时采纳；本流仍在旧基准上则作废。
+    /// 曾经是「确认时直接清空兄弟的判据，下一个 tag 无条件套新 offset」——CDN 成对重发
+    /// timestamp=0 的垃圾 tag 就能凑满两个样本，兄弟流带着旧基准的大时间戳套上按 0 算出
+    /// 的 offset，落盘前跳几千秒（issue #62）。
+    adopt: Option<i64>,
 }
 
 /// 写盘侧的时间戳重基。
@@ -149,10 +156,12 @@ struct StreamBase {
 /// 这里在写出前统一套一层 `emit = src + offset`，`offset` 只在基准确认改变时更新。
 ///
 /// 连续性判据按 **tag 类型分别** 维护：audio 与 video 交错送达，跨流比较会把每个合法交错的
-/// audio tag 误判成换基准，把音画同步打散；各自流内则本来就是单调的。修正量 `offset` 反过来
-/// 必须全局唯一，同基准内的相对关系（音画同步）才原样保留。
+/// audio tag 误判成换基准，把音画同步打散；各自流内则本来就是单调的。修正量按流持有，但
+/// 同一基准内必须是同一个值，同基准内的相对关系（音画同步）才原样保留——所以某流确认换
+/// 基准后，其它流在自己也偏离旧基准时采纳同一个 offset，而不是各自再算一个。
 #[derive(Default)]
 struct TimestampRebase {
+    /// 最近一次确认的 offset，只给某流的第一个 tag（还没有判据）用。
     offset: i64,
     /// 已写出的最大时间戳。换基准时新基准接在它之后，不能用「上一个写出值」——
     /// 合法交错本来就允许小于它。
@@ -183,9 +192,11 @@ impl TimestampRebase {
         let stream = self.streams[slot];
         let mut deviation = None;
         let emit = match stream.last_src {
-            // 本流的第一个 tag：没有判据可用，沿用当前基准。
+            // 本流的第一个 tag：没有判据可用，沿用最近确认的基准。
             None => {
                 self.streams[slot].last_src = Some(src);
+                self.streams[slot].offset = self.offset;
+                self.streams[slot].adopt = None;
                 src + self.offset
             }
             Some(last) if follows(last, src) => {
@@ -197,7 +208,22 @@ impl TimestampRebase {
                 if src > last {
                     self.streams[slot].pending = None;
                 }
-                src + self.offset
+                // 拿到一个旧基准的时间戳就足以说明本流没跟着换：兄弟那次确认对本流不成立。
+                self.streams[slot].adopt = None;
+                src + stream.offset
+            }
+            // 兄弟流已经确认了新基准，本流现在也偏离了旧基准：直接采纳同一个 offset。
+            // 不算本流自己的发现，不报 deviation，事件语义与原先的「清空后沿用」一致。
+            Some(_) if stream.adopt.is_some() => {
+                let offset = stream.adopt.unwrap_or(self.offset);
+                self.streams[slot] = StreamBase {
+                    last_src: Some(src),
+                    pending: None,
+                    offset,
+                    adopt: None,
+                    ..stream
+                };
+                src + offset
             }
             Some(last) => {
                 deviation = Some((
@@ -214,12 +240,12 @@ impl TimestampRebase {
                         self.offset = self.high_water + REBASE_NOMINAL_GAP_MS - src;
                         self.streams[slot].last_src = Some(src);
                         self.streams[slot].pending = None;
-                        // 其它流也一起换了基准，但它们各自的新起点还没见过：清掉判据，让下一个
-                        // tag 直接落到新 offset 上，而不是再触发一次重基。
+                        self.streams[slot].offset = self.offset;
+                        // 其它流大概率也换了基准，但只有它们自己的下一个 tag 能证明：挂上
+                        // 新 offset 等它们偏离时采纳，判据不动。
                         for other in 0..self.streams.len() {
                             if other != slot {
-                                self.streams[other].last_src = None;
-                                self.streams[other].pending = None;
+                                self.streams[other].adopt = Some(self.offset);
                             }
                         }
                         src + self.offset
@@ -1239,6 +1265,96 @@ mod tests {
                 (8_000..12_000).contains(&span),
                 "10 帧 × 1s 的真实时长必须保住，实测 {span}ms：{emits:?}"
             );
+        }
+
+        /// issue #62：Script 槽的 `last_src` 停在切段 restamp 的 K，424s 后 CDN 连发两个
+        /// timestamp=0 的 script tag。第二个被当成「新基准确认」，曾经会清空 A/V 槽的判据，
+        /// A/V 下一个 tag（仍在旧基准）无条件套上新 offset，落盘前跳 ≈ K（实测 3794020ms）。
+        #[test]
+        fn a_phantom_confirmation_does_not_drag_the_other_streams() {
+            const K: u32 = 3_790_667;
+            let mut rebase = TimestampRebase::default();
+            let mut emit = |t: TagType, src: u32| rebase.map(t, src).emit;
+            emit(TagType::Script, K);
+            emit(TagType::Audio, K);
+            emit(TagType::Video, K);
+            let mut last_v = 0;
+            let mut last_a = 0;
+            for i in 1..=100u32 {
+                last_a = emit(TagType::Audio, K + i * 33 - 10);
+                last_v = emit(TagType::Video, K + i * 33);
+            }
+            emit(TagType::Script, 0);
+            emit(TagType::Script, 0);
+            let next_a = emit(TagType::Audio, K + 101 * 33 - 10);
+            let next_v = emit(TagType::Video, K + 101 * 33);
+            assert_eq!(next_a - last_a, 33, "audio 必须按真实增量继续");
+            assert_eq!(next_v - last_v, 33, "video 必须按真实增量继续");
+        }
+
+        /// 同一条路的 A/V 形态：CDN 成对重发 timestamp=0 的初始化 tag（sequence header +
+        /// 关键帧），码流仍留在旧基准。#35 只推演过逐帧交替 `[0, B, 0, B]`，成对 `[0, 0, B]`
+        /// 刚好凑满二次确认的两个样本。
+        #[test]
+        fn a_paired_resend_in_one_stream_leaves_the_other_untouched() {
+            const B: u32 = 4_000_000;
+            let mut rebase = TimestampRebase::default();
+            let mut audio = Vec::new();
+            let mut video = Vec::new();
+            let mut feed = |t: TagType, src: u32| {
+                let emit = rebase.map(t, src).emit;
+                match t {
+                    TagType::Audio => audio.push((src, emit)),
+                    _ => video.push((src, emit)),
+                }
+            };
+            for i in 1..100u32 {
+                feed(TagType::Audio, B + i * 33 - 10);
+                feed(TagType::Video, B + i * 33);
+            }
+            feed(TagType::Video, 0);
+            feed(TagType::Video, 0);
+            for i in 100..110u32 {
+                feed(TagType::Audio, B + i * 33 - 10);
+                feed(TagType::Video, B + i * 33);
+            }
+            assert!(
+                audio.iter().all(|(src, emit)| src == emit),
+                "audio 不在场的确认不该动 audio：{audio:?}"
+            );
+            let emits: Vec<u32> = video.iter().map(|(_, emit)| *emit).collect();
+            assert!(
+                emits.windows(2).all(|pair| pair[0] < pair[1] && pair[1] - pair[0] <= 33),
+                "video 单调且每步不超过一帧：{emits:?}"
+            );
+            let (src, emit) = *video.last().unwrap();
+            let (asrc, aemit) = *audio.last().unwrap();
+            assert!(
+                (emit as i64 - src as i64 - (aemit as i64 - asrc as i64)).abs() <= 33,
+                "占位 tag 之后 video 与 audio 回到同一时间轴：video {src}->{emit}, audio {asrc}->{aemit}"
+            );
+        }
+
+        /// 真换基准时先确认的流把 offset 挂给兄弟，兄弟偏离时采纳同一个值：
+        /// 换基准前后 audio 领先 video 的 20ms 逐 ms 相同，不是「大致」。
+        #[test]
+        fn a_real_rebase_keeps_audio_video_skew_exactly() {
+            const B: u32 = 100_000;
+            let mut rebase = TimestampRebase::default();
+            let mut skew = |rebase: &mut TimestampRebase, ts: u32| {
+                let a = rebase.map(TagType::Audio, ts - 20).emit as i64;
+                let v = rebase.map(TagType::Video, ts).emit as i64;
+                v - a
+            };
+            for i in 1..10u32 {
+                assert_eq!(skew(&mut rebase, B + i * 1_000), 20);
+            }
+            rebase.map(TagType::Script, 0);
+            skew(&mut rebase, 1_000);
+            skew(&mut rebase, 2_000);
+            for i in 3..10u32 {
+                assert_eq!(skew(&mut rebase, i * 1_000), 20, "第 {i} 帧");
+            }
         }
 
         /// 孤立的一帧噪声不该改基准：下一帧回到原基准时，原基准继续。
