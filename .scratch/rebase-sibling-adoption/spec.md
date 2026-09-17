@@ -114,6 +114,9 @@ issue 要的那一层：#13 step 02 加的 `detect_packet_jump` 用 `ffprobe -sh
 
 01 是根因，独立闭环。02 改的是上传策略，主人拍板「修，修不好的不上传」后与 01 同一分支落地。
 
+两步已随 [#63](https://github.com/dplei/biliup/pull/63) 合入 `dev`，随 1.3.30 发版。生产验收清单贴在
+issue #62 评论里（标签 `awaiting-verification`），验完再归档本目录。
+
 ## 不做什么
 
 - 不动 `Segmentable`（`util.rs`）：分段计时不受影响。
