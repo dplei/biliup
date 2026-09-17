@@ -87,7 +87,7 @@ interface Props {
 
 function RecoveryLink() {
 	return (
-		<Link href="/missing" className={styles.recoveryLink}>
+		<Link href="/uploads" className={styles.recoveryLink}>
 			去上传列表
 			<IconArrowRight size="small" aria-hidden="true" />
 		</Link>

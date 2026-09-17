@@ -94,7 +94,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                     ),
                 },
                 {
-                    itemKey: 'missing',
+                    itemKey: 'uploads',
                     text: '上传列表',
                     icon: (
                         <div
@@ -211,7 +211,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     )
     const renderWrapper = useCallback(({ itemElement, isSubNav, isInSubNav, props }: any) => {
         const routerMap: Record<string, string> = {
-            missing: '/missing',
+            uploads: '/uploads',
             history: '/history',
             dashboard: '/dashboard',
             streamers: '/streamers',

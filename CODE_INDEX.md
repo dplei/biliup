@@ -56,7 +56,7 @@
 | `app/ui/StreamerActions/RecordingLeaseModal.tsx` | 录制期限的创建、延期、清除与状态/通知反馈弹窗，负责把浏览器本地选择转换为明确 UTC 时间点。 | `RecordingLeaseModal` |
 | `app/ui/StreamerActions/CheckStreamButton.tsx` | 直播管理卡片上的「立即检查直播流」按钮：调一次主动检查接口并按结论提示，随后刷新主播列表。 | `CheckStreamButton` |
 | `app/ui/StreamerActions/PauseButton.tsx` | 以显式目标状态暂停/恢复单个直播间；到期暂停的恢复入口会禁用并提示先处理期限。 | `PauseButton`、`setRecordingState` |
-| `app/(app)/missing/page.tsx` | 上传列表页（路由仍是 `/missing`）：每个分段从登记起就在这里，首传与失败重试同表；独立轮询待投稿会话和分段列表，按状态在单个「详情」列展示进度/去向/错误，并触发会话恢复、空会话逻辑终结、立即上传、换线重传、停止、删除与本场补扫。 | `UploadList`、`renderDetail`、`AttemptHistoryPanel` |
+| `app/(app)/uploads/page.tsx` | 上传列表页：每个分段从登记起就在这里，首传与失败重试同表；独立轮询待投稿会话和分段列表，按状态在单个「详情」列展示进度/去向/错误，并触发会话恢复、空会话逻辑终结、立即上传、换线重传、停止、删除与本场补扫。 | `UploadList`、`renderDetail`、`AttemptHistoryPanel` |
 | `app/ui/OverrideModal.tsx` | 主播级「配置覆写」弹窗：顶部 JSON 文本框与各分区控件合成同一份 `override`，提交时控件值覆盖文本框的同名键。`entityFields` 里的键是 livestreamers 表上的真实列，不进 override。音量一组由「为这个房间单独设置音量」独占，与全局同值且原先未覆写的项不写入，override 保持最小。Form 带 `key`，每次打开重建，否则 Semi 保留的折叠面板不会重新应用 initValues。 | `OverrideModal`、`handleOk`、`AudioOverrideSection`、`CoverSection`、`AUDIO_OVERRIDE_FIELDS`、`AUDIO_OVERRIDE_TOGGLE` |
 | `app/ui/AudioNormalizationControl.tsx` | 响度标准化的表单控件，空间配置页与主播覆写弹窗共用同一套界面：开关、磁盘保留线、保留原片、竖向音量推子，以及基于 WebAudio 增益的样片试听。样片全局唯一，覆写弹窗传 `showSample={false}` 隐藏其更新/删除按钮。 | `AudioNormalizationControl`、`prepareAudio`、`STATUS_URL`、`SAMPLE_URL` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |
@@ -195,7 +195,7 @@
 - `crates/biliup-cli/src/server/common/missing_segment.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`cancel_registered_attempt`）：收割一条仍被本进程持有的租约时，先真正取消并等它退出，再 CAS 落库，杜绝幽灵上传。
 - `crates/biliup-cli/src/server/common/recovery_scheduler.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`claim_manual_recovery`）：主动扫描与按会话恢复复用手动补传的资格判定和 claim，只是把执行搬到后台任务。
 - `crates/biliup-cli/src/server/common/submission_scheduler.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`reconcile_session_submission`）：启动与周期扫描按数据库投稿意图选出到期会话，以有界并发唤醒同一协调器；跨事件/扫描去重仍由持久 submit claim 保证。
-- `app/(app)/missing/page.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`discard_empty_upload_session`）：页面分别读取分段聚合视图和独立待投稿会话；投稿操作状态由后端给出，不确定 claim 不显示危险重试入口，严格零基线会话可逻辑终结而不删除历史身份。
+- `app/(app)/uploads/page.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`discard_empty_upload_session`）：页面分别读取分段聚合视图和独立待投稿会话；投稿操作状态由后端给出，不确定 claim 不显示危险重试入口，严格零基线会话可逻辑终结而不删除历史身份。
 - `crates/biliup-cli/src/server/api/stream_check.rs` → `crates/biliup-cli/src/server/core/download_manager.rs`（`check_room_now`）：接口把主动检查转交监控 Actor，摘队列与检查是同一步原子操作，避免和轮询同时检查同一个房间、把一场直播拉起两次录制。
 - `crates/biliup-cli/src/server/core/monitor.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`reusable_streamer_info`）：开播检测先用平台场次键找同场未 finalize 的 `streamer_info`，重启不再为同一场直播造出第二个身份。
 - `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup-cli/src/server/common/upload_session.rs`（`session_submit_readiness`、`claim_complete_session`、`schedule_submit_retry`）：分段成功和多类结束事件只唤醒统一协调器；协调器按意图/退避预检并共用严格完整性 claim 闸门，明确失败释放 claim，不确定远端结果保留 claim。
