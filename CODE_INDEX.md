@@ -56,7 +56,7 @@
 | `app/ui/StreamerActions/RecordingLeaseModal.tsx` | 录制期限的创建、延期、清除与状态/通知反馈弹窗，负责把浏览器本地选择转换为明确 UTC 时间点。 | `RecordingLeaseModal` |
 | `app/ui/StreamerActions/CheckStreamButton.tsx` | 直播管理卡片上的「立即检查直播流」按钮：调一次主动检查接口并按结论提示，随后刷新主播列表。 | `CheckStreamButton` |
 | `app/ui/StreamerActions/PauseButton.tsx` | 以显式目标状态暂停/恢复单个直播间；到期暂停的恢复入口会禁用并提示先处理期限。 | `PauseButton`、`setRecordingState` |
-| `app/(app)/missing/page.tsx` | 缺失补传与待投稿控制页：独立轮询待投稿会话和分段列表，展示后端给出的投稿五态、attempt 阶段/进度/线路健康/完整性与线路历史，并触发会话恢复、空会话逻辑终结、补传、换线重投、停止、删除与本场补扫。 | `MissingRecovery`、`AttemptHistoryPanel` |
+| `app/(app)/missing/page.tsx` | 上传列表页（路由仍是 `/missing`）：每个分段从登记起就在这里，首传与失败重试同表；独立轮询待投稿会话和分段列表，按状态在单个「详情」列展示进度/去向/错误，并触发会话恢复、空会话逻辑终结、立即上传、换线重传、停止、删除与本场补扫。 | `UploadList`、`renderDetail`、`AttemptHistoryPanel` |
 | `app/ui/OverrideModal.tsx` | 主播级「配置覆写」弹窗：顶部 JSON 文本框与各分区控件合成同一份 `override`，提交时控件值覆盖文本框的同名键。`entityFields` 里的键是 livestreamers 表上的真实列，不进 override。音量一组由「为这个房间单独设置音量」独占，与全局同值且原先未覆写的项不写入，override 保持最小。Form 带 `key`，每次打开重建，否则 Semi 保留的折叠面板不会重新应用 initValues。 | `OverrideModal`、`handleOk`、`AudioOverrideSection`、`CoverSection`、`AUDIO_OVERRIDE_FIELDS`、`AUDIO_OVERRIDE_TOGGLE` |
 | `app/ui/AudioNormalizationControl.tsx` | 响度标准化的表单控件，空间配置页与主播覆写弹窗共用同一套界面：开关、磁盘保留线、保留原片、竖向音量推子，以及基于 WebAudio 增益的样片试听。样片全局唯一，覆写弹窗传 `showSample={false}` 隐藏其更新/删除按钮。 | `AudioNormalizationControl`、`prepareAudio`、`STATUS_URL`、`SAMPLE_URL` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |

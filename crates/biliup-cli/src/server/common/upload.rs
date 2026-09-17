@@ -834,7 +834,7 @@ pub async fn reconcile_session_submission(
                     config.cookie_health_webhook.as_deref(),
                     "投稿已暂停：存在未完成分段",
                     &format!(
-                        "会话 #{session_row_id} 因 {} 个未完成或异常分段暂停投稿；请在缺失补传页面处理。",
+                        "会话 #{session_row_id} 因 {} 个未完成或异常分段暂停投稿；请在上传列表页面处理。",
                         completeness.incomplete_count()
                     ),
                 );

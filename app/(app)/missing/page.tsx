@@ -1,5 +1,5 @@
 'use client'
-import { Button, Layout, Popconfirm, Select, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
+import { Banner, Button, Layout, Popconfirm, Progress, Select, Table, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { IconDeleteStroked, IconRefresh, IconSendStroked } from '@douyinfe/semi-icons'
 import { useEffect, useMemo, useState } from 'react'
 import useSWR from 'swr'
@@ -65,8 +65,8 @@ interface RecoveryAccepted {
 }
 
 const ELIGIBILITY_TEXT: Record<string, string> = {
-  already_succeeded: '该分段已经补传成功',
-  already_running: '已有一次补传在跑，本页会持续刷新它的进度',
+  already_succeeded: '该分段已经上传成功',
+  already_running: '已有一次上传在跑，本页会持续刷新它的进度',
   source_missing: '本地源文件不存在',
   finalized_rejected: '所属会话已投稿完成，不再接受新分段',
   legacy_finalized_edit: '已补进现有稿件；该编辑可能触发重新审核',
@@ -160,9 +160,9 @@ interface RescanResult {
 }
 
 const STATUS_META: Record<string, { color: 'grey' | 'red' | 'orange' | 'green'; text: string }> = {
-  pending: { color: 'grey', text: '待补传' },
+  pending: { color: 'grey', text: '待上传' },
   failed: { color: 'red', text: '失败' },
-  uploading: { color: 'orange', text: '补传中' },
+  uploading: { color: 'orange', text: '上传中' },
   succeeded: { color: 'green', text: '已完成' },
   source_missing: { color: 'grey', text: '源文件缺失' },
 }
@@ -223,7 +223,7 @@ const baseName = (p: string) => p.split(/[/\\]/).pop() || p
 // 仍由 Semi 校验，这里只截断无意义的类型展开。
 const SimpleSelect = Select as any
 
-export default function MissingRecovery() {
+export default function UploadList() {
   const { Header, Content } = Layout
   const { Text } = Typography
   const [statusFilter, setStatusFilter] = useState<'active' | 'succeeded' | 'all'>('active')
@@ -289,7 +289,7 @@ export default function MissingRecovery() {
         arg: { streamer_info_id: rescanStreamerInfoId },
       })) as RescanResult
       if (result.skipped_finalized && result.upload_session_id != null) {
-        Toast.success(`会话 #${result.upload_session_id} 已终结，补扫未创建新的补传任务`)
+        Toast.success(`会话 #${result.upload_session_id} 已终结，补扫未创建新的上传任务`)
       } else if (result.upload_session_id == null) {
         Toast.info(
           `补扫完成：未发现可登记分段；${result.skipped_known} 段已登记，${result.skipped_invalid} 段无效`,
@@ -323,7 +323,7 @@ export default function MissingRecovery() {
   const describeAccepted = (result: RecoveryAccepted) => {
     if (!result.ok) return null
     const line = result.line ? `，线路 ${result.line}` : ''
-    return `已在后台开始补传${line}；进度会在本页自动刷新`
+    return `已在后台开始上传${line}；进度会在本页自动刷新`
   }
 
   const handleRecover = async (id: number) => {
@@ -333,7 +333,7 @@ export default function MissingRecovery() {
         arg: lineArg(id),
       })) as RecoveryAccepted
       if (!result.ok) {
-        Toast.warning(`未执行补传：${ELIGIBILITY_TEXT[result.eligibility] ?? result.eligibility}`)
+        Toast.warning(`未执行上传：${ELIGIBILITY_TEXT[result.eligibility] ?? result.eligibility}`)
       } else {
         Toast.success(describeAccepted(result)!)
         if (result.line_skip_reason) {
@@ -342,7 +342,7 @@ export default function MissingRecovery() {
       }
       await mutate()
     } catch (e: any) {
-      Toast.error(`补传失败：${e?.message ?? e}`)
+      Toast.error(`上传失败：${e?.message ?? e}`)
     } finally {
       setRecoveringId(null)
     }
@@ -364,7 +364,7 @@ export default function MissingRecovery() {
       }
       await mutate()
     } catch (e: any) {
-      Toast.error(`重新补投失败：${e?.message ?? e}`)
+      Toast.error(`换线重传失败：${e?.message ?? e}`)
     } finally {
       setRetryingId(null)
     }
@@ -394,7 +394,7 @@ export default function MissingRecovery() {
     setDeletingId(id)
     try {
       await requestDelete('/v1/uploads/missing', { arg: id })
-      Toast.success('已删除缺失记录和本地文件')
+      Toast.success('已删除上传记录和本地文件')
       await mutate()
     } catch (e: any) {
       Toast.error(`删除失败：${e?.message ?? e}`)
@@ -410,7 +410,7 @@ export default function MissingRecovery() {
         arg: {},
       })) as SessionRecoveryAccepted
       if (result.segments_started.length > 0) {
-        Toast.success(`会话 #${id} 已开始补传 ${result.segments_started.length} 个分段`)
+        Toast.success(`会话 #${id} 已开始上传 ${result.segments_started.length} 个分段`)
       } else if (result.submission_queued) {
         Toast.success(`会话 #${id} 已排队投稿，页面会自动刷新结果`)
       } else if (result.blocking_summary) {
@@ -459,186 +459,162 @@ export default function MissingRecovery() {
     />
   )
 
+  /** 表格里「详情」一列：按状态只显示此刻有意义的信息，不再让十来列大多写着「—」。 */
+  const renderDetail = (record: MissingSegment) => {
+    if (record.status === 'uploading') {
+      const phase = record.attempt_phase ? PHASE_META[record.attempt_phase] : undefined
+      const phaseSeconds = record.phase_started_at
+        ? (now - new Date(record.phase_started_at).getTime()) / 1000
+        : 0
+      // 转码与排队阶段没有网络字节可言，显示「已无进度」只会让人误以为卡住了。
+      if (record.attempt_phase && record.attempt_phase !== 'transferring') {
+        return (
+          <div>
+            <div>{phase?.text ?? record.attempt_phase} · 已 {fmtDuration(phaseSeconds)}</div>
+            <Text type="tertiary" size="small">{phase?.hint ?? ''}</Text>
+            <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
+          </div>
+        )
+      }
+      const total = record.total_bytes ?? 0
+      const percent = total > 0 ? Math.min(100, (record.uploaded_bytes / total) * 100) : 0
+      const stalledSeconds = record.last_progress_at
+        ? Math.max(0, Math.floor((now - new Date(record.last_progress_at).getTime()) / 1000))
+        : 0
+      return (
+        <div>
+          <Progress percent={Number(percent.toFixed(1))} showInfo style={{ maxWidth: 290 }} aria-label="上传进度" />
+          <Text type="tertiary" size="small">
+            {fmtBytes(record.uploaded_bytes)} / {fmtBytes(total)} · {record.current_line ?? '未知线路'}
+            {record.line_source ? `（${LINE_SOURCE_TEXT[record.line_source] ?? record.line_source}）` : ''}
+            {stalledSeconds >= 30 ? ` · 已无进度 ${fmtDuration(stalledSeconds)}` : ''}
+          </Text>
+          {record.last_chunk_index != null && (
+            <div>
+              <Text type="tertiary" size="small">
+                最近确认分块 #{record.last_chunk_index}
+                {record.last_chunk_started_at
+                  ? ` · 距今 ${fmtDuration((now - new Date(record.last_chunk_started_at).getTime()) / 1000)}`
+                  : ''}
+              </Text>
+            </div>
+          )}
+          <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
+        </div>
+      )
+    }
+
+    if (record.status === 'succeeded') {
+      // 番号优先看 missing 行自身 aid，没有再回退到所属会话的 aid/bvid。
+      const aid = record.aid ?? record.session_aid
+      const link = aid != null
+        ? { href: `https://www.bilibili.com/video/av${aid}`, text: `已投稿 av${aid}` }
+        : record.session_bvid
+          ? { href: `https://www.bilibili.com/video/${record.session_bvid}`, text: `已投稿 ${record.session_bvid}` }
+          : null
+      return (
+        <div>
+          {link ? (
+            <a href={link.href} target="_blank" rel="noreferrer">{link.text}</a>
+          ) : record.upload_session_id != null ? (
+            <Text type="tertiary">待投稿（会话 #{record.upload_session_id}）</Text>
+          ) : (
+            '—'
+          )}
+          <div><Text type="tertiary" size="small">完成于 {fmtTime(record.updated_at)}</Text></div>
+        </div>
+      )
+    }
+
+    const errors = (
+      <>
+        {record.last_error && (
+          <div>
+            <Text type="danger" size="small" ellipsis={{ showTooltip: { opts: { content: record.last_error } } }} style={{ maxWidth: 290 }}>
+              {record.last_error}
+            </Text>
+          </div>
+        )}
+        {record.last_chunk_error && (
+          <div>
+            <Text type="tertiary" size="small" ellipsis={{ showTooltip: { opts: { content: record.last_chunk_error } } }} style={{ maxWidth: 290 }}>
+              {record.last_chunk_error}
+            </Text>
+          </div>
+        )}
+      </>
+    )
+    if (record.status === 'source_missing') return <div>{errors}</div>
+    return (
+      <div>
+        <div>
+          <Text type="tertiary" size="small">下次自动重试 {fmtTime(record.next_retry_at)}</Text>
+        </div>
+        {errors}
+      </div>
+    )
+  }
+
   const columns = [
     {
       title: '文件',
       dataIndex: 'file_path',
+      width: 280,
       render: (path: string, record: MissingSegment) => (
-        <div id={`missing-segment-${record.id}`}>
-          <Text ellipsis={{ showTooltip: { opts: { content: path } } }} style={{ maxWidth: 240 }}>
+        <div id={`missing-segment-${record.id}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Tag size="small" color="white">P{record.segment_order}</Tag>
+          <Text ellipsis={{ showTooltip: { opts: { content: path } } }} style={{ maxWidth: 220 }}>
             {baseName(path)}
           </Text>
         </div>
       ),
     },
-    { title: '分 P 顺序', dataIndex: 'segment_order', width: 96 },
     {
       title: '状态',
       dataIndex: 'status',
-      width: 100,
-      render: (status: string) => {
+      width: 120,
+      render: (status: string, record: MissingSegment) => {
         const meta = STATUS_META[status] ?? { color: 'grey' as const, text: status }
-        return <Tag color={meta.color}>{meta.text}</Tag>
-      },
-    },
-    { title: '尝试次数', dataIndex: 'attempts', width: 96 },
-    {
-      title: '上传进度',
-      dataIndex: 'uploaded_bytes',
-      width: 260,
-      render: (_: number, record: MissingSegment) => {
-        if (record.status !== 'uploading') return '—'
-        const phase = record.attempt_phase ? PHASE_META[record.attempt_phase] : undefined
-        const phaseSeconds = record.phase_started_at
-          ? (now - new Date(record.phase_started_at).getTime()) / 1000
-          : 0
-        // 转码与排队阶段没有网络字节可言，显示「已无进度」只会让人误以为卡住了。
-        if (record.attempt_phase && record.attempt_phase !== 'transferring') {
-          return (
-            <div>
-              <div>{phase?.text ?? record.attempt_phase} · 已 {fmtDuration(phaseSeconds)}</div>
-              <Text type="tertiary" size="small">{phase?.hint ?? ''}</Text>
-              <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
-            </div>
-          )
-        }
-        const total = record.total_bytes ?? 0
-        const percent = total > 0 ? Math.min(100, (record.uploaded_bytes / total) * 100) : 0
-        const stalledSeconds = record.last_progress_at
-          ? Math.max(0, Math.floor((now - new Date(record.last_progress_at).getTime()) / 1000))
-          : 0
         return (
           <div>
-            <div>{percent.toFixed(1)}% · {fmtBytes(record.uploaded_bytes)} / {fmtBytes(total)}</div>
-            <Text type="tertiary" size="small">
-              {record.current_line ?? '未知线路'}
-              {record.line_source ? `（${LINE_SOURCE_TEXT[record.line_source] ?? record.line_source}）` : ''}
-              {' · '}已无进度 {fmtDuration(stalledSeconds)}
-            </Text>
-            {record.last_chunk_index != null && (
-              <div>
-                <Text type="tertiary" size="small">
-                  最近确认分块 #{record.last_chunk_index}
-                  {record.last_chunk_started_at
-                    ? ` · 距今 ${fmtDuration((now - new Date(record.last_chunk_started_at).getTime()) / 1000)}`
-                    : ''}
-                </Text>
-              </div>
+            <Tag color={meta.color}>{meta.text}</Tag>
+            {record.attempts > 0 && status !== 'succeeded' && (
+              <div><Text type="tertiary" size="small">已尝试 {record.attempts} 次</Text></div>
             )}
-            <div><Text type="tertiary" size="small">开始于 {fmtTime(record.upload_started_at)}</Text></div>
           </div>
         )
       },
+    },
+    {
+      title: '详情',
+      dataIndex: 'detail',
+      width: 320,
+      render: (_: unknown, record: MissingSegment) => renderDetail(record),
     },
     {
       title: '线路',
       dataIndex: 'line_index',
-      width: 210,
-      render: (_: number, record: MissingSegment) => (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div>
-            下次：{lineChoice[record.id] || record.next_line}
-            {lineChoice[record.id] ? '（手动指定）' : ''}
-          </div>
-          {record.status !== 'succeeded' && renderLinePicker(record)}
-          {record.line_skip_reason && (
-            <Text type="tertiary" size="small">
-              已跳过 {record.line_skip_reason}
-            </Text>
-          )}
-        </div>
-      ),
-    },
-    {
-      title: '下次重试',
-      dataIndex: 'next_retry_at',
       width: 180,
-      render: (s: string) => fmtTime(s),
-    },
-    {
-      title: '最后错误',
-      dataIndex: 'last_error',
-      render: (err: string | null, record: MissingSegment) => {
-        if (!err && !record.last_chunk_error) return '—'
+      render: (_: number, record: MissingSegment) => {
+        if (record.status === 'succeeded') return <Text type="tertiary">{record.current_line ?? '—'}</Text>
         return (
-          <div>
-            {err && (
-              <Text type="danger" ellipsis={{ showTooltip: { opts: { content: err } } }} style={{ maxWidth: 280 }}>
-                {err}
-              </Text>
-            )}
-            {record.last_chunk_error && (
-              <div>
-                <Text
-                  type="tertiary"
-                  size="small"
-                  ellipsis={{ showTooltip: { opts: { content: record.last_chunk_error } } }}
-                  style={{ maxWidth: 280 }}
-                >
-                  {record.last_chunk_error}
-                </Text>
-              </div>
-            )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {renderLinePicker(record)}
+            <Text type="tertiary" size="small">
+              下次 {lineChoice[record.id] || record.next_line}
+              {lineChoice[record.id] ? '（手动指定）' : ''}
+              {record.line_skip_reason ? ` · 已跳过 ${record.line_skip_reason}` : ''}
+            </Text>
           </div>
         )
       },
     },
     {
-      title: '去向',
-      dataIndex: 'destination',
-      width: 220,
-      render: (_: unknown, record: MissingSegment) => {
-        if (record.status !== 'succeeded') return '—'
-        // 番号优先看 missing 行自身 aid，没有再回退到所属会话的 aid/bvid。
-        const aid = record.aid ?? record.session_aid
-        if (aid != null) {
-          return (
-            <a
-              href={`https://www.bilibili.com/video/av${aid}`}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: 'inherit' }}
-            >
-              已投稿 av{aid}
-            </a>
-          )
-        }
-        if (record.session_bvid) {
-          return (
-            <a
-              href={`https://www.bilibili.com/video/${record.session_bvid}`}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: 'inherit' }}
-            >
-              已投稿 {record.session_bvid}
-            </a>
-          )
-        }
-        if (record.upload_session_id != null) {
-          return (
-            <Text type="tertiary">
-              待提交（会话 #{record.upload_session_id}，尚未投稿）
-            </Text>
-          )
-        }
-        return '—'
-      },
-    },
-    {
-      title: '完成时间',
-      dataIndex: 'updated_at',
-      width: 180,
-      render: (s: string, record: MissingSegment) =>
-        record.status === 'succeeded' ? fmtTime(s) : '—',
-    },
-    {
       title: '操作',
       dataIndex: 'operate',
-      width: 180,
-      fixed: 'right' as const,
+      width: 200,
       render: (_: unknown, record: MissingSegment) => {
-        if (record.status === 'succeeded') return '—'
+        if (record.status === 'succeeded') return null
 
         if (record.status === 'source_missing') {
           return (
@@ -652,13 +628,13 @@ export default function MissingRecovery() {
                 重新检查文件
               </Button>
               <Popconfirm
-                title="删除这条缺失记录？"
+                title="删除这条记录？"
                 content="仅删除本地记录；源文件已经不存在。"
                 okText="删除"
                 okButtonProps={{ type: 'danger' }}
                 onConfirm={() => handleDelete(record.id)}
               >
-                <Button theme="borderless" type="danger" icon={<IconDeleteStroked />} loading={deletingId === record.id} />
+                <Button theme="borderless" type="danger" icon={<IconDeleteStroked />} aria-label="删除记录" loading={deletingId === record.id} />
               </Popconfirm>
             </div>
           )
@@ -668,7 +644,7 @@ export default function MissingRecovery() {
           return (
             <div style={{ display: 'flex', gap: 4 }}>
               <Popconfirm
-                title="停止这次补传？"
+                title="停止这次上传？"
                 content="取消当前 attempt 并释放它，状态转为「失败」。不会自动重传——停止之后由你决定下一步。"
                 okText="停止"
                 okButtonProps={{ type: 'danger' }}
@@ -679,9 +655,9 @@ export default function MissingRecovery() {
                 </Button>
               </Popconfirm>
               <Popconfirm
-                title="换线重投这一段？"
-                content="将取消旧 attempt，等待其退出，并按上方选择的线路重新上传该分段。"
-                okText="换线重投"
+                title="换线重传这一段？"
+                content="将取消旧 attempt，等待其退出，并按左侧选择的线路重新上传该分段。"
+                okText="换线重传"
                 onConfirm={() => handleRetry(record.id)}
               >
                 <Button
@@ -689,7 +665,7 @@ export default function MissingRecovery() {
                   icon={<IconSendStroked />}
                   loading={retryingId === record.id}
                 >
-                  换线重投
+                  换线重传
                 </Button>
               </Popconfirm>
             </div>
@@ -699,9 +675,9 @@ export default function MissingRecovery() {
         return (
           <div style={{ display: 'flex', gap: 4 }}>
             <Popconfirm
-              title="补传这一段？"
-              content="将在后台重新上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待提交会话。"
-              okText="补传"
+              title="立即上传这一段？"
+              content="将在后台上传该分段，并按原分 P 位置补进对应稿件（已投稿）或待投稿会话。"
+              okText="上传"
               onConfirm={() => handleRecover(record.id)}
             >
               <Button
@@ -709,12 +685,12 @@ export default function MissingRecovery() {
                 icon={<IconSendStroked />}
                 loading={recoveringId === record.id}
               >
-                补传
+                立即上传
               </Button>
             </Popconfirm>
             <Popconfirm
-              title="删除这条缺失记录？"
-              content="将删除缺失补传记录，并同时删除对应本地视频文件和弹幕文件。此操作不会补投到 B 站。"
+              title="删除这条记录？"
+              content="将删除上传记录，并同时删除对应本地视频文件和弹幕文件。此操作不会投到 B 站。"
               okText="删除"
               okButtonProps={{ type: 'danger' }}
               onConfirm={() => handleDelete(record.id)}
@@ -723,6 +699,7 @@ export default function MissingRecovery() {
                 theme="borderless"
                 type="danger"
                 icon={<IconDeleteStroked />}
+                aria-label="删除记录"
                 loading={deletingId === record.id}
               />
             </Popconfirm>
@@ -731,6 +708,13 @@ export default function MissingRecovery() {
       },
     },
   ]
+
+  const sectionTitle = (title: string, hint?: string) => (
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+      <Text strong style={{ fontSize: 16 }}>{title}</Text>
+      {hint && <Text type="tertiary" size="small">{hint}</Text>}
+    </div>
+  )
 
   return (
     <>
@@ -756,30 +740,17 @@ export default function MissingRecovery() {
               }}
               size="large"
             />
-            <h4>缺失补传</h4>
+            <h4>上传列表</h4>
           </div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <SimpleSelect
-              value={rescanStreamerInfoId ?? undefined}
-              onChange={(value: unknown) => setRescanStreamerInfoId(Number(value))}
-              filter
-              placeholder="选择本场直播"
-              style={{ width: 300 }}
-              optionList={recentStreamerInfos.map((info) => ({
-                value: info.id,
-                label: `${info.name} · ${new Date(info.date * 1000).toLocaleString()}`,
-              }))}
-            />
-            <Button icon={<IconRefresh />} loading={rescanning} onClick={handleRescan}>
-              补扫本场
-            </Button>
             <SimpleSelect
               value={statusFilter}
               onChange={(v: unknown) => setStatusFilter(v as 'active' | 'succeeded' | 'all')}
               style={{ width: 130 }}
+              aria-label="按状态筛选"
               optionList={[
-                { value: 'active', label: '待补传' },
-                { value: 'succeeded', label: '已补传' },
+                { value: 'active', label: '进行中' },
+                { value: 'succeeded', label: '已完成' },
                 { value: 'all', label: '全部' },
               ]}
             />
@@ -795,30 +766,25 @@ export default function MissingRecovery() {
       </Header>
       <Content style={{ padding: '24px', backgroundColor: 'var(--semi-color-bg-0)' }}>
         {coolingLines.length > 0 && (
-          <div
-            style={{
-              marginBottom: 16,
-              padding: 12,
-              borderRadius: 6,
-              background: 'var(--semi-color-danger-light-default)',
-            }}
-          >
-            <Text strong>以下上传线路正在冷却，补传会自动绕开它们</Text>
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 4 }}>
-              {coolingLines.map((line) => (
-                <Text key={line.line_key} type="tertiary" size="small">
-                  {line.line_key}：{line.last_failure_kind ?? '失败'} · 连续失败 {line.consecutive_failures} 次 ·
-                  剩余 {fmtDuration((new Date(line.cooldown_until!).getTime() - now) / 1000)}
-                </Text>
-              ))}
-            </div>
-          </div>
+          <Banner
+            type="danger"
+            closeIcon={null}
+            style={{ marginBottom: 16 }}
+            title="以下上传线路正在冷却，上传会自动绕开它们"
+            description={
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                {coolingLines.map((line) => (
+                  <Text key={line.line_key} size="small">
+                    {line.line_key}：{line.last_failure_kind ?? '失败'} · 连续失败 {line.consecutive_failures} 次 ·
+                    剩余 {fmtDuration((new Date(line.cooldown_until!).getTime() - now) / 1000)}
+                  </Text>
+                ))}
+              </div>
+            }
+          />
         )}
-        <section style={{ marginBottom: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
-            <Text strong style={{ fontSize: 16 }}>待投稿会话</Text>
-            <Text type="tertiary" size="small">独立于下方缺失分段筛选</Text>
-          </div>
+        <section style={{ marginBottom: 28 }}>
+          <div style={{ marginBottom: 12 }}>{sectionTitle('待投稿会话', '不受下方状态筛选影响')}</div>
           {pendingSessionsLoading && <Text type="tertiary">正在读取待投稿状态…</Text>}
           {!pendingSessionsLoading && (pendingSessions?.length ?? 0) === 0 && (
             <div style={{ padding: 12, borderRadius: 6, background: 'var(--semi-color-fill-0)' }}>
@@ -843,9 +809,8 @@ export default function MissingRecovery() {
                     padding: 12,
                     borderRadius: 6,
                     border: '1px solid var(--semi-color-border)',
-                    background: session.action === 'manual_inspection'
-                      ? 'var(--semi-color-danger-light-default)'
-                      : 'var(--semi-color-warning-light-default)',
+                    borderLeft: `4px solid var(--semi-color-${session.action === 'manual_inspection' ? 'danger' : 'warning'})`,
+                    background: 'var(--semi-color-bg-1)',
                   }}
                 >
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -907,34 +872,63 @@ export default function MissingRecovery() {
             })}
           </div>
         </section>
-        <Text type="tertiary" style={{ display: 'block', marginBottom: 16 }}>
-          录制期间上传失败、尚未补传的分段。下播提交前会自动换线重试到期的分段；这里可手动立即补传，
-          补传成功后会按原分 P 位置补进对应稿件或待提交会话。切换「已补传」可查看历史记录与去向，
-          其中「#会话号」即日志里的 session，可在「实时日志」按该号检索整条上传链路。若有效录像已留在
-          本地但列表中没有记录，请选择对应的本场直播并点「补扫本场」；空片段不会被加入。
-          「补传」「换线重投」都是后台执行，接口立刻返回，进度看本页；「停止」只释放卡住的任务，不会自动重传。
-          展开任意一行可以看到它先后用过哪些线路、每次为何结束。
-        </Text>
-        <Table
-          rowKey="id"
-          columns={columns}
-          dataSource={rows}
-          loading={isLoading}
-          pagination={false}
-          scroll={{ x: 'max-content' }}
-          expandedRowRender={(record?: MissingSegment) =>
-            record ? <AttemptHistoryPanel missingId={record.id} /> : null
-          }
-          empty={
-            <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--semi-color-text-2)' }}>
-              <IconSendStroked
-                size="extra-large"
-                style={{ color: 'var(--semi-color-text-3)', marginBottom: 8 }}
+        <section>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+            {sectionTitle('分段', rows ? `${rows.length} 条` : undefined)}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <SimpleSelect
+                value={rescanStreamerInfoId ?? undefined}
+                onChange={(value: unknown) => setRescanStreamerInfoId(Number(value))}
+                filter
+                placeholder="选择本场直播"
+                aria-label="补扫的直播场次"
+                style={{ width: 300 }}
+                optionList={recentStreamerInfos.map((info) => ({
+                  value: info.id,
+                  label: `${info.name} · ${new Date(info.date * 1000).toLocaleString()}`,
+                }))}
               />
-              <div>暂无待补传的缺失分段</div>
+              <Button icon={<IconRefresh />} loading={rescanning} onClick={handleRescan}>
+                补扫本场
+              </Button>
             </div>
-          }
-        />
+          </div>
+          <details style={{ marginBottom: 12 }}>
+            <summary style={{ cursor: 'pointer', color: 'var(--semi-color-text-2)', fontSize: 13 }}>这一页怎么用</summary>
+            <Text type="tertiary" size="small" style={{ display: 'block', marginTop: 6, lineHeight: 1.7 }}>
+              每个录制分段从登记起就在这里：首次上传、失败后的自动换线重试、下播后的投稿都能看到。
+              「立即上传」「换线重传」都在后台执行，接口立刻返回，进度看本页；「停止」只释放卡住的任务，不会自动重传。
+              上传成功后会按原分 P 位置补进对应稿件或待投稿会话；切到「已完成」可看去向，
+              「#会话号」即日志里的 session，可在「实时日志」按它检索整条上传链路。
+              若有效录像留在本地但列表中没有记录，选对应场次点「补扫本场」；空片段不会被加入。
+              展开任意一行可以看到它先后用过哪些线路、每次为何结束。
+            </Text>
+          </details>
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={rows}
+            loading={isLoading}
+            pagination={false}
+            scroll={{ x: 'max-content' }}
+            hideExpandedColumn={false}
+            expandedRowRender={(record?: MissingSegment) =>
+              record ? <AttemptHistoryPanel missingId={record.id} /> : null
+            }
+            empty={
+              <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--semi-color-text-2)' }}>
+                <IconSendStroked
+                  size="extra-large"
+                  style={{ color: 'var(--semi-color-text-3)', marginBottom: 8 }}
+                />
+                <div>{statusFilter === 'active' ? '没有进行中的上传' : '还没有记录'}</div>
+                {statusFilter === 'active' && (
+                  <Text type="tertiary" size="small">切到「已完成」或「全部」查看历史</Text>
+                )}
+              </div>
+            }
+          />
+        </section>
       </Content>
     </>
   )
