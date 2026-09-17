@@ -1,6 +1,6 @@
 # 02 上传侧：前跳判 `Unfixable` 之后不该直传原片
 
-Status: needs-decision
+Status: resolved（主人拍板：修，修不好的不上传）
 
 不是根因，是第二道防线的策略缺口。step 01 上线后新片不会再产生这种前跳，本步只影响
 存量坏片与 01 漏掉的未知形态。
@@ -11,7 +11,29 @@ Status: needs-decision
 `Anomalous { max_backward_ms: None }`；`normalize_timestamps` 对 `None` 判 `Unfixable`，
 `upload.rs` 的处置是**直传原片 + 告警**。#62 的文件就是这样被送去 B 站的。
 
-## 两个方向，需要主人选
+## 落地
+
+采用 A，并把 `Unfixable` 从「直传原片 + 告警」改成「报错不上传 + 告警，本地文件保留」，
+三处消费点（首次上传 / 补传 / 手动补投）的直传分支删除，lifecycle 行按常规 10 分钟退避重试。
+表达式实际写法（`delta_setts`）：
+
+```
+STEP = if(gt(DTS-PREV_INDTS,30000), 1, max(DTS-PREV_INDTS,1))
+dts  = if(lt(PREV_OUTDTS,-1e15), DTS, PREV_OUTDTS+STEP)
+pts  = if(lt(PREV_OUTDTS,-1e15), PTS, PREV_OUTDTS+STEP+PTS-DTS)
+```
+
+`clip(Δ,1,30000)` 是错的——它把 30 s 以上的前跳压成 30 s 而不是 1 ms，本机实测过一次才改成
+上面的分段写法。首个 packet 的 `PREV_OUTDTS` 是 NOPTS（≈ −9.2e18），用 `lt(…,-1e15)` 识别。
+ffmpeg 9 实测：干净文件产物与旧表达式逐包一致；前跳 4000 s 与回退 3 s 的样本都回到 8.01 s
+且过现有 `detect`。`system_ffmpeg_*` 四条 ignored 测试全绿（重置样本产物 38.3 s = 25 s +
+关键帧回退后的 13.3 s 尾段）。
+
+已知上限（代码里有 `ponytail:` 注记）：文件内逐帧交替的垃圾 tag 会按 tag 数压缩时间轴，
+录制侧已不会产生这种文件；`Unfixable` 行每 10 分钟重跑一遍全片扫描，真修不好的靠缺失补传页
+删除。
+
+## 当时的两个方向（记录）
 
 **A. 检出即修，用增量模型而不是夹取**
 

@@ -109,16 +109,14 @@ issue 要的那一层：#13 step 02 加的 `detect_packet_jump` 用 `ffprobe -sh
 
 | 步骤 | 内容 | 状态 |
 |---|---|---|
-| [01](steps/01-adopt-only-when-deviating.md) | 兄弟槽按「自己也偏离」采纳 offset（根因），复现测试 + 三场景单测 | 待做 |
-| [02](steps/02-upload-gate-forward-jump.md) | 上传侧：前跳 `Unfixable` 的处置（不直传 / 用增量模型修） | 待决策 |
+| [01](steps/01-adopt-only-when-deviating.md) | 兄弟槽按「自己也偏离」采纳 offset（根因），复现测试 + 三场景单测 | 已完成 |
+| [02](steps/02-upload-gate-forward-jump.md) | 上传侧：增量模型修回退与前跳，`Unfixable` 不上传 | 已完成 |
 
-01 是根因，独立闭环。02 改的是上传策略，牵涉磁盘预算，需要主人拍板后再拆。
-**按 session 约定一轮一步。**
+01 是根因，独立闭环。02 改的是上传策略，主人拍板「修，修不好的不上传」后与 01 同一分支落地。
 
 ## 不做什么
 
 - 不动 `Segmentable`（`util.rs`）：分段计时不受影响。
 - 不改 `flv_writer.rs`：仍是「给什么写什么」。
 - 不做 `biliup recover --missing-id` 子命令：取回路径已由 `segment-recover` skill 覆盖
-  （`upos_recovery_json` + `scripts/timestamp_shift.py`）；前跳形态的本机修复表达式要补，
-  记在 step 02 的待办里。
+  （`upos_recovery_json` + `scripts/timestamp_shift.py`）；脚本的前跳分支仍是待办。
