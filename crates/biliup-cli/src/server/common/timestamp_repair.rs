@@ -10,22 +10,32 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
-/// 单次 DTS 回退的上限：超过它就不做时间戳重写，直接判 `Unfixable`。
+/// 时间戳重写用的 setts 表达式：**按流累加增量**，而不是把时间戳夹成单调。
 ///
-/// setts 的 `max()` 把回退的那段时间夹掉。**它的损害上限恰好等于回退量**——最坏情况下
-/// 回退点之后的内容追不上，被压进「回退量 × 1ms/packet」的窗口里，被毁的内容不会超过
-/// 回退的那一段。所以这条判据不需要知道文件总时长，一个绝对值就够；而总时长在这类文件上
-/// 恰恰是拿不到的：`format.duration` 在有回退的 FLV 上返回的是回退点，不是真实跨度。
+/// 旧写法 `max(TS, PREV_OUT+1)` 只对「回退后追得上」的 CDN 回放重叠有效：回退量一大，回退点
+/// 之后的内容全被压进 1ms/packet 的窗口（帧风暴），所以曾经有一道 10 秒闸门把时间戳重置
+/// 拦成 `Unfixable`；对前跳（#62 的形态，以及 32 位回绕被解复用器展开后的单调大跳变）它
+/// 结构上无效——输入本来就单调。
 ///
-/// 取 10 秒的依据：
+/// 增量模型两种都修：每个 packet 的输出 = 上一个输出 + 本流相邻两个输入的增量；增量为负
+/// （回退）或超过 `MAX_PACKET_STEP_MS`（前跳、回绕）都压成 1ms，之后按真实增量继续。内容一帧
+/// 不丢，文件时长等于真实内容时长，闸门不再需要。A/V 各自压缩，跳变处相对偏移改变不超过一帧。
+/// `PREV_OUTDTS` 在第一个 packet 上是 NOPTS（一个极大的负数），用 `lt(…, -1e15)` 识别后
+/// 原样放行。表达式在输入 timebase 上求值（FLV 为 1ms），30000 与 `MAX_PACKET_STEP_MS` 同源，
+/// 录制侧与上传侧对「什么算跳变」保持一个口径。
 ///
-/// - 回退量的物理含义是 CDN 回放的重叠时长，边缘节点缓冲区是秒级；生产实测 2.6 秒，
-///   本地构造的重叠样本 3.6 秒。10 秒留了约 4 倍余量。
-/// - 万一误放行，损害上限是 10 秒内容被压成快进，对 30–60 分钟的分段是 0.5% 以下。
-/// - 时间戳重置／回绕（见 #13）的回退量是分钟到小时级，被稳稳挡在外面。实测「重置到 0」
-///   的样本回退 12 秒，clamp 会把之后 10.6 秒的真实内容压进 0.35 秒，而复检看不出来——
-///   它只看单调性。没有这道闸门，那种输入会被当成修复成功上传。
-const MAX_REPAIRABLE_BACKWARD_MS: i64 = 10_000;
+/// ponytail: 一个文件里若 CDN 逐帧交替重发 timestamp=0 的垃圾 tag（`[B, 0, B+33, 0, …]`），
+/// 每个垃圾 tag 会吃掉紧随其后那个真 tag 的增量，时间轴按 tag 数被压缩。录制侧的
+/// `TimestampRebase` 已经不会把这种形态写进文件，这里不再为它加 NEXT_DTS 前瞻。
+fn delta_setts(chain: &str) -> String {
+    const STEP: &str = r"if(gt(DTS-PREV_INDTS\,30000)\,1\,max(DTS-PREV_INDTS\,1))";
+    // pts 表达式不能引用 dts 表达式的结果，只能把同一段算式再写一遍，再补回原来的 PTS−DTS
+    // （composition time），有 B 帧的源不会被破坏。
+    format!(
+        "{chain}setts=pts=if(lt(PREV_OUTDTS\\,-1e15)\\,PTS\\,PREV_OUTDTS+{STEP}+PTS-DTS)\
+         :dts=if(lt(PREV_OUTDTS\\,-1e15)\\,DTS\\,PREV_OUTDTS+{STEP})"
+    )
+}
 
 /// 一次全片扫描的结论。
 #[derive(Debug, PartialEq, Eq)]
@@ -74,7 +84,7 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
     path: &Path,
     runner: &R,
 ) -> RepairOutcome {
-    // 1) 检测。检测出错 → 保守降级直传原片。
+    // 1) 检测。检测出错是环境问题，保守降级直传原片。
     let backward = match runner.detect(path).await {
         Ok(Detection::Clean) => return RepairOutcome::Clean,
         Ok(Detection::Anomalous { max_backward_ms }) => max_backward_ms,
@@ -84,29 +94,11 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
         }
     };
 
-    // 2) 回退量闸门。见 `MAX_REPAIRABLE_BACKWARD_MS`：超限的输入被 setts 修过之后是单调的，
-    //    复检也认为修好了，但内容已经被压成帧风暴——所以必须在动手之前拦住。
+    // 2) 增量模型对回退与前跳一视同仁，回退量只用来留痕；解析不出数值（前跳、措辞变化）
+    //    也照样修，一律以复检为准。
     match backward {
-        Some(ms) if ms <= MAX_REPAIRABLE_BACKWARD_MS => {
-            info!(file = ?path, backward_ms = ms, "检测到时间戳异常，尝试修复");
-        }
-        Some(ms) => {
-            error!(
-                file = ?path,
-                backward_ms = ms,
-                limit_ms = MAX_REPAIRABLE_BACKWARD_MS,
-                "时间戳回退超过可安全重写的上限，标记 Unfixable 并直传原片"
-            );
-            return RepairOutcome::Unfixable;
-        }
-        None => {
-            error!(
-                file = ?path,
-                "检测到时间戳异常但回退量未知（措辞未识别，或异常形态本就不是回退），\
-                 保守标记 Unfixable 并直传原片"
-            );
-            return RepairOutcome::Unfixable;
-        }
+        Some(ms) => info!(file = ?path, backward_ms = ms, "检测到时间戳回退，尝试修复"),
+        None => info!(file = ?path, "检测到时间戳异常（前跳或回退量未解析），尝试修复"),
     }
 
     let dst = repaired_temp_path(path);
@@ -137,11 +129,6 @@ pub async fn normalize_timestamps<R: FfmpegRunner + Sync>(
         }
     }
 }
-
-/// 把 packet 时间戳夹成单调递增。见 `remux_copy` 里的注释说明为什么是这个写法。
-const SETTS_MONOTONIC: &str = r"setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)";
-const SETTS_MONOTONIC_AFTER_ADTSTOASC: &str =
-    r"aac_adtstoasc,setts=pts=max(PTS\,PREV_OUTPTS+1):dts=max(DTS\,PREV_OUTDTS+1)";
 
 #[derive(Default)]
 pub struct SystemFfmpeg {
@@ -272,21 +259,20 @@ impl FfmpegRunner for SystemFfmpeg {
             .args([
                 "-c",
                 "copy",
-                // 时间戳是容器/packet 元数据，修它不该动 H.264/AAC payload。setts 把每个
-                // packet 的时间戳夹到「不小于上一个已输出的时间戳」，回退的那一段时间被压掉，
-                // 成本是一次顺序读写而不是一次视频编码。
+                // 时间戳是容器/packet 元数据，修它不该动 H.264/AAC payload。setts 按流累加
+                // 增量重写时间戳（见 `delta_setts`），成本是一次顺序读写而不是一次视频编码。
                 //
                 // 两处细节，改之前先看这里：
-                // 1. 变量名是 PREV_OUTPTS / PREV_OUTDTS。没有 PREV_OUTTS，写错会直接
+                // 1. 变量名是 PREV_OUTPTS / PREV_OUTDTS / PREV_INDTS。写错会直接
                 //    "Error initializing bitstream filter: setts"。
                 // 2. 分开写 pts=/dts= 而不是省事的 ts=：ts= 会把两者设成同一个值，有 B 帧
                 //    的源会被破坏。直播 FLV 通常没有 B 帧，但不值得赌。
                 "-bsf:v",
-                SETTS_MONOTONIC,
+                &delta_setts(""),
                 // 音频这条是链式：aac_adtstoasc 之后再跑 setts。不能写成第二个 -bsf:a，
                 // 那是覆盖而不是追加。
                 "-bsf:a",
-                SETTS_MONOTONIC_AFTER_ADTSTOASC,
+                &delta_setts("aac_adtstoasc,"),
                 "-movflags",
                 "+faststart",
                 "-avoid_negative_ts",
@@ -403,25 +389,29 @@ mod tests {
         );
     }
 
-    /// 闸门：回退量超过上限时**一次 remux 都不能发起**。setts 会把这种输入压成帧风暴，
-    /// 而复检只看单调性、会认为修好了，于是坏片被当成成功产物上传、原片被删。
+    /// 增量模型没有回退量上限：时间戳重置（回退分钟级）也是一次 remux + 复检。
     #[tokio::test]
-    async fn unfixable_when_backward_exceeds_limit() {
-        let path = p("unfixable_when_backward_exceeds_limit");
-        // detect 只排了一次结果：如果闸门放行去 remux，第二次 detect 会 panic。
-        let f = FakeFfmpeg::new(vec![anomalous(MAX_REPAIRABLE_BACKWARD_MS + 1)], true);
+    async fn repaired_when_backward_is_large() {
+        let path = p("repaired_when_backward_is_large");
+        let f = FakeFfmpeg::new(vec![anomalous(600_000), Ok(Detection::Clean)], true);
         assert_eq!(
             normalize_timestamps(&path, &f).await,
-            RepairOutcome::Unfixable
+            RepairOutcome::Repaired(repaired_temp_path(&path))
         );
-        assert!(!repaired_temp_path(&path).exists());
     }
 
+    /// 解析不出回退量（前跳、或 ffmpeg 换了措辞）不再是「保守放弃」：增量模型不需要知道
+    /// 回退量，修完以复检为准。
     #[tokio::test]
-    async fn repaired_exactly_at_the_limit() {
-        let path = p("repaired_exactly_at_the_limit");
+    async fn repaired_when_backward_is_unparsed() {
+        let path = p("repaired_when_backward_is_unparsed");
         let f = FakeFfmpeg::new(
-            vec![anomalous(MAX_REPAIRABLE_BACKWARD_MS), Ok(Detection::Clean)],
+            vec![
+                Ok(Detection::Anomalous {
+                    max_backward_ms: None,
+                }),
+                Ok(Detection::Clean),
+            ],
             true,
         );
         assert_eq!(
@@ -430,20 +420,11 @@ mod tests {
         );
     }
 
-    /// 解析不出回退量不等于「没有回退」：ffmpeg 换了措辞时必须保守，不能盲目 clamp。
-    #[tokio::test]
-    async fn unfixable_when_backward_is_unparsed() {
-        let path = p("unfixable_when_backward_is_unparsed");
-        let f = FakeFfmpeg::new(
-            vec![Ok(Detection::Anomalous {
-                max_backward_ms: None,
-            })],
-            true,
-        );
-        assert_eq!(
-            normalize_timestamps(&path, &f).await,
-            RepairOutcome::Unfixable
-        );
+    /// 表达式里的步长必须与包扫描的判据同源，否则会出现「扫描判异常、重写却放过」的夹缝。
+    #[test]
+    fn delta_setts_uses_the_packet_scan_step() {
+        assert!(delta_setts("").contains(&format!("\\,{MAX_PACKET_STEP_MS})")));
+        assert!(delta_setts("aac_adtstoasc,").starts_with("aac_adtstoasc,setts=pts="));
     }
 
     #[tokio::test]
@@ -606,11 +587,12 @@ mod tests {
         }
     }
 
-    /// 时间戳重置（#13 的形态）：回退量吃掉了剩余内容，setts 会把后半段压成帧风暴，
-    /// 而复检看不出来。闸门必须在动手之前拦住它。
+    /// 时间戳重置（#13 的形态）：回退量吃掉了剩余内容。旧的夹取写法会把后半段压成帧风暴，
+    /// 增量模型把后半段接在前半段之后，产物时长 = 前段 25s + 后段（`-ss 21.4 -c copy` 会退到
+    /// 前一个关键帧 16.7s，所以后段实际 13.3s）≈ 38s。
     #[tokio::test]
     #[ignore]
-    async fn system_ffmpeg_refuses_to_rewrite_a_timestamp_reset() {
+    async fn system_ffmpeg_repairs_a_timestamp_reset() {
         let dir = std::env::temp_dir();
         let good = dir.join("tsr_reset_source.flv");
         let reset = dir.join("tsr_reset.flv");
@@ -618,15 +600,31 @@ mod tests {
         splice(&good, "25", "21.4", false, &reset).await;
 
         let outcome = normalize_timestamps(&reset, &SystemFfmpeg::default()).await;
-        assert_eq!(
-            outcome,
-            RepairOutcome::Unfixable,
-            "时间戳重置必须被闸门拦住，绝不能产出被压扁的修复件"
+        let RepairOutcome::Repaired(fixed) = outcome else {
+            panic!("时间戳重置应当被增量模型修好，实际 {outcome:?}");
+        };
+        let duration = probe_duration(&fixed).await;
+        assert!(
+            (36.0..40.0).contains(&duration),
+            "后半段必须接在前半段之后而不是被压扁，实测 {duration}s"
         );
-        assert!(!repaired_temp_path(&reset).exists());
-        for path in [&good, &reset] {
+        for path in [&good, &reset, &fixed] {
             let _ = tokio::fs::remove_file(path).await;
         }
+    }
+
+    /// `ffprobe` 读产物的容器时长。
+    async fn probe_duration(path: &Path) -> f64 {
+        let output = tokio::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .await
+            .expect("spawn ffprobe");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("parse duration")
     }
 
     /// 把 `from_ms` 之后的所有 FLV tag 时间戳整体前移 `jump_ms`。
@@ -678,13 +676,17 @@ mod tests {
             },
             "单调大跳变必须被判为异常；前跳没有回退量，按约定交给 None 分支保守处理"
         );
-        assert_eq!(
-            normalize_timestamps(&jumped, &SystemFfmpeg::default()).await,
-            RepairOutcome::Unfixable,
-            "前跳不是 setts 能修的形态，必须在动手之前拦住"
+        // #62 的形态：前跳被增量模型压成 1ms，产物回到真实的 8s。
+        let outcome = normalize_timestamps(&jumped, &SystemFfmpeg::default()).await;
+        let RepairOutcome::Repaired(fixed) = outcome else {
+            panic!("前跳应当被增量模型修好，实际 {outcome:?}");
+        };
+        let duration = probe_duration(&fixed).await;
+        assert!(
+            (7.5..8.5).contains(&duration),
+            "前跳必须被压掉，产物时长应回到 8s，实测 {duration}s"
         );
-        assert!(!repaired_temp_path(&jumped).exists());
-        for path in [&good, &jumped] {
+        for path in [&good, &jumped, &fixed] {
             let _ = tokio::fs::remove_file(path).await;
         }
     }
