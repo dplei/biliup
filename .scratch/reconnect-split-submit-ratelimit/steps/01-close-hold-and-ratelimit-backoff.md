@@ -1,6 +1,6 @@
 # 01 关闭窗口 + 21566 独立退避 + 退避基数对齐
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## 改动
 
@@ -20,3 +20,9 @@ Status: ready-for-agent
 - `cargo test -p biliup-cli`。
 
 ## Comments
+
+- 2026-09-18：实现完成，`cargo test -p biliup-cli` 全绿（399 单测 + 集成）。新增单测：
+  `close_boundary_holds_new_intent_for_the_reconnect_window`、
+  `submit_rate_limit_backoff_starts_at_quarter_hour_and_caps_at_hours`、
+  `repeated_rate_limit_keeps_the_hour_scale_backoff_and_last_error`。
+  剩余：生产验收（状态改 `ready-for-human`）。

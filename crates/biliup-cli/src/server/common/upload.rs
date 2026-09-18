@@ -123,8 +123,20 @@ const TOTAL_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_BYTES: u64 = 16 * 1024 * 1024;
-const SUBMIT_RETRY_BASE_SECS: i64 = 30;
+/// Equal to the `PeriodicScan` period: anything shorter is rounded up to the next scan anyway.
+const SUBMIT_RETRY_BASE_SECS: i64 = 60;
 const SUBMIT_RETRY_MAX_SECS: i64 = 30 * 60;
+/// Bilibili 21566 is an account-level submit rate limit. Retrying on the generic minute-scale
+/// backoff keeps hitting it and just extends the cooldown, so it gets its own hour-scale curve.
+const SUBMIT_RATE_LIMIT_BASE_SECS: i64 = 15 * 60;
+const SUBMIT_RATE_LIMIT_MAX_SECS: i64 = 4 * 60 * 60;
+/// Debug rendering of `ResponseData` as produced by `submit_by_*` on a non-zero code.
+const SUBMIT_RATE_LIMIT_MARKER: &str = "code: 21566";
+
+fn is_submit_rate_limited(error: &str) -> bool {
+    // ponytail: string match on the Debug output; type the remote code if a second one needs it.
+    error.contains(SUBMIT_RATE_LIMIT_MARKER)
+}
 
 /// Why the idempotent session-level submission coordinator was woken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -655,20 +667,22 @@ async fn defer_segments_after_upload_init_failure(
 fn submit_retry_at(
     submit_attempts: i64,
     now: chrono::DateTime<chrono::Utc>,
+    rate_limited: bool,
 ) -> chrono::DateTime<chrono::Utc> {
+    let (base, max) = if rate_limited {
+        (SUBMIT_RATE_LIMIT_BASE_SECS, SUBMIT_RATE_LIMIT_MAX_SECS)
+    } else {
+        (SUBMIT_RETRY_BASE_SECS, SUBMIT_RETRY_MAX_SECS)
+    };
     let exponent = u32::try_from(submit_attempts.max(0))
         .unwrap_or(u32::MAX)
         .min(10);
-    let base_seconds = SUBMIT_RETRY_BASE_SECS
-        .saturating_mul(2_i64.saturating_pow(exponent))
-        .min(SUBMIT_RETRY_MAX_SECS);
+    let base_seconds = base.saturating_mul(2_i64.saturating_pow(exponent)).min(max);
     // Spread failures from one scan batch across nearby ticks while keeping the documented hard
     // upper bound. At the cap the jitter naturally becomes zero.
     let jitter_ceiling = (base_seconds / 5).max(1);
     let jitter = rand::thread_rng().gen_range(0..=jitter_ceiling);
-    let seconds = base_seconds
-        .saturating_add(jitter)
-        .min(SUBMIT_RETRY_MAX_SECS);
+    let seconds = base_seconds.saturating_add(jitter).min(max);
     now + chrono::Duration::seconds(seconds)
 }
 
@@ -680,14 +694,15 @@ async fn retry_submission(
     remote_attempted: bool,
     webhook: Option<&str>,
 ) -> AppResult<SessionSubmissionOutcome> {
-    let retry_attempts = sqlx::query_scalar::<_, i64>(
-        "SELECT submit_retry_attempts FROM upload_session WHERE id = ?1",
+    let (retry_attempts, last_error) = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT submit_retry_attempts, last_submit_error FROM upload_session WHERE id = ?1",
     )
     .bind(session_row_id)
     .fetch_one(pool)
     .await
     .change_context(AppError::Unknown)?;
-    let next_at = submit_retry_at(retry_attempts, chrono::Utc::now());
+    let rate_limited = is_submit_rate_limited(&error);
+    let next_at = submit_retry_at(retry_attempts, chrono::Utc::now(), rate_limited);
     if !schedule_submit_retry(
         pool,
         session_row_id,
@@ -711,14 +726,33 @@ async fn retry_submission(
             "precondition_failed"
         },
     );
-    notify_alert(
-        webhook,
-        "投稿将在退避后重试",
-        &format!(
-            "会话 #{session_row_id} 的分段账本已完整，但本次投稿明确失败；系统将在 {next_at} 后自动重试。最近错误：{}",
-            sanitize_error(&error)
-        ),
-    );
+    if rate_limited {
+        // One alert per cooldown: the account is throttled, every further hit is the same news.
+        if last_error.as_deref().is_some_and(is_submit_rate_limited) {
+            info!(
+                session = session_row_id,
+                %next_at,
+                "投稿仍在频控冷却中，退避已延长，不重复告警"
+            );
+        } else {
+            notify_alert(
+                webhook,
+                "投稿已进入频控冷却",
+                &format!(
+                    "会话 #{session_row_id} 投稿被 B 站频控（21566）拒绝；系统将在 {next_at} 后自动重试，期间不再重复告警。"
+                ),
+            );
+        }
+    } else {
+        notify_alert(
+            webhook,
+            "投稿将在退避后重试",
+            &format!(
+                "会话 #{session_row_id} 的分段账本已完整，但本次投稿明确失败；系统将在 {next_at} 后自动重试。最近错误：{}",
+                sanitize_error(&error)
+            ),
+        );
+    }
     Ok(SessionSubmissionOutcome::RetryScheduled { next_at, error })
 }
 
@@ -5466,13 +5500,65 @@ mod tests {
     #[test]
     fn submit_retry_backoff_is_bounded() {
         let now = chrono::Utc::now();
-        let first = submit_retry_at(0, now);
+        let first = submit_retry_at(0, now, false);
         assert!(first >= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS));
         assert!(first <= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
         assert_eq!(
-            submit_retry_at(100, now),
+            submit_retry_at(100, now, false),
             now + chrono::Duration::seconds(SUBMIT_RETRY_MAX_SECS)
         );
+    }
+
+    /// 连续两次 21566：第二次要在上一次的基础上继续拉长退避，并把上一条错误留给告警去重判定。
+    #[tokio::test]
+    async fn repeated_rate_limit_keeps_the_hour_scale_backoff_and_last_error() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let rate_limited =
+            "ResponseData { code: 21566, data: None, message: \"投稿过于频繁\", ttl: Some(1) }";
+        let mut next_ats = Vec::new();
+        for _ in 0..2 {
+            sqlx::query(
+                "UPDATE upload_session SET submit_claim_token = 'claim', next_submit_at = NULL \
+                 WHERE id = 30",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let before = chrono::Utc::now();
+            let SessionSubmissionOutcome::RetryScheduled { next_at, .. } =
+                retry_submission(&pool, 30, "claim", rate_limited.to_string(), true, None)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected retry scheduling")
+            };
+            next_ats.push(next_at - before);
+        }
+        assert!(next_ats[0] >= chrono::Duration::minutes(15));
+        assert!(next_ats[1] >= chrono::Duration::minutes(30));
+        let last_error: Option<String> =
+            sqlx::query_scalar("SELECT last_submit_error FROM upload_session WHERE id = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(last_error.as_deref().is_some_and(is_submit_rate_limited));
+    }
+
+    /// 21566 是账号级频控：分钟级重试只会持续撞墙，首个退避必须是小时量级的起点（#60）。
+    #[test]
+    fn submit_rate_limit_backoff_starts_at_quarter_hour_and_caps_at_hours() {
+        let now = chrono::Utc::now();
+        let first = submit_retry_at(0, now, true);
+        assert!(first >= now + chrono::Duration::minutes(15));
+        assert!(first <= now + chrono::Duration::minutes(18));
+        assert_eq!(
+            submit_retry_at(100, now, true),
+            now + chrono::Duration::seconds(SUBMIT_RATE_LIMIT_MAX_SECS)
+        );
+        assert!(is_submit_rate_limited(
+            "ResponseData { code: 21566, data: None, message: \"投稿过于频繁\", ttl: Some(1) }"
+        ));
+        assert!(!is_submit_rate_limited("load live_streamer failed"));
     }
 
     #[test]
