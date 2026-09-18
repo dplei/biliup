@@ -994,10 +994,13 @@ fn pending_submit_action(
     if let Some(next_at) = row.next_submit_at
         && next_at > now
     {
-        return (
-            PendingSubmitAction::RetryScheduled,
-            format!("上次投稿明确失败，系统将在 {next_at} 后自动重试。"),
-        );
+        // `next_submit_at` without a failed state is the post-close reconnect window, not a retry.
+        let message = if row.submit_state.as_deref() == Some("failed") {
+            format!("上次投稿明确失败，系统将在 {next_at} 后自动重试。")
+        } else {
+            format!("本场刚结束，等待 {next_at} 之前可能的重连并入同一稿件后再投稿。")
+        };
+        return (PendingSubmitAction::RetryScheduled, message);
     }
     (
         PendingSubmitAction::ReadyToSubmit,

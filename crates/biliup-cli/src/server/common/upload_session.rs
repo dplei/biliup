@@ -788,6 +788,30 @@ pub async fn request_session_submit(
     })
 }
 
+/// Keep a freshly closed session out of the submit gate until `until`, so a reconnect inside
+/// `config.delay` re-attaches to this still-open session instead of opening a second one (#60).
+///
+/// Reuses `next_submit_at`: readiness and the scheduler already treat it as "not due", and every
+/// path that clears it runs after a claim, so segment enrollment cannot cut the window short.
+/// Deliberately a no-op once a retry backoff or claim exists.
+pub async fn hold_session_submit(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    until: DateTime<Utc>,
+) -> AppResult<bool> {
+    let updated = sqlx::query(
+        "UPDATE upload_session SET next_submit_at = ?1 \
+         WHERE id = ?2 AND status != 'finalized' AND submit_claim_token IS NULL \
+         AND next_submit_at IS NULL",
+    )
+    .bind(until)
+    .bind(session_row_id)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(updated.rows_affected() == 1)
+}
+
 /// Read only session-level submit state. This query deliberately does not aggregate lifecycle
 /// rows; the strict ledger check remains `claim_complete_session` after this cheap preflight.
 pub async fn session_submit_readiness(

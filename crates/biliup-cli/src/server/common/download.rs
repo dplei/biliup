@@ -7,7 +7,9 @@ use crate::server::common::segment_enrollment::{
     normalize_segment_path,
 };
 use crate::server::common::upload::{SubmissionTrigger, UploaderMessage, spawn_session_submission};
-use crate::server::common::upload_session::{RequestSessionSubmit, request_session_submit};
+use crate::server::common::upload_session::{
+    RequestSessionSubmit, hold_session_submit, request_session_submit,
+};
 use crate::server::common::util::{FileValidator, InvalidMediaReason, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
 use crate::server::core::downloader::{
@@ -154,17 +156,37 @@ impl SegmentProcessingStats {
     }
 }
 
+/// `hold` is `config.delay`: a reconnect inside it must land in this session, so a newly closed
+/// session is kept out of the submit gate for that long. A recorder that already waited the
+/// grace before closing pays nothing extra when the tail upload outlives the window (#60).
 async fn persist_closed_session_intents(
     pool: &crate::server::infrastructure::connection_pool::ConnectionPool,
     enrolled_session_ids: &HashSet<i64>,
     now: chrono::DateTime<chrono::Utc>,
+    hold: Duration,
 ) -> Vec<i64> {
     let mut requested = Vec::new();
     let mut session_ids: Vec<_> = enrolled_session_ids.iter().copied().collect();
     session_ids.sort_unstable();
     for session_id in session_ids {
         match request_session_submit(pool, session_id, now).await {
-            Ok(RequestSessionSubmit::Requested { .. }) => requested.push(session_id),
+            Ok(RequestSessionSubmit::Requested {
+                newly_requested, ..
+            }) => {
+                if newly_requested && !hold.is_zero() {
+                    let until = now + chrono::Duration::from_std(hold).unwrap_or_default();
+                    // Failure-open: losing the window only risks the split this fix targets, never
+                    // the submission itself.
+                    if let Err(error) = hold_session_submit(pool, session_id, until).await {
+                        warn!(
+                            session = session_id,
+                            ?error,
+                            "写入下播后重连窗口失败，照常投稿"
+                        );
+                    }
+                }
+                requested.push(session_id)
+            }
             Ok(outcome) => info!(
                 session = session_id,
                 ?outcome,
@@ -287,6 +309,7 @@ impl SegmentEventProcessor {
             self.ctx.pool(),
             &self.enrolled_session_ids,
             chrono::Utc::now(),
+            Duration::from_secs(self.ctx.config().delay),
         )
         .await;
 
@@ -1992,7 +2015,7 @@ mod retry_state_tests {
         }
         let ids = HashSet::from([31_i64, 32_i64]);
 
-        let requested = persist_closed_session_intents(&pool, &ids, now).await;
+        let requested = persist_closed_session_intents(&pool, &ids, now, Duration::ZERO).await;
 
         assert_eq!(requested, vec![31]);
         drop(pool);
@@ -2006,6 +2029,57 @@ mod retry_state_tests {
                 .await
                 .unwrap();
         assert_eq!(rows, vec![(31, Some(now)), (32, None)]);
+    }
+
+    /// #60：关闭后 `delay` 内的重连要并入同一会话，所以刚关闭的会话在窗口内不能被领取投稿；
+    /// 再次关闭（重连后的那次下播）不能把窗口往后推，也不能覆盖已有的退避。
+    #[tokio::test]
+    async fn close_boundary_holds_new_intent_for_the_reconnect_window() {
+        let (_directory, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 45, 0).unwrap();
+        sqlx::query(
+            "INSERT INTO upload_session \
+             (id, live_streamer_id, streamer_info_id, videos_json, status, created_at, updated_at) \
+             VALUES (31, 10, 20, '[]', 'uploading', ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ids = HashSet::from([31_i64]);
+        let hold = Duration::from_secs(300);
+
+        persist_closed_session_intents(&pool, &ids, now, hold).await;
+        let next_at = || async {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+                "SELECT next_submit_at FROM upload_session WHERE id = 31",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(next_at().await, Some(now + chrono::Duration::seconds(300)));
+        assert!(matches!(
+            crate::server::common::upload_session::session_submit_readiness(&pool, 31, now)
+                .await
+                .unwrap(),
+            crate::server::common::upload_session::SessionSubmitReadiness::NotDue(_)
+        ));
+        assert!(matches!(
+            crate::server::common::upload_session::session_submit_readiness(
+                &pool,
+                31,
+                now + chrono::Duration::seconds(301)
+            )
+            .await
+            .unwrap(),
+            crate::server::common::upload_session::SessionSubmitReadiness::Ready
+        ));
+
+        // The reconnected recording closes again later: the first window stands.
+        persist_closed_session_intents(&pool, &ids, now + chrono::Duration::seconds(200), hold)
+            .await;
+        assert_eq!(next_at().await, Some(now + chrono::Duration::seconds(300)));
     }
 }
 
