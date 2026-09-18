@@ -33,6 +33,9 @@ A 会话在关闭边界上传完尾段就立即被领取投稿并 finalize，新
    首次告警文案改为「已进入投稿频控冷却，预计 HH:MM 重试」。
 3. **退避基数 30 → 60 s**：与 `PeriodicScan` 周期对齐，文档值即实际值。
 
+已随 [#66](https://github.com/dplei/biliup/pull/66) 合入 `dev`，随 1.3.32 发版。生产验收清单贴在
+issue #60 评论里（标签 `awaiting-verification`），验完再归档本目录。
+
 ## 不做
 
 - 不做「上一会话已 finalized 则用 `/x/vu/web/edit` 追加分P」：方案 1 已覆盖 delay 内的重连；
