@@ -9,7 +9,7 @@
 # 真要手工改，取值方式是：
 #   docker buildx imagetools inspect node:lts --format '{{.Manifest.Digest}}'
 # Build biliup's web-ui
-FROM node:lts@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0 AS webui-builder
+FROM node:lts@sha256:64af3819f9275802414d7cdc38c27e9d82bd564dec4d4da87d008255d36c63b4 AS webui-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
@@ -41,7 +41,7 @@ RUN set -eux; \
 
 
 # Build biliup's python wheel
-FROM rust:latest@sha256:4c61226ac47123e625c1c869480c4b836b71c8e02b048a264661c1b5b944c18b AS wheel-builder
+FROM rust:latest@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS wheel-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
@@ -79,7 +79,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 
 # Deploy Biliup
-FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS biliup
+FROM python:3.13-slim@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS biliup
 
 ENV TZ="Asia/Shanghai"
 ENV LANG="C.UTF-8"
