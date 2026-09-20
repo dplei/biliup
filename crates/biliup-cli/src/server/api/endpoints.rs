@@ -11,7 +11,9 @@ use crate::server::common::upload::{
     stop_missing_segment_attempt, submit_to_bilibili, upload_with_task,
 };
 use crate::server::common::upload_line_health;
-use crate::server::common::upload_line_selection::{cooling_lines, plan_upload_line};
+use crate::server::common::upload_line_selection::{
+    IMPLICIT_FALLBACKS, cooling_lines, plan_upload_line,
+};
 use crate::server::common::upload_session::{
     EmptySessionDiscardResult, RequestSessionSubmit, SessionCompleteness, discard_empty_session,
     get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
@@ -45,7 +47,7 @@ use biliup::credential::Credential;
 use chrono::Utc;
 use error_stack::{Report, ResultExt};
 use ormlite::{Insert, Model};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -798,6 +800,43 @@ pub struct MissingSegmentView {
     /// The full candidate sequence behind `next_line`, so the page can show what a fallback
     /// would try next without guessing.
     pub line_candidates: Vec<String>,
+}
+
+/// 可显式选择的上传线路，来自 B 站 `preupload?r=probe` 索引；`auto` 不在其中，由页面自己置顶。
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct UploadLines {
+    pub lines: Vec<String>,
+    /// 索引没拉到、`lines` 是本地兜底候选时为 true，页面据此提示。
+    pub degraded: bool,
+}
+
+impl UploadLines {
+    fn from_index(index: biliup::error::Result<Vec<String>>) -> Self {
+        match index {
+            Ok(lines) if !lines.is_empty() => Self {
+                lines,
+                degraded: false,
+            },
+            other => {
+                if let Err(error) = other {
+                    tracing::warn!(%error, "拉取 B 站上传线路索引失败，返回兜底线路");
+                }
+                Self {
+                    lines: IMPLICIT_FALLBACKS.iter().map(|k| k.to_string()).collect(),
+                    degraded: true,
+                }
+            }
+        }
+    }
+}
+
+// ponytail: 每次请求都打一次 B 站索引，没有缓存——SWR 在浏览器侧去重，页面挂载才会请求。
+// 出现高频轮询再加 5 min 内存缓存。
+pub async fn get_upload_lines() -> Json<UploadLines> {
+    let client = biliup::client::StatelessClient::default();
+    Json(UploadLines::from_index(
+        biliup::uploader::line::Probe::index_keys(&client.client).await,
+    ))
 }
 
 pub async fn get_upload_line_health(
@@ -2082,5 +2121,26 @@ mod session_recovery_tests {
                 .await
                 .unwrap();
         assert!(requested.is_none());
+    }
+}
+
+#[cfg(test)]
+mod upload_lines_tests {
+    use super::*;
+
+    #[test]
+    fn upload_lines_fall_back_to_implicit_candidates_and_say_so() {
+        let live = UploadLines::from_index(Ok(vec!["estx".into(), "bda2".into()]));
+        assert_eq!(live.lines, ["estx", "bda2"]);
+        assert!(!live.degraded);
+
+        for broken in [
+            Ok(vec![]),
+            Err(biliup::error::Kind::Custom("index unreachable".into())),
+        ] {
+            let fallback = UploadLines::from_index(broken);
+            assert_eq!(fallback.lines, IMPLICIT_FALLBACKS);
+            assert!(fallback.degraded);
+        }
     }
 }

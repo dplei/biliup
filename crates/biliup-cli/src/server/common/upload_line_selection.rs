@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 /// Implicit fallbacks, in order, after the operator's own choice. `bldsa` is deliberately absent:
 /// it is only ever used when explicitly configured.
-const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
+pub(crate) const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
 
 /// 上传完还能凭原始 `X-Upos-Auth` 把源对象整体 GET 回来的线路。
 ///

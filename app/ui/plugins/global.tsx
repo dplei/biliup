@@ -4,9 +4,11 @@ import styles from '../../styles/dashboard.module.scss'
 import { Form, Select, Space, useFormApi } from '@douyinfe/semi-ui'
 import { IconUpload, IconDownload } from '@douyinfe/semi-icons'
 import AudioNormalizationControl from '../AudioNormalizationControl'
+import { lineLabel, useUploadLines } from '../../lib/use-upload-lines'
 
 const Global: React.FC = () => {
   const formApi = useFormApi()
+  const uploadLines = useUploadLines(formApi.getValue('lines'))
 
   return (
     <>
@@ -431,7 +433,11 @@ const Global: React.FC = () => {
         <Form.Select
           field="lines"
           label="上传线路（lines）"
-          extraText="b站上传线路选择，默认为自动模式，可手动切换为bda, bda2, ws, qn, bldsa, tx, txa"
+          extraText={
+            uploadLines.degraded
+              ? 'B 站线路索引暂时拉不到，下面是本地兜底列表'
+              : 'B 站上传线路，列表实时来自 preupload 索引，默认自动探测'
+          }
           placeholder="AUTO（自动，默认）"
           style={{ width: '100%' }}
           fieldStyle={{
@@ -441,13 +447,11 @@ const Global: React.FC = () => {
           showClear={true}
         >
           <Form.Select.Option value="AUTO">AUTO（自动，默认）</Form.Select.Option>
-          <Form.Select.Option value="alia">alia（海外-阿里云）</Form.Select.Option>
-          {/* <Form.Select.Option value="bda">bda</Form.Select.Option> */}
-          <Form.Select.Option value="bda2">bda2（大陆-百度云）</Form.Select.Option>
-          <Form.Select.Option value="bldsa">bldsa（大陆-B站自建）</Form.Select.Option>
-          <Form.Select.Option value="qn">qn（全球-七牛）</Form.Select.Option>
-          <Form.Select.Option value="tx">tx（大陆-腾讯云）</Form.Select.Option>
-          <Form.Select.Option value="txa">txa（海外-腾讯云）</Form.Select.Option>
+          {uploadLines.lines.map((key) => (
+            <Form.Select.Option key={key} value={key}>
+              {lineLabel(key)}
+            </Form.Select.Option>
+          ))}
         </Form.Select>
         <Form.InputNumber
           field="threads"

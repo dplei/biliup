@@ -10,7 +10,7 @@ use crate::server::api::endpoints::{
     discard_empty_upload_session, get_configuration, get_cookie_health,
     get_missing_upload_attempts, get_missing_uploads, get_pending_submit_sessions, get_qrcode,
     get_recovery_batches, get_status, get_streamer_info, get_streamer_info_files,
-    get_streamers_endpoint, get_upload_enrollment_health, get_upload_line_health,
+    get_streamers_endpoint, get_upload_enrollment_health, get_upload_line_health, get_upload_lines,
     get_upload_missing_segment_health, get_upload_rate_health, get_upload_streamer_endpoint,
     get_upload_streamers_endpoint, get_users_endpoint, get_videos, login_by_qrcode,
     post_streamers_endpoint, post_uploads, put_configuration, put_streamers_endpoint,
@@ -105,6 +105,7 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/v1/health/cookie", get(get_cookie_health)) // cookie 健康状态（前端横幅轮询）
         .route("/v1/health/upload-rate", get(get_upload_rate_health))
         .route("/v1/health/upload-lines", get(get_upload_line_health))
+        .route("/v1/upload-lines", get(get_upload_lines)) // B 站当前公布的 upcdn key 列表
         .route(
             "/v1/health/upload-enrollment",
             get(get_upload_enrollment_health),

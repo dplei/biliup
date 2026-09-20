@@ -14,7 +14,7 @@ issue：[#67](https://github.com/dplei/biliup/issues/67)。根因、方案与验
 |---|---|---|
 | [01](steps/01-line-explicit.md) | `Line::explicit`，删 15 个构造函数，`explicit_upload_line` 改校验+构造 | 完成 |
 | [02](steps/02-drop-enums.md) | 删 `biliup-cli` / `stream-gears` 的 `UploadLine` 枚举与 match，CLI `--line` 改自由字串 | 完成 |
-| [03](steps/03-lines-endpoint.md) | `GET /v1/upload-lines` + 两处前端下拉改为动态渲染 | 待做 |
+| [03](steps/03-lines-endpoint.md) | `GET /v1/upload-lines` + 两处前端下拉改为动态渲染 | 完成 |
 | [04](steps/04-real-upload.md) | 本地 dev 真实录制上传验收（issue 清单「真实上传」段），全过才建 PR | 待做 |
 
 ## 不做

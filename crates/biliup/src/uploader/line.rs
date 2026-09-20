@@ -199,13 +199,7 @@ impl Probe {
         allowed: &[String],
         excluded: &[String],
     ) -> Result<(Line, Vec<ProbeFailure>)> {
-        let res: Self = client
-            .get("https://member.bilibili.com/preupload?r=probe")
-            .timeout(PROBE_INDEX_TIMEOUT)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let res = Self::fetch_index(client).await?;
 
         let lines = retained_lines(res.lines, allowed, excluded);
         let total_lines = lines.len();
@@ -242,6 +236,26 @@ impl Probe {
         }
 
         choose_line_and_failures(candidates)
+    }
+
+    /// B 站当前公布的线路索引。
+    async fn fetch_index(client: &reqwest::Client) -> Result<Self> {
+        Ok(client
+            .get("https://member.bilibili.com/preupload?r=probe")
+            .timeout(PROBE_INDEX_TIMEOUT)
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// 索引里每条线路的 `upcdn` key，按 B 站给出的顺序。页面下拉靠它渲染，不再维护登记表。
+    pub async fn index_keys(client: &reqwest::Client) -> Result<Vec<String>> {
+        Ok(Self::fetch_index(client).await?.keys())
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.lines.iter().map(|line| line.key().to_string()).collect()
     }
 
     async fn probe_line(
@@ -564,6 +578,24 @@ mod tests {
                     .collect()
             );
         }
+    }
+
+    /// 2026-09-20 `preupload?r=probe` 的真实响应形状（probe_url 域名保留，auth 无关）。
+    #[test]
+    fn index_keys_follow_the_order_bilibili_publishes() {
+        let index: Probe = serde_json::from_value(serde_json::json!({
+            "OK": 1,
+            "lines": [
+                {"os": "upos", "query": "probe_version=20221109&upcdn=estx&zone=cs", "probe_url": "//e17962d5cstx.esheep.com/OK"},
+                {"os": "upos", "query": "probe_version=20221109&upcdn=akbd&zone=cs", "probe_url": "//bb27c891csbd.aikobo.cn/OK"},
+                {"os": "upos", "query": "probe_version=20221109&upcdn=bldsa&zone=cs", "probe_url": "//upos-cs-upcdnbldsa.bilivideo.com/OK"},
+                {"os": "upos", "query": "probe_version=20221109&upcdn=bda2&zone=cs", "probe_url": "//upos-cs-upcdnbda2.bilivideo.com/OK"},
+                {"os": "upos", "query": "probe_version=20221109&upcdn=tx&zone=cs", "probe_url": "//upos-cs-upcdntx.bilivideo.com/OK"}
+            ],
+            "probe": {"post": 0.1}
+        }))
+        .unwrap();
+        assert_eq!(index.keys(), ["estx", "akbd", "bldsa", "bda2", "tx"]);
     }
 
     #[test]
