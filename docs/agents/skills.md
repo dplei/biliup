@@ -65,8 +65,8 @@ agent 把渲染出的样图读进来真的看；`segment-recover` 强制 agent �
 - **稿件与分P**：`av`/`BV` 号，加上坏掉的是第几个分P（B 站页面上的 P1/P2/P3）。
 - **取回描述符**：生产库里
   `select upos_recovery_json from upload_missing_segment where id = <missing_id>;`
-  的结果，含 `endpoint` / `upos_uri` / `auth` 三个字段。数据库 7 天后会清理它，但这只是
-  敏感字段的保留上限；描述符非空不代表临时凭证仍有效。
+  的结果，含 `endpoint` / `upos_uri` / `auth` 三个字段。临时凭证上传后约 5 天失效（实测），
+  数据库同步按 5 天清理；描述符非空不代表临时凭证仍有效。
 - **原始大小**：同一行的 `total_bytes`，用来验证下载完整。
 
 已知的止损线，省得白忙：
