@@ -2380,9 +2380,10 @@ enum UploadActivity {
 
 /// UPOS 取回描述符的保留期。
 ///
-/// 站内异步转码的结论通常几小时内就有，主人的处理节奏是「问题出现后两日内解决」。
-/// 七天覆盖一个周末加余量；B 站那边的凭证多半更早就失效了，这里只负责不把死令牌留在库里。
-const UPOS_RECOVERY_TTL: chrono::Duration = chrono::Duration::days(7);
+/// 与 B 站临时凭证的实际寿命对齐：2026-09-20 对生产库现存描述符逐条 `HEAD`，上传后
+/// 4.9 天内全部 200，5.3 天以上全部 403，bda2 / tx / bldsa 各线路一致。凭证本身没有可读的
+/// deadline 字段，这是经验值。过了 5 天令牌必死，再留只是把敏感字段多放几天。
+const UPOS_RECOVERY_TTL: chrono::Duration = chrono::Duration::days(5);
 
 /// 落下本次 preupload 的取回描述符，顺带把过期的清成 NULL。
 ///
