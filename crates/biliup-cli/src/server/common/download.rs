@@ -884,10 +884,8 @@ fn merge_compatible_segments(
         .first()
         .ok_or_else(|| AppError::Custom("cannot merge an empty segment group".into()))?;
     let last = events.last().expect("non-empty segment group");
-    let parent = first
-        .prev_file_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = recovery_work_dir(&first.prev_file_path)?;
+    let parent = parent.as_path();
     let stem = first
         .prev_file_path
         .file_stem()
@@ -969,6 +967,16 @@ fn merge_compatible_segments(
             .collect(),
         enrollment: None,
     })
+}
+
+/// ffmpeg's concat demuxer resolves every entry against the list file's path as a URL, so a
+/// relative list name like `.主播 2026-09-20 16:13:53.concat.txt` turns everything before the
+/// first ':' into a scheme and makes every entry unopenable. Keep the work dir absolute.
+fn recovery_work_dir(segment: &std::path::Path) -> AppResult<std::path::PathBuf> {
+    let parent = segment.parent().unwrap_or_else(|| std::path::Path::new(""));
+    Ok(std::env::current_dir()
+        .change_context(AppError::Unknown)?
+        .join(parent))
 }
 
 fn write_concat_list<'a>(
@@ -1909,6 +1917,22 @@ fn douyin_failover_enabled(
     route_health_enabled: bool,
 ) -> bool {
     platform == "douyin" && douyin_route_failover.unwrap_or(false) && route_health_enabled
+}
+
+#[cfg(test)]
+mod recovery_work_dir_tests {
+    use super::recovery_work_dir;
+    use std::path::Path;
+
+    #[test]
+    fn relative_segment_with_colons_gets_an_absolute_work_dir() {
+        // 相对路径的 concat 列表会被 ffmpeg 当成 `scheme:` URL，合并必然失败。
+        let dir = recovery_work_dir(Path::new("主播 2026-09-20 16:13:53.flv")).unwrap();
+        assert!(dir.is_absolute());
+        assert_eq!(dir, std::env::current_dir().unwrap());
+        let dir = recovery_work_dir(Path::new("/opt/主播 2026-09-20 16:13:53.flv")).unwrap();
+        assert_eq!(dir, Path::new("/opt"));
+    }
 }
 
 #[cfg(test)]
