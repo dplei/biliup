@@ -14,7 +14,6 @@
 use crate::server::common::upload_line_health::{self, LineAvailability, UploadFailureKind};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
-use biliup::uploader::line;
 use biliup::uploader::line::{Line, Probe};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -97,27 +96,18 @@ impl LinePlan {
     }
 }
 
-/// Every line that can be named explicitly, by its `upcdn` key. `auto` is not here: it is a
-/// decision, not a line.
+/// Any well-formed `upcdn` key names an explicit line; `auto` is not here: it is a decision, not
+/// a line.
+///
+/// 不再维护登记表：B 站索引里线路的 `query` 只差 key，`Line::explicit` 直接构造。索引已下线的
+/// key 会在 preupload 阶段被 B 站拒绝，走既有的线路健康/冷却，而不是在这里被静默降级成 auto。
+/// 形状校验只挡明显写错的值（空、带分隔符、大小写混用），不挡「索引里没见过」的 key。
 pub fn explicit_upload_line(key: &str) -> Option<Line> {
-    match key {
-        "bldsa" => Some(line::bldsa()),
-        "cnbldsa" => Some(line::cnbldsa()),
-        "andsa" => Some(line::andsa()),
-        "atdsa" => Some(line::atdsa()),
-        "bda2" => Some(line::bda2()),
-        "cnbd" => Some(line::cnbd()),
-        "anbd" => Some(line::anbd()),
-        "atbd" => Some(line::atbd()),
-        "tx" => Some(line::tx()),
-        "cntx" => Some(line::cntx()),
-        "antx" => Some(line::antx()),
-        "attx" => Some(line::attx()),
-        "bda" => Some(line::bda()),
-        "txa" => Some(line::txa()),
-        "alia" => Some(line::alia()),
-        _ => None,
-    }
+    let well_formed = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (well_formed && !key.eq_ignore_ascii_case(AUTO)).then(|| Line::explicit(key))
 }
 
 /// Build the candidate sequence: the operator's choice first, then the implicit fallbacks, with
@@ -504,11 +494,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_configured_value_degrades_to_auto_rather_than_bda2() {
+    fn a_malformed_configured_value_degrades_to_auto_rather_than_bda2() {
         let plan = plan_upload_line("no-such-line", None, &HashMap::new(), now());
 
         assert_eq!(plan.chosen, AUTO);
         assert_eq!(plan.source, LineSource::AutoProbe);
         assert_eq!(plan.candidates, ["auto"]);
+    }
+
+    /// 索引里新出现、代码里从未登记过的 key 也能显式使用；登记表就是为此删掉的。
+    #[test]
+    fn an_unregistered_but_well_formed_key_is_an_explicit_line() {
+        assert_eq!(
+            explicit_upload_line("estx").map(|l| l.key().to_string()),
+            Some("estx".into())
+        );
+        assert_eq!(
+            explicit_upload_line("akbd").map(|l| l.key().to_string()),
+            Some("akbd".into())
+        );
+        for rejected in ["", "AUTO", "auto", "Bda2", "bda 2", "bda2&zone=xx"] {
+            assert!(
+                explicit_upload_line(rejected).is_none(),
+                "{rejected:?} should be rejected"
+            );
+        }
+        let plan = plan_upload_line("estx", None, &HashMap::new(), now());
+        assert_eq!(plan.chosen, "estx");
+        assert_eq!(plan.source, LineSource::Configured);
     }
 }
