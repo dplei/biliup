@@ -74,12 +74,12 @@ async fn independent_tasks_keep_identity_and_do_not_invent_remote_success() {
         // Exercise real early-return paths, not just the event helper.
         let dir = tempfile::tempdir().unwrap();
         assert!(biliup_cli::uploader::upload_by_command(serde_json::from_value::<Studio>(serde_json::json!({"tid":171,"title":"synthetic"})).unwrap(),dir.path().join("missing.json"),
-            vec![dir.path().join("input.flv")],Some(biliup_cli::UploadLine::Bda2),1,SubmitOption::App,None).await.is_err());
+            vec![dir.path().join("input.flv")],Some("bda2".to_string()),1,SubmitOption::App,None).await.is_err());
         let bili = bilibili_from_info(serde_json::from_value(serde_json::json!({
             "cookie_info":{"cookies":[]}, "sso":[],
             "token_info":{"access_token":"synthetic","expires_in":0,"mid":0,"refresh_token":"synthetic"}
         })).unwrap(),None).unwrap();
-        assert!(biliup_cli::uploader::upload(&[dir.path().join("missing.flv")],&bili,Some(biliup_cli::UploadLine::Bda2),1).await.is_err());
+        assert!(biliup_cli::uploader::upload(&[dir.path().join("missing.flv")],&bili,Some("bda2".to_string()),1).await.is_err());
     }.with_subscriber(subscriber).await;
     assert!(runtime.shutdown(Duration::from_secs(2)).closed);
     let events = events.lock().unwrap();

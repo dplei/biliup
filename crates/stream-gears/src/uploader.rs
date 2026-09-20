@@ -1,6 +1,5 @@
 use biliup::uploader::bilibili::{Credit, ResponseData, Studio};
 use pyo3::prelude::*;
-use pyo3::pyclass;
 
 use biliup_cli::server::common;
 use biliup_cli::server::common::upload::submit_to_bilibili;
@@ -10,50 +9,6 @@ use bon::Builder;
 use error_stack::ResultExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-#[pyclass]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum UploadLine {
-    Bldsa,
-    Cnbldsa,
-    Andsa,
-    Atdsa,
-    Bda2,
-    Cnbd,
-    Anbd,
-    Atbd,
-    Tx,
-    Cntx,
-    Antx,
-    Attx,
-    Bda,
-    Txa,
-    Alia,
-}
-
-impl From<UploadLine> for biliup_cli::UploadLine {
-    fn from(val: UploadLine) -> Self {
-        use UploadLine as P;
-        use biliup_cli::UploadLine as C;
-        match val {
-            P::Bldsa => C::Bldsa,
-            P::Cnbldsa => C::Cnbldsa,
-            P::Andsa => C::Andsa,
-            P::Atdsa => C::Atdsa,
-            P::Bda2 => C::Bda2,
-            P::Cnbd => C::Cnbd,
-            P::Anbd => C::Anbd,
-            P::Atbd => C::Atbd,
-            P::Tx => C::Tx,
-            P::Cntx => C::Cntx,
-            P::Antx => C::Antx,
-            P::Attx => C::Attx,
-            P::Bda => C::Bda,
-            P::Txa => C::Txa,
-            P::Alia => C::Alia,
-        }
-    }
-}
 
 #[derive(FromPyObject)]
 pub struct PyCredit {
@@ -69,7 +24,7 @@ pub struct PyCredit {
 pub struct StudioPre {
     video_path: Vec<PathBuf>,
     cookie_file: PathBuf,
-    line: Option<UploadLine>,
+    line: Option<String>,
     limit: usize,
     title: String,
     tid: u16,
@@ -140,7 +95,7 @@ pub async fn upload(
     let (bilibili, videos) = common::upload::upload_with_task(
         &cookie_file,
         proxy,
-        line.map(Into::into),
+        line,
         video_path.as_slice(),
         limit,
         &runtime_config,

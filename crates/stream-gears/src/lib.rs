@@ -7,7 +7,6 @@ use pyo3::prelude::*;
 use time::macros::format_description;
 use uploader::{PyCredit, StudioPre};
 
-use crate::uploader::UploadLine;
 use axum::http::HeaderMap;
 use biliup::credential::Credential;
 use biliup::downloader::util::{CallbackFn, LifecycleFile, Segmentable};
@@ -408,7 +407,7 @@ fn upload(
     limit: usize,
     desc_v2: Vec<PyCredit>,
     dtime: Option<u32>,
-    line: Option<UploadLine>,
+    line: Option<String>,
     extra_fields: Option<String>,
     submit: Option<String>,
     proxy: Option<String>,
@@ -559,7 +558,6 @@ fn stream_gears(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(login_by_web_qrcode, m)?)?;
     m.add_function(wrap_pyfunction!(main_loop, m)?)?;
     m.add_function(wrap_pyfunction!(server::config_bindings, m)?)?;
-    m.add_class::<UploadLine>()?;
     m.add_class::<PySegment>()?;
     Ok(())
 }
