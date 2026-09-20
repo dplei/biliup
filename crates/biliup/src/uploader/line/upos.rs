@@ -321,12 +321,8 @@ mod recovery_tests {
         let client = StatelessClient::default();
 
         let mut downloadable = Vec::new();
-        for (name, line) in [
-            ("bldsa", crate::uploader::line::bldsa()),
-            ("tx", crate::uploader::line::tx()),
-            ("bda", crate::uploader::line::bda()),
-            ("alia", crate::uploader::line::alia()),
-        ] {
+        for name in ["bldsa", "tx", "bda", "alia"] {
+            let line = crate::uploader::line::Line::explicit(name);
             let video_file = crate::uploader::VideoFile::new(&probe).expect("VideoFile");
             let parcel = match line.pre_upload(&bili, video_file).await {
                 Ok(parcel) => parcel,

@@ -315,6 +315,20 @@ impl Line {
             .unwrap_or("auto")
     }
 
+    /// 按 `upcdn` key 构造一条显式线路。
+    ///
+    /// B 站 `preupload?r=probe` 索引里每条线路的 `query` 都是 `zone=cs&upcdn=<key>&probe_version=…`，
+    /// 只有 key 不同，所以显式选线不需要预先登记表。`probe_url` 只在 AUTO 探测时读取，显式路径
+    /// 直接 `pre_upload`，这里留空。
+    pub fn explicit(upcdn: &str) -> Line {
+        Line {
+            os: Uploader::Upos,
+            query: format!("zone=cs&upcdn={upcdn}&probe_version=20221109"),
+            probe_url: String::new(),
+            cost: 0,
+        }
+    }
+
     pub async fn pre_upload(&self, bili: &BiliBili, video_file: VideoFile) -> Result<Parcel> {
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
@@ -400,15 +414,6 @@ fn retained_lines(lines: Vec<Line>, allowed: &[String], excluded: &[String]) -> 
         .collect()
 }
 
-impl Default for Line {
-    fn default() -> Self {
-        Line {
-            cost: u128::MAX,
-            ..bldsa()
-        }
-    }
-}
-
 #[cfg(test)]
 mod probe_filter_tests {
     use super::*;
@@ -423,13 +428,25 @@ mod probe_filter_tests {
 
     #[test]
     fn empty_allowed_means_no_restriction() {
-        let lines = vec![bldsa(), bda2(), tx()];
-        assert_eq!(keys(&retained_lines(lines, &[], &[])), ["bldsa", "bda2", "tx"]);
+        let lines = vec![
+            Line::explicit("bldsa"),
+            Line::explicit("bda2"),
+            Line::explicit("tx"),
+        ];
+        assert_eq!(
+            keys(&retained_lines(lines, &[], &[])),
+            ["bldsa", "bda2", "tx"]
+        );
     }
 
     #[test]
     fn allowed_keeps_only_the_listed_lines() {
-        let lines = vec![bldsa(), bda2(), tx(), alia()];
+        let lines = vec![
+            Line::explicit("bldsa"),
+            Line::explicit("bda2"),
+            Line::explicit("tx"),
+            Line::explicit("alia"),
+        ];
         assert_eq!(
             keys(&retained_lines(lines, &owned(&["bda2", "tx"]), &[])),
             ["bda2", "tx"]
@@ -439,16 +456,20 @@ mod probe_filter_tests {
     /// 冷却优先于白名单：一条既在白名单又在冷却里的线路必须被剔除。
     #[test]
     fn excluded_wins_over_allowed() {
-        let lines = vec![bda2(), tx()];
+        let lines = vec![Line::explicit("bda2"), Line::explicit("tx")];
         assert_eq!(
-            keys(&retained_lines(lines, &owned(&["bda2", "tx"]), &owned(&["bda2"]))),
+            keys(&retained_lines(
+                lines,
+                &owned(&["bda2", "tx"]),
+                &owned(&["bda2"])
+            )),
             ["tx"]
         );
     }
 
     #[test]
     fn an_allow_list_matching_nothing_yields_no_candidate() {
-        let lines = vec![bldsa()];
+        let lines = vec![Line::explicit("bldsa")];
         assert!(retained_lines(lines, &owned(&["bda2"]), &[]).is_empty());
     }
 }
@@ -468,156 +489,6 @@ mod rate_limit_tests {
     #[test]
     fn ordinary_json_is_not_a_rate_limit() {
         assert!(parse_rate_limit(br#"{"OK":1}"#).is_none());
-    }
-}
-
-/// B站自建DSA
-pub fn bldsa() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=bldsa&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdnbldsa.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// B站自建DSA
-pub fn cnbldsa() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=cnbldsa&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdnbldsa.bilivideo.cn/OK".into(),
-        cost: 0,
-    }
-}
-
-/// B站自建DSA
-pub fn andsa() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=andsa&probe_version=20221109".into(),
-        probe_url: "//c3350892csdsa.anitama.cn/OK".into(),
-        cost: 0,
-    }
-}
-
-/// B站自建DSA
-pub fn atdsa() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=atdsa&probe_version=20221109".into(),
-        probe_url: "//c3350892csdsa.anitama.net/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 百度云
-pub fn bda2() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "probe_version=20221109&upcdn=bda2&zone=cs".into(),
-        probe_url: "//upos-cs-upcdnbda2.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 百度云
-pub fn cnbd() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "probe_version=20221109&upcdn=cnbd&zone=cs".into(),
-        probe_url: "//upos-cs-upcdnbd.bilivideo.cn/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 百度云
-pub fn anbd() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "probe_version=20221109&upcdn=anbd&zone=cs".into(),
-        probe_url: "//c3350892csbd.anitama.cn/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 百度云
-pub fn atbd() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "probe_version=20221109&upcdn=atbd&zone=cs".into(),
-        probe_url: "//c3350892csbd.anitama.net/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 腾讯云EO
-pub fn tx() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=tx&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdntx.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 腾讯云EO
-pub fn cntx() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=cntx&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdntx.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 腾讯云EO
-pub fn antx() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=antx&probe_version=20221109".into(),
-        probe_url: "//c3350892cstx.anitama.cn/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 腾讯云EO
-pub fn attx() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=attx&probe_version=20221109".into(),
-        probe_url: "//c3350892cstx.anitama.net/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 百度云海外（Cloudflare）
-pub fn bda() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=bda&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdnbda.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 腾讯云EO海外
-pub fn txa() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=txa&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdntxa.bilivideo.com/OK".into(),
-        cost: 0,
-    }
-}
-
-/// 阿里云海外
-pub fn alia() -> Line {
-    Line {
-        os: Uploader::Upos,
-        query: "zone=cs&upcdn=alia&probe_version=20221109".into(),
-        probe_url: "//upos-cs-upcdnalia.bilivideo.com/OK".into(),
-        cost: 0,
     }
 }
 
@@ -662,10 +533,13 @@ mod tests {
 
     #[test]
     fn successful_auto_probe_preserves_other_line_failures_for_breaker() {
-        let mut healthy = bda2();
+        let mut healthy = Line::explicit("bda2");
         healthy.cost = 20;
         let (selected, failures) = choose_line_and_failures(vec![
-            (bldsa(), Some(Custom("certificate has expired".to_string()))),
+            (
+                Line::explicit("bldsa"),
+                Some(Custom("certificate has expired".to_string())),
+            ),
             (healthy, None),
         ])
         .unwrap();
@@ -673,6 +547,23 @@ mod tests {
         assert_eq!(selected.key(), "bda2");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].line_key, "bldsa");
+    }
+
+    /// 显式线路只靠 key 就能构造：`pre_upload` 只读 `query`，而 `query` 里除 key 外全是常量。
+    #[test]
+    fn explicit_line_carries_the_key_in_its_query() {
+        for key in ["bldsa", "bda2", "tx", "alia", "estx"] {
+            let line = Line::explicit(key);
+            assert_eq!(line.key(), key);
+            let params: std::collections::BTreeSet<&str> = line.query.split('&').collect();
+            let upcdn = format!("upcdn={key}");
+            assert_eq!(
+                params,
+                ["zone=cs", upcdn.as_str(), "probe_version=20221109"]
+                    .into_iter()
+                    .collect()
+            );
+        }
     }
 
     #[test]
