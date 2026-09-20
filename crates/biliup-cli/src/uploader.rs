@@ -1,4 +1,3 @@
-use crate::UploadLine;
 use crate::observe::{self, standalone::UploadTask};
 use crate::server::errors::{AppError, AppResult};
 use crate::upload_lock::UploadLock;
@@ -6,11 +5,11 @@ use biliup::client::StatelessClient;
 use biliup::error::Kind;
 use biliup::uploader::bilibili::{BiliBili, Studio, Vid, Video};
 use biliup::uploader::credential::{Credential, LoginInfo};
-use biliup::uploader::line::{Line, Probe};
+use biliup::uploader::line::Probe;
+use crate::server::common::upload_line_selection::explicit_upload_line;
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, credential, load_config};
 use bytes::{Buf, Bytes};
-use clap::ValueEnum;
 use dialoguer::Input;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
@@ -130,7 +129,7 @@ pub async fn upload_by_command(
     mut studio: Studio,
     user_cookie: PathBuf,
     video_path: Vec<PathBuf>,
-    line: Option<UploadLine>,
+    line: Option<String>,
     limit: usize,
     submit: SubmitOption,
     proxy: Option<&str>,
@@ -221,10 +220,7 @@ pub async fn upload_by_config(
             upload_with_task(
                 &paths,
                 &bilibili,
-                config
-                    .line
-                    .as_ref()
-                    .and_then(|l| UploadLine::from_str(l, true).ok()),
+                config.line.clone(),
                 config.limit,
                 &task,
             )
@@ -269,7 +265,7 @@ pub async fn append(
     user_cookie: PathBuf,
     vid: Vid,
     video_path: Vec<PathBuf>,
-    line: Option<UploadLine>,
+    line: Option<String>,
     limit: usize,
     submit: SubmitOption,
     replace: Option<usize>,
@@ -506,7 +502,7 @@ pub async fn cover_up(studio: &mut Studio, bili: &BiliBili) -> AppResult<()> {
 pub async fn upload(
     video_path: &[PathBuf],
     bili: &BiliBili,
-    line: Option<UploadLine>,
+    line: Option<String>,
     limit: usize,
 ) -> AppResult<Vec<Video>> {
     let task = UploadTask::default();
@@ -519,7 +515,7 @@ pub async fn upload(
 async fn upload_with_task(
     video_path: &[PathBuf],
     bili: &BiliBili,
-    line: Option<UploadLine>,
+    line: Option<String>,
     limit: usize,
     task: &UploadTask,
 ) -> AppResult<Vec<Video>> {
@@ -565,11 +561,16 @@ async fn upload_with_task(
     } else {
         "automatic"
     };
-    let line = match line {
-        Some(line) => Line::explicit(line.key()),
-        None => Probe::probe(&client.client)
-            .await
-            .change_context(AppError::Unknown)?,
+    let line = match line.as_deref().and_then(explicit_upload_line) {
+        Some(line) => line,
+        None => {
+            if let Some(rejected) = line.as_deref().filter(|l| !l.eq_ignore_ascii_case("auto")) {
+                warn!(line = rejected, "上传线路不是合法的 upcdn key，改为自动探测");
+            }
+            Probe::probe(&client.client)
+                .await
+                .change_context(AppError::Unknown)?
+        }
     };
     // let line = line::kodo();
     for (index, video_path) in video_path.iter().enumerate() {

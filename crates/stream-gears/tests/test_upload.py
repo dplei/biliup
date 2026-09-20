@@ -44,7 +44,7 @@ if __name__ == '__main__':
     #     limit=3,  # 并发数
     #     desc_v2=[],  # 视频简介v2
     #     dtime=None,  # 立即发布
-    #     line=stream_gears.UploadLine.Bda2,  # 指定上传线路
+    #     line="bda2",  # 指定上传线路 (upcdn key)
     #     extra_fields=None,  # 额外字段
     #     submit="BCutAndroid",  # 使用必剪安卓版接口提交
     #     proxy=None  # 不使用代理

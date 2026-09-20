@@ -110,31 +110,6 @@ def login_by_web_qrcode(sess_data: str, dede_user_id: str, proxy: Optional[str])
     """
 
 
-class UploadLine(Enum):
-    """上传线路"""
-
-    Bda2 = 1
-    """百度云"""
-
-    Qn = 2
-    """七牛"""
-
-    Bda = 3
-    """百度云海外"""
-
-    Tx = 4
-    """腾讯云EO"""
-
-    Txa = 5
-    """腾讯云EO海外"""
-
-    Bldsa = 6
-    """Bilibili大陆动态加速"""
-
-    Alia = 7
-    """阿里云海外"""
-
-
 def upload(video_path: List[str],
            cookie_file: str,
            title: str,
@@ -152,7 +127,7 @@ def upload(video_path: List[str],
            limit: int,
            desc_v2: List[Credit],
            dtime: Optional[int],
-           line: Optional[UploadLine],
+           line: Optional[str],
            extra_fields: Optional[str],
            submit: Optional[str],
            proxy: Optional[str]) -> None:
@@ -177,7 +152,7 @@ def upload(video_path: List[str],
     :param int limit: 单视频文件最大并发数
     :param List[Credit] desc_v2: 视频简介v2
     :param Optional[dtime] int dtime: 定时发布时间, 距离提交大于2小时小于15天, 格式为10位时间戳
-    :param Optional[UploadLine] line: 上传线路
+    :param Optional[str] line: 上传线路, B 站 preupload 索引里的 upcdn key (如 bda2/tx/bldsa/estx/akbd), None 为自动探测
     :param Optional[ExtraFields] line: 上传额外参数
     :param Optional[str] submit: 提交接口, 可选值: BCutAndroid, App（默认）
     :param Optional[str] proxy: 代理

@@ -1,4 +1,3 @@
-use crate::UploadLine;
 use crate::server::common::attempt_lease::{self, AttemptPhase, StaleReason, preprocess_deadline};
 use crate::server::common::audio_normalization::{
     AudioSampleStore, DiskBudget, NormalizationOutcome, NormalizationSettings, NormalizedForm,
@@ -3465,7 +3464,7 @@ pub async fn execute_postprocessor(video_paths: Vec<PathBuf>, ctx: &Context) -> 
 pub async fn upload(
     cookie_file: impl AsRef<Path>,
     proxy: Option<&str>,
-    line: Option<UploadLine>,
+    line: Option<String>,
     video_paths: &[PathBuf],
     limit: usize,
     config: &Config,
@@ -3490,7 +3489,7 @@ pub async fn upload(
 pub async fn upload_with_task(
     cookie_file: impl AsRef<Path>,
     proxy: Option<&str>,
-    line: Option<UploadLine>,
+    line: Option<String>,
     video_paths: &[PathBuf],
     limit: usize,
     config: &Config,
@@ -3526,7 +3525,7 @@ pub async fn upload_with_task(
         pool,
         &client.client,
         &config.lines,
-        line.clone().map(UploadLine::key),
+        line.as_deref(),
         config.cookie_health_webhook.as_deref(),
         "page_upload",
     )

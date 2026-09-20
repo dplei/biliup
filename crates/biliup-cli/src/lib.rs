@@ -19,7 +19,6 @@ use crate::server::infrastructure::models::upload_streamer::{
 };
 use crate::server::infrastructure::repositories;
 use crate::server::infrastructure::service_register::ServiceRegister;
-use clap::ValueEnum;
 use error_stack::{Report, ResultExt};
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -315,46 +314,3 @@ fn to_live_streamer_insert(
     })
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum UploadLine {
-    Bldsa,
-    Cnbldsa,
-    Andsa,
-    Atdsa,
-    Bda2,
-    Cnbd,
-    Anbd,
-    Atbd,
-    Tx,
-    Cntx,
-    Antx,
-    Attx,
-    Bda,
-    Txa,
-    Alia,
-}
-
-impl UploadLine {
-    /// The `upcdn` key this line is known by everywhere else — line health, the recovery page,
-    /// `config.lines`. Keeping the mapping here means the CLI enum and the unified line decision
-    /// cannot drift apart.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Bldsa => "bldsa",
-            Self::Cnbldsa => "cnbldsa",
-            Self::Andsa => "andsa",
-            Self::Atdsa => "atdsa",
-            Self::Bda2 => "bda2",
-            Self::Cnbd => "cnbd",
-            Self::Anbd => "anbd",
-            Self::Atbd => "atbd",
-            Self::Tx => "tx",
-            Self::Cntx => "cntx",
-            Self::Antx => "antx",
-            Self::Attx => "attx",
-            Self::Bda => "bda",
-            Self::Txa => "txa",
-            Self::Alia => "alia",
-        }
-    }
-}

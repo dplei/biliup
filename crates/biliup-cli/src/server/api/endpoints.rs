@@ -36,14 +36,13 @@ use crate::server::infrastructure::repositories::{
     del_streamer, find_streamer, get_all_streamer, get_streamer_by_url, get_upload_config,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
-use crate::{LogHandle, UploadLine};
+use crate::LogHandle;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use biliup::credential::Credential;
 use chrono::Utc;
-use clap::ValueEnum;
 use error_stack::{Report, ResultExt};
 use ormlite::{Insert, Model};
 use serde::Deserialize;
@@ -676,12 +675,9 @@ pub async fn post_uploads(
     let task_id = task.submission.task_id.clone();
     let upload_config = json_data.params;
     let files = json_data.files;
-    let (line, limit, submit_api) = {
+    let (limit, submit_api) = {
         let config = config.read().unwrap();
-        let line = UploadLine::from_str(&config.lines, true).ok();
-        let limit = config.threads;
-        let submit_api = config.submit_api.clone();
-        (line, limit, submit_api)
+        (config.threads, config.submit_api.clone())
     };
 
     // 按第一段文件（P1）反查它属于哪个主播，用真实 StreamerInfo 填标题/简介模板。
@@ -733,7 +729,9 @@ pub async fn post_uploads(
                     .as_deref()
                     .unwrap_or("cookies.json"),
                 None,
-                line,
+                // 线路来自 runtime_config.lines（decide_upload_line 的 configured 输入）；
+                // 这里不再把同一个值重复当成 forced 传入，否则来源会被误标为 Manual。
+                None,
                 &files,
                 limit as usize,
                 &runtime_config,

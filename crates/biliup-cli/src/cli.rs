@@ -2,7 +2,6 @@ use biliup::uploader::bilibili::{Studio, Vid};
 use biliup::uploader::util::SubmitOption;
 use clap::{Parser, Subcommand};
 
-use crate::UploadLine;
 use std::path::PathBuf;
 
 /// 扩展路径中的 ~ 为用户主目录
@@ -58,9 +57,10 @@ pub enum Commands {
         #[arg(short, long, value_name = "FILE")]
         config: Option<PathBuf>,
 
-        /// 选择上传线路
-        #[arg(short, long, value_enum)]
-        line: Option<UploadLine>,
+        /// 选择上传线路：B 站 `preupload?r=probe` 索引里的任意 upcdn key（如 bda2、tx、bldsa、
+        /// estx、akbd），不填则自动探测
+        #[arg(short, long, value_name = "UPCDN")]
+        line: Option<String>,
 
         /// 单视频文件最大并发数
         #[arg(long, default_value = "3")]
@@ -86,9 +86,9 @@ pub enum Commands {
         #[arg()]
         video_path: Vec<PathBuf>,
 
-        /// 选择上传线路
-        #[arg(short, long, value_enum)]
-        line: Option<UploadLine>,
+        /// 选择上传线路：任意 upcdn key，不填则自动探测
+        #[arg(short, long, value_name = "UPCDN")]
+        line: Option<String>,
 
         /// 单视频文件最大并发数
         #[arg(long, default_value = "3")]
