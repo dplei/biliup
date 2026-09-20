@@ -59,6 +59,7 @@
 | `app/(app)/uploads/page.tsx` | 上传列表页：每个分段从登记起就在这里，首传与失败重试同表；独立轮询待投稿会话和分段列表，按状态在单个「详情」列展示进度/去向/错误，并触发会话恢复、空会话逻辑终结、立即上传、换线重传、停止、删除与本场补扫。 | `UploadList`、`renderDetail`、`AttemptHistoryPanel` |
 | `app/ui/OverrideModal.tsx` | 主播级「配置覆写」弹窗：顶部 JSON 文本框与各分区控件合成同一份 `override`，提交时控件值覆盖文本框的同名键。`entityFields` 里的键是 livestreamers 表上的真实列，不进 override。音量一组由「为这个房间单独设置音量」独占，与全局同值且原先未覆写的项不写入，override 保持最小。Form 带 `key`，每次打开重建，否则 Semi 保留的折叠面板不会重新应用 initValues。 | `OverrideModal`、`handleOk`、`AudioOverrideSection`、`CoverSection`、`AUDIO_OVERRIDE_FIELDS`、`AUDIO_OVERRIDE_TOGGLE` |
 | `app/ui/AudioNormalizationControl.tsx` | 响度标准化的表单控件，空间配置页与主播覆写弹窗共用同一套界面：开关、磁盘保留线、保留原片、竖向音量推子，以及基于 WebAudio 增益的样片试听。样片全局唯一，覆写弹窗传 `showSample={false}` 隐藏其更新/删除按钮。 | `AudioNormalizationControl`、`prepareAudio`、`STATUS_URL`、`SAMPLE_URL` |
+| `app/lib/use-upload-lines.ts` | 两处线路下拉共用的 `/v1/upload-lines` hook：不含 auto、按字母排序求稳定，已保存却不在索引里的 key 保留为选项，已知 key 附中文说明。 | `useUploadLines`、`lineLabel`、`UploadLines` |
 | `app/lib/api-streamer.ts` | 前端统一的 fetch 封装与错误处理边界：401 跳登录，JSON 错误透传，HTML/空正文按状态码翻译成中文提示。 | `fetcher`、`sendRequest`、`handleResponse`、`describeError` |
 
 ## 日志与存储基础设施
@@ -135,7 +136,7 @@
 | `crates/biliup-cli/src/server/common/disk_space.rs` | 文件系统可用空间探测（unix `statvfs`，取非特权可用的 `f_bavail`）：响度标准化的准入与硬水位共用，探测不出一律返回 `None` 让调用方放行。 | `available_bytes` |
 | `crates/biliup-cli/src/server/common/process_priority.rs` | 给上传前的 ffmpeg 预处理子进程设置后台 nice 与 IO 优先级，使其让路给网页请求；录制与用户 hook 不降级。 | `background`、`background_std` |
 | `crates/biliup-cli/src/server/router.rs` | 组装主要 v1 业务 HTTP 路由和静态文件服务；认证与日志 WebSocket 另由应用启动层挂载。 | `router`、`static_file_router` |
-| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失补传/待投稿五态与人工恢复、上传健康和页面整场上传；页面响应返回观测 task，跨后台上传/投稿传递，首文件主播反查只用于模板。分段补传只 claim，按会话恢复持久化授权后异步唤醒投稿协调器。 | `post_uploads`、`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`get_missing_upload_attempts` |
+| `crates/biliup-cli/src/server/api/endpoints.rs` | 实现 Web API 业务端点：缺失补传/待投稿五态与人工恢复、上传健康、B 站线路索引转发（`/v1/upload-lines`，拉不到时回 `IMPLICIT_FALLBACKS` 并标 `degraded`）和页面整场上传；页面响应返回观测 task，跨后台上传/投稿传递，首文件主播反查只用于模板。分段补传只 claim，按会话恢复持久化授权后异步唤醒投稿协调器。 | `post_uploads`、`get_missing_uploads`、`get_pending_submit_sessions`、`recover_session_uploads`、`get_missing_upload_attempts`、`get_upload_lines`、`UploadLines` |
 | `crates/biliup-cli/src/server/common/missing_segment.rs` | 分段补传状态机：入队、按状态计数与 stale-uploading 健康快照、后台自愈租约（先取消进程内 attempt 再落库）与 v1 重试状态转换。`upload_missing_segment` 的 v1 行是失败/补救队列，v2 行是所有已验证分段的持久账本；当前健康以 `status` 为准，`last_error` 只存真实失败诊断，成功转换必须清空它。 | `missing_segment_health`、`recover_stale_upload_attempts`、`start_stale_attempt_recovery`、`enqueue_pending_segment`、`mark_retry_success` |
 
 ## 上传核心
@@ -184,6 +185,7 @@
 - `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/api/ws.rs`（`ws_logs`）：应用启动层单独挂载日志 WebSocket；检查认证边界时不能只读业务 router。
 - `crates/biliup-cli/src/server/router.rs` → `crates/biliup-cli/src/server/api/log_events.rs`、`api/ws.rs`（`list_log_events`、`ws_logs`）：新老两个日志入口都挂在 router 内，`app.rs` 的 `login_required` 因此对两者同时生效；开启 `--auth` 时未登录一律 401，显式关闭认证的部署行为不变。
 - `app/ui/logviewer/LegacyLogViewer.tsx` → `crates/biliup-cli/src/server/api/ws.rs`（`/v1/ws/logs`）：文件 tab 以 `file` 参数订阅文本流，前端逐条追加显示。
+- `app/ui/plugins/global.tsx`、`app/(app)/uploads/page.tsx` → `app/lib/use-upload-lines.ts` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_upload_lines`）→ `crates/biliup/src/uploader/line.rs`（`Probe::index_keys`）：线路下拉不再写死，B 站 `preupload?r=probe` 索引里新增/下线的 upcdn key 自动反映到页面；显式选线只靠 key（`Line::explicit`），代码里没有登记表。
 - `app/(app)/layout.tsx`、`app/(app)/logviewer/page.tsx` → `app/lib/log-view-config.ts`（`LOG_NAV_ENTRIES`、`LOG_EVENTS_IS_DEFAULT`）：导航条目与默认页由同一个开关决定，切换默认页不需要改路由或页面代码。
 - `app/ui/logevents/useLogEventFeed.ts` → `crates/biliup-cli/src/server/api/log_events.rs`（`/v1/log-events`、`/stream`）：历史用 `order=desc` + `until_id` 往回翻，实时用同一套筛选从已见最大 id 接续，两边共用入库序号游标。
 - `app/ui/logevents/ProgressView.tsx` → `crates/biliup-cli/src/server/api/endpoints.rs`（`get_status`、`get_missing_uploads`、`get_pending_submit_sessions`）：进度视图只读已有业务快照，不在日志页另建一套上传状态机。

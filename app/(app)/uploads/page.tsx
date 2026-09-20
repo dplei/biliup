@@ -4,6 +4,7 @@ import { IconDeleteStroked, IconRefresh, IconSendStroked } from '@douyinfe/semi-
 import { useEffect, useMemo, useState } from 'react'
 import useSWR from 'swr'
 import { fetcher, requestDelete, sendRequest } from '../../lib/api-streamer'
+import { useUploadLines } from '../../lib/use-upload-lines'
 
 interface MissingSegment {
   id: number
@@ -197,16 +198,10 @@ const SUBMIT_ACTION_META: Record<PendingSubmitAction, { color: 'green' | 'red' |
   manual_inspection: { color: 'red', text: '需人工核对' },
 }
 
-// 可手动指定的线路。空串表示「跟随配置」，也就是不传 line 参数。
-const LINE_OPTIONS = [
+// 可手动指定的线路的固定头部；其余来自 /v1/upload-lines。空串表示「跟随配置」，也就是不传 line 参数。
+const FIXED_LINE_OPTIONS = [
   { value: '', label: '跟随配置' },
   { value: 'auto', label: 'auto（自动探测）' },
-  { value: 'bda2', label: 'bda2' },
-  { value: 'bda', label: 'bda' },
-  { value: 'tx', label: 'tx' },
-  { value: 'txa', label: 'txa' },
-  { value: 'alia', label: 'alia' },
-  { value: 'bldsa', label: 'bldsa' },
 ]
 
 const fmtTime = (s?: string | null) => (s ? new Date(s).toLocaleString() : '—')
@@ -238,6 +233,11 @@ export default function UploadList() {
   const { data: lineHealth } = useSWR<UploadLineHealth[]>('/v1/health/upload-lines', fetcher, {
     refreshInterval: 15000,
   })
+  const uploadLines = useUploadLines()
+  const lineOptions = useMemo(
+    () => [...FIXED_LINE_OPTIONS, ...uploadLines.lines.map((key) => ({ value: key, label: key }))],
+    [uploadLines.lines],
+  )
   const {
     data: pendingSessions,
     isLoading: pendingSessionsLoading,
@@ -450,7 +450,7 @@ export default function UploadList() {
       onChange={(value: unknown) =>
         setLineChoice((prev) => ({ ...prev, [record.id]: String(value ?? '') }))
       }
-      optionList={LINE_OPTIONS.map((option) => ({
+      optionList={lineOptions.map((option) => ({
         value: option.value,
         label: coolingLines.some((line) => line.line_key === option.value)
           ? `${option.label}（冷却中）`
