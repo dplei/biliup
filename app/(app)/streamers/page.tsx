@@ -4,7 +4,7 @@ import {
     Button,
     Tag,
     Typography,
-    Popconfirm,
+    Modal,
     Notification,
     Card,
     Dropdown,
@@ -324,9 +324,15 @@ export default function Home() {
                       <CheckStreamButton streamer={item} />
                       <PauseButton streamer={item}/>
                     </ButtonGroup>
+                    {/* 编辑/覆写/期限三个 Modal 都挂在这个菜单的 React 子树里：
+                        clickToHide 让菜单在点选后收起，keepDOM 让收起只是 display:none 而不是卸载，
+                        否则 Modal 会随菜单一起消失。删除改用 Modal.confirm（命令式，id 在点击时捕获），
+                        不再用 Popconfirm——它挂在已隐藏的菜单项上定位会失效。 */}
                     <Dropdown
                       trigger="click"
                       position="bottomRight"
+                      clickToHide
+                      keepDOM
                       render={
                         <Dropdown.Menu>
                             <TemplateModal onOk={handleUpdate} entity={item}>
@@ -339,13 +345,20 @@ export default function Home() {
                               <Dropdown.Item icon={<IconCalendarClockStroked />}>录制期限</Dropdown.Item>
                             </RecordingLeaseButton>
                             <Dropdown.Divider />
-                            <Popconfirm
-                              title="确定是否要删除？"
-                              content="此操作将不可逆"
-                              onConfirm={async () => await onConfirm(item.id)}
+                            <Dropdown.Item
+                              type="danger"
+                              icon={<IconDeleteStroked />}
+                              onClick={() => {
+                                const id = item.id
+                                Modal.confirm({
+                                  title: `确定删除「${item.remark}」？`,
+                                  content: '此操作将不可逆',
+                                  onOk: () => onConfirm(id),
+                                })
+                              }}
                             >
-                              <Dropdown.Item type="danger" icon={<IconDeleteStroked />}>删除</Dropdown.Item>
-                            </Popconfirm>
+                              删除
+                            </Dropdown.Item>
                         </Dropdown.Menu>
                       }
                     >
