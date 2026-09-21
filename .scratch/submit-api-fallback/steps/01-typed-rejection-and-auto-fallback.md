@@ -1,6 +1,6 @@
 # 01 · 结构化远端拒绝与自动通道降级
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标
 
@@ -52,8 +52,18 @@ Status: ready-for-agent
 
 ## 回执
 
-实现后记录实际结果类型、共享入口的调用面、定向测试数量与命令结果。
+- `Kind::SubmitRejected { code, message }` 保留三条投稿接口的明确远端拒绝；成功响应不变。
+- 服务端共享入口用 `SubmitFailure` 区分配置、本地前置、明确拒绝与未知结果；未配置时仅
+  App 21566 降级一次 Web，显式接口严格，非法值在远端请求前失败。页面与 Python / wheel 继续
+  复用该入口，独立 CLI 未改。
+- 验证：`biliup --lib` 82 passed、1 ignored（其中新增响应测试 2 passed）；投稿决策相关
+  `biliup-cli` 测试随 `submit` 过滤共
+  15 passed；`standalone_upload_events` 1 passed；`page_upload_events` 1 passed；
+  `stream-gears --lib` 编译通过（0 tests）。
+- 实现文件的定向 rustfmt 检查通过；`config.rs` / `endpoints.rs` 的全文件检查仍只报告本任务前已存在
+  的格式差异，未扩大到无关行。
 
 ## Comments
 
 - 全仓 `cargo fmt --all -- --check` 当前会报告与本任务无关的既有差异；本 step 只检查触达文件。
+- 2026-09-21：实现与定向回归完成。

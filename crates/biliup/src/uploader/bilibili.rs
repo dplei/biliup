@@ -348,12 +348,9 @@ impl BiliBili {
             .json()
             .await?;
         info!("{:?}", ret);
-        if ret.code == 0 {
-            info!("BCUT接口投稿成功");
-            Ok(ret)
-        } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
-        }
+        let ret = accepted_submit_response(ret)?;
+        info!("BCUT接口投稿成功");
+        Ok(ret)
     }
 
     pub async fn submit_by_app(
@@ -397,12 +394,9 @@ impl BiliBili {
             .json()
             .await?;
         info!("{:?}", ret);
-        if ret.code == 0 {
-            info!("APP接口投稿成功");
-            Ok(ret)
-        } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
-        }
+        let ret = accepted_submit_response(ret)?;
+        info!("APP接口投稿成功");
+        Ok(ret)
     }
 
     /// 通过 Web 接口投稿
@@ -437,13 +431,9 @@ impl BiliBili {
             .json()
             .await?;
         info!("{:?}", ret);
-
-        if ret.code == 0 {
-            info!("Web 接口投稿成功");
-            Ok(ret)
-        } else {
-            Err(Kind::Custom(format!("{:?}", ret)))
-        }
+        let ret = accepted_submit_response(ret)?;
+        info!("Web 接口投稿成功");
+        Ok(ret)
     }
 
     /// 列出当前账号的视频合集（season）及其分区（section），用于查询 section_id。
@@ -956,6 +946,17 @@ pub struct ResponseData<T = Value> {
     ttl: Option<u8>,
 }
 
+fn accepted_submit_response(ret: ResponseData) -> Result<ResponseData> {
+    if ret.code == 0 {
+        Ok(ret)
+    } else {
+        Err(Kind::SubmitRejected {
+            code: ret.code,
+            message: ret.message,
+        })
+    }
+}
+
 impl<T: Serialize> Display for ResponseData<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -963,5 +964,39 @@ impl<T: Serialize> Display for ResponseData<T> {
             "{}",
             serde_json::to_string(self).map_err(std::fmt::Error::custom)?
         )
+    }
+}
+
+#[cfg(test)]
+mod submit_response_tests {
+    use super::{ResponseData, accepted_submit_response};
+    use crate::error::Kind;
+
+    #[test]
+    fn preserves_submit_rejection_code_and_message() {
+        let error = accepted_submit_response(ResponseData::<serde_json::Value> {
+            code: 21566,
+            data: None,
+            message: "投稿过于频繁".to_string(),
+            ttl: Some(1),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Kind::SubmitRejected { code: 21566, message } if message == "投稿过于频繁"
+        ));
+    }
+
+    #[test]
+    fn returns_success_response_unchanged() {
+        let response = accepted_submit_response(ResponseData {
+            code: 0,
+            data: Some(serde_json::json!({"aid": 1})),
+            message: "ok".to_string(),
+            ttl: Some(1),
+        })
+        .unwrap();
+        assert_eq!(response.code, 0);
+        assert_eq!(response.data.unwrap()["aid"], 1);
     }
 }

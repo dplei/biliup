@@ -38,6 +38,9 @@ pub enum Kind {
 
     #[error("upload rate limit (code: {code}): {message}")]
     RateLimit { code: i64, message: String },
+
+    #[error("submit rejected (code: {code}): {message}")]
+    SubmitRejected { code: i32, message: String },
 }
 
 impl From<&str> for Kind {

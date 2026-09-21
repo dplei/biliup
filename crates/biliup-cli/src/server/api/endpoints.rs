@@ -1003,16 +1003,22 @@ fn pending_submit_action(
                 "投稿协调器已取得唯一 claim，正在提交；请勿重复操作。".to_string(),
             );
         }
-        let message = if row.submit_state.as_deref() == Some("ok_no_aid") {
-            "远端可能已接受投稿但没有返回稳定 aid；请先在创作中心核对，系统不会自动重投。"
-        } else {
-            "投稿 claim 长时间未收敛或结果不确定；请人工核对远端稿件，系统不会自动偷取 claim。"
+        let message = match row.submit_state.as_deref() {
+            Some("ok_no_aid") => {
+                "远端可能已接受投稿但没有返回稳定 aid；请先在创作中心核对，系统不会自动重投。"
+            }
+            Some("unknown_remote_result") => {
+                "投稿请求的远端结果不确定；请人工核对稿件，系统不会自动重投。"
+            }
+            _ => {
+                "投稿 claim 长时间未收敛或结果不确定；请人工核对远端稿件，系统不会自动偷取 claim。"
+            }
         };
         return (PendingSubmitAction::ManualInspection, message.to_string());
     }
     if matches!(
         row.submit_state.as_deref(),
-        Some("ok_no_aid" | "submitting")
+        Some("ok_no_aid" | "submitting" | "unknown_remote_result")
     ) {
         return (
             PendingSubmitAction::ManualInspection,
@@ -1443,6 +1449,16 @@ fn recovery_blocking_summary(
             segment_ids: Vec::new(),
         });
     }
+    if matches!(
+        snapshot.submit_state.as_deref(),
+        Some("ok_no_aid" | "submitting" | "unknown_remote_result")
+    ) {
+        return Some(SessionRecoveryBlockingSummary {
+            code: "submission_result_unknown",
+            message: "投稿结果不确定且缺少可验证的 claim；请人工核对远端稿件。".to_string(),
+            segment_ids: Vec::new(),
+        });
+    }
     if !started.is_empty() {
         return Some(SessionRecoveryBlockingSummary {
             code: "segments_recovering",
@@ -1722,6 +1738,16 @@ mod pending_submit_view_tests {
             pending_submit_action(&value, &complete(), now).0,
             PendingSubmitAction::ManualInspection
         );
+
+        value.submit_state = Some("unknown_remote_result".to_string());
+        let (action, message) = pending_submit_action(&value, &complete(), now);
+        assert_eq!(action, PendingSubmitAction::ManualInspection);
+        assert!(message.contains("不会自动重投"));
+
+        value.submit_claim_token = None;
+        let (action, message) = pending_submit_action(&value, &complete(), now);
+        assert_eq!(action, PendingSubmitAction::ManualInspection);
+        assert!(message.contains("人工检查"));
     }
 
     #[test]
@@ -1737,6 +1763,21 @@ mod pending_submit_view_tests {
             PendingSubmitAction::ManualInspection
         );
         assert_eq!(value.submit_claim_token.as_deref(), Some("held"));
+    }
+
+    #[test]
+    fn unknown_submit_result_blocks_recovery_even_without_claim() {
+        let snapshot = SessionRecoverySnapshot {
+            status: "uploading".to_string(),
+            submit_state: Some("unknown_remote_result".to_string()),
+            submit_requested_at: Some(Utc::now()),
+            next_submit_at: None,
+            submit_claim_token: None,
+            last_submit_error: Some("remote_result_unknown".to_string()),
+        };
+        let blocker =
+            recovery_blocking_summary(&snapshot, &complete(), &[], Vec::new(), false).unwrap();
+        assert_eq!(blocker.code, "submission_result_unknown");
     }
 
     #[test]

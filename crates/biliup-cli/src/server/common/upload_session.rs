@@ -446,7 +446,10 @@ async fn discard_empty_session_in_transaction(
             EmptySessionDiscardRejection::Claimed,
         ));
     }
-    if matches!(submit_state.as_deref(), Some("ok_no_aid" | "submitting")) {
+    if matches!(
+        submit_state.as_deref(),
+        Some("ok_no_aid" | "submitting" | "unknown_remote_result")
+    ) {
         return Ok(EmptySessionDiscardResult::Rejected(
             EmptySessionDiscardRejection::ManualInspection,
         ));
@@ -1018,8 +1021,8 @@ pub async fn mark_submitted(
     Ok(())
 }
 
-/// 记录一次投稿异常（ok_no_aid / failed）。不改 status/aid，仅落投稿状态，
-/// 使「投稿成功却无 aid」「投稿接口失败」可持久查证。
+/// 记录一次投稿异常（ok_no_aid / unknown_remote_result / failed）。不改 status/aid，仅落投稿状态，
+/// 使「投稿成功却无 aid」「远端结果不确定」「投稿接口失败」可持久查证。
 pub async fn mark_submit_anomaly(
     pool: &ConnectionPool,
     session_row_id: i64,
@@ -1482,6 +1485,16 @@ mod tests {
         );
         sqlx::query(
             "UPDATE upload_session SET videos_json = '[]', submit_state = 'ok_no_aid' WHERE id = 70",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            discard_empty_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::ManualInspection)
+        );
+        sqlx::query(
+            "UPDATE upload_session SET submit_state = 'unknown_remote_result' WHERE id = 70",
         )
         .execute(&pool)
         .await

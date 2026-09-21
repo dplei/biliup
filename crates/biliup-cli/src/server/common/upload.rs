@@ -125,17 +125,6 @@ const PROGRESS_PERSIST_BYTES: u64 = 16 * 1024 * 1024;
 /// Equal to the `PeriodicScan` period: anything shorter is rounded up to the next scan anyway.
 const SUBMIT_RETRY_BASE_SECS: i64 = 60;
 const SUBMIT_RETRY_MAX_SECS: i64 = 30 * 60;
-/// Bilibili 21566 is an account-level submit rate limit. Retrying on the generic minute-scale
-/// backoff keeps hitting it and just extends the cooldown, so it gets its own hour-scale curve.
-const SUBMIT_RATE_LIMIT_BASE_SECS: i64 = 15 * 60;
-const SUBMIT_RATE_LIMIT_MAX_SECS: i64 = 4 * 60 * 60;
-/// Debug rendering of `ResponseData` as produced by `submit_by_*` on a non-zero code.
-const SUBMIT_RATE_LIMIT_MARKER: &str = "code: 21566";
-
-fn is_submit_rate_limited(error: &str) -> bool {
-    // ponytail: string match on the Debug output; type the remote code if a second one needs it.
-    error.contains(SUBMIT_RATE_LIMIT_MARKER)
-}
 
 /// Why the idempotent session-level submission coordinator was woken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,22 +655,20 @@ async fn defer_segments_after_upload_init_failure(
 fn submit_retry_at(
     submit_attempts: i64,
     now: chrono::DateTime<chrono::Utc>,
-    rate_limited: bool,
 ) -> chrono::DateTime<chrono::Utc> {
-    let (base, max) = if rate_limited {
-        (SUBMIT_RATE_LIMIT_BASE_SECS, SUBMIT_RATE_LIMIT_MAX_SECS)
-    } else {
-        (SUBMIT_RETRY_BASE_SECS, SUBMIT_RETRY_MAX_SECS)
-    };
     let exponent = u32::try_from(submit_attempts.max(0))
         .unwrap_or(u32::MAX)
         .min(10);
-    let base_seconds = base.saturating_mul(2_i64.saturating_pow(exponent)).min(max);
+    let base_seconds = SUBMIT_RETRY_BASE_SECS
+        .saturating_mul(2_i64.saturating_pow(exponent))
+        .min(SUBMIT_RETRY_MAX_SECS);
     // Spread failures from one scan batch across nearby ticks while keeping the documented hard
     // upper bound. At the cap the jitter naturally becomes zero.
     let jitter_ceiling = (base_seconds / 5).max(1);
     let jitter = rand::thread_rng().gen_range(0..=jitter_ceiling);
-    let seconds = base_seconds.saturating_add(jitter).min(max);
+    let seconds = base_seconds
+        .saturating_add(jitter)
+        .min(SUBMIT_RETRY_MAX_SECS);
     now + chrono::Duration::seconds(seconds)
 }
 
@@ -693,15 +680,14 @@ async fn retry_submission(
     remote_attempted: bool,
     webhook: Option<&str>,
 ) -> AppResult<SessionSubmissionOutcome> {
-    let (retry_attempts, last_error) = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT submit_retry_attempts, last_submit_error FROM upload_session WHERE id = ?1",
+    let retry_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT submit_retry_attempts FROM upload_session WHERE id = ?1",
     )
     .bind(session_row_id)
     .fetch_one(pool)
     .await
     .change_context(AppError::Unknown)?;
-    let rate_limited = is_submit_rate_limited(&error);
-    let next_at = submit_retry_at(retry_attempts, chrono::Utc::now(), rate_limited);
+    let next_at = submit_retry_at(retry_attempts, chrono::Utc::now());
     if !schedule_submit_retry(
         pool,
         session_row_id,
@@ -725,34 +711,47 @@ async fn retry_submission(
             "precondition_failed"
         },
     );
-    if rate_limited {
-        // One alert per cooldown: the account is throttled, every further hit is the same news.
-        if last_error.as_deref().is_some_and(is_submit_rate_limited) {
-            info!(
-                session = session_row_id,
-                %next_at,
-                "投稿仍在频控冷却中，退避已延长，不重复告警"
-            );
-        } else {
-            notify_alert(
-                webhook,
-                "投稿已进入频控冷却",
-                &format!(
-                    "会话 #{session_row_id} 投稿被 B 站频控（21566）拒绝；系统将在 {next_at} 后自动重试，期间不再重复告警。"
-                ),
-            );
-        }
-    } else {
-        notify_alert(
-            webhook,
-            "投稿将在退避后重试",
-            &format!(
-                "会话 #{session_row_id} 的分段账本已完整，但本次投稿明确失败；系统将在 {next_at} 后自动重试。最近错误：{}",
-                sanitize_error(&error)
-            ),
-        );
-    }
+    notify_alert(
+        webhook,
+        "投稿将在退避后重试",
+        &format!(
+            "会话 #{session_row_id} 的分段账本已完整，但本次投稿明确失败；系统将在 {next_at} 后自动重试。最近错误：{}",
+            sanitize_error(&error)
+        ),
+    );
     Ok(SessionSubmissionOutcome::RetryScheduled { next_at, error })
+}
+
+async fn preserve_unknown_submission(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    claim_token: &str,
+    submission: &crate::observe::SubmissionIdentity,
+    endpoint: SubmitEndpoint,
+) -> AppResult<SessionSubmissionOutcome> {
+    let reason = format!(
+        "submit result unknown: endpoint={}, reason=transport_or_response",
+        endpoint.as_str()
+    );
+    error!(
+        endpoint = endpoint.as_str(),
+        reason_code = "remote_result_unknown",
+        "submit_unknown：投稿请求结果不确定，保留 claim 等待人工核对"
+    );
+    crate::observe::submission_completed(submission, "unknown", "remote_result_unknown");
+    if let Err(error) = mark_submit_anomaly(
+        pool,
+        session_row_id,
+        claim_token,
+        "unknown_remote_result",
+        reason.clone(),
+        false,
+    )
+    .await
+    {
+        error!(?error, "写回 submit_state=unknown_remote_result 失败");
+    }
+    Ok(SessionSubmissionOutcome::ManualInspectionRequired { reason })
 }
 
 /// Reconcile one closed upload session using its durable id only.
@@ -781,24 +780,33 @@ pub async fn reconcile_session_submission(
         SessionSubmitReadiness::Claimed { state } => {
             // A claim held with no stable remote id is an unknown result, not a skip: nothing
             // may resubmit it, and nothing may call it successful either.
+            let manual_inspection = matches!(
+                state.as_deref(),
+                Some("ok_no_aid" | "unknown_remote_result")
+            );
             crate::observe::submission_decided(
                 &submission,
-                if state.as_deref() == Some("ok_no_aid") {
+                if manual_inspection {
                     "unknown"
                 } else {
                     "skipped"
                 },
-                if state.as_deref() == Some("ok_no_aid") {
-                    "missing_remote_id"
-                } else {
-                    "claimed_elsewhere"
+                match state.as_deref() {
+                    Some("ok_no_aid") => "missing_remote_id",
+                    Some("unknown_remote_result") => "remote_result_unknown",
+                    _ => "claimed_elsewhere",
                 },
                 0,
             );
-            return if state.as_deref() == Some("ok_no_aid") {
+            return if manual_inspection {
                 Ok(SessionSubmissionOutcome::ManualInspectionRequired {
-                    reason: "remote accepted submission without a stable aid; claim preserved"
-                        .to_string(),
+                    reason: match state.as_deref() {
+                        Some("ok_no_aid") => {
+                            "remote accepted submission without a stable aid; claim preserved"
+                                .to_string()
+                        }
+                        _ => "remote submission result is unknown; claim preserved".to_string(),
+                    },
                 })
             } else {
                 Ok(SessionSubmissionOutcome::ClaimedElsewhere)
@@ -1021,19 +1029,35 @@ pub async fn reconcile_session_submission(
         "submit_attempt：开始下播一次性投稿"
     );
     crate::observe::submission_started(&submission, trigger.as_str());
-    let resp = match submit_to_bilibili(&bilibili, &studio, effective_config.submit_api.as_deref())
-        .await
+    let resp = match submit_to_bilibili_classified(
+        &bilibili,
+        &studio,
+        effective_config.submit_api.as_deref(),
+    )
+    .await
     {
         Ok(resp) => resp,
-        Err(e) => {
-            let msg = format!("{e:?}");
+        Err(failure @ SubmitFailure::Unknown { .. }) => {
+            let endpoint = failure.endpoint().expect("unknown result has an endpoint");
+            return preserve_unknown_submission(
+                pool,
+                session_row_id,
+                &claim_token,
+                &submission,
+                endpoint,
+            )
+            .await;
+        }
+        Err(failure) => {
+            let remote_attempted = failure.remote_attempted();
+            let msg = failure.to_string();
             error!(error = %msg, "submit_failed：投稿接口失败，保持 uploading 待补提交");
             return retry_submission(
                 pool,
                 session_row_id,
                 &claim_token,
                 msg,
-                true,
+                remote_attempted,
                 submit_webhook,
             )
             .await;
@@ -3256,30 +3280,190 @@ async fn recover_due_missing_segments(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitEndpoint {
+    App,
+    Web,
+    BCutAndroid,
+}
+
+impl SubmitEndpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Web => "web",
+            Self::BCutAndroid => "b-cut-android",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SubmitFailure {
+    Configuration(String),
+    Local {
+        endpoint: SubmitEndpoint,
+        detail: String,
+    },
+    Rejected {
+        endpoint: SubmitEndpoint,
+        code: i32,
+        message: String,
+    },
+    Unknown {
+        endpoint: SubmitEndpoint,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(detail) => write!(f, "invalid submit_api: {detail}"),
+            Self::Local { endpoint, detail } => {
+                write!(
+                    f,
+                    "{} submit precondition failed: {detail}",
+                    endpoint.as_str()
+                )
+            }
+            Self::Rejected {
+                endpoint,
+                code,
+                message,
+            } => write!(
+                f,
+                "{} submit rejected (code: {code}): {message}",
+                endpoint.as_str()
+            ),
+            Self::Unknown { endpoint, detail } => write!(
+                f,
+                "{} submit result is unknown: {detail}",
+                endpoint.as_str()
+            ),
+        }
+    }
+}
+
+impl SubmitFailure {
+    fn endpoint(&self) -> Option<SubmitEndpoint> {
+        match self {
+            Self::Configuration(_) => None,
+            Self::Local { endpoint, .. }
+            | Self::Rejected { endpoint, .. }
+            | Self::Unknown { endpoint, .. } => Some(*endpoint),
+        }
+    }
+
+    fn remote_attempted(&self) -> bool {
+        matches!(self, Self::Rejected { .. } | Self::Unknown { .. })
+    }
+
+    fn into_report(self) -> error_stack::Report<AppError> {
+        error_stack::Report::new(AppError::Custom(self.to_string()))
+    }
+}
+
+fn configured_submit_endpoint(
+    submit_api: Option<&str>,
+) -> Result<(SubmitEndpoint, bool), SubmitFailure> {
+    let Some(value) = submit_api else {
+        return Ok((SubmitEndpoint::App, true));
+    };
+    let endpoint = match SubmitOption::from_str(value) {
+        Ok(SubmitOption::App) => SubmitEndpoint::App,
+        Ok(SubmitOption::Web) => SubmitEndpoint::Web,
+        Ok(SubmitOption::BCutAndroid) => SubmitEndpoint::BCutAndroid,
+        Err(error) => return Err(SubmitFailure::Configuration(error)),
+    };
+    Ok((endpoint, false))
+}
+
+fn fallback_endpoint(
+    automatic: bool,
+    current: SubmitEndpoint,
+    failure: &SubmitFailure,
+) -> Option<SubmitEndpoint> {
+    if automatic
+        && current == SubmitEndpoint::App
+        && matches!(failure, SubmitFailure::Rejected { code: 21566, .. })
+    {
+        Some(SubmitEndpoint::Web)
+    } else {
+        None
+    }
+}
+
+fn classify_submit_error(endpoint: SubmitEndpoint, error: Kind) -> SubmitFailure {
+    match error {
+        Kind::SubmitRejected { code, message } => SubmitFailure::Rejected {
+            endpoint,
+            code,
+            message,
+        },
+        Kind::Reqwest(error) => SubmitFailure::Unknown {
+            endpoint,
+            detail: error.to_string(),
+        },
+        Kind::ReqwestMiddleware(error) => SubmitFailure::Unknown {
+            endpoint,
+            detail: error.to_string(),
+        },
+        Kind::SerdeJson(error) => SubmitFailure::Unknown {
+            endpoint,
+            detail: error.to_string(),
+        },
+        error => SubmitFailure::Local {
+            endpoint,
+            detail: error.to_string(),
+        },
+    }
+}
+
+async fn submit_once(
+    bilibili: &BiliBili,
+    studio: &Studio,
+    endpoint: SubmitEndpoint,
+) -> Result<ResponseData, SubmitFailure> {
+    let result = match endpoint {
+        SubmitEndpoint::App => bilibili.submit_by_app(studio, None).await,
+        SubmitEndpoint::Web => bilibili.submit_by_web(studio, None).await,
+        SubmitEndpoint::BCutAndroid => bilibili.submit_by_bcut_android(studio, None).await,
+    };
+    result.map_err(|error| classify_submit_error(endpoint, error))
+}
+
+async fn submit_to_bilibili_classified(
+    bilibili: &BiliBili,
+    studio: &Studio,
+    submit_api: Option<&str>,
+) -> Result<ResponseData, SubmitFailure> {
+    let (endpoint, automatic) = configured_submit_endpoint(submit_api)?;
+    match submit_once(bilibili, studio, endpoint).await {
+        Ok(response) => Ok(response),
+        Err(failure) => {
+            let Some(fallback) = fallback_endpoint(automatic, endpoint, &failure) else {
+                return Err(failure);
+            };
+            warn!(
+                event = "submit_fallback",
+                from = endpoint.as_str(),
+                to = fallback.as_str(),
+                code = 21566,
+                "投稿接口明确拒绝，切换备用通道"
+            );
+            submit_once(bilibili, studio, fallback).await
+        }
+    }
+}
+
 pub async fn submit_to_bilibili(
     bilibili: &BiliBili,
     studio: &Studio,
     submit_api: Option<&str>,
 ) -> AppResult<ResponseData> {
-    let submit_option = match submit_api {
-        Some(submit) => SubmitOption::from_str(submit).unwrap_or(SubmitOption::App),
-        _ => SubmitOption::App,
-    };
-
-    let result = match submit_option {
-        SubmitOption::BCutAndroid => bilibili
-            .submit_by_bcut_android(studio, None)
-            .await
-            .change_context(AppError::Unknown)?,
-        SubmitOption::Web => bilibili
-            .submit_by_web(studio, None)
-            .await
-            .change_context(AppError::Unknown)?,
-        _ => bilibili
-            .submit_by_app(studio, None)
-            .await
-            .change_context(AppError::Unknown)?,
-    };
+    let result = submit_to_bilibili_classified(bilibili, studio, submit_api)
+        .await
+        .map_err(SubmitFailure::into_report)?;
     info!("Submit successful");
     Ok(result)
 }
@@ -5500,65 +5684,134 @@ mod tests {
     #[test]
     fn submit_retry_backoff_is_bounded() {
         let now = chrono::Utc::now();
-        let first = submit_retry_at(0, now, false);
+        let first = submit_retry_at(0, now);
         assert!(first >= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS));
         assert!(first <= now + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
         assert_eq!(
-            submit_retry_at(100, now, false),
+            submit_retry_at(100, now),
             now + chrono::Duration::seconds(SUBMIT_RETRY_MAX_SECS)
         );
     }
 
-    /// 连续两次 21566：第二次要在上一次的基础上继续拉长退避，并把上一条错误留给告警去重判定。
     #[tokio::test]
-    async fn repeated_rate_limit_keeps_the_hour_scale_backoff_and_last_error() {
+    async fn explicit_app_21566_uses_regular_submit_backoff() {
         let (_directory, pool) = deferred_test_pool().await;
-        let rate_limited =
-            "ResponseData { code: 21566, data: None, message: \"投稿过于频繁\", ttl: Some(1) }";
-        let mut next_ats = Vec::new();
-        for _ in 0..2 {
-            sqlx::query(
-                "UPDATE upload_session SET submit_claim_token = 'claim', next_submit_at = NULL \
-                 WHERE id = 30",
-            )
-            .execute(&pool)
-            .await
-            .unwrap();
-            let before = chrono::Utc::now();
-            let SessionSubmissionOutcome::RetryScheduled { next_at, .. } =
-                retry_submission(&pool, 30, "claim", rate_limited.to_string(), true, None)
-                    .await
-                    .unwrap()
-            else {
-                panic!("expected retry scheduling")
-            };
-            next_ats.push(next_at - before);
-        }
-        assert!(next_ats[0] >= chrono::Duration::minutes(15));
-        assert!(next_ats[1] >= chrono::Duration::minutes(30));
-        let last_error: Option<String> =
-            sqlx::query_scalar("SELECT last_submit_error FROM upload_session WHERE id = 30")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(last_error.as_deref().is_some_and(is_submit_rate_limited));
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'claim', next_submit_at = NULL, \
+             submit_retry_attempts = 0 \
+             WHERE id = 30",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = chrono::Utc::now();
+        let SessionSubmissionOutcome::RetryScheduled { next_at, .. } = retry_submission(
+            &pool,
+            30,
+            "claim",
+            "app submit rejected (code: 21566): 投稿过于频繁".to_string(),
+            true,
+            None,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected retry scheduling")
+        };
+        assert!(next_at >= before + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS));
+        assert!(next_at <= before + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
     }
 
-    /// 21566 是账号级频控：分钟级重试只会持续撞墙，首个退避必须是小时量级的起点（#60）。
     #[test]
-    fn submit_rate_limit_backoff_starts_at_quarter_hour_and_caps_at_hours() {
-        let now = chrono::Utc::now();
-        let first = submit_retry_at(0, now, true);
-        assert!(first >= now + chrono::Duration::minutes(15));
-        assert!(first <= now + chrono::Duration::minutes(18));
-        assert_eq!(
-            submit_retry_at(100, now, true),
-            now + chrono::Duration::seconds(SUBMIT_RATE_LIMIT_MAX_SECS)
+    fn automatic_submit_falls_back_only_for_app_21566() {
+        let (endpoint, automatic) = configured_submit_endpoint(None).unwrap();
+        assert_eq!(endpoint, SubmitEndpoint::App);
+        assert!(automatic);
+        let rejected = classify_submit_error(
+            endpoint,
+            Kind::SubmitRejected {
+                code: 21566,
+                message: "投稿过于频繁".to_string(),
+            },
         );
-        assert!(is_submit_rate_limited(
-            "ResponseData { code: 21566, data: None, message: \"投稿过于频繁\", ttl: Some(1) }"
+        assert!(matches!(
+            rejected,
+            SubmitFailure::Rejected { code: 21566, .. }
         ));
-        assert!(!is_submit_rate_limited("load live_streamer failed"));
+        assert_eq!(
+            fallback_endpoint(automatic, endpoint, &rejected),
+            Some(SubmitEndpoint::Web)
+        );
+
+        let other = SubmitFailure::Rejected {
+            endpoint,
+            code: -1,
+            message: "rejected".to_string(),
+        };
+        assert_eq!(fallback_endpoint(automatic, endpoint, &other), None);
+        let unknown = SubmitFailure::Unknown {
+            endpoint,
+            detail: "timeout".to_string(),
+        };
+        assert_eq!(fallback_endpoint(automatic, endpoint, &unknown), None);
+    }
+
+    #[test]
+    fn explicit_submit_endpoint_is_strict_and_invalid_config_fails() {
+        for (value, expected) in [
+            ("app", SubmitEndpoint::App),
+            ("web", SubmitEndpoint::Web),
+            ("b-cut-android", SubmitEndpoint::BCutAndroid),
+        ] {
+            let (endpoint, automatic) = configured_submit_endpoint(Some(value)).unwrap();
+            assert_eq!(endpoint, expected);
+            assert!(!automatic);
+            let rejected = SubmitFailure::Rejected {
+                endpoint,
+                code: 21566,
+                message: "rejected".to_string(),
+            };
+            assert_eq!(fallback_endpoint(automatic, endpoint, &rejected), None);
+        }
+        assert!(matches!(
+            configured_submit_endpoint(Some("invalid")),
+            Err(SubmitFailure::Configuration(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_submit_result_preserves_claim_without_retry_time() {
+        let (_directory, pool) = deferred_test_pool().await;
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'claim', submit_state = 'submitting', \
+             next_submit_at = NULL WHERE id = 30",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = preserve_unknown_submission(
+            &pool,
+            30,
+            "claim",
+            &crate::observe::SubmissionIdentity::session(30),
+            SubmitEndpoint::Web,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            SessionSubmissionOutcome::ManualInspectionRequired { .. }
+        ));
+        let (state, claim, next_at): (Option<String>, Option<String>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT submit_state, submit_claim_token, next_submit_at \
+                 FROM upload_session WHERE id = 30",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("unknown_remote_result"));
+        assert_eq!(claim.as_deref(), Some("claim"));
+        assert_eq!(next_at, None);
     }
 
     #[test]
