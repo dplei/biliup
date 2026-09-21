@@ -1,6 +1,6 @@
 # 02 · 不确定投稿结果保留 claim
 
-Status: ready-for-agent
+Status: resolved
 
 依赖：01
 
@@ -54,8 +54,17 @@ Status: ready-for-agent
 
 ## 回执
 
-实现后记录持久状态迁移、claim/扫描器断言、退避测试替换情况与完整命令结果。
+- 传输或响应解析不确定时写 `submit_state=unknown_remote_result`、保留 claim、清空自动重试时间，
+  返回 `ManualInspectionRequired`；明确拒绝与本地失败仍走可重试路径。
+- 周期扫描器、空会话清理、待投稿视图和整场恢复入口都把 `unknown_remote_result` 当成人工核对状态；
+  即使 claim 被异常清空也不会自动投稿。
+- 删除 21566 字符串匹配、15 min～4 h 专用退避与账号冷却告警；最终明确拒绝统一使用 60 s 起、
+  30 min 封顶的普通投稿退避。
+- 验证：`submission_scheduler` 3 passed；`pending_submit` 4 passed；`biliup-cli --lib` 405 passed、
+  9 ignored；`python3 scripts/check_code_index.py` 通过（119 files，63 relationships）；
+  `git diff --check` 通过。
 
 ## Comments
 
 - 全仓 `cargo fmt --all -- --check` 当前会报告与本任务无关的既有差异；本 step 只检查触达文件。
+- 2026-09-21：实现与全库回归完成；真实 21566 → Web 成功链留待合并后的生产验收。

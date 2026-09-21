@@ -158,7 +158,7 @@ pub struct Config {
     #[serde(default = "default_upload_601_max_cooldown_secs")]
     pub upload_601_max_cooldown_secs: u64,
 
-    /// 提交API类型：web | client
+    /// 提交 API 类型：app | web | b-cut-android；未设置时自动选择。
     #[serde(default)]
     pub submit_api: Option<String>,
 

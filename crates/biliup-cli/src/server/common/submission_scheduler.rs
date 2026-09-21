@@ -26,9 +26,8 @@ const MAX_SCAN_CANDIDATES: i64 = 128;
 
 /// Sessions safe for automatic reconciliation at `now`.
 ///
-/// `ok_no_aid` and a claim-less `submitting` state are treated as ambiguous even though their
-/// normal paths retain a claim. The defensive exclusion keeps a damaged row from creating a
-/// duplicate remote submission.
+/// Ambiguous states are excluded even if their claim was lost. The defensive exclusion keeps a
+/// damaged or manually edited row from creating a duplicate remote submission.
 pub async fn due_submission_session_ids(
     pool: &ConnectionPool,
     now: DateTime<Utc>,
@@ -40,7 +39,7 @@ pub async fn due_submission_session_ids(
            AND submit_requested_at IS NOT NULL \
            AND submit_claim_token IS NULL \
            AND (next_submit_at IS NULL OR next_submit_at <= ?1) \
-           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting') \
+           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting', 'unknown_remote_result') \
            AND (?2 OR COALESCE(submit_state, '') != 'blocked_missing_segments' OR updated_at <= ?3) \
          ORDER BY COALESCE(next_submit_at, submit_requested_at) ASC, id ASC \
          LIMIT ?4",
@@ -273,6 +272,16 @@ mod tests {
             Some(now),
             None,
             Some("blocked_missing_segments"),
+            None,
+        )
+        .await;
+        insert_session(
+            &pool,
+            9,
+            "uploading",
+            Some(now),
+            None,
+            Some("unknown_remote_result"),
             None,
         )
         .await;
