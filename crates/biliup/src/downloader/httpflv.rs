@@ -236,7 +236,10 @@ impl TimestampRebase {
                 ));
                 match stream.pending {
                     // 连续两个样本落在同一条新时间轴上：确认换基准，把它接到已写出的最大值之后。
-                    Some(pending) if follows(pending, src) => {
+                    // 第二个样本必须真的推进：CDN 成对重发的 timestamp=0 初始化 tag（aac/avc
+                    // sequence header）两个样本相等，不是新时间轴，不能凭它换基准——落后的流
+                    // 会被拉到兄弟流的 high_water 上，之后整段音画错位 1s 以上（实测 1.1s）。
+                    Some(pending) if src > pending && follows(pending, src) => {
                         self.offset = self.high_water + REBASE_NOMINAL_GAP_MS - src;
                         self.streams[slot].last_src = Some(src);
                         self.streams[slot].pending = None;
@@ -250,11 +253,16 @@ impl TimestampRebase {
                         }
                         src + self.offset
                     }
-                    // 首次偏离：还分不清是孤立噪声（重发的初始化帧）还是新基准，先接在已写出的
-                    // 最大值之后，`last_src` 不动，等下一个样本表态。
+                    // 首次偏离：还分不清是孤立噪声（重发的初始化帧）还是新基准，先紧跟在
+                    // **本流**已写出的最后一个之后，`last_src` 不动，等下一个样本表态。
+                    // 不能接到全局 high_water 之后：B 帧编码器的 video 比 audio 晚到 1s 以上，
+                    // 一个重发的 sequence header 会把 video 推到 audio 的位置，之后一秒的真实
+                    // 帧全被 `last_emit + 1` 压成 1ms 间隔，上传侧判为时间戳异常且修不好。
                     _ => {
                         self.streams[slot].pending = Some(src);
-                        self.high_water + REBASE_NOMINAL_GAP_MS
+                        stream
+                            .last_emit
+                            .map_or(self.high_water + REBASE_NOMINAL_GAP_MS, |last| last + 1)
                     }
                 }
             }
@@ -1218,14 +1226,14 @@ mod tests {
                 video(&mut rebase, src);
             }
             let jump = video_mapped(&mut rebase, 0);
-            assert_eq!(jump.emit, 100_010);
+            assert_eq!(jump.emit, 100_001, "首个样本紧跟本流最后一个");
             assert_eq!(
                 jump.deviation,
                 Some((100_000, "timestamp_backward"))
             );
-            assert_eq!(video(&mut rebase, 1_000), 100_020, "第二个样本确认新基准");
-            assert_eq!(video(&mut rebase, 2_000), 101_020);
-            assert_eq!(video(&mut rebase, 3_000), 102_020, "此后按真实增量累加");
+            assert_eq!(video(&mut rebase, 1_000), 100_011, "第二个样本确认新基准");
+            assert_eq!(video(&mut rebase, 2_000), 101_011);
+            assert_eq!(video(&mut rebase, 3_000), 102_011, "此后按真实增量累加");
         }
 
         /// 换基准不一定归零，也可能跳到更大的值——不能当成真的过了这么久。
@@ -1235,13 +1243,13 @@ mod tests {
             video(&mut rebase, 1_000);
             video(&mut rebase, 2_000);
             let jump = video_mapped(&mut rebase, 3_600_000);
-            assert_eq!(jump.emit, 2_010);
+            assert_eq!(jump.emit, 2_001);
             assert_eq!(
                 jump.deviation.map(|(_, reason)| reason),
                 Some("timestamp_jump_forward")
             );
-            assert_eq!(video(&mut rebase, 3_601_000), 2_020);
-            assert_eq!(video(&mut rebase, 3_602_000), 3_020);
+            assert_eq!(video(&mut rebase, 3_601_000), 2_011);
+            assert_eq!(video(&mut rebase, 3_602_000), 3_011);
         }
 
         /// spec 断言「交替重发下不需要二次确认」——推演结果是**反的**：没有 `pending`
@@ -1363,8 +1371,40 @@ mod tests {
             let mut rebase = TimestampRebase::default();
             video(&mut rebase, 1_000);
             video(&mut rebase, 2_000);
-            assert_eq!(video(&mut rebase, 0), 2_010, "噪声接在已写出的最大值之后");
+            assert_eq!(video(&mut rebase, 0), 2_001, "噪声紧跟本流最后一个之后");
             assert_eq!(video(&mut rebase, 3_000), 3_000, "基准没变，恒等映射继续");
+        }
+
+        /// 生产实测（2026-09-20，iPhone 硬编 B 帧推流）：video 比 audio 晚到 1.1s，CDN 中途
+        /// 重发 timestamp=0 的初始化 tag——avc sequence header 一个、aac sequence header 一对。
+        /// 曾经：avc header 被接到 audio 的 high_water 之后，随后 1.1s 的真实 video 帧全被压成
+        /// 1ms 间隔（上传侧判 Unfixable）；一对 aac header 又凑成「新基准确认」，audio 被拉到
+        /// video 的位置上，整段音画错位。两条流都必须按各自真实增量继续，且相对关系不变。
+        #[test]
+        fn resent_headers_do_not_disturb_a_lagging_stream() {
+            const LAG: u32 = 1_100;
+            const B: u32 = 20_000_000;
+            let mut rebase = TimestampRebase::default();
+            let mut feed = |t: TagType, src: u32| rebase.map(t, src).emit;
+            let mut last_a = 0;
+            let mut last_v = 0;
+            for i in 1..=100u32 {
+                last_a = feed(TagType::Audio, B + i * 50);
+                last_v = feed(TagType::Video, B + i * 50 - LAG);
+            }
+            feed(TagType::Script, 0);
+            feed(TagType::Audio, 0);
+            feed(TagType::Video, 0);
+            feed(TagType::Audio, 0);
+            for i in 101..=130u32 {
+                let a = feed(TagType::Audio, B + i * 50);
+                let v = feed(TagType::Video, B + i * 50 - LAG);
+                assert_eq!(a - last_a, 50, "audio 第 {i} 帧必须按真实增量继续");
+                assert_eq!(v - last_v, 50, "video 第 {i} 帧必须按真实增量继续");
+                assert_eq!(a - v, LAG, "第 {i} 帧音画相对关系必须原样保留");
+                last_a = a;
+                last_v = v;
+            }
         }
     }
 
