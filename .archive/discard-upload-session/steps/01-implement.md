@@ -1,6 +1,6 @@
 # 01 实现残缺会话作废出口
 
-Status: ready-for-human
+Status: resolved
 
 ## 范围
 
@@ -12,4 +12,5 @@ Status: ready-for-human
 
 ## Answer
 
-已完成后端原子丢弃、`source_missing` 删除准入、上传页操作与回归验证；等待 PR 合并及真实环境验收。
+已完成后端原子丢弃、`source_missing` 删除准入、上传页操作与回归验证；
+[PR #74](https://github.com/dplei/biliup/pull/74) 已合入 `dev`。

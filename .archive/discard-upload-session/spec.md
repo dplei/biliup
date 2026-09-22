@@ -1,6 +1,6 @@
 # Issue #65：残缺上传会话可安全作废
 
-Status: ready-for-human
+Status: resolved
 
 来源：https://github.com/dplei/biliup/issues/65
 
@@ -34,3 +34,4 @@ Status: ready-for-human
 - 上传页展示二次确认，并明确提示单删缺失分段可能触发自动投稿。
 - `cargo test -p biliup-cli --lib`：408 passed、0 failed、10 ignored（首次并发运行有 1 个连接池用例超时，单独复跑及全量复跑均通过）。
 - `next lint` 通过（仅保留既有 `<img>` 警告），`tsc --noEmit` 与代码索引检查通过。
+- [PR #74](https://github.com/dplei/biliup/pull/74) 已合入 `dev`。
