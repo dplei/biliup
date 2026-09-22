@@ -13,8 +13,14 @@
 #
 # 阶段拆成独立 job，Actions 左栏按 job 显示进度：
 #   读取版本号 → 构建 → 冒烟 → 推送 → 核对
-# 镜像在 job 之间用 artifact 传递（docker save + zstd），不经 registry，
+# 镜像在 job 之间用 artifact 传递（BuildKit 直接导出 OCI 归档），不经 registry，
 # 所以冒烟没过的镜像永远不会出现在 registry 上，push=false 时也不会留下半成品 tag。
+#
+# 推送用 skopeo 而不是 docker push：fresh runner 上的 docker daemon 不知道任何层的压缩
+# digest，每次都把整个镜像（压缩后 ~250 MB）重传；OCI 归档里的层带 digest，skopeo 先
+# HEAD 再传，没变的层（apt/ffmpeg 那 372 MB）直接跳过，只传 wheel 那两层。GitHub runner
+# 到 ACR 杭州个人版的跨境链路抽风时（1.3.37：单层 13 min，推送 job 20 min 超时两次），
+# 传得少就是唯一的缓解。
 # 含 secret 的 job output 会被 Actions 丢弃，所以 job 之间只传版本号，
 # 各 job 自己用 REGISTRY_IMAGE 拼 tag。
 
@@ -98,24 +104,21 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: 构建（amd64 原生，只 load 到本地）
+      - name: 构建（amd64 原生，导出 OCI 归档）
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          load: true
           push: false
           tags: biliup:candidate
+          outputs: type=oci,dest=image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: 导出镜像
-        run: docker save biliup:candidate | zstd -T0 -o image.tar.zst
 
       - uses: actions/upload-artifact@v4
         with:
           name: image
-          path: image.tar.zst
+          path: image.tar
           compression-level: 0
           retention-days: 1
 
@@ -129,8 +132,9 @@ jobs:
         with:
           name: image
 
+      # docker load 认 OCI 归档（Docker ≥ 25），tag 来自归档里的 ref.name 注解。
       - name: 载入镜像
-        run: zstd -dc image.tar.zst | docker load
+        run: docker load -i image.tar
 
       - name: 容器冒烟
         env:
@@ -155,31 +159,31 @@ jobs:
         with:
           name: image
 
-      - name: 载入镜像
-        run: zstd -dc image.tar.zst | docker load
-
       - name: 取 registry host
         id: reg
         env:
           IMAGE: ${{ secrets.REGISTRY_IMAGE }}
         run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
 
+      # skopeo 读 ~/.docker/config.json，login-action 写进去的凭证直接可用。
       - uses: docker/login-action@v3
         with:
           registry: ${{ steps.reg.outputs.host }}
           username: ${{ secrets.REGISTRY_USERNAME }}
           password: ${{ secrets.REGISTRY_PASSWORD }}
 
-      - name: 打 tag 并推送
+      # 第一个 tag 传层，后两个只 HEAD + 写 manifest。--retry-times 兜网络抖动；
+      # 同一次 copy 里已传完的层重试时 HEAD 命中不会再传。
+      - name: 推送（按 digest 跳过已存在的层）
         env:
           IMAGE: ${{ secrets.REGISTRY_IMAGE }}
           VERSION: ${{ needs.meta.outputs.version }}
           ALIAS: ${{ inputs.alias }}
         run: |
           set -euo pipefail
+          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
           for tag in "$IMAGE:$VERSION" "$IMAGE:latest" ${ALIAS:+"$IMAGE:$VERSION-$ALIAS"}; do
-            docker tag biliup:candidate "$tag"
-            docker push "$tag"
+            skopeo copy --retry-times 3 oci-archive:image.tar "docker://$tag"
           done
 
   verify:
