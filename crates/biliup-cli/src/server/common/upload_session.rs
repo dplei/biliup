@@ -230,6 +230,7 @@ pub enum EmptySessionDiscardRejection {
     HasVideos,
     HasRemoteIdentity,
     Claimed,
+    ActiveSegments,
     ManualInspection,
 }
 
@@ -241,6 +242,7 @@ impl EmptySessionDiscardRejection {
             Self::HasVideos => "会话已保存远端视频信息，不能作为空会话丢弃",
             Self::HasRemoteIdentity => "会话已有 aid 或 bvid，不能覆盖远端投稿结果",
             Self::Claimed => "会话已有投稿 claim，请先核对远端投稿状态",
+            Self::ActiveSegments => "会话仍有正在上传或删除的分段，请等待操作结束后再丢弃",
             Self::ManualInspection => "会话处于远端结果不确定状态，必须人工核对",
         }
     }
@@ -423,6 +425,7 @@ pub async fn session_completeness(
 async fn discard_empty_session_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     session_row_id: i64,
+    empty_only: bool,
 ) -> AppResult<EmptySessionDiscardResult> {
     let row = sqlx::query(
         "SELECT status, submit_state, submit_requested_at, submit_claim_token, \
@@ -454,10 +457,8 @@ async fn discard_empty_session_in_transaction(
             EmptySessionDiscardRejection::ManualInspection,
         ));
     }
-    if row
-        .get::<Option<DateTime<Utc>>, _>("submit_requested_at")
-        .is_none()
-    {
+    let submit_requested_at = row.get::<Option<DateTime<Utc>>, _>("submit_requested_at");
+    if submit_requested_at.is_none() {
         return Ok(EmptySessionDiscardResult::Rejected(
             EmptySessionDiscardRejection::SubmitNotRequested,
         ));
@@ -468,33 +469,62 @@ async fn discard_empty_session_in_transaction(
             EmptySessionDiscardRejection::HasRemoteIdentity,
         ));
     }
-    let videos_json = row.get::<String, _>("videos_json");
-    if !matches!(serde_json::from_str::<Vec<serde_json::Value>>(&videos_json), Ok(videos) if videos.is_empty())
-    {
-        return Ok(EmptySessionDiscardResult::Rejected(
-            EmptySessionDiscardRejection::HasVideos,
-        ));
-    }
-    let lifecycle_rows = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM upload_missing_segment WHERE upload_session_id = ?1",
-    )
-    .bind(session_row_id)
-    .fetch_one(&mut **tx)
-    .await
-    .change_context(AppError::Unknown)?;
-    if lifecycle_rows != 0 {
-        return Ok(EmptySessionDiscardResult::Rejected(
-            EmptySessionDiscardRejection::HasLifecycleRows(lifecycle_rows),
-        ));
+    if empty_only {
+        let videos_json = row.get::<String, _>("videos_json");
+        if !matches!(serde_json::from_str::<Vec<serde_json::Value>>(&videos_json), Ok(videos) if videos.is_empty())
+        {
+            return Ok(EmptySessionDiscardResult::Rejected(
+                EmptySessionDiscardRejection::HasVideos,
+            ));
+        }
+        let lifecycle_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_missing_segment WHERE upload_session_id = ?1",
+        )
+        .bind(session_row_id)
+        .fetch_one(&mut **tx)
+        .await
+        .change_context(AppError::Unknown)?;
+        if lifecycle_rows != 0 {
+            return Ok(EmptySessionDiscardResult::Rejected(
+                EmptySessionDiscardRejection::HasLifecycleRows(lifecycle_rows),
+            ));
+        }
+    } else {
+        let active_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM upload_missing_segment \
+             WHERE upload_session_id = ?1 AND status IN ('uploading', 'deleting')",
+        )
+        .bind(session_row_id)
+        .fetch_one(&mut **tx)
+        .await
+        .change_context(AppError::Unknown)?;
+        if active_rows != 0 {
+            return Ok(EmptySessionDiscardResult::Rejected(
+                EmptySessionDiscardRejection::ActiveSegments,
+            ));
+        }
     }
 
     let now = Utc::now();
+    let discarded_state = if empty_only {
+        "discarded_empty"
+    } else {
+        "discarded"
+    };
+    let submit_requested_at = if empty_only {
+        submit_requested_at
+    } else {
+        None
+    };
     sqlx::query(
-        "UPDATE upload_session SET status = 'finalized', submit_state = 'discarded_empty', \
+        "UPDATE upload_session SET status = 'finalized', submit_state = ?1, \
+                submit_requested_at = ?2, \
                 last_submit_error = NULL, blocked_signature = NULL, next_submit_at = NULL, \
-                submit_claim_token = NULL, submit_claimed_at = NULL, updated_at = ?1 \
-         WHERE id = ?2",
+                submit_claim_token = NULL, submit_claimed_at = NULL, updated_at = ?3 \
+         WHERE id = ?4",
     )
+    .bind(discarded_state)
+    .bind(submit_requested_at)
     .bind(now)
     .bind(session_row_id)
     .execute(&mut **tx)
@@ -517,7 +547,21 @@ pub async fn discard_empty_session(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .change_context(AppError::Unknown)?;
-    let result = discard_empty_session_in_transaction(&mut tx, session_row_id).await?;
+    let result = discard_empty_session_in_transaction(&mut tx, session_row_id, true).await?;
+    tx.commit().await.change_context(AppError::Unknown)?;
+    Ok(result)
+}
+
+/// Explicitly abandon a closed session without submitting it, retaining its lifecycle ledger.
+pub async fn discard_session(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+) -> AppResult<EmptySessionDiscardResult> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .change_context(AppError::Unknown)?;
+    let result = discard_empty_session_in_transaction(&mut tx, session_row_id, false).await?;
     tx.commit().await.change_context(AppError::Unknown)?;
     Ok(result)
 }
@@ -532,7 +576,7 @@ pub async fn claim_complete_session(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .change_context(AppError::Unknown)?;
-    match discard_empty_session_in_transaction(&mut tx, session_row_id).await? {
+    match discard_empty_session_in_transaction(&mut tx, session_row_id, true).await? {
         EmptySessionDiscardResult::Discarded { .. } => {
             tx.commit().await.change_context(AppError::Unknown)?;
             return Ok(SubmitClaim::DiscardedEmpty);
@@ -1531,6 +1575,48 @@ mod tests {
                 ))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_discard_finalizes_nonempty_session_and_retains_ledger() {
+        let (_directory, pool) = completeness_pool().await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+        let uploaded = video("part");
+        insert_ledger(&pool, 1, 0, "succeeded", "/uploaded.flv", Some(&uploaded)).await;
+        insert_ledger(&pool, 2, 1, "source_missing", "/gone.flv", None).await;
+
+        let result = discard_session(&pool, 70).await.unwrap();
+        assert!(matches!(
+            result,
+            EmptySessionDiscardResult::Discarded { .. }
+        ));
+
+        let state: (String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT status, submit_state, submit_requested_at FROM upload_session WHERE id = 70",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("finalized".into(), Some("discarded".into()), None));
+        let lifecycle_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upload_missing_segment WHERE upload_session_id = 70",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn manual_discard_rejects_active_segment() {
+        let (_directory, pool) = completeness_pool().await;
+        request_session_submit(&pool, 70, Utc::now()).await.unwrap();
+        insert_ledger(&pool, 1, 0, "uploading", "/active.flv", None).await;
+
+        assert_eq!(
+            discard_session(&pool, 70).await.unwrap(),
+            EmptySessionDiscardResult::Rejected(EmptySessionDiscardRejection::ActiveSegments)
         );
     }
 

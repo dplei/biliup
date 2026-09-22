@@ -1,3 +1,4 @@
+use crate::LogHandle;
 use crate::observe::{self, standalone::UploadTask};
 use crate::server::common::missing_segment::{
     MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
@@ -15,7 +16,7 @@ use crate::server::common::upload_line_selection::{
     IMPLICIT_FALLBACKS, cooling_lines, plan_upload_line,
 };
 use crate::server::common::upload_session::{
-    EmptySessionDiscardResult, RequestSessionSubmit, SessionCompleteness, discard_empty_session,
+    EmptySessionDiscardResult, RequestSessionSubmit, SessionCompleteness, discard_session,
     get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
     request_session_submit, session_completeness,
 };
@@ -38,7 +39,6 @@ use crate::server::infrastructure::repositories::{
     del_streamer, find_streamer, get_all_streamer, get_streamer_by_url, get_upload_config,
 };
 use crate::server::infrastructure::service_register::ServiceRegister;
-use crate::LogHandle;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1343,15 +1343,15 @@ pub struct EmptySessionDiscarded {
     pub already_finalized: bool,
 }
 
-/// Logically finalize a closed session which has no lifecycle rows or remote identity.
+/// Logically finalize a closed session without submitting it.
 ///
-/// This deliberately keeps the database row: its finalized identity is the boundary that stops a
-/// later local rescan from recreating the historical empty shell.
+/// This deliberately keeps the session and lifecycle rows for audit and to stop a later local
+/// rescan from recreating the abandoned session.
 pub async fn discard_empty_upload_session(
     State(service_register): State<ServiceRegister>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> Result<Json<EmptySessionDiscarded>, Response> {
-    match discard_empty_session(&service_register.pool, id)
+    match discard_session(&service_register.pool, id)
         .await
         .map_err(report_to_response)?
     {
@@ -1359,20 +1359,26 @@ pub async fn discard_empty_upload_session(
             tracing::info!(
                 session = id,
                 source = "manual",
-                reason = "zero_lifecycle_baseline",
-                "empty upload session logically finalized"
+                reason = "operator_discarded",
+                "upload session logically finalized without submission"
             );
             Ok(Json(EmptySessionDiscarded {
                 upload_session_id: id,
                 previous_status,
                 status: "finalized",
-                submit_state: Some("discarded_empty".to_string()),
+                submit_state: Some("discarded".to_string()),
                 discarded: true,
                 already_finalized: false,
             }))
         }
         EmptySessionDiscardResult::AlreadyFinalized { submit_state } => {
-            let discarded = submit_state.as_deref() == Some("discarded_empty");
+            let discarded = matches!(
+                submit_state.as_deref(),
+                Some("discarded" | "discarded_empty")
+            );
+            if !discarded {
+                return Err((StatusCode::CONFLICT, "会话已经终结，未执行丢弃").into_response());
+            }
             Ok(Json(EmptySessionDiscarded {
                 upload_session_id: id,
                 previous_status: "finalized".to_string(),
@@ -1975,7 +1981,7 @@ mod session_recovery_tests {
                 .unwrap();
         assert!(first.discarded);
         assert!(!first.already_finalized);
-        assert_eq!(first.submit_state.as_deref(), Some("discarded_empty"));
+        assert_eq!(first.submit_state.as_deref(), Some("discarded"));
 
         let Json(second) =
             discard_empty_upload_session(State(service.clone()), axum::extract::Path(708))
@@ -1997,7 +2003,7 @@ mod session_recovery_tests {
     }
 
     #[tokio::test]
-    async fn empty_session_discard_endpoint_rejects_nonempty_or_uncertain_sessions() {
+    async fn session_discard_endpoint_retains_nonempty_ledger_and_rejects_uncertain_sessions() {
         let (_directory, service) = service().await;
         insert_session(&service.pool, 709, "uploading").await;
         insert_segment(
@@ -2011,11 +2017,19 @@ mod session_recovery_tests {
         request_session_submit(&service.pool, 709, Utc::now())
             .await
             .unwrap();
-        let nonempty =
+        let Json(nonempty) =
             discard_empty_upload_session(State(service.clone()), axum::extract::Path(709))
                 .await
-                .unwrap_err();
-        assert_eq!(nonempty.status(), StatusCode::CONFLICT);
+                .unwrap();
+        assert!(nonempty.discarded);
+        assert_eq!(nonempty.submit_state.as_deref(), Some("discarded"));
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upload_missing_segment WHERE upload_session_id = 709",
+        )
+        .fetch_one(&service.pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, 1);
 
         insert_session(&service.pool, 710, "uploading").await;
         request_session_submit(&service.pool, 710, Utc::now())
@@ -2031,8 +2045,19 @@ mod session_recovery_tests {
                 .unwrap_err();
         assert_eq!(uncertain.status(), StatusCode::CONFLICT);
 
-        let statuses: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, status FROM upload_session WHERE id IN (709, 710) ORDER BY id",
+        insert_session(&service.pool, 711, "finalized").await;
+        sqlx::query("UPDATE upload_session SET submit_state = 'submitted' WHERE id = 711")
+            .execute(&service.pool)
+            .await
+            .unwrap();
+        let completed =
+            discard_empty_upload_session(State(service.clone()), axum::extract::Path(711))
+                .await
+                .unwrap_err();
+        assert_eq!(completed.status(), StatusCode::CONFLICT);
+
+        let statuses: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, submit_state FROM upload_session WHERE id IN (709, 710) ORDER BY id",
         )
         .fetch_all(&service.pool)
         .await
@@ -2040,8 +2065,8 @@ mod session_recovery_tests {
         assert_eq!(
             statuses,
             vec![
-                (709, "uploading".to_string()),
-                (710, "uploading".to_string())
+                (709, "finalized".to_string(), Some("discarded".to_string())),
+                (710, "uploading".to_string(), Some("ok_no_aid".to_string()))
             ]
         );
     }

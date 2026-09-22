@@ -82,7 +82,7 @@ pub fn is_due_for_silent_recovery(
 }
 
 pub fn can_delete_missing_segment(status: &str) -> bool {
-    matches!(status, "pending" | "failed")
+    matches!(status, "pending" | "failed" | "source_missing")
 }
 
 /// One `uploading` row, in the shape the stale verdict needs.
@@ -264,7 +264,7 @@ pub async fn claim_missing_segment_for_delete(
 ) -> AppResult<MissingSegmentDeleteClaim> {
     let claim = sqlx::query(
         "UPDATE upload_missing_segment SET status = 'deleting', updated_at = ?1 \
-         WHERE id = ?2 AND status IN ('pending', 'failed')",
+         WHERE id = ?2 AND status IN ('pending', 'failed', 'source_missing')",
     )
     .bind(now)
     .bind(id)
@@ -904,6 +904,7 @@ mod tests {
     fn delete_is_allowed_only_for_unrecovered_rows() {
         assert!(can_delete_missing_segment("pending"));
         assert!(can_delete_missing_segment("failed"));
+        assert!(can_delete_missing_segment("source_missing"));
         assert!(!can_delete_missing_segment("uploading"));
         assert!(!can_delete_missing_segment("succeeded"));
     }
@@ -933,6 +934,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "deleting");
+    }
+
+    #[tokio::test]
+    async fn claim_missing_segment_for_delete_accepts_absent_source() {
+        let (_dir, pool) = test_pool().await;
+        let id =
+            insert_missing_row_with_status(&pool, "source_missing", "/tmp/already-gone.flv").await;
+
+        let claim = claim_missing_segment_for_delete(&pool, id, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(matches!(claim, MissingSegmentDeleteClaim::Claimed(_)));
     }
 
     #[tokio::test]
