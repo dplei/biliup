@@ -132,9 +132,12 @@ jobs:
         with:
           name: image
 
-      # docker load 认 OCI 归档（Docker ≥ 25），tag 来自归档里的 ref.name 注解。
+      # runner 的 docker 是经典 overlay2 存储，docker load 不认 OCI 归档
+      # （"blobs/json: no such file"），用 skopeo 转进 daemon。
       - name: 载入镜像
-        run: docker load -i image.tar
+        run: |
+          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          skopeo copy oci-archive:image.tar docker-daemon:biliup:candidate
 
       - name: 容器冒烟
         env:
