@@ -186,17 +186,15 @@ impl FfmpegRunner for SystemFfmpeg {
         // 全片扫描：-c copy -f null，只读不重编码。
         // 使用 verbose 级别确保 "Invalid timestamp" / "Application provided invalid" 等
         // 低于 warning 的模式也能输出；-nostats 抑制进度行噪声。
+        //
+        // 不能加 `-fflags +igndts`：它丢掉文件里的 DTS 让解复用器从 PTS 反推。B 帧源的 PTS
+        // 本来就不单调，反推只在「每个 PTS 只出现一次」时成立——CDN 重发一帧（同 PTS，录制侧
+        // 给它 DTS+1）就让反推出的 DTS 相等或倒退，muxer 报 "non monotonically increasing
+        // dts"，而文件自己的 DTS 严格单调。这种假阳性 setts 修不掉（没东西可修），复检照样
+        // 命中，整段被判 Unfixable 扣住不传（2026-09-21 腾讯云两段 40 分钟录像）。
         let mut command = Command::new("ffmpeg");
         command
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "verbose",
-                "-nostats",
-                "-fflags",
-                "+igndts",
-                "-i",
-            ])
+            .args(["-hide_banner", "-loglevel", "verbose", "-nostats", "-i"])
             .arg(path)
             .args(["-c", "copy", "-f", "null", "-"]);
         let (status, scan) = run_scanning_stderr(
@@ -689,6 +687,61 @@ mod tests {
         for path in [&good, &jumped, &fixed] {
             let _ = tokio::fs::remove_file(path).await;
         }
+    }
+
+    /// 在 `src`（FLV）里把第 `nth` 个视频 tag 原样复制一份插到它后面，时间戳 +1——录制侧
+    /// `TimestampRebase` 给 CDN 重发帧的落盘形状。
+    async fn duplicate_video_tag(src: &Path, nth: usize, dst: &Path) {
+        let bytes = tokio::fs::read(src).await.expect("read flv");
+        let mut out = bytes[..13].to_vec();
+        let (mut pos, mut seen) = (13, 0);
+        while pos + 11 <= bytes.len() {
+            let size =
+                u32::from_be_bytes([0, bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+            let end = pos + 11 + size + 4;
+            let tag = &bytes[pos..end];
+            out.extend_from_slice(tag);
+            if tag[0] == 9 {
+                seen += 1;
+                if seen == nth {
+                    let mut dup = tag.to_vec();
+                    let ts = u32::from_be_bytes([dup[7], dup[4], dup[5], dup[6]]) + 1;
+                    let [ext, b1, b2, b3] = ts.to_be_bytes();
+                    dup[4..8].copy_from_slice(&[b1, b2, b3, ext]);
+                    out.extend_from_slice(&dup);
+                }
+            }
+            pos = end;
+        }
+        assert!(seen >= nth, "source has too few video tags");
+        tokio::fs::write(dst, out).await.expect("write dup");
+    }
+
+    /// B 帧源里 CDN 重发一帧（同 PTS、DTS+1）不是时间戳异常：文件自己的 DTS 严格单调。
+    /// 曾经 detect 带 `+igndts`，从 PTS 反推 DTS 在重复帧处必然倒退，整段被误判 Unfixable。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_detect_clean_on_bframe_source_with_a_resent_frame() {
+        let dir = std::env::temp_dir();
+        let src = dir.join("tsr_bframe_src.flv");
+        let status = tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=duration=3:size=320x240:rate=30")
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-bf", "3", "-an"])
+            .arg(&src)
+            .status()
+            .await
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+        let dup = dir.join("tsr_bframe_dup.flv");
+        duplicate_video_tag(&src, 40, &dup).await;
+        assert_eq!(
+            SystemFfmpeg::default().detect(&dup).await.expect("detect"),
+            Detection::Clean,
+            "重发一帧的 B 帧源不应报时间戳异常"
+        );
+        let _ = tokio::fs::remove_file(&src).await;
+        let _ = tokio::fs::remove_file(&dup).await;
     }
 
     /// 干净文件走整条流程应得 Clean。
