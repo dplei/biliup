@@ -428,14 +428,14 @@ export default function UploadList() {
     }
   }
 
-  const handleDiscardEmptySession = async (id: number) => {
+  const handleDiscardSession = async (id: number) => {
     setDiscardingSessionId(id)
     try {
       await requestDelete('/v1/uploads/sessions', { arg: id })
-      Toast.success(`空会话 #${id} 已终结；历史身份已保留，不会再自动投稿`)
+      Toast.success(`会话 #${id} 已丢弃；分段账本已保留，不会再自动投稿`)
       await Promise.all([mutate(), mutatePendingSessions()])
     } catch (e: any) {
-      Toast.error(`丢弃空会话失败：${e?.message ?? e}`)
+      Toast.error(`丢弃会话失败：${e?.message ?? e}`)
     } finally {
       setDiscardingSessionId(null)
     }
@@ -629,7 +629,7 @@ export default function UploadList() {
               </Button>
               <Popconfirm
                 title="删除这条记录？"
-                content="仅删除本地记录；源文件已经不存在。"
+                content="删除后若所属会话的其余分段都已上传，会自动投稿；若整场都不想投稿，请使用上方的「丢弃会话」。"
                 okText="删除"
                 okButtonProps={{ type: 'danger' }}
                 onConfirm={() => handleDelete(record.id)}
@@ -795,11 +795,12 @@ export default function UploadList() {
             {(pendingSessions ?? []).map((session) => {
               const meta = SUBMIT_ACTION_META[session.action]
               const completeness = session.completeness
-              const canDiscardEmpty = completeness.total_expected === 0
-                && session.aid == null
+              const canDiscard = session.aid == null
                 && session.bvid == null
                 && !session.submit_claimed
                 && session.action !== 'manual_inspection'
+                && completeness.uploading === 0
+                && completeness.deleting === 0
               const canRecover = completeness.total_expected > 0
                 && !['submitting', 'manual_inspection'].includes(session.action)
               return (
@@ -845,13 +846,13 @@ export default function UploadList() {
                         恢复会话
                       </Button>
                     )}
-                    {canDiscardEmpty && (
+                    {canDiscard && (
                       <Popconfirm
-                        title="确认终结这个空会话？"
-                        content="只保留历史身份，不删除录像文件；终结后该会话不再自动投稿，也不会被补扫复活。"
-                        okText="终结空会话"
+                        title="确认丢弃这个会话且不投稿？"
+                        content="会保留分段账本，不删除本地录像；已经上传到 UPOS 的分段不会组成稿件。此操作不可恢复。"
+                        okText="丢弃且不投稿"
                         cancelText="取消"
-                        onConfirm={() => handleDiscardEmptySession(session.id)}
+                        onConfirm={() => handleDiscardSession(session.id)}
                       >
                         <Button
                           size="small"
@@ -859,7 +860,7 @@ export default function UploadList() {
                           icon={<IconDeleteStroked />}
                           loading={discardingSessionId === session.id}
                         >
-                          丢弃空会话
+                          丢弃会话
                         </Button>
                       </Popconfirm>
                     )}
