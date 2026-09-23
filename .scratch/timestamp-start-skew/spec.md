@@ -2,6 +2,8 @@
 
 来源：[dplei/biliup#75](https://github.com/dplei/biliup/issues/75)。发起时版本 1.3.38。
 
+Status: ready-for-human（[#77](https://github.com/dplei/biliup/pull/77) 已合入，1.3.39 发版，dev 实录通过，待生产验证）
+
 关联：#62（`.scratch/rebase-sibling-adoption/`，script 槽只在切段时收到 onMetaData 的
 事实在那里已经写过）、#13（`TimestampRebase` 的来源）。
 

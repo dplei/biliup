@@ -1,6 +1,6 @@
 # 02 检测跨流起点差，修复时对齐起点
 
-Status: implemented（待 PR）
+Status: ready-for-human（已合入 `dev`；待生产观察）
 
 ## 改哪里
 
@@ -35,7 +35,8 @@ Status: implemented（待 PR）
 - `cargo test -p biliup-cli -p biliup` 全绿（`explicit_app_21566_uses_regular_submit_backoff`
   偶发失败，与本改动无关：jitter 上界与 `before` 取值的时序竞争，重试上限那一轮一并修）。
 
-## 待验
+## 待验（生产）
 
-生产上线后：`timestamp_repair` 出现 `reason_code=repaired` 的分段，其产物各流起点差 < 1 s；
+本机实录的 4 段都是干净原片，没有走到修复分支；修复路径只有合成样本的系统测试覆盖。
+上线后：`timestamp_repair` 出现 `reason_code=repaired` 的分段，其产物各流起点差 < 1 s；
 含单包 script 流错位的原片（R2 修好之前录的存量）被判异常并修复，投稿不再因 21588 被拒。

@@ -2,6 +2,8 @@
 
 来源：[dplei/biliup#76](https://github.com/dplei/biliup/issues/76)。发起时版本 1.3.38。
 
+Status: ready-for-human（[#78](https://github.com/dplei/biliup/pull/78) 已合入，1.3.39 发版，dev 验证通过，待生产验证）
+
 关联：#75（`.scratch/timestamp-start-skew/`，触发本题的那场 21588 拒稿）。
 
 > 单点修复，一轮做完，不拆 `steps/`。
@@ -59,8 +61,16 @@
 - 顺带修了 `explicit_app_21566_uses_regular_submit_backoff` 的偶发失败：上界改用调用之后的时刻。
 - `cargo test -p biliup-cli -p biliup` 全绿。
 
+## dev 环境验证（2026-09-23，库的临时副本）
+
+- 把一个因分段缺失而阻塞的会话置 `held`（带 21588 错误），把它缺失的那一段置 `failed`、
+  `attempts=6`：待投稿会话接口返回 `action=held`，分段接口返回 `auto_retry_stopped=true`；
+  页面分别显示「已停止自动重投」「已停止自动重试，需手动重试」。期间周期扫描没有领取这两者。
+- 点「恢复会话」：`held` 解除、`submit_retry_attempts=0`、`next_submit_at` 置为当下，协调器立即
+  运行并因分段不完整停在 `blocked_missing_segments`（未发远端请求）；已用完次数的那一段被人工
+  恢复领取，源文件不在，转为 `source_missing`。
+- 同一环境随后真实录制 4 段并上传，下播后一次投稿成功，正常路径未受影响。
+
 ## 待验
 
-- dev 环境：造一个被拒的会话（`submit_api` 指向返回拒绝码的场景不好造，可直接在本地库把
-  `submit_state` 置 `held`），页面显示「已停止自动重投」，点「恢复会话」后立即发起投稿。
 - 生产：下一次 21588 拒稿后会话停在 `held`、收到告警、不再每 30 分钟重投。
