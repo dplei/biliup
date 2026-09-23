@@ -221,6 +221,7 @@ pub(crate) fn _main(args: &[String]) -> AppResult<()> {
                     limit,
                     studio,
                     submit,
+                    no_submit,
                 } => {
                     upload_by_command(
                         studio,
@@ -229,6 +230,7 @@ pub(crate) fn _main(args: &[String]) -> AppResult<()> {
                         line,
                         limit,
                         submit.unwrap_or(SubmitOption::App),
+                        no_submit,
                         cli.proxy.as_deref(),
                     )
                     .await?

@@ -74,6 +74,7 @@ async fn main() -> AppResult<()> {
                 limit,
                 studio,
                 submit,
+                no_submit,
             } => {
                 let video_path: Vec<_> = video_path.into_iter().map(expand_path).collect();
                 upload_by_command(
@@ -83,6 +84,7 @@ async fn main() -> AppResult<()> {
                     line,
                     limit,
                     submit.unwrap_or(SubmitOption::App),
+                    no_submit,
                     cli.proxy.as_deref(),
                 )
                 .await?

@@ -66,6 +66,10 @@ pub enum Commands {
         #[arg(long, default_value = "3")]
         limit: usize,
 
+        /// 只上传不投稿：打印 B 站返回的分P信息（含 filename）后退出
+        #[arg(long)]
+        no_submit: bool,
+
         #[command(flatten)]
         studio: Studio,
         // #[arg(required = false, last = true, default_value = "client")]
