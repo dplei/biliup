@@ -1,7 +1,8 @@
 use crate::LogHandle;
 use crate::observe::{self, standalone::UploadTask};
 use crate::server::common::missing_segment::{
-    MissingSegmentDeleteClaim, claim_missing_segment_for_delete, remove_missing_segment_files,
+    MAX_AUTO_UPLOAD_ATTEMPTS, MissingSegmentDeleteClaim, claim_missing_segment_for_delete,
+    remove_missing_segment_files,
 };
 use crate::server::common::recording_lease;
 use crate::server::common::recovery_eligibility::RecoveryEligibility;
@@ -18,7 +19,7 @@ use crate::server::common::upload_line_selection::{
 use crate::server::common::upload_session::{
     EmptySessionDiscardResult, RequestSessionSubmit, SessionCompleteness, discard_session,
     get_streamer_info as load_streamer_info, match_streamer_by_filename, missing_status_where,
-    request_session_submit, session_completeness,
+    rearm_session_submit, request_session_submit, session_completeness,
 };
 use crate::server::common::util::Recorder;
 use crate::server::config::Config;
@@ -800,6 +801,8 @@ pub struct MissingSegmentView {
     /// The full candidate sequence behind `next_line`, so the page can show what a fallback
     /// would try next without guessing.
     pub line_candidates: Vec<String>,
+    /// 自动重试次数已用完（或时间戳修不好直接用完），只有人工重试才会再启动它。
+    pub auto_retry_stopped: bool,
 }
 
 /// 可显式选择的上传线路，来自 B 站 `preupload?r=probe` 索引；`auto` 不在其中，由页面自己置顶。
@@ -921,6 +924,8 @@ pub async fn get_missing_uploads(
                 next_line,
                 line_skip_reason,
                 line_candidates: plan.candidates,
+                auto_retry_stopped: matches!(r.status.as_str(), "pending" | "failed")
+                    && r.attempts >= MAX_AUTO_UPLOAD_ATTEMPTS,
                 segment: r,
             }
         })
@@ -936,6 +941,8 @@ pub enum PendingSubmitAction {
     ReadyToSubmit,
     Submitting,
     RetryScheduled,
+    /// 远端明确拒绝后已停止自动重投，等人工恢复。
+    Held,
     ManualInspection,
 }
 
@@ -1023,6 +1030,13 @@ fn pending_submit_action(
         return (
             PendingSubmitAction::ManualInspection,
             "会话处于不确定投稿状态但缺少可验证的 claim；请人工检查数据库与远端稿件。".to_string(),
+        );
+    }
+    if row.submit_state.as_deref() == Some("held") {
+        return (
+            PendingSubmitAction::Held,
+            "B 站明确拒绝了这次投稿，重投相同内容不会成功，已停止自动重投。处理问题分段后点「恢复会话」立即重投。"
+                .to_string(),
         );
     }
     if !completeness.is_complete() {
@@ -1555,6 +1569,10 @@ pub async fn recover_session_uploads(
         }
         RequestSessionSubmit::Requested { requested_at, .. } => requested_at,
     };
+    // 人工恢复是明确的「现在就投」：越过退避、解除 held。防重复稿件的状态不受影响。
+    rearm_session_submit(&service_register.pool, id, now)
+        .await
+        .map_err(report_to_response)?;
 
     // An individual recovery click and an older recovery run do not necessarily own the
     // scheduler's in-process group key. The durable attempt state is therefore the authoritative

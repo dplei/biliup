@@ -24,6 +24,13 @@ pub fn next_line_index(current: i64) -> i64 {
     }
 }
 
+/// 自动重试的次数上限。按 `retry_delay_for_attempt` 退避（10m → 30m → 1h → 2h → 6h），第 6 次
+/// 失败大约在首次失败后 10 小时；之后只有人工（单段重试、「恢复会话」）能再启动它。
+/// 分段上传失败多半是传到一半断掉，每次自动重试都重新消耗上行带宽（issue #76）。
+pub const MAX_AUTO_UPLOAD_ATTEMPTS: i64 = 6;
+
+/// v2 行传本次失败之前的次数（第 1 次失败后等 10 分钟）；v1 的 `mark_retry_failure` 沿用旧口径
+/// 传失败之后的次数。
 pub fn retry_delay_for_attempt(attempts: i64) -> chrono::Duration {
     match attempts {
         i if i <= 0 => chrono::Duration::minutes(10),
@@ -513,10 +520,12 @@ pub async fn due_missing_segments_for_session(
     sqlx::query_as::<_, UploadMissingSegment>(
         "SELECT * FROM upload_missing_segment \
          WHERE upload_session_id = ? AND status IN ('pending', 'failed') AND next_retry_at <= ? \
+           AND attempts < ? \
          ORDER BY segment_order ASC, id ASC",
     )
     .bind(upload_session_id)
     .bind(now)
+    .bind(MAX_AUTO_UPLOAD_ATTEMPTS)
     .fetch_all(pool)
     .await
     .change_context(AppError::Unknown)

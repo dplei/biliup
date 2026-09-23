@@ -44,6 +44,8 @@ interface MissingSegment {
   next_line: string
   line_skip_reason: string | null
   line_candidates: string[]
+  // 自动重试次数已用完，只有手动重试 / 恢复会话才会再启动
+  auto_retry_stopped: boolean
 }
 
 interface UploadLineHealth {
@@ -108,6 +110,7 @@ type PendingSubmitAction =
   | 'ready_to_submit'
   | 'submitting'
   | 'retry_scheduled'
+  | 'held'
   | 'manual_inspection'
 
 interface PendingSubmitSession {
@@ -188,6 +191,7 @@ const OUTCOME_META: Record<string, { color: 'green' | 'red' | 'orange' | 'grey';
   failed: { color: 'red', text: '失败' },
   cancelled: { color: 'orange', text: '已取消' },
   stale: { color: 'grey', text: '租约超时' },
+  unfixable: { color: 'red', text: '时间戳修不好' },
 }
 
 const SUBMIT_ACTION_META: Record<PendingSubmitAction, { color: 'green' | 'red' | 'orange' | 'grey'; text: string }> = {
@@ -195,6 +199,7 @@ const SUBMIT_ACTION_META: Record<PendingSubmitAction, { color: 'green' | 'red' |
   ready_to_submit: { color: 'green', text: '待投稿' },
   submitting: { color: 'orange', text: '投稿中' },
   retry_scheduled: { color: 'orange', text: '退避重试' },
+  held: { color: 'red', text: '已停止自动重投' },
   manual_inspection: { color: 'red', text: '需人工核对' },
 }
 
@@ -548,7 +553,9 @@ export default function UploadList() {
     return (
       <div>
         <div>
-          <Text type="tertiary" size="small">下次自动重试 {fmtTime(record.next_retry_at)}</Text>
+          {record.auto_retry_stopped
+            ? <Text type="danger" size="small">已停止自动重试，需手动重试</Text>
+            : <Text type="tertiary" size="small">下次自动重试 {fmtTime(record.next_retry_at)}</Text>}
         </div>
         {errors}
       </div>
@@ -810,7 +817,7 @@ export default function UploadList() {
                     padding: 12,
                     borderRadius: 6,
                     border: '1px solid var(--semi-color-border)',
-                    borderLeft: `4px solid var(--semi-color-${session.action === 'manual_inspection' ? 'danger' : 'warning'})`,
+                    borderLeft: `4px solid var(--semi-color-${['manual_inspection', 'held'].includes(session.action) ? 'danger' : 'warning'})`,
                     background: 'var(--semi-color-bg-1)',
                   }}
                 >

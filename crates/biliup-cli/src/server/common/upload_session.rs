@@ -29,7 +29,11 @@ pub enum RequestSessionSubmit {
 pub enum SessionSubmitReadiness {
     NotRequested,
     NotDue(DateTime<Utc>),
-    Claimed { state: Option<String> },
+    Claimed {
+        state: Option<String>,
+    },
+    /// 远端拒绝后已停止自动重投，等人工恢复。
+    Held,
     Ready,
     Finalized,
     NotFound,
@@ -891,6 +895,9 @@ pub async fn session_submit_readiness(
             state: row.get("submit_state"),
         });
     }
+    if row.get::<Option<String>, _>("submit_state").as_deref() == Some("held") {
+        return Ok(SessionSubmitReadiness::Held);
+    }
     if let Some(next_at) = row.get::<Option<DateTime<Utc>>, _>("next_submit_at")
         && next_at > now
     {
@@ -925,6 +932,58 @@ pub async fn schedule_submit_retry(
     .bind(next_at)
     .bind(session_row_id)
     .bind(claim_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// 远端明确拒绝、重投相同内容不可能成功时：释放 claim、停止自动重投（`submit_state = 'held'`，
+/// `next_submit_at = NULL`）。调度扫描与就绪预检都不再领取它，只有人工「恢复会话」
+/// （`rearm_session_submit`）能重新放行。
+pub async fn hold_session_submit_after_rejection(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    claim_token: &str,
+    error: String,
+) -> AppResult<bool> {
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE upload_session SET submit_state = 'held', last_submit_error = ?1, \
+         last_submit_at = ?2, submit_attempts = submit_attempts + 1, \
+         submit_retry_attempts = submit_retry_attempts + 1, \
+         submit_claim_token = NULL, submit_claimed_at = NULL, next_submit_at = NULL, \
+         updated_at = ?2 WHERE id = ?3 AND status != 'finalized' AND submit_claim_token = ?4",
+    )
+    .bind(error)
+    .bind(now)
+    .bind(session_row_id)
+    .bind(claim_token)
+    .execute(pool)
+    .await
+    .change_context(AppError::Unknown)?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// 人工恢复会话：越过退避立即放行投稿，清零退避计数，解除 `held`。
+///
+/// 远端结果不确定的状态（`ok_no_aid` / `submitting` / `unknown_remote_result`）和持有 claim 的
+/// 会话一律不动——它们防的是重复稿件，不是退避。
+pub async fn rearm_session_submit(
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    now: DateTime<Utc>,
+) -> AppResult<bool> {
+    let updated = sqlx::query(
+        "UPDATE upload_session SET next_submit_at = ?1, submit_retry_attempts = 0, \
+         submit_state = CASE WHEN submit_state = 'held' THEN 'failed' ELSE submit_state END, \
+         updated_at = ?1 \
+         WHERE id = ?2 AND status != 'finalized' AND submit_requested_at IS NOT NULL \
+           AND submit_claim_token IS NULL \
+           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting', 'unknown_remote_result')",
+    )
+    .bind(now)
+    .bind(session_row_id)
     .execute(pool)
     .await
     .change_context(AppError::Unknown)?;
