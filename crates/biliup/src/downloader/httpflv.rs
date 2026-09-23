@@ -183,6 +183,24 @@ fn follows(from: i64, to: i64) -> bool {
 
 impl TimestampRebase {
     fn map(&mut self, tag_type: TagType, src: u32) -> Mapped {
+        // script tag 不走连续性判据：切段 prelude 的 onMetaData 一段只有一个，相邻两个隔着整段
+        // 时长，必然超过 `REBASE_MAX_STEP_MS`，于是每次都判成偏离、写成「上一个 script +1ms」，
+        // 文件起点被这一个包拉回整整一个分段（issue #75，转码据此拒稿）。它不承载时间轴，
+        // 贴在已写出的最大值上即可；也就不能再凭它确认换基准。还没写出过任何 tag 时照旧映射。
+        if tag_type == TagType::Script && self.streams.iter().any(|s| s.last_emit.is_some()) {
+            let script = &mut self.streams[2];
+            let emit = script
+                .last_emit
+                .map_or(self.high_water, |last| self.high_water.max(last + 1))
+                .clamp(0, u32::MAX as i64);
+            script.last_src = Some(src as i64);
+            script.last_emit = Some(emit);
+            self.high_water = self.high_water.max(emit);
+            return Mapped {
+                emit: emit as u32,
+                deviation: None,
+            };
+        }
         let slot = match tag_type {
             TagType::Audio => 0,
             TagType::Video => 1,
@@ -1227,10 +1245,7 @@ mod tests {
             }
             let jump = video_mapped(&mut rebase, 0);
             assert_eq!(jump.emit, 100_001, "首个样本紧跟本流最后一个");
-            assert_eq!(
-                jump.deviation,
-                Some((100_000, "timestamp_backward"))
-            );
+            assert_eq!(jump.deviation, Some((100_000, "timestamp_backward")));
             assert_eq!(video(&mut rebase, 1_000), 100_011, "第二个样本确认新基准");
             assert_eq!(video(&mut rebase, 2_000), 101_011);
             assert_eq!(video(&mut rebase, 3_000), 102_011, "此后按真实增量累加");
@@ -1332,7 +1347,9 @@ mod tests {
             );
             let emits: Vec<u32> = video.iter().map(|(_, emit)| *emit).collect();
             assert!(
-                emits.windows(2).all(|pair| pair[0] < pair[1] && pair[1] - pair[0] <= 33),
+                emits
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1] && pair[1] - pair[0] <= 33),
                 "video 单调且每步不超过一帧：{emits:?}"
             );
             let (src, emit) = *video.last().unwrap();
@@ -1362,6 +1379,31 @@ mod tests {
             skew(&mut rebase, 2_000);
             for i in 3..10u32 {
                 assert_eq!(skew(&mut rebase, i * 1_000), 20, "第 {i} 帧");
+            }
+        }
+
+        /// issue #75：切段 prelude 的 onMetaData 按关键帧的源时间戳重发，和上一个 script tag
+        /// 隔着整段时长（40 分钟）。曾经它被判成偏离、写成「上一个 script +1ms」，比同段的
+        /// video 早 2400s，文件起点被拉回一整段。它必须落在本段第一个关键帧附近。
+        #[test]
+        fn split_prelude_script_tag_stays_with_the_segment() {
+            const SEGMENT: u32 = 2_400_000;
+            let mut rebase = TimestampRebase::default();
+            assert_eq!(rebase.map(TagType::Script, 0).emit, 0);
+            for split in 0..3u32 {
+                let start = split * SEGMENT;
+                if split > 0 {
+                    let script = rebase.map(TagType::Script, start).emit as i64;
+                    let video = rebase.map(TagType::Video, start).emit as i64;
+                    assert!(
+                        (0..=100).contains(&(video - script)),
+                        "第 {split} 段：script {script} 必须紧贴 video {video}"
+                    );
+                }
+                for ms in (start + 40..start + SEGMENT).step_by(40) {
+                    rebase.map(TagType::Audio, ms);
+                    rebase.map(TagType::Video, ms);
+                }
             }
         }
 
@@ -1470,8 +1512,9 @@ mod tests {
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
 
-        let mut connection =
-            Connection::new(complete_response(flv_with_a_mid_stream_base_change(10, 4_000)));
+        let mut connection = Connection::new(complete_response(flv_with_a_mid_stream_base_change(
+            10, 4_000,
+        )));
         connection.read_frame(9).await.unwrap();
         let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
         // 切一刀，顺带覆盖段首 prelude 重发
@@ -1487,7 +1530,11 @@ mod tests {
             .filter(|path| path.extension().is_some_and(|ext| ext == "flv"))
             .collect();
         files.sort();
-        assert!(files.len() >= 2, "本用例要覆盖切段，实测 {} 个文件", files.len());
+        assert!(
+            files.len() >= 2,
+            "本用例要覆盖切段，实测 {} 个文件",
+            files.len()
+        );
 
         for path in &files {
             let tags = written_tags(path);
@@ -1654,4 +1701,3 @@ mod tests {
         Ok(())
     }
 }
-
