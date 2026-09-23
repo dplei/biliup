@@ -11,6 +11,7 @@
 //! new live segment arrived. After a restart, an already-due segment waited for the streamer to
 //! go live again. [`start_due_recovery_scan`] takes that job.
 
+use crate::server::common::missing_segment::MAX_AUTO_UPLOAD_ATTEMPTS;
 use crate::server::common::recovery_eligibility::RecoveryEligibility;
 use crate::server::common::upload::{
     ClaimedRecovery, RecoveryClaim, claim_manual_recovery, run_claimed_recovery,
@@ -90,7 +91,11 @@ struct DueRow {
     segment_order: i64,
 }
 
-/// Rows that are due now: `pending`/`failed`, past their retry time, in `segment_order`.
+/// Rows to start, in `segment_order`.
+///
+/// 自动扫描（`session_id = None`）只取已过退避时间、且没用完自动重试次数的行；人工恢复某个
+/// 会话是明确的「现在就传」，越过退避与次数上限（`claim_manual_recovery` 会把
+/// `next_retry_at` 拉到现在）。
 ///
 /// `finalized` sessions are excluded here as a cheap first pass; the authoritative check is
 /// `check_recovery_eligibility`, which every claim goes through.
@@ -102,17 +107,20 @@ async fn due_rows(
     let mut sql = String::from(
         "SELECT m.id, m.upload_session_id, m.segment_order FROM upload_missing_segment m \
          LEFT JOIN upload_session s ON s.id = m.upload_session_id \
-         WHERE m.status IN ('pending', 'failed') AND m.next_retry_at <= ?1 \
+         WHERE m.status IN ('pending', 'failed') \
            AND (s.id IS NULL OR s.status != 'finalized')",
     );
     if session_id.is_some() {
-        sql.push_str(" AND m.upload_session_id = ?2");
+        sql.push_str(" AND m.upload_session_id = ?1");
+    } else {
+        sql.push_str(" AND m.next_retry_at <= ?1 AND m.attempts < ?2");
     }
     sql.push_str(" ORDER BY m.upload_session_id ASC, m.segment_order ASC, m.id ASC");
-    let mut query = sqlx::query_as::<_, DueRow>(&sql).bind(now);
-    if let Some(session_id) = session_id {
-        query = query.bind(session_id);
-    }
+    let query = sqlx::query_as::<_, DueRow>(&sql);
+    let query = match session_id {
+        Some(session_id) => query.bind(session_id),
+        None => query.bind(now).bind(MAX_AUTO_UPLOAD_ATTEMPTS),
+    };
     query
         .fetch_all(pool)
         .await
@@ -258,6 +266,66 @@ mod tests {
         assert!(
             try_claim_group(4242).is_some(),
             "the group must be released once its run ends"
+        );
+    }
+
+    /// 自动扫描只取已到期且没用完次数的行；人工恢复会话越过退避与次数上限。
+    #[tokio::test]
+    async fn manual_recovery_overrides_backoff_and_the_auto_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::server::infrastructure::connection_pool::ConnectionManager::new_pool(
+            dir.path().join("test.db").to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO streamerinfo (id, name, url, title, date, live_cover_path) \
+             VALUES (20, 'test', 'https://example.com/live', 'test stream', ?1, '')",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upload_session (id, live_streamer_id, streamer_info_id, videos_json, \
+             status, created_at, updated_at) VALUES (30, 10, 20, '[]', 'uploading', ?1, ?1)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = [
+            (1, now - chrono::Duration::minutes(1), 0),
+            (2, now + chrono::Duration::hours(1), 1),
+            (
+                3,
+                now - chrono::Duration::minutes(1),
+                MAX_AUTO_UPLOAD_ATTEMPTS,
+            ),
+        ];
+        for (id, next_retry_at, attempts) in rows {
+            sqlx::query(
+                "INSERT INTO upload_missing_segment \
+                 (id, live_streamer_id, streamer_info_id, upload_session_id, file_path, \
+                  segment_order, status, attempts, next_retry_at, created_at, updated_at, \
+                  lifecycle_version) \
+                 VALUES (?1, 10, 20, 30, ?2, ?1, 'failed', ?3, ?4, ?5, ?5, 2)",
+            )
+            .bind(id)
+            .bind(format!("/{id}.flv"))
+            .bind(attempts)
+            .bind(next_retry_at)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let ids = |rows: Vec<DueRow>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(ids(due_rows(&pool, None, now).await.unwrap()), [1]);
+        assert_eq!(
+            ids(due_rows(&pool, Some(30), now).await.unwrap()),
+            [1, 2, 3]
         );
     }
 

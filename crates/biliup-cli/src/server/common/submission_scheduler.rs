@@ -39,7 +39,7 @@ pub async fn due_submission_session_ids(
            AND submit_requested_at IS NOT NULL \
            AND submit_claim_token IS NULL \
            AND (next_submit_at IS NULL OR next_submit_at <= ?1) \
-           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting', 'unknown_remote_result') \
+           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting', 'unknown_remote_result', 'held') \
            AND (?2 OR COALESCE(submit_state, '') != 'blocked_missing_segments' OR updated_at <= ?3) \
          ORDER BY COALESCE(next_submit_at, submit_requested_at) ASC, id ASC \
          LIMIT ?4",
@@ -74,9 +74,8 @@ impl SubmissionScanSummary {
                 self.retry_scheduled.push(session_id)
             }
             SessionSubmissionOutcome::ClaimedElsewhere => self.claimed_elsewhere.push(session_id),
-            SessionSubmissionOutcome::ManualInspectionRequired { .. } => {
-                self.manual_inspection.push(session_id)
-            }
+            SessionSubmissionOutcome::ManualInspectionRequired { .. }
+            | SessionSubmissionOutcome::Held { .. } => self.manual_inspection.push(session_id),
             SessionSubmissionOutcome::NotRequested
             | SessionSubmissionOutcome::NotDue { .. }
             | SessionSubmissionOutcome::DiscardedEmpty

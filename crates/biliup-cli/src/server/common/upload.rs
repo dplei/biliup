@@ -8,8 +8,9 @@ use crate::server::common::cover_generator::{
     Background, CoverOptions, render_to_tempfile, split_template_lines,
 };
 use crate::server::common::missing_segment::{
-    due_missing_segments_for_session, enqueue_pending_segment, mark_retry_failure,
-    mark_retry_success, next_missing_segment_order, patch_studio_videos,
+    MAX_AUTO_UPLOAD_ATTEMPTS, due_missing_segments_for_session, enqueue_pending_segment,
+    mark_retry_failure, mark_retry_success, next_missing_segment_order, patch_studio_videos,
+    retry_delay_for_attempt,
 };
 use crate::server::common::path_safety::single_segment_name;
 use crate::server::common::recovery_eligibility::{
@@ -34,10 +35,10 @@ use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
 use crate::server::common::upload_session::{
     LiveArchive, RequestSessionSubmit, SessionCompleteness, SessionSubmitReadiness, SubmitClaim,
     active_sessions_for_room, claim_complete_session, get_streamer_info,
-    insert_session_video_at_order, insert_uploading_session, mark_submit_anomaly, mark_submitted,
-    parse_videos, reattach_session, request_session_submit, schedule_submit_retry,
-    select_recovery_candidate, select_stale_session_indices, session_submit_readiness,
-    submit_claim_is_owned, submit_state_label, touch_session_activity,
+    hold_session_submit_after_rejection, insert_session_video_at_order, insert_uploading_session,
+    mark_submit_anomaly, mark_submitted, parse_videos, reattach_session, request_session_submit,
+    schedule_submit_retry, select_recovery_candidate, select_stale_session_indices,
+    session_submit_readiness, submit_claim_is_owned, submit_state_label, touch_session_activity,
 };
 use crate::server::common::util::{FileValidator, MediaValidation, Recorder};
 use crate::server::config::Config;
@@ -123,6 +124,9 @@ const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_INTERVAL: Duration = Duration::from_secs(5);
 const PROGRESS_PERSIST_BYTES: u64 = 16 * 1024 * 1024;
 /// Equal to the `PeriodicScan` period: anything shorter is rounded up to the next scan anyway.
+/// 时间戳修不好时上传路径返回的错误前缀。失败落库时靠它认出这是确定性失败（见
+/// `fail_enrolled_attempt`），改措辞要两处一起改——它们在同一个文件里用同一个常量。
+const UNFIXABLE_UPLOAD_ERROR: &str = "timestamp repair unfixable, upload withheld";
 const SUBMIT_RETRY_BASE_SECS: i64 = 60;
 const SUBMIT_RETRY_MAX_SECS: i64 = 30 * 60;
 
@@ -173,6 +177,10 @@ pub enum SessionSubmissionOutcome {
     },
     ManualInspectionRequired {
         reason: String,
+    },
+    /// 远端明确拒绝且重投相同内容不会成功：已停止自动重投，等人工「恢复会话」。
+    Held {
+        error: String,
     },
 }
 
@@ -672,12 +680,28 @@ fn submit_retry_at(
     now + chrono::Duration::seconds(seconds)
 }
 
+/// 针对稿件内容本身的拒绝码：内容不变，重投必然再被同一个错误拒掉。
+/// 21588 = 「该视频内部存在时间戳跳变」（issue #75）。只收实测确认过的码。
+const FINAL_REJECTION_CODES: &[i32] = &[21588];
+/// 其余远端明确拒绝（含 21566 投稿过于频繁）连续这么多次后停止自动重投。按 60s 起的指数
+/// 退避、30 分钟封顶，第 8 次拒绝大约在首次失败后 1.5 小时。本地前置失败（登录、模板、封面）
+/// 不发远端请求，不计入。
+const MAX_SUBMIT_REJECTIONS: i64 = 8;
+
+/// 这次远端拒绝之后是否停止自动重投。`retry_attempts` 是本次之前的退避次数，人工恢复会清零。
+fn stops_auto_submit(rejection_code: Option<i32>, retry_attempts: i64) -> bool {
+    rejection_code.is_some_and(|code| {
+        FINAL_REJECTION_CODES.contains(&code) || retry_attempts + 1 >= MAX_SUBMIT_REJECTIONS
+    })
+}
+
 async fn retry_submission(
     pool: &ConnectionPool,
     session_row_id: i64,
     claim_token: &str,
     error: String,
     remote_attempted: bool,
+    rejection_code: Option<i32>,
     webhook: Option<&str>,
 ) -> AppResult<SessionSubmissionOutcome> {
     let retry_attempts = sqlx::query_scalar::<_, i64>(
@@ -687,6 +711,36 @@ async fn retry_submission(
     .fetch_one(pool)
     .await
     .change_context(AppError::Unknown)?;
+    if stops_auto_submit(rejection_code, retry_attempts) {
+        if !hold_session_submit_after_rejection(pool, session_row_id, claim_token, error.clone())
+            .await?
+        {
+            return Ok(SessionSubmissionOutcome::ManualInspectionRequired {
+                reason: format!("submit claim was lost while holding after: {error}"),
+            });
+        }
+        warn!(
+            session = session_row_id,
+            ?rejection_code,
+            retry_attempts,
+            reason_code = "submit_held",
+            "投稿被远端拒绝且重投不会成功，停止自动重投"
+        );
+        crate::observe::submission_completed(
+            &crate::observe::SubmissionIdentity::session(session_row_id),
+            "failed",
+            "submit_held",
+        );
+        notify_alert(
+            webhook,
+            "投稿已停止自动重试",
+            &format!(
+                "会话 #{session_row_id} 的投稿被 B 站明确拒绝，重投相同内容不会成功，已停止自动重投。处理后在「上传」页点「恢复会话」立即重投。最近错误：{}",
+                sanitize_error(&error)
+            ),
+        );
+        return Ok(SessionSubmissionOutcome::Held { error });
+    }
     let next_at = submit_retry_at(retry_attempts, chrono::Utc::now());
     if !schedule_submit_retry(
         pool,
@@ -821,6 +875,12 @@ pub async fn reconcile_session_submission(
                 "upload session {session_row_id} does not exist"
             ))));
         }
+        SessionSubmitReadiness::Held => {
+            crate::observe::submission_decided(&submission, "skipped", "submit_held", 0);
+            return Ok(SessionSubmissionOutcome::Held {
+                error: "automatic submission stopped after a remote rejection".to_string(),
+            });
+        }
         SessionSubmitReadiness::Ready => {}
     }
 
@@ -918,6 +978,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 format!("load streamer_info failed: {error:?}"),
                 false,
+                None,
                 submit_webhook,
             )
             .await;
@@ -937,6 +998,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 format!("load live_streamer failed: {error:?}"),
                 false,
+                None,
                 submit_webhook,
             )
             .await;
@@ -949,6 +1011,7 @@ pub async fn reconcile_session_submission(
             &claim_token,
             "live_streamer has no upload template".to_string(),
             false,
+            None,
             submit_webhook,
         )
         .await;
@@ -967,6 +1030,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 format!("load upload template failed: {error:?}"),
                 false,
+                None,
                 submit_webhook,
             )
             .await;
@@ -989,6 +1053,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 format!("cookie login failed: {error:?}"),
                 false,
+                None,
                 submit_webhook,
             )
             .await;
@@ -1012,6 +1077,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 format!("build_studio failed: {error:?}"),
                 false,
+                None,
                 submit_webhook,
             )
             .await;
@@ -1050,6 +1116,10 @@ pub async fn reconcile_session_submission(
         }
         Err(failure) => {
             let remote_attempted = failure.remote_attempted();
+            let rejection_code = match &failure {
+                SubmitFailure::Rejected { code, .. } => Some(*code),
+                _ => None,
+            };
             let msg = failure.to_string();
             error!(error = %msg, "submit_failed：投稿接口失败，保持 uploading 待补提交");
             return retry_submission(
@@ -1058,6 +1128,7 @@ pub async fn reconcile_session_submission(
                 &claim_token,
                 msg,
                 remote_attempted,
+                rejection_code,
                 submit_webhook,
             )
             .await;
@@ -1240,7 +1311,14 @@ pub async fn fail_enrolled_attempt(
     error: String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<bool> {
-    fail_enrolled_attempt_with_outcome(pool, missing_id, attempt_token, error, "failed", now).await
+    // 时间戳修不好是确定性的：同一个文件、同一版 ffmpeg，重跑多少次都修不好，自动重试只是
+    // 反复整片扫描。单独记一个 outcome，让它直接用完自动重试次数。
+    let outcome = if error.contains(UNFIXABLE_UPLOAD_ERROR) {
+        "unfixable"
+    } else {
+        "failed"
+    };
+    fail_enrolled_attempt_with_outcome(pool, missing_id, attempt_token, error, outcome, now).await
 }
 
 /// Release a lease and record its terminal state.
@@ -1260,9 +1338,24 @@ pub async fn fail_enrolled_attempt_with_outcome(
     // gets the same Cookie/token/query-string scrub as the line-health error summary, not just
     // the tracing log line below (attempt_token itself is a random UUID lease id, not a secret).
     let error = sanitize_error(&error);
+    // 只有持有这个 lease 的人会改这一行，先读后写不会和别人交错；下面的 UPDATE 仍按 token 守卫。
+    let previous_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT attempts FROM upload_missing_segment WHERE id = ?1 AND attempt_token = ?2",
+    )
+    .bind(missing_id)
+    .bind(attempt_token)
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)?
+    .unwrap_or(0);
+    let attempts = if outcome == "unfixable" {
+        (previous_attempts + 1).max(MAX_AUTO_UPLOAD_ATTEMPTS)
+    } else {
+        previous_attempts + 1
+    };
     let updated_attempts = sqlx::query_scalar::<_, i64>(
         "UPDATE upload_missing_segment \
-         SET status = 'failed', attempts = attempts + 1, line_index = line_index + 1, \
+         SET status = 'failed', attempts = ?6, line_index = line_index + 1, \
              next_retry_at = ?1, last_error = ?2, attempt_token = NULL, current_line = NULL, \
              attempt_phase = NULL, phase_started_at = NULL, last_heartbeat_at = NULL, \
              updated_at = ?3 \
@@ -1270,11 +1363,12 @@ pub async fn fail_enrolled_attempt_with_outcome(
            AND attempt_token = ?5 \
          RETURNING attempts",
     )
-    .bind(now + chrono::Duration::minutes(10))
+    .bind(now + retry_delay_for_attempt(previous_attempts))
     .bind(&error)
     .bind(now)
     .bind(missing_id)
     .bind(attempt_token)
+    .bind(attempts)
     .fetch_optional(pool)
     .await
     .change_context(AppError::Unknown)?;
@@ -1427,6 +1521,7 @@ pub async fn persist_segment(
         Ok(
             SessionSubmitReadiness::NotRequested
             | SessionSubmitReadiness::Claimed { .. }
+            | SessionSubmitReadiness::Held
             | SessionSubmitReadiness::Finalized
             | SessionSubmitReadiness::NotFound,
         ) => {}
@@ -1870,8 +1965,8 @@ async fn upload_single_file_with_repair(
         RepairOutcome::Clean
     };
     // 修不好的不传：B 站转码会在投稿数小时后才拒掉时间轴异常的稿件，届时原片早已按
-    // 「上传后删除」清掉。这里报错让 lifecycle 行留在本地按常规退避重试，文件不动。
-    // ponytail: 重试每 10 分钟重跑一次全片扫描；真修不好的行靠缺失补传页手动删除。
+    // 「上传后删除」清掉。这里报错让 lifecycle 行留在本地，文件不动；错误带
+    // `UNFIXABLE_UPLOAD_ERROR` 前缀，落库时直接用完自动重试次数，只等人工重试或删除。
     if matches!(outcome, RepairOutcome::Unfixable) {
         error!(file = ?original_path, "时间戳无法修复，不上传，本地文件保留");
         notify_alert(
@@ -1883,7 +1978,7 @@ async fn upload_single_file_with_repair(
             artifact.cleanup().await;
         }
         return Err(error_stack::Report::new(AppError::Custom(format!(
-            "timestamp repair unfixable, upload withheld for {}",
+            "{UNFIXABLE_UPLOAD_ERROR} for {}",
             original_path.display()
         ))));
     }
@@ -5711,14 +5806,17 @@ mod tests {
             "claim",
             "app submit rejected (code: 21566): 投稿过于频繁".to_string(),
             true,
+            Some(21566),
             None,
         )
         .await
         .unwrap() else {
             panic!("expected retry scheduling")
         };
+        // 上界要用调用之后的时刻：`next_at` 是函数内部现取的 now 加最多 20% jitter。
+        let after = chrono::Utc::now();
         assert!(next_at >= before + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS));
-        assert!(next_at <= before + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
+        assert!(next_at <= after + chrono::Duration::seconds(SUBMIT_RETRY_BASE_SECS * 6 / 5));
     }
 
     #[test]
@@ -6581,6 +6679,143 @@ mod tests {
         assert_eq!(plan.chosen, "bda2");
         assert_eq!(plan.source, LineSource::Fallback);
         assert!(plan.skipped[0].contains("alia: slow_transfer"));
+    }
+
+    /// issue #76：v2 行按次数退避，第 `MAX_AUTO_UPLOAD_ATTEMPTS` 次失败后自动恢复不再领取。
+    /// 曾经固定 10 分钟、没有上限，传到一半断掉的分段每 10 分钟重新烧一遍上行。
+    #[tokio::test]
+    async fn upload_failures_back_off_and_stop_auto_retry_at_the_cap() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "capped.flv").await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap();
+        let mut delays = Vec::new();
+        for _ in 0..MAX_AUTO_UPLOAD_ATTEMPTS {
+            let token = claim_enrolled_attempt(&pool, &enrollment, "bda2", LineSource::Configured)
+                .await
+                .unwrap()
+                .unwrap();
+            fail_enrolled_attempt(&pool, enrollment.missing_id, &token, "reset".into(), now)
+                .await
+                .unwrap();
+            let retry_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT next_retry_at FROM upload_missing_segment WHERE id = ?")
+                    .bind(enrollment.missing_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            delays.push((retry_at - now).num_minutes());
+        }
+        assert_eq!(delays, [10, 30, 60, 120, 360, 360]);
+        let due = due_missing_segments_for_session(&pool, enrollment.upload_session_id, Utc::now())
+            .await
+            .unwrap();
+        assert!(due.is_empty(), "用完自动重试次数后，自动恢复不再领取它");
+    }
+
+    /// 时间戳修不好是确定性失败：一次就用完自动重试次数，不再每轮重跑整片扫描。
+    #[tokio::test]
+    async fn an_unfixable_segment_stops_auto_retry_at_once() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "unfixable.flv").await;
+        let token = claim_enrolled_attempt(&pool, &enrollment, "bda2", LineSource::Configured)
+            .await
+            .unwrap()
+            .unwrap();
+        // 与上传路径一样用 `{e:?}` 落库，确认 error_stack 的 Debug 输出里认得出标记。
+        let error = error_stack::Report::new(AppError::Custom(format!(
+            "{UNFIXABLE_UPLOAD_ERROR} for /x.flv"
+        )));
+        fail_enrolled_attempt(
+            &pool,
+            enrollment.missing_id,
+            &token,
+            format!("{error:?}"),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let (attempts, outcome): (i64, String) = sqlx::query_as(
+            "SELECT m.attempts, h.outcome FROM upload_missing_segment m \
+             JOIN upload_attempt h ON h.missing_id = m.id WHERE m.id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, MAX_AUTO_UPLOAD_ATTEMPTS);
+        assert_eq!(outcome, "unfixable");
+    }
+
+    #[test]
+    fn only_remote_rejections_can_stop_auto_submit() {
+        assert!(stops_auto_submit(Some(21588), 0), "内容被拒，重投必然再拒");
+        assert!(!stops_auto_submit(Some(21566), 0));
+        assert!(!stops_auto_submit(Some(21566), MAX_SUBMIT_REJECTIONS - 2));
+        assert!(stops_auto_submit(Some(21566), MAX_SUBMIT_REJECTIONS - 1));
+        assert!(
+            !stops_auto_submit(None, 1_000),
+            "本地前置失败不发远端请求，不计入上限"
+        );
+    }
+
+    /// issue #76：21588 被拒后停止自动重投，调度扫描与分段成功的唤醒都不再领取；人工恢复
+    /// 越过退避重新放行，并清零退避计数。
+    #[tokio::test]
+    async fn a_content_rejection_holds_the_session_until_manual_recovery() {
+        let (_directory, pool) = deferred_test_pool().await;
+        sqlx::query(
+            "UPDATE upload_session SET submit_claim_token = 'claim', submit_requested_at = ?1, \
+             submit_retry_attempts = 3 WHERE id = 30",
+        )
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = retry_submission(
+            &pool,
+            30,
+            "claim",
+            "web submit rejected (code: 21588): 该视频内部存在时间戳跳变".to_string(),
+            true,
+            Some(21588),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, SessionSubmissionOutcome::Held { .. }),
+            "{outcome:?}"
+        );
+        let now = Utc::now();
+        assert!(matches!(
+            session_submit_readiness(&pool, 30, now).await.unwrap(),
+            SessionSubmitReadiness::Held
+        ));
+        assert!(
+            crate::server::common::submission_scheduler::due_submission_session_ids(
+                &pool, now, true
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+
+        assert!(
+            crate::server::common::upload_session::rearm_session_submit(&pool, 30, now)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            session_submit_readiness(&pool, 30, now).await.unwrap(),
+            SessionSubmitReadiness::Ready
+        ));
+        let (state, retries): (String, i64) = sqlx::query_as(
+            "SELECT submit_state, submit_retry_attempts FROM upload_session WHERE id = 30",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((state.as_str(), retries), ("failed", 0));
     }
 
     #[tokio::test]
