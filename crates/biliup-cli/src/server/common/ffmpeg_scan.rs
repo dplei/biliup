@@ -87,6 +87,8 @@ pub struct PacketJumpScan {
     pub max_forward_jump_ms: Option<i64>,
     /// 读到的包数，用来区分「没有跳变」和「根本没读到包」。
     pub packets: u64,
+    /// 各流首包 dts 毫秒，与 `last` 同序。
+    first: Vec<i64>,
 }
 
 impl PacketJumpScan {
@@ -113,8 +115,22 @@ impl PacketJumpScan {
                 }
                 *previous = dts_ms;
             }
-            None => self.last.push((index, dts_ms)),
+            None => {
+                self.last.push((index, dts_ms));
+                self.first.push(dts_ms);
+            }
         }
+    }
+
+    /// 各流起点之差（最晚首包 − 最早首包）。
+    ///
+    /// 流内判据看不见的错位：每条流各自单调，只是起点彼此错开——修复产物的音频晚视频
+    /// 1616s、一个没跟着重基的 script 数据包早音视频 2400s（issue #75）。相差超过
+    /// `MAX_PACKET_STEP_MS` 与「流内前跳超过它」是同一回事，用同一个阈值。
+    pub fn start_skew_ms(&self) -> i64 {
+        let min = self.first.iter().min();
+        let max = self.first.iter().max();
+        max.zip(min).map_or(0, |(max, min)| max - min)
     }
 }
 
@@ -396,6 +412,29 @@ mod tests {
         assert_eq!(over_limit.max_forward_jump_ms, Some(30_001));
     }
 
+    /// issue #75 的两种形态：流内都单调、没有前跳，只是起点错开。
+    #[test]
+    fn start_skew_spans_the_earliest_and_latest_stream() {
+        let mut repaired = PacketJumpScan::default();
+        for line in ["0,0.033000", "1,1616.673000", "0,0.066000", "1,1616.696000"] {
+            repaired.push_line(line);
+        }
+        assert_eq!(repaired.max_forward_jump_ms, None);
+        assert_eq!(repaired.start_skew_ms(), 1_616_640);
+
+        let mut stale_data = PacketJumpScan::default();
+        for line in [
+            "2,0.001000",
+            "0,2400.011000",
+            "1,2400.026000",
+            "0,2400.044000",
+        ] {
+            stale_data.push_line(line);
+        }
+        assert_eq!(stale_data.start_skew_ms(), 2_400_025);
+        assert_eq!(PacketJumpScan::default().start_skew_ms(), 0);
+    }
+
     /// 认不出的行不能把好片判坏：跳过即可。
     #[test]
     fn unreadable_lines_are_skipped() {
@@ -420,7 +459,9 @@ mod tests {
     #[test]
     fn parses_the_previous_current_form() {
         assert_eq!(
-            parse_backward_ms("Non-monotonic DTS in output stream 0:1; previous: 11990, current: 8356; changing to 11991"),
+            parse_backward_ms(
+                "Non-monotonic DTS in output stream 0:1; previous: 11990, current: 8356; changing to 11991"
+            ),
             Some(3635 - 1)
         );
     }

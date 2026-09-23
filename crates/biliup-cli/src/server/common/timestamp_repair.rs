@@ -1,5 +1,5 @@
 use crate::server::common::ffmpeg_scan::{
-    MAX_PACKET_STEP_MS, ScanObserver, run_packet_jump_scan, run_scanning_stderr,
+    MAX_PACKET_STEP_MS, PacketJumpScan, ScanObserver, run_packet_jump_scan, run_scanning_stderr,
 };
 use crate::server::common::process_priority::background;
 use crate::server::errors::{AppError, AppResult};
@@ -20,20 +20,28 @@ use tracing::{error, info, warn};
 /// 增量模型两种都修：每个 packet 的输出 = 上一个输出 + 本流相邻两个输入的增量；增量为负
 /// （回退）或超过 `MAX_PACKET_STEP_MS`（前跳、回绕）都压成 1ms，之后按真实增量继续。内容一帧
 /// 不丢，文件时长等于真实内容时长，闸门不再需要。A/V 各自压缩，跳变处相对偏移改变不超过一帧。
-/// `PREV_OUTDTS` 在第一个 packet 上是 NOPTS（一个极大的负数），用 `lt(…, -1e15)` 识别后
-/// 原样放行。表达式在输入 timebase 上求值（FLV 为 1ms），30000 与 `MAX_PACKET_STEP_MS` 同源，
-/// 录制侧与上传侧对「什么算跳变」保持一个口径。
+/// `PREV_OUTDTS` 在第一个 packet 上是 NOPTS（一个极大的负数），用 `lt(…, -1e15)` 识别。
+/// 首包**不能原样放行**：各流只压自己流内的跳变，首包就落在跳变之后的那条流会带着原始
+/// 时间戳，音视频起点错开跳变的全长（issue #75：视频从 0 开始、音频从 1616s 开始）。
+/// ffmpeg 在 bsf 之前已经减掉了文件起点（所有流里最早的首包），所以首包 DTS 超过
+/// `MAX_PACKET_STEP_MS` 就等于「本流起点比最早的流晚了一次跳变」，把它拉回 0；没超过的
+/// 原样保留，正常文件的音画起点差一个毫秒都不动。表达式在输入 timebase 上求值（FLV 为
+/// 1ms），30000 与 `MAX_PACKET_STEP_MS` 同源，录制侧与上传侧对「什么算跳变」保持一个口径。
+///
+/// ponytail: 被拉回 0 的流丢掉了它与兄弟流原本几十毫秒以内的起点差；一条流真的晚 30s 以上
+/// 才有第一个包（前 30s 纯视频）也会被拉齐。都没在直播录像里见过，见到再按兄弟流的首包对齐。
 ///
 /// ponytail: 一个文件里若 CDN 逐帧交替重发 timestamp=0 的垃圾 tag（`[B, 0, B+33, 0, …]`），
 /// 每个垃圾 tag 会吃掉紧随其后那个真 tag 的增量，时间轴按 tag 数被压缩。录制侧的
 /// `TimestampRebase` 已经不会把这种形态写进文件，这里不再为它加 NEXT_DTS 前瞻。
 fn delta_setts(chain: &str) -> String {
     const STEP: &str = r"if(gt(DTS-PREV_INDTS\,30000)\,1\,max(DTS-PREV_INDTS\,1))";
+    const FIRST: &str = r"if(gt(DTS\,30000)\,0\,DTS)";
     // pts 表达式不能引用 dts 表达式的结果，只能把同一段算式再写一遍，再补回原来的 PTS−DTS
     // （composition time），有 B 帧的源不会被破坏。
     format!(
-        "{chain}setts=pts=if(lt(PREV_OUTDTS\\,-1e15)\\,PTS\\,PREV_OUTDTS+{STEP}+PTS-DTS)\
-         :dts=if(lt(PREV_OUTDTS\\,-1e15)\\,DTS\\,PREV_OUTDTS+{STEP})"
+        "{chain}setts=pts=if(lt(PREV_OUTDTS\\,-1e15)\\,{FIRST}+PTS-DTS\\,PREV_OUTDTS+{STEP}+PTS-DTS)\
+         :dts=if(lt(PREV_OUTDTS\\,-1e15)\\,{FIRST}\\,PREV_OUTDTS+{STEP})"
     )
 }
 
@@ -140,7 +148,7 @@ impl SystemFfmpeg {
         Self { context }
     }
 
-    /// 用 ffprobe 的包时间戳做数值判据，返回超过阈值的最大前跳。
+    /// 用 ffprobe 的包时间戳做数值判据：流内前跳与跨流起点差。
     ///
     /// 只在文本判据判干净之后才跑：命中文本判据时已经知道文件有问题，也已经有回退量，
     /// 没必要再读一遍整片。健康文件因此多付一遍解复用（实测与现有 `-c copy -f null -`
@@ -149,7 +157,7 @@ impl SystemFfmpeg {
     /// ffprobe 本身跑不起来时**返回 `None` 而不是报错**：这一层是给文本判据兜底的加法，
     /// 把它的环境故障升级成 `DetectFailed` 会让没装 ffprobe 的机器上每个文件都降级，
     /// 比漏掉这条判据更糟。
-    async fn detect_packet_jump(&self, path: &Path) -> Option<i64> {
+    async fn packet_scan(&self, path: &Path) -> Option<PacketJumpScan> {
         let mut command = Command::new("ffprobe");
         command
             .args([
@@ -167,7 +175,7 @@ impl SystemFfmpeg {
         )
         .await
         {
-            Ok((status, scan)) if status.success() => scan.max_forward_jump_ms,
+            Ok((status, scan)) if status.success() => Some(scan),
             Ok((status, _)) => {
                 warn!(file = ?path, ?status, "ffprobe 包扫描非零退出，本条判据跳过");
                 None
@@ -219,15 +227,31 @@ impl FfmpegRunner for SystemFfmpeg {
         // 文本判据没话说不等于文件干净：源里的 32 位倒退可能已经被解复用器展开成一个单调的
         // 巨大前跳，展开之后 muxer 一条警告都不会打（实测 0 条）。这是确定性漏检，再用包
         // 时间戳的数值兜一层。
-        if let Some(jump_ms) = self.detect_packet_jump(path).await {
+        let Some(scan) = self.packet_scan(path).await else {
+            return Ok(Detection::Clean);
+        };
+        if let Some(jump_ms) = scan.max_forward_jump_ms {
             warn!(
                 file = ?path,
                 jump_ms,
                 limit_ms = MAX_PACKET_STEP_MS,
                 "相邻包时间戳异常大幅前跳，判为时间戳异常"
             );
-            // 前跳不是回退：setts 的 clamp 修不了它（它本来就单调），回退量也无从谈起。
-            // 按既有约定交给 `None` 分支保守处理，走同一套分档，不自成一路。
+            // 前跳不是回退，回退量无从谈起：按既有约定交给 `None` 分支。
+            return Ok(Detection::Anomalous {
+                max_backward_ms: None,
+            });
+        }
+        // 各流各自单调、只是起点错开，流内判据全都看不见；这正是修复产物与未重基的 script
+        // 数据包被拒稿的形态（issue #75）。修复要能把它对齐，复检也靠这一条把关。
+        let skew_ms = scan.start_skew_ms();
+        if skew_ms > MAX_PACKET_STEP_MS {
+            warn!(
+                file = ?path,
+                skew_ms,
+                limit_ms = MAX_PACKET_STEP_MS,
+                "各流起点相差过大，判为时间戳异常"
+            );
             return Ok(Detection::Anomalous {
                 max_backward_ms: None,
             });
@@ -255,6 +279,13 @@ impl FfmpegRunner for SystemFfmpeg {
             ])
             .arg(src)
             .args([
+                // 只要一路视频、一路音频。FLV 的 script 数据包（ffprobe 里是一条 text 流）不跟着
+                // 录制侧重基时会比音视频早一整段（issue #75），留着它产物照样起点错位；投稿也
+                // 用不上它。
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
                 "-c",
                 "copy",
                 // 时间戳是容器/packet 元数据，修它不该动 H.264/AAC payload。setts 按流累加
@@ -528,7 +559,15 @@ mod tests {
 
         let mut command = tokio::process::Command::new("ffmpeg");
         command
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", resume_secs, "-i"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                resume_secs,
+                "-i",
+            ])
             .arg(src)
             .args(["-c", "copy"]);
         if keep_timestamps {
@@ -614,7 +653,14 @@ mod tests {
     /// `ffprobe` 读产物的容器时长。
     async fn probe_duration(path: &Path) -> f64 {
         let output = tokio::process::Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(path)
             .output()
             .await
@@ -668,7 +714,10 @@ mod tests {
         jump_timestamps(&good, 4_000, 4_294_000_000, &jumped).await;
 
         assert_eq!(
-            SystemFfmpeg::default().detect(&jumped).await.expect("detect"),
+            SystemFfmpeg::default()
+                .detect(&jumped)
+                .await
+                .expect("detect"),
             Detection::Anomalous {
                 max_backward_ms: None
             },
@@ -685,6 +734,131 @@ mod tests {
             "前跳必须被压掉，产物时长应回到 8s，实测 {duration}s"
         );
         for path in [&good, &jumped, &fixed] {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    /// 逐 tag 改写 FLV 时间戳：`shift(tag_type, timestamp)` 返回新值。`text_tag` 为真时在
+    /// 第一个 tag 后插一个 timestamp=0 的 onTextData script tag——ffprobe 把它认成一条只有
+    /// 一个包的 text 流，就是录制侧没跟着重基的那个数据包。
+    async fn restamp_flv(src: &Path, dst: &Path, text_tag: bool, shift: impl Fn(u8, u32) -> u32) {
+        let bytes = tokio::fs::read(src).await.expect("read flv");
+        let mut out = bytes[..13].to_vec();
+        let mut pos = 13;
+        while pos + 11 <= bytes.len() {
+            let size =
+                u32::from_be_bytes([0, bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+            let end = pos + 11 + size + 4;
+            let mut tag = bytes[pos..end].to_vec();
+            let ts = u32::from_be_bytes([tag[7], tag[4], tag[5], tag[6]]);
+            let [ext, b1, b2, b3] = shift(tag[0], ts).to_be_bytes();
+            tag[4..8].copy_from_slice(&[b1, b2, b3, ext]);
+            out.extend_from_slice(&tag);
+            if text_tag && pos == 13 {
+                // AMF0: "onTextData" + ECMA array { text: "hi" }
+                let mut body = vec![2, 0, 10];
+                body.extend_from_slice(b"onTextData");
+                body.extend_from_slice(&[8, 0, 0, 0, 1, 0, 4]);
+                body.extend_from_slice(b"text");
+                body.extend_from_slice(&[2, 0, 2]);
+                body.extend_from_slice(b"hi");
+                body.extend_from_slice(&[0, 0, 9]);
+                let len = body.len() as u32;
+                out.push(18);
+                out.extend_from_slice(&len.to_be_bytes()[1..]);
+                out.extend_from_slice(&[0; 7]);
+                out.extend_from_slice(&body);
+                out.extend_from_slice(&(11 + len).to_be_bytes());
+            }
+            pos = end;
+        }
+        tokio::fs::write(dst, out).await.expect("write restamped");
+    }
+
+    /// ffprobe 读各流起点。
+    async fn probe_starts(path: &Path) -> Vec<f64> {
+        let output = tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=start_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .expect("spawn ffprobe");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().parse().expect("parse start_time"))
+            .collect()
+    }
+
+    /// 断言修复后各流起点对齐（相差不到 0.1s）、时长回到真实的 8s。
+    async fn assert_aligned_repair(sample: &Path) {
+        assert!(
+            matches!(
+                SystemFfmpeg::default()
+                    .detect(sample)
+                    .await
+                    .expect("detect"),
+                Detection::Anomalous { .. }
+            ),
+            "起点错位必须被判为异常，否则这个测试什么也没验"
+        );
+        let outcome = normalize_timestamps(sample, &SystemFfmpeg::default()).await;
+        let RepairOutcome::Repaired(fixed) = outcome else {
+            panic!("起点错位应当被修好，实际 {outcome:?}");
+        };
+        let starts = probe_starts(&fixed).await;
+        assert_eq!(starts.len(), 2, "只保留一路视频一路音频：{starts:?}");
+        assert!(
+            (starts[0] - starts[1]).abs() < 0.1,
+            "起点必须对齐：{starts:?}"
+        );
+        let duration = probe_duration(&fixed).await;
+        assert!(
+            (7.5..8.5).contains(&duration),
+            "产物时长应为 8s，实测 {duration}s"
+        );
+        let _ = tokio::fs::remove_file(&fixed).await;
+    }
+
+    /// issue #75 修复产物的形态：一条流只有首包在跳变前，另一条流首包就在跳变后。曾经各流
+    /// 首包原样放行，修出来两条流起点错开整个跳变，复检还判干净。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_aligns_a_stream_that_starts_after_the_jump() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_late_start_source.flv");
+        let sample = dir.join("tsr_late_start.flv");
+        make_source(&good, 8).await;
+        restamp_flv(&good, &sample, false, |_, ts| {
+            if ts > 0 { ts + 1_616_666 } else { ts }
+        })
+        .await;
+        assert_aligned_repair(&sample).await;
+        for path in [&good, &sample] {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    /// issue #75 的另一种：音视频自己对齐，一个 script 数据包比它们早一整段。
+    #[tokio::test]
+    #[ignore]
+    async fn system_ffmpeg_drops_a_stale_data_packet() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("tsr_stale_data_source.flv");
+        let sample = dir.join("tsr_stale_data.flv");
+        make_source(&good, 8).await;
+        restamp_flv(&good, &sample, true, |kind, ts| {
+            if kind == 18 { ts } else { ts + 2_400_000 }
+        })
+        .await;
+        assert_aligned_repair(&sample).await;
+        for path in [&good, &sample] {
             let _ = tokio::fs::remove_file(path).await;
         }
     }
@@ -725,7 +899,15 @@ mod tests {
         let dir = std::env::temp_dir();
         let src = dir.join("tsr_bframe_src.flv");
         let status = tokio::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
             .arg("testsrc=duration=3:size=320x240:rate=30")
             .args(["-c:v", "libx264", "-preset", "ultrafast", "-bf", "3", "-an"])
             .arg(&src)
