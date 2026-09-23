@@ -112,3 +112,7 @@ protocol/quality/codec 一次性扩张契约。
 - 不修改 `ROUTE_STABLE_THRESHOLD`：五分钟仍是线路健康与切线成功的稳定标准。
 - 不先修 `RouteKey`：这次零切换已有更早、更确定的开关根因。
 - 不在本任务处理短分段的保留/合并策略；那是独立的数据保全问题。
+
+## 生产验证结论（2026-09-23）
+
+拿到真实 `no_media_track → circuit_opened(count=2) → route_selected fallback/route_changed` 链，`quality.rejected` 均为 0，熔断后无 `failover_disabled`/`no_candidate`。结论已回贴 #6（#39 已先行关闭） 并关闭 issue。

@@ -24,6 +24,10 @@
 
 | 目录 | 内容 | 归档日期 | 完结依据 |
 | --- | --- | --- | --- |
+| [`short-segment-concat-path/`](short-segment-concat-path/) | 短片段 concat 列表改用绝对路径，文件名含冒号不再被当作 URL scheme | 2026-09-23 | 唯一 step `resolved`；[#70](https://github.com/dplei/biliup/pull/70) 已合入 `dev`，生产验证 4 条全部满足，[#69](https://github.com/dplei/biliup/issues/69) 已关闭 |
+| [`submit-gate-boundary-noise/`](submit-gate-boundary-noise/) | 下播边界在飞分段的门禁阻塞静默化，不再误发「投稿已暂停」 | 2026-09-23 | 唯一 step `complete`；[#49](https://github.com/dplei/biliup/pull/49) 已合入 `dev`，生产验证 5 条满足、缺口 B 核对为空不做，[#48](https://github.com/dplei/biliup/issues/48) 已关闭 |
+| [`missing-segment-last-error/`](missing-segment-last-error/) | `last_error` 写入契约收口：成功清空、历史回填、读取侧按错误渲染 | 2026-09-23 | 01–03 全部 `complete`；[#47](https://github.com/dplei/biliup/pull/47) 已合入 `dev`，生产验证满足不变量，[#7](https://github.com/dplei/biliup/issues/7) 已关闭 |
+| [`short-eof-retry-failover/`](short-eof-retry-failover/) | 短连接后重置失败计数、启用抖音选路与选路决策事件 | 2026-09-23 | 01–03 全部 `resolved`；[#40](https://github.com/dplei/biliup/pull/40) 已合入 `dev`，[#39](https://github.com/dplei/biliup/issues/39) 与 [#6](https://github.com/dplei/biliup/issues/6) 均已按生产事件链验证关闭 |
 | [`discard-upload-session/`](discard-upload-session/) | `source_missing` 分段删除与残缺上传会话原子丢弃（不投稿） | 2026-09-22 | 唯一步骤 `resolved`；[#74](https://github.com/dplei/biliup/pull/74) 已合入 `dev`，Rust 全量库测试、前端 lint/typecheck 与代码索引检查通过 |
 | [`upload-preprocess-reuse/`](upload-preprocess-reuse/) | 服务端预上传瞬时网络重试与 UPOS 线路 breaker 归因修正 | 2026-09-08 | 01、06 `resolved`，02–05 `wontfix`；[#45](https://github.com/dplei/biliup/pull/45) 已合入 `dev`，故障注入、完整 CLI 测试与代码索引检查通过 |
 | [`retry-attempt-correlation/`](retry-attempt-correlation/) | 录制退避事件关联到触发它的下载 attempt | 2026-09-07 | 唯一 step `resolved`；[#44](https://github.com/dplei/biliup/pull/44) 已合入 `dev`，定向事件回归与 `biliup-cli` 库测试通过 |

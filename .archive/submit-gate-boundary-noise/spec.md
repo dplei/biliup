@@ -100,3 +100,7 @@ AND status NOT IN ('succeeded') GROUP BY status`。为 0 则 B 不做；非 0 �
 - 单测：`lifecycle_version=1`、`status=uploading`、`attempt_token IS NULL` 的行调 `stop_missing_segment_attempt`
   → `Stopped`，行变 `failed` 且 `last_error` 含 reason；`attempt_token` 非空的行行为不变。
 - issue 严重度按「预期行为 + 告警噪音」下调。
+
+## 生产验证结论（2026-09-23）
+
+在飞阻塞为 `INFO quiet=true` 且无通知，随后 `Submitted`；`failed`/`source_missing` 与超窗阻塞仍为 `WARN quiet=false`；缺口 B 只读核对非终态 v1 行为空，不做。结论已回贴 #48 并关闭 issue。

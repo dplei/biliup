@@ -30,3 +30,7 @@ remux 临时文件及最终产物继续沿用现有命名和清理逻辑。已�
 - `cargo test -p biliup-cli server::common::download::` 通过。
 - `rustfmt --edition 2024 --check crates/biliup-cli/src/server/common/download.rs` 通过。
 - 合并及部署后观察新的短片段合并，生产验证前保留在 `.scratch/`。
+
+## 生产验证结论（2026-09-23）
+
+多个兼容短片段 `short segment merge phase succeeded` → `segment validated and enrolled` → 上传 → 投稿成功；上线后无 `scheme:` 截断错误、无新增 `Deferred` 批次。结论已回贴 #69 并关闭 issue。

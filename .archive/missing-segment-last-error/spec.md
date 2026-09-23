@@ -57,3 +57,7 @@
 - 当前代码中没有正常状态说明写入 `upload_missing_segment.last_error`。
 - migration 只影响 `succeeded` 行，失败行诊断原样保留。
 - Rust 测试和前端检查通过，PR 以 `dev` 为 base 并关联 issue #7。
+
+## 生产验证结论（2026-09-23）
+
+`succeeded` 且 `last_error` 非空为空集并持续保持；重试后成功的行 `last_error` 均已清空；失败行诊断完整保留；手动恢复路径由回归测试锁住。结论已回贴 #7 并关闭 issue。
