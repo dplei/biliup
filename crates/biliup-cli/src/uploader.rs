@@ -132,6 +132,7 @@ pub async fn upload_by_command(
     line: Option<String>,
     limit: usize,
     submit: SubmitOption,
+    no_submit: bool,
     proxy: Option<&str>,
 ) -> AppResult<()> {
     let task = UploadTask::default();
@@ -158,6 +159,15 @@ pub async fn upload_by_command(
         upload_with_task(&video_path, &bili, line, limit, &task).await,
         "upload_failed",
     )?;
+    if no_submit {
+        // 只要 B 站侧的 filename，拿去替换一个还没投出去的会话里的分段。
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&studio.videos)
+                .change_context_lazy(|| AppError::Unknown)?
+        );
+        return Ok(());
+    }
 
     task.submit(async {
         Ok(match submit {
