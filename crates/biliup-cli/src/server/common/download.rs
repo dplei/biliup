@@ -235,7 +235,12 @@ impl SegmentEventProcessor {
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         // 删除决定只能发生在媒体内容探测之后；体积本身不再代表文件无效。
-        let validation = self.file_validator.validate(&event.prev_file_path)?;
+        // 完整段的探测要十几秒；放进阻塞线程池，同 task 里的拉流才能继续被 poll（issue #79）。
+        let validator = self.file_validator.clone();
+        let path = event.prev_file_path.clone();
+        let validation = tokio::task::spawn_blocking(move || validator.validate(&path))
+            .await
+            .change_context(AppError::Unknown)??;
         self.stats.record_validation(&validation);
         match validation {
             MediaValidation::Valid => {
@@ -351,7 +356,14 @@ impl SegmentEventProcessor {
                     self.enqueue_validated(&mut event, bytes).await?;
                 }
                 ShortSegmentFlushPlan::Merge(group) => {
-                    match merge_compatible_segments(&group, &self.file_validator) {
+                    let validator = self.file_validator.clone();
+                    let (group, merge_result) = tokio::task::spawn_blocking(move || {
+                        let result = merge_compatible_segments(&group, &validator);
+                        (group, result)
+                    })
+                    .await
+                    .change_context(AppError::Unknown)?;
+                    match merge_result {
                         Ok(merged) => {
                             self.stats.merged_recovery_outputs += 1;
                             let original_files: Vec<_> = group
@@ -1662,33 +1674,22 @@ impl DownloadTask {
         let mut download_config = ctx.download_config(stream);
         download_config.reconnect = reconnect;
         let download = self.downloader.download(Box::new(hook), download_config);
-        tokio::pin!(download);
-        let mut receive_segments = true;
-        let result = loop {
-            tokio::select! {
-                result = &mut download => {
-                    break result.change_context(AppError::Custom("Failed to download segment".into()));
-                }
-                event = segment_rx.recv(), if receive_segments => {
-                    match event {
-                        Ok(event) => {
-                            if let Err(error) = processor.process(event).await {
-                                error!(?error, "failed to durably process completed segment");
-                            }
-                        }
-                        Err(_) => receive_segments = false,
-                    }
+        // 拉流与分段处理必须并发：处理在 select 分支体里 await 时 download 不被 poll，
+        // 校验一个完整段的十几秒里 socket 没人读，抖音 CDN 会直接断开连接（issue #79）。
+        // 拉流结束后关闭通道，处理端取完剩余分段再退出。
+        let downloading = async {
+            let result = download.await;
+            segment_rx.close();
+            result.change_context(AppError::Custom("Failed to download segment".into()))
+        };
+        let processing = async {
+            while let Ok(event) = segment_rx.recv().await {
+                if let Err(error) = processor.process(event).await {
+                    error!(?error, "failed to durably process completed segment");
                 }
             }
         };
-        while let Ok(event) = segment_rx.try_recv() {
-            if let Err(error) = processor.process(event).await {
-                error!(
-                    ?error,
-                    "failed to durably process trailing completed segment"
-                );
-            }
-        }
+        let (result, ()) = tokio::join!(downloading, processing);
         let connected_for = started_at.elapsed();
         let completed_configured_segment = completed_configured_segment.load(Ordering::Relaxed)
             || matches!(result.as_ref().ok(), Some(DownloadStatus::SegmentCompleted));
