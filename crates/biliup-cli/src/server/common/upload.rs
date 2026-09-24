@@ -1634,9 +1634,9 @@ async fn prepare_archive(upload_context: &UploadContext, ctx: &Context) -> AppRe
     }
 }
 
-/// Upload initialization can fail before `prepare_archive` gets a chance to consume the receiver.
-/// Create or reattach a local session without doing any network I/O so deferred segments remain
-/// recoverable instead of becoming untracked files.
+/// Called before network upload initialization on every pipeline start. Reattach the local
+/// session without doing any network I/O so that, if initialization later fails, deferred
+/// segments remain recoverable instead of becoming untracked files.
 async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
     let room_id = ctx.worker_id();
     let window = ctx
@@ -1657,7 +1657,7 @@ async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
             row_id = row.id,
             room_id,
             n = videos.len(),
-            "上传初始化失败：续接本地投稿会话用于登记待补传"
+            "上传初始化前续接本地投稿会话（初始化失败时用于登记待补传）"
         );
         Ok(LiveArchive {
             session_row_id: Some(row.id),
@@ -1667,7 +1667,7 @@ async fn prepare_deferred_archive(ctx: &Context) -> AppResult<LiveArchive> {
         })
     } else {
         Err(error_stack::Report::new(AppError::Custom(
-            "upload initialization failed without an enrollment-created session".to_string(),
+            "no enrollment-created session to reattach before upload initialization".to_string(),
         )))
     }
 }
