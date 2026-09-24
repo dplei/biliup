@@ -1,6 +1,6 @@
 # 01 · 整机限速时忍住慢传输
 
-Status: ready-for-agent
+Status: resolved
 
 来源：[issue #82](https://github.com/dplei/biliup/issues/82)，设计见 [spec](../spec.md)。
 
@@ -65,5 +65,24 @@ upload-line-degradation 已记录这一点）。不专门为它造 harness，交
 - `cargo test -p biliup-cli` 通过。
 - `cargo clippy -p biliup-cli` 没有新增告警。
 - 日志里能区分两种结果：`verdict="abort"` 和 `verdict="tolerate" reason="machine_wide" evidence_lines=[...]`。
+
+## 落地
+
+- `upload_line_health.rs`：`machine_wide_slowness` 纯函数；另有 2 个纯函数单测，外加
+  1 个真 pool 的回放测试（`evidence_follows_the_slow_cooldown_lifetime`：13 分钟后证据为
+  `["estx"]`，31 分钟后为空）。
+- `upload.rs`：`AttemptWatch.slowness_tolerated`；`Abort` 时经 `machine_wide_slowness_evidence`
+  （读库失败按无证据处理）决定是 `verdict="tolerate"` 还是 `verdict="abort"`；
+  `TotalUploadTimeout if watch.slowness_tolerated` 打 `info!` 后重置计时器、继续传。
+- `cargo test -p biliup-cli` 417 passed；两个改动文件 rustfmt 干净，clippy 没有新增告警
+  （仓库里原有的 `needless_return` 等告警不在本次改动的范围内）。
+
+与计划的偏差：
+
+- **锁定后不滚动窗口**。锁定以后 `Progress` 分支直接返回 `Continue`，不会再判速，窗口起点
+  推进了也没有读者。
+- **证据可能比 30 分钟多出最多 5 分钟**：`acquire_line` 在冷却到期、领探测租约时，只改
+  `cooldown_until`（顺延 5 分钟），不清 `last_failure_kind`。所以一条刚过冷却期、正在被探测的
+  慢线路仍会算作证据。它刚刚确实慢过，把它当证据是合理的，因此不专门处理。
 
 ## Comments
