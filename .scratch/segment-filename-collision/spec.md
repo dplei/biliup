@@ -2,7 +2,7 @@
 
 来源：[dplei/biliup#88](https://github.com/dplei/biliup/issues/88)。
 
-Status: in-progress
+Status: ready-for-human（[#89](https://github.com/dplei/biliup/pull/89) 已合入，1.3.43 发版，待生产验证；清单见 #88）
 
 关联：#75（`.scratch/timestamp-start-skew/`，同为 21588，但本例各流起点对齐，跳变在流内）。
 
@@ -36,10 +36,10 @@ v/a 均在 9.95 → 26.13 前跳。
 ## 不在本 effort
 
 - 前跳门槛 30s 放过 16s 跳变——另议。
-- 已被 hold 的那一场：P1 需人工换成留存原片后补提交。
+- 触发本问题的那一场的补救属于运维处置，不在代码范围。
 
 ## 步骤
 
 | # | 步骤 | 状态 |
 |---|---|---|
-| 01 | [文件名撞车时追加序号](steps/01-unique-segment-filename.md) | 实现完成，待合并 |
+| 01 | [文件名撞车时追加序号](steps/01-unique-segment-filename.md) | 已合入，待生产验证 |

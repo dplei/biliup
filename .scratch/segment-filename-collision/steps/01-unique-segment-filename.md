@@ -1,6 +1,6 @@
 # 01 文件名撞车时追加序号
 
-Status: 实现完成，待合并
+Status: ready-for-human（已合入 `dev`，1.3.43 发版；待生产观察）
 
 ## 改哪里
 
@@ -15,7 +15,12 @@ Status: 实现完成，待合并
 - `cargo test -p biliup --test recording_events`、`-p biliup --lib downloader`、
   `-p biliup-cli --lib download` 全绿；clippy 警告数改前改后一致。
 
-## 生产验收（合并发版后）
+## dev 实跑
+
+不做：撞名要靠 CDN 在同一秒内触发两次建文件，dev 无法按需复现；单测直接构造了同模板同秒
+连续建两段的场景，比实跑更确定。
+
+## 生产验收（合并发版后，完整清单见 #88）
 
 - 日志里不再出现 `merged compatible recoverable short segments` 的 `originals` 含重复路径。
 - 出现 `Different h264 sequence header` 同秒切段时，能看到 `Save to <name>-1.flv.part`。
