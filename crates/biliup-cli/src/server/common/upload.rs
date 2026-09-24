@@ -2624,6 +2624,8 @@ struct AttemptWatch {
     baseline_mbps: Option<f64>,
     window_started_at: Instant,
     window_start_bytes: u64,
+    /// 判慢时已有证据表明是整机出口限速：本次 attempt 锁定为不再判慢、不受总时长上限中止。
+    slowness_tolerated: bool,
 }
 
 impl AttemptWatch {
@@ -2739,6 +2741,7 @@ async fn upload_enrolled_with_watchdog(
         baseline_mbps: None,
         window_started_at: Instant::now(),
         window_start_bytes: 0,
+        slowness_tolerated: false,
     };
     let phase_deadline = tokio::time::sleep(watch.phase_deadline);
     let total = tokio::time::sleep(TOTAL_UPLOAD_TIMEOUT);
@@ -2853,6 +2856,20 @@ async fn upload_enrolled_with_watchdog(
                     &diagnostics,
                 )
                 .await);
+            }
+            AttemptEvent::TotalUploadTimeout if watch.slowness_tolerated => {
+                // 总时长上限原本为爬行线路兜底；整机限速下大分段本就可能超过它，到时中止等于扔掉
+                // 大半已传字节。真卡死仍由无进度超时兜底。
+                info!(
+                    missing_id,
+                    watchdog = "total_upload",
+                    reason = "machine_wide_throttle",
+                    uploaded_bytes = watch.persisted_bytes,
+                    "total upload deadline extended: slowness already attributed to the whole egress"
+                );
+                total
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + TOTAL_UPLOAD_TIMEOUT);
             }
             AttemptEvent::TotalUploadTimeout => {
                 let diagnostics = watch.diagnostics(&context.line_key);
@@ -2990,26 +3007,56 @@ async fn upload_enrolled_with_watchdog(
                 let window_bytes = progress
                     .uploaded_bytes
                     .saturating_sub(watch.window_start_bytes);
-                match classify_transfer_rate(
-                    watch.baseline_mbps,
-                    window_elapsed,
-                    window_bytes,
-                    progress.uploaded_bytes,
-                    progress.total_bytes,
-                ) {
+                // 已判定整机限速：本次 attempt 不再判慢，传完为止。
+                let verdict = if watch.slowness_tolerated {
+                    SlowVerdict::Continue
+                } else {
+                    classify_transfer_rate(
+                        watch.baseline_mbps,
+                        window_elapsed,
+                        window_bytes,
+                        progress.uploaded_bytes,
+                        progress.total_bytes,
+                    )
+                };
+                match verdict {
                     SlowVerdict::Continue => {}
                     SlowVerdict::Roll => {
                         watch.window_started_at = Instant::now();
                         watch.window_start_bytes = progress.uploaded_bytes;
                     }
                     SlowVerdict::Abort => {
-                        let diagnostics = watch.diagnostics(&context.line_key);
                         let window_mbps = window_bytes as f64
                             / 1_000_000.
                             / window_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+                        // 中止的前提是「换一条线会快」。别的线路刚因慢被冷却，说明慢的是整机
+                        // 出口；没有断点续传，这时中止只会作废已传字节。
+                        let evidence =
+                            machine_wide_slowness_evidence(pool, missing_id, &context.line_key)
+                                .await;
+                        if !evidence.is_empty() {
+                            watch.slowness_tolerated = true;
+                            warn!(
+                                missing_id,
+                                watchdog = "slow_transfer",
+                                verdict = "tolerate",
+                                reason = "machine_wide",
+                                evidence_lines = ?evidence,
+                                line = %context.line_key,
+                                window_secs = window_elapsed.as_secs(),
+                                window_mbps,
+                                baseline_mbps = watch.baseline_mbps,
+                                uploaded_bytes = progress.uploaded_bytes,
+                                total_bytes = progress.total_bytes,
+                                "slow transfer tolerated: other lines are slow too, switching would not help"
+                            );
+                            continue;
+                        }
+                        let diagnostics = watch.diagnostics(&context.line_key);
                         warn!(
                             missing_id,
                             watchdog = "slow_transfer",
+                            verdict = "abort",
                             window_secs = window_elapsed.as_secs(),
                             window_mbps,
                             baseline_mbps = watch.baseline_mbps,
@@ -3033,6 +3080,24 @@ async fn upload_enrolled_with_watchdog(
                     }
                 }
             }
+        }
+    }
+}
+
+/// 作为「整机限速」证据的其它慢线路。读库失败按无证据处理，退回原来的中止换线。
+async fn machine_wide_slowness_evidence(
+    pool: &ConnectionPool,
+    missing_id: i64,
+    line_key: &str,
+) -> Vec<String> {
+    match upload_line_health::active_cooldowns(pool, chrono::Utc::now()).await {
+        Ok(active) => upload_line_health::machine_wide_slowness(line_key, &active)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        Err(error) => {
+            warn!(?error, missing_id, "读取线路冷却失败，按单线劣化处理");
+            Vec::new()
         }
     }
 }

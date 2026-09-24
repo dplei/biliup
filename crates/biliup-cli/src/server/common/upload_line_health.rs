@@ -232,6 +232,25 @@ pub async fn active_cooldowns(
     .change_context(AppError::Unknown)
 }
 
+/// 另有线路正因「慢」处于冷却 → 慢的是整机出口，不是这条线路，换线无益。返回作为证据的线路；
+/// 空表示没有证据，此时仍按单线劣化处理。`active` 取自 [`active_cooldowns`]。
+pub fn machine_wide_slowness<'a>(
+    current_line: &str,
+    active: &'a [UploadLineHealth],
+) -> Vec<&'a str> {
+    active
+        .iter()
+        .filter(|row| row.line_key != current_line)
+        .filter(|row| {
+            matches!(
+                row.last_failure_kind.as_deref(),
+                Some(kind) if kind == UploadFailureKind::SlowTransfer.as_str() || kind == SLOW_THROUGHPUT
+            )
+        })
+        .map(|row| row.line_key.as_str())
+        .collect()
+}
+
 pub async fn all_health(pool: &ConnectionPool) -> AppResult<Vec<UploadLineHealth>> {
     sqlx::query_as::<_, UploadLineHealth>("SELECT * FROM upload_line_health ORDER BY line_key")
         .fetch_all(pool)
@@ -587,5 +606,65 @@ mod tests {
         assert!(row.last_error.is_none());
         assert_eq!(row.consecutive_failures, 0);
         assert_eq!(row.avg_mbps, Some(26.0));
+    }
+
+    fn cooling(line_key: &str, kind: &str) -> UploadLineHealth {
+        let now = Utc.with_ymd_and_hms(2026, 9, 24, 14, 0, 0).unwrap();
+        UploadLineHealth {
+            line_key: line_key.to_string(),
+            consecutive_failures: 1,
+            cooldown_until: Some(now + SLOW_COOLDOWN),
+            last_failure_kind: Some(kind.to_string()),
+            last_error: None,
+            avg_mbps: None,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn slowness_on_another_line_is_machine_wide_evidence() {
+        let active = [
+            cooling("estx", "slow_transfer"),
+            cooling("bda2", SLOW_THROUGHPUT),
+            cooling("tx", "slow_transfer"),
+        ];
+        assert_eq!(machine_wide_slowness("tx", &active), ["estx", "bda2"]);
+    }
+
+    #[test]
+    fn own_or_non_slow_cooldowns_are_not_evidence() {
+        let active = [
+            cooling("tx", "slow_transfer"),
+            cooling("bda2", "request_timeout"),
+            cooling("alia", "probe_failure"),
+        ];
+        assert!(machine_wide_slowness("tx", &active).is_empty());
+        assert!(machine_wide_slowness("tx", &[]).is_empty());
+    }
+
+    /// issue #82 的链条：estx 刚被判慢，tx 随即也慢——证据成立；冷却过期后回到「第一次」语义。
+    #[tokio::test]
+    async fn evidence_follows_the_slow_cooldown_lifetime() {
+        let (_dir, pool) = migrated_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 9, 24, 14, 0, 0).unwrap();
+        record_failure(
+            &pool,
+            "estx",
+            UploadFailureKind::SlowTransfer,
+            "slow_transfer",
+            now,
+        )
+        .await
+        .unwrap();
+
+        let soon = active_cooldowns(&pool, now + Duration::minutes(13))
+            .await
+            .unwrap();
+        assert_eq!(machine_wide_slowness("tx", &soon), ["estx"]);
+
+        let later = active_cooldowns(&pool, now + Duration::minutes(31))
+            .await
+            .unwrap();
+        assert!(machine_wide_slowness("tx", &later).is_empty());
     }
 }
