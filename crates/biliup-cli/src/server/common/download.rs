@@ -1330,9 +1330,22 @@ impl DownloadTask {
                     let selection =
                         route_health.select_route(&mut stream, Instant::now(), failover_enabled);
                     let (route_changed, selection_backoff) = match selection {
-                        RouteSelection::Selected { ref key, changed } => {
+                        RouteSelection::Selected {
+                            ref key,
+                            changed,
+                            half_open,
+                        } => {
                             can_download = true;
-                            if changed {
+                            if half_open {
+                                info!(
+                                    url = url,
+                                    half_open = true,
+                                    host = key.host.as_deref().unwrap_or("unknown"),
+                                    protocol = key.protocol,
+                                    quality = key.quality.as_deref().unwrap_or("unknown"),
+                                    "all stream routes cooling down; probing one while live"
+                                );
+                            } else if changed {
                                 info!(
                                     url = url,
                                     host = key.host.as_deref().unwrap_or("unknown"),
@@ -1342,12 +1355,19 @@ impl DownloadTask {
                                     "selected a different healthy stream route"
                                 );
                             }
-                            if let Some((outcome, reason_code)) = route_selection_event(
-                                route_attempt_failed,
-                                Some(changed),
-                                failover_enabled,
-                                has_candidates,
-                            ) {
+                            // 探测常发生在一次 Unavailable 等待之后，那一轮没有 attempt，
+                            // 不能套用「上一轮失败才发事件」的规则。
+                            let event = if half_open {
+                                Some(("probing", "half_open_probe"))
+                            } else {
+                                route_selection_event(
+                                    route_attempt_failed,
+                                    Some(changed),
+                                    failover_enabled,
+                                    has_candidates,
+                                )
+                            };
+                            if let Some((outcome, reason_code)) = event {
                                 crate::observe::route_selected(
                                     &identity,
                                     &stream.platform,
@@ -1403,6 +1423,7 @@ impl DownloadTask {
                     }
                 }
                 Ok(LiveStatus::Offline) => {
+                    route_health.reset_after_offline();
                     // 下播是一次成功的检查（cookie 正常）
                     cookie_health::record_success(platform, cookie_webhook.as_deref());
                     let now = Instant::now();
@@ -1527,6 +1548,7 @@ impl DownloadTask {
             successful_flv_to_hls_switches = health_metrics.successful_flv_to_hls_switches,
             flv_to_hls_connected_ms = health_metrics.flv_to_hls_connected_for.as_millis(),
             all_routes_backoffs = health_metrics.all_routes_backoffs,
+            half_open_probes = health_metrics.half_open_probes,
             stream_gap_count,
             estimated_missing_ms = estimated_missing.as_millis(),
             valid_segments = processor.stats.valid_segments,

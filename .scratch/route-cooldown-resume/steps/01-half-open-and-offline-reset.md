@@ -1,6 +1,6 @@
 # 01 · 全部冷却时半开探测，下播时清空线路健康
 
-Status: ready-for-agent
+Status: resolved
 
 来源：[issue #83](https://github.com/dplei/biliup/issues/83)，设计见 [spec](../spec.md)。
 
@@ -73,5 +73,33 @@ Status: ready-for-agent
 
 - `cargo test -p biliup-cli` 通过，`cargo clippy -p biliup-cli` 无新增告警。
 - 切线关闭时行为不变（现有 `failover_rollback_keeps_the_refreshed_primary_route` 通过）。
+
+## 落地
+
+分支 `fix/issue83-260924-163115`。
+
+- `route_health.rs`：`HALF_OPEN_INTERVAL`、`RouteRecord.half_open`、`last_probe_at` /
+  `half_open_probes`、`Selected.half_open`、`reset_after_offline`；探测失败时
+  `circuit_opened = consecutive_failures >= 2 || half_open`。`RouteRecord::retry_after` 已无调用者，删掉。
+- `download.rs`：探测日志、`("probing", "half_open_probe")` 事件、Offline 分支清空、summary 加
+  `half_open_probes`。
+- 测试：新增 `all_open_routes_probe_earliest_cooldown_then_back_off`、
+  `failed_half_open_probe_reopens_and_rotates`、`productive_half_open_probe_recovers_route`、
+  `offline_reset_lets_current_route_resume`、`issue_83_replay_never_blocks_longer_than_one_probe_interval`
+  （模拟主播 10 分钟不恢复，断言每次等待 ≤ 30 秒且探测 ≥ 19 次；旧代码在第一次等待就会失败）。
+- `cargo test -p biliup-cli` 421 passed；两个改动文件 rustfmt 干净，clippy 无告警。
+
+与计划的偏差：
+
+- **`route_selection_event` 没加参数**：半开事件在调用处直接给出 `("probing", "half_open_probe")`，
+  纯函数和它的 7 条单测不动，diff 更小。
+- **`protocol_fallback_disabled_candidate_set_never_switches_to_hls` 改了断言**：只有一条 FLV
+  时，原来断言熔断后 `Unavailable`，现在是半开探测同一条 FLV（`changed: false`）。测试的本意
+  「不会换到 HLS」不变。
+- 原 `cooling_route_is_not_selected_and_all_open_routes_back_off` 改写为
+  `all_open_routes_probe_earliest_cooldown_then_back_off`。
+- 有产出的探测以正常 EOF 结束时，返回的是 `Failure { failures: 1, circuit_opened: false }`，
+  不是 `Recovered`：`productive` 先复位失败串，EOF 再记一次失败（这是既有口径）。线路照样
+  恢复可选，step 02 验收时看「探测后有新分段登记」，不要只找 `stream route recovered`。
 
 ## Comments

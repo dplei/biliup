@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(2 * 60);
 pub const ROUTE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 pub const ROUTE_STABLE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+/// 全部线路冷却但直播间仍在播时，每隔这么久放行一次试探（half-open），
+/// 与录制循环的最长检查间隔对齐。
+pub const HALF_OPEN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
@@ -82,8 +85,14 @@ pub enum HealthUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteSelection {
-    Selected { key: RouteKey, changed: bool },
-    Unavailable { retry_after: Duration },
+    Selected {
+        key: RouteKey,
+        changed: bool,
+        half_open: bool,
+    },
+    Unavailable {
+        retry_after: Duration,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +113,7 @@ pub struct RouteHealthSnapshot {
     pub successful_flv_to_hls_switches: u64,
     pub flv_to_hls_connected_for: Duration,
     pub all_routes_backoffs: u64,
+    pub half_open_probes: u64,
     pub routes: Vec<RouteMetricSnapshot>,
 }
 
@@ -127,17 +137,12 @@ struct RouteRecord {
     last_failure_at: Option<Instant>,
     cooldown_until: Option<Instant>,
     auth_refresh_pending: bool,
+    half_open: bool,
 }
 
 impl RouteRecord {
     fn is_cooling_down(&self, now: Instant) -> bool {
         self.cooldown_until.is_some_and(|until| until > now)
-    }
-
-    fn retry_after(&self, now: Instant) -> Option<Duration> {
-        self.cooldown_until
-            .filter(|until| *until > now)
-            .map(|until| until.saturating_duration_since(now))
     }
 
     fn clear(&mut self) -> bool {
@@ -164,6 +169,8 @@ pub struct RouteHealthState {
     successful_flv_to_hls_switches: u64,
     flv_to_hls_connected_for: Duration,
     all_routes_backoffs: u64,
+    half_open_probes: u64,
+    last_probe_at: Option<Instant>,
     pending_switch: Option<PendingSwitch>,
 }
 
@@ -182,6 +189,8 @@ impl RouteHealthState {
             successful_flv_to_hls_switches: 0,
             flv_to_hls_connected_for: Duration::ZERO,
             all_routes_backoffs: 0,
+            half_open_probes: 0,
+            last_probe_at: None,
             pending_switch: None,
         }
     }
@@ -225,6 +234,7 @@ impl RouteHealthState {
             successful_flv_to_hls_switches: self.successful_flv_to_hls_switches,
             flv_to_hls_connected_for: self.flv_to_hls_connected_for,
             all_routes_backoffs: self.all_routes_backoffs,
+            half_open_probes: self.half_open_probes,
             routes,
         }
     }
@@ -309,7 +319,9 @@ impl RouteHealthState {
             record.consecutive_failures = 1;
         }
         record.last_failure_at = Some(now);
-        let circuit_opened = record.consecutive_failures >= 2;
+        // 半开探测失败直接重新熔断：推后这条线路的冷却，下一次探测自然轮到别的线路。
+        let circuit_opened = record.consecutive_failures >= 2 || record.half_open;
+        record.half_open = false;
         if circuit_opened {
             record.cooldown_until = Some(now + ROUTE_COOLDOWN);
         }
@@ -339,6 +351,7 @@ impl RouteHealthState {
             return RouteSelection::Selected {
                 changed: previous.as_ref().is_some_and(|previous| previous != &key),
                 key,
+                half_open: false,
             };
         }
 
@@ -364,18 +377,35 @@ impl RouteHealthState {
                 })
         };
 
-        let Some(selected_index) = selected_index else {
-            self.all_routes_backoffs += 1;
-            let retry_after = candidates
-                .iter()
-                .filter_map(|candidate| {
-                    self.routes
-                        .get(&RouteKey::from_candidate(candidate))
-                        .and_then(|record| record.retry_after(now))
-                })
-                .min()
-                .unwrap_or(Duration::from_secs(30));
-            return RouteSelection::Unavailable { retry_after };
+        // 全部冷却：调用方已确认在播，每个 HALF_OPEN_INTERVAL 放行冷却最早到期的一条。
+        let half_open = selected_index.is_none();
+        let selected_index = match selected_index {
+            Some(index) => index,
+            None => {
+                let since_probe = self
+                    .last_probe_at
+                    .map(|last| now.saturating_duration_since(last));
+                if let Some(since_probe) = since_probe.filter(|since| *since < HALF_OPEN_INTERVAL) {
+                    self.all_routes_backoffs += 1;
+                    return RouteSelection::Unavailable {
+                        retry_after: HALF_OPEN_INTERVAL - since_probe,
+                    };
+                }
+                let index = (0..candidates.len())
+                    .min_by_key(|index| {
+                        self.routes
+                            .get(&RouteKey::from_candidate(&candidates[*index]))
+                            .and_then(|record| record.cooldown_until)
+                    })
+                    .expect("candidates are not empty");
+                self.routes
+                    .entry(RouteKey::from_candidate(&candidates[index]))
+                    .or_default()
+                    .half_open = true;
+                self.last_probe_at = Some(now);
+                self.half_open_probes += 1;
+                index
+            }
         };
 
         let candidate = candidates[selected_index].clone();
@@ -395,7 +425,19 @@ impl RouteHealthState {
                 flv_to_hls,
             });
         }
-        RouteSelection::Selected { changed, key }
+        RouteSelection::Selected {
+            changed,
+            key,
+            half_open,
+        }
+    }
+
+    /// 直播间已报下播：过渡期里记下的 404 等不是线路的错，恢复开播后从头算。
+    /// 整场统计与当前线路保留，恢复后优先回到原线路。
+    pub fn reset_after_offline(&mut self) {
+        self.routes.clear();
+        self.last_probe_at = None;
+        self.storm_alert_sent = false;
     }
 
     fn is_cooling_down(&self, key: &RouteKey, now: Instant) -> bool {
@@ -623,17 +665,20 @@ mod tests {
         )]);
         let mut health = RouteHealthState::new(true);
         fail_twice(&mut health, &stream, now);
+        // 唯一线路熔断后只会半开探测它自己，不会凭空换协议。
         assert!(matches!(
             health.select_route(&mut stream, now + Duration::from_secs(32), true),
-            RouteSelection::Unavailable { .. }
+            RouteSelection::Selected {
+                half_open: true,
+                changed: false,
+                ..
+            }
         ));
         assert_eq!(stream.suffix, "flv");
     }
 
-    #[test]
-    fn cooling_route_is_not_selected_and_all_open_routes_back_off() {
-        let now = Instant::now();
-        let candidates = vec![
+    fn flv_and_hls() -> Vec<StreamCandidate> {
+        vec![
             candidate(
                 "flv.example",
                 StreamProtocol::Flv,
@@ -650,18 +695,196 @@ mod tests {
                 "1080p",
                 1,
             ),
-        ];
+        ]
+    }
+
+    /// FLV 在 `now + 31s` 熔断、HLS 在 `now + 71s` 熔断，返回熔断后的 health 与当前流。
+    fn all_routes_open(now: Instant) -> (RouteHealthState, LiveStream) {
         let mut health = RouteHealthState::new(true);
-        let mut current = stream(candidates.clone());
+        let mut current = stream(flv_and_hls());
         fail_twice(&mut health, &current, now);
         let _ = health.select_route(&mut current, now + Duration::from_secs(32), true);
         fail_twice(&mut health, &current, now + Duration::from_secs(40));
+        (health, current)
+    }
 
-        let mut refreshed = stream(candidates);
-        let selection = health.select_route(&mut refreshed, now + Duration::from_secs(72), true);
-        assert!(
-            matches!(selection, RouteSelection::Unavailable { retry_after } if !retry_after.is_zero())
+    fn observe(
+        health: &mut RouteHealthState,
+        stream: &LiveStream,
+        status: DownloadStatus,
+        productive: bool,
+        at: Instant,
+    ) -> HealthUpdate {
+        health.begin_attempt(stream);
+        health.observe_live_attempt(Some(&status), Duration::from_secs(1), false, productive, at)
+    }
+
+    #[test]
+    fn all_open_routes_probe_earliest_cooldown_then_back_off() {
+        let now = Instant::now();
+        let (mut health, _) = all_routes_open(now);
+
+        let at = now + Duration::from_secs(72);
+        let mut refreshed = stream(flv_and_hls());
+        let selection = health.select_route(&mut refreshed, at, true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Selected { half_open: true, ref key, .. } if key.protocol == "flv"
+        ));
+
+        let mut again = stream(flv_and_hls());
+        let selection = health.select_route(&mut again, at, true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Unavailable { retry_after }
+                if !retry_after.is_zero() && retry_after <= HALF_OPEN_INTERVAL
+        ));
+        assert_eq!(health.metrics_snapshot().half_open_probes, 1);
+    }
+
+    #[test]
+    fn failed_half_open_probe_reopens_and_rotates() {
+        let now = Instant::now();
+        let (mut health, _) = all_routes_open(now);
+
+        // 距 FLV 上次失败已超出 FAILURE_WINDOW，按旧逻辑这次失败不会熔断。
+        let at = now + Duration::from_secs(300);
+        let mut probe = stream(flv_and_hls());
+        let _ = health.select_route(&mut probe, at, true);
+        let update = observe(
+            &mut health,
+            &probe,
+            DownloadStatus::HttpStatus { status: 404 },
+            false,
+            at + Duration::from_secs(1),
         );
+        assert!(matches!(
+            update,
+            HealthUpdate::Failure {
+                failures: 1,
+                circuit_opened: true,
+                alert: false,
+                ..
+            }
+        ));
+
+        let mut next = stream(flv_and_hls());
+        let selection = health.select_route(&mut next, at + HALF_OPEN_INTERVAL, true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Selected { half_open: true, changed: true, ref key } if key.protocol == "hls"
+        ));
+    }
+
+    #[test]
+    fn productive_half_open_probe_recovers_route() {
+        let now = Instant::now();
+        let (mut health, _) = all_routes_open(now);
+
+        let at = now + Duration::from_secs(72);
+        let mut probe = stream(flv_and_hls());
+        let _ = health.select_route(&mut probe, at, true);
+        let update = observe(
+            &mut health,
+            &probe,
+            DownloadStatus::StreamEnded,
+            true,
+            at + Duration::from_secs(20),
+        );
+        // 有产出先复位旧失败串，正常 EOF 再记一次失败，但不熔断。
+        assert!(matches!(
+            update,
+            HealthUpdate::Failure {
+                failures: 1,
+                circuit_opened: false,
+                ..
+            }
+        ));
+
+        let mut next = stream(flv_and_hls());
+        let selection = health.select_route(&mut next, at + Duration::from_secs(21), true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Selected { half_open: false, changed: false, ref key } if key.protocol == "flv"
+        ));
+    }
+
+    #[test]
+    fn offline_reset_lets_current_route_resume() {
+        let now = Instant::now();
+        let (mut health, _) = all_routes_open(now);
+
+        health.reset_after_offline();
+        let mut refreshed = stream(flv_and_hls());
+        let selection = health.select_route(&mut refreshed, now + Duration::from_secs(72), true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Selected {
+                half_open: false,
+                changed: false,
+                ..
+            }
+        ));
+        assert_eq!(health.metrics_snapshot().half_open_probes, 0);
+    }
+
+    /// issue #83：FLV 正常结束 + 404 熔断，HLS 404 两次熔断，此后主播一直没恢复。
+    /// 修改前这段是 10 分钟的 Unavailable；现在任意两次放行之间不超过一个探测间隔。
+    #[test]
+    fn issue_83_replay_never_blocks_longer_than_one_probe_interval() {
+        let start = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        let mut current = stream(flv_and_hls());
+        let mut at = start;
+        for status in [
+            DownloadStatus::StreamEnded,
+            DownloadStatus::HttpStatus { status: 404 },
+        ] {
+            let _ = observe(&mut health, &current, status, false, at);
+            at += Duration::from_secs(5);
+        }
+        let selection = health.select_route(&mut current, at, true);
+        assert!(matches!(
+            selection,
+            RouteSelection::Selected { half_open: false, changed: true, ref key } if key.protocol == "hls"
+        ));
+        for _ in 0..2 {
+            let _ = observe(
+                &mut health,
+                &current,
+                DownloadStatus::HttpStatus { status: 404 },
+                false,
+                at,
+            );
+            at += Duration::from_secs(5);
+        }
+
+        // 录制循环：每轮检查确认在播后选路；放行则立刻失败一次，否则按 retry_after 等待。
+        let mut last_selected = at;
+        let end = at + ROUTE_COOLDOWN;
+        while at < end {
+            let mut refreshed = stream(flv_and_hls());
+            match health.select_route(&mut refreshed, at, true) {
+                RouteSelection::Selected { half_open, .. } => {
+                    assert!(half_open);
+                    assert!(at.saturating_duration_since(last_selected) <= HALF_OPEN_INTERVAL);
+                    last_selected = at;
+                    let _ = observe(
+                        &mut health,
+                        &refreshed,
+                        DownloadStatus::HttpStatus { status: 404 },
+                        false,
+                        at + Duration::from_secs(1),
+                    );
+                    at += Duration::from_secs(2);
+                }
+                RouteSelection::Unavailable { retry_after } => {
+                    assert!(retry_after <= HALF_OPEN_INTERVAL);
+                    at += retry_after;
+                }
+            }
+        }
+        assert!(health.metrics_snapshot().half_open_probes >= 19);
     }
 
     #[test]
