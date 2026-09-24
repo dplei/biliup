@@ -506,12 +506,17 @@ impl<'a> LifecycleFile<'a> {
     }
 
     pub fn create(&mut self) -> Result<&Path, std::io::Error> {
-        // 构建最终文件名
-        self.file_name = format!(
-            "{}.{}",
-            format_filename(&self.fmt_file_name),
-            self.extension
-        );
+        // 构建最终文件名。模板通常只精确到秒：同一秒内再建文件会与上一段同名，
+        // finalize 的 rename 会静默覆盖上一段（issue #88），所以撞名时追加序号。
+        let base = format_filename(&self.fmt_file_name);
+        self.file_name = format!("{base}.{}", self.extension);
+        let mut n = 0;
+        while Path::new(&self.file_name).exists()
+            || Path::new(&format!("{}.part", self.file_name)).exists()
+        {
+            n += 1;
+            self.file_name = format!("{base}-{n}.{}", self.extension);
+        }
 
         // 构建临时文件路径（带 .part 后缀）
         self.path = PathBuf::from(&self.file_name);
