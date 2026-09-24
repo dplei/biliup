@@ -59,6 +59,26 @@ B 的补充观察：
 
 三次上传都只传到了 UPOS，没有产生稿件。跑完后已停掉服务，并删除临时目录（包括合成素材），真实的 `data/` 没有被改动。
 
+### dev 真实录制 → 上传 → 投稿（建 PR 前的闸门）
+
+同一个 debug 构建，重新复制一份 `data/` 起服务，前端 `npm run dev`。临时库里把 `segment_time` 改成 2 分钟、
+关掉响度标准化，上传线路是显式的 `bda2`，投稿模板仅自己可见。主播换成一个正在直播的抖音间。
+
+- 录制：`validated and enrolled media segment ... close_reason=TimedSplit`，第一段 25 MB。
+- 上传：`upload attempt started line="bda2" line_source="configured"` →
+  `Upload completed ... cost 7.46s, 3.41 MB/s` → `upload attempt completed`，没有出现任何 `verdict=`（分段太小，
+  传不到 90 秒判速窗口）。
+- 暂停录制触发下播：第二段只有约 38 秒，按 `below_filtering_threshold` 删除（正常行为）；
+  投稿协调给出 `outcome=NotDue`，等 `delay=300` 秒的保持窗口。
+- 投稿：保持窗口到期后，定期扫描发起 `submit_attempt：开始下播一次性投稿 n_videos=1 trigger="periodic_scan"`
+  → `APP接口投稿成功` → `submit_ok_with_aid：投稿成功并已写回 aid` → `待投稿会话扫描完成 ... submitted=[<本会话>]`；
+  会话状态 `finalized` / `ok_with_aid`，`submit_attempts=1`。稿件仅自己可见。✅
+
+跑完后已停掉前后端，并删除临时目录，真实的 `data/` 没有被改动。
+
+顺带观察（和本次改动无关，没有处理）：`process_with_upload` 一开始无条件调用 `prepare_deferred_archive`，
+但它的日志文案写死为「上传初始化失败：续接本地投稿会话用于登记待补传」，上传初始化其实成功了，会误导排查。
+
 ### 未覆盖
 
 **总时长豁免没有在 dev 触发。** 要触发它，得在限速状态下连续传 2 小时以上，按本机带宽需要几十 GB
