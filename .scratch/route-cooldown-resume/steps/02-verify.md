@@ -1,8 +1,6 @@
 # 02 · 验证
 
-Status: needs-triage
-
-Blocked by: 01
+Status: ready-for-human
 
 来源：[issue #83](https://github.com/dplei/biliup/issues/83)，设计见 [spec](../spec.md)。
 
