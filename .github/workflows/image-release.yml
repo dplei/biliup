@@ -16,11 +16,8 @@
 # 镜像在 job 之间用 artifact 传递（BuildKit 直接导出 OCI 归档），不经 registry，
 # 所以冒烟没过的镜像永远不会出现在 registry 上，push=false 时也不会留下半成品 tag。
 #
-# 推送用 skopeo 而不是 docker push：fresh runner 上的 docker daemon 不知道任何层的压缩
-# digest，每次都把整个镜像（压缩后 ~250 MB）重传；OCI 归档里的层带 digest，skopeo 先
-# HEAD 再传，没变的层（apt/ffmpeg 那 372 MB）直接跳过，只传 wheel 那两层。GitHub runner
-# 到 ACR 杭州个人版的跨境链路抽风时（1.3.37：单层 13 min，推送 job 20 min 超时两次），
-# 传得少就是唯一的缓解。
+# 推送由日本中转机上的 skopeo 完成（见 push job）：OCI 归档里的层带 digest，skopeo 先
+# HEAD 再传，没变的层（apt/ffmpeg 那 372 MB）直接跳过，只传 wheel 那两层。
 # 含 secret 的 job output 会被 Actions 丢弃，所以 job 之间只传版本号，
 # 各 job 自己用 REGISTRY_IMAGE 拼 tag。
 
@@ -162,32 +159,30 @@ jobs:
         with:
           name: image
 
-      - name: 取 registry host
-        id: reg
+      # 美国 runner 直推 ACR 杭州的跨境链路反复劣化（1.3.37、1.3.39 推送 job 20 min 超时，
+      # 1.3.40 单层卡 16 min），改由日本中转机推送：runner → 中转机走国际线路，中转机 → ACR
+      # 实测 68.5 MB 层 11s。归档经 ssh stdin 传过去；中转机的 authorized_keys 用 command=
+      # 强制执行推送脚本，这把 key 只能传「版本号 [别名]」，拿不到 shell。ACR 地址与凭证
+      # 只存在中转机上。中转失败时从本机推送兜底。
+      #
+      #   RELAY_HOST         中转机地址
+      #   RELAY_SSH_KEY      只能触发推送脚本的私钥
+      #   RELAY_KNOWN_HOSTS  中转机 host key（ssh-keyscan 结果），拒绝未知主机
+      - name: 经中转机推送（按 digest 跳过已存在的层）
         env:
-          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
-        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
-
-      # skopeo 读 ~/.docker/config.json，login-action 写进去的凭证直接可用。
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ steps.reg.outputs.host }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      # 第一个 tag 传层，后两个只 HEAD + 写 manifest。--retry-times 兜网络抖动；
-      # 同一次 copy 里已传完的层重试时 HEAD 命中不会再传。
-      - name: 推送（按 digest 跳过已存在的层）
-        env:
-          IMAGE: ${{ secrets.REGISTRY_IMAGE }}
+          RELAY_HOST: ${{ secrets.RELAY_HOST }}
+          RELAY_SSH_KEY: ${{ secrets.RELAY_SSH_KEY }}
+          RELAY_KNOWN_HOSTS: ${{ secrets.RELAY_KNOWN_HOSTS }}
           VERSION: ${{ needs.meta.outputs.version }}
           ALIAS: ${{ inputs.alias }}
         run: |
           set -euo pipefail
-          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
-          for tag in "$IMAGE:$VERSION" "$IMAGE:latest" ${ALIAS:+"$IMAGE:$VERSION-$ALIAS"}; do
-            skopeo copy --retry-times 3 oci-archive:image.tar "docker://$tag"
-          done
+          test -n "$RELAY_HOST" || { echo "::error::secret RELAY_HOST 未配置"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$RELAY_SSH_KEY" > ~/.ssh/relay && chmod 600 ~/.ssh/relay
+          printf '%s\n' "$RELAY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/relay -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o ServerAliveInterval=30 "root@$RELAY_HOST" "$VERSION $ALIAS" < image.tar
 
   verify:
     name: 核对 digest
