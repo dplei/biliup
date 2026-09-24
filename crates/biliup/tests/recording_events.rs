@@ -99,7 +99,11 @@ fn each_created_file_gets_its_own_identity_and_reports_it_on_close() {
         file.finalize(SegmentCloseReason::StreamEnded).unwrap();
 
         assert_ne!(first.segment_id, second.segment_id);
-        assert_eq!(first.original_file, second.original_file, "same template");
+        // Same template within the same period must not reuse the path: the second rename
+        // would silently overwrite the first segment (issue #88).
+        assert_ne!(first.original_file, second.original_file);
+        assert_eq!(std::fs::read(&first.original_file).unwrap(), b"first-segment");
+        assert_eq!(std::fs::read(&second.original_file).unwrap(), b"second");
     });
 
     let created = captured.native("recording.segment_created");
