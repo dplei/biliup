@@ -409,6 +409,9 @@ pub enum InvalidMediaReason {
     UnsupportedFormat(String),
     MalformedContainer(String),
     NoMediaTrack,
+    /// 有音频帧但没有任何视频帧（容器可能声明了视频流，只带 sequence header）。
+    /// B 站转码会以「缺少视频轨」拒掉这种分P。
+    NoVideoTrack,
     ProbeFailed(String),
 }
 
@@ -528,6 +531,7 @@ fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
     let mut last_media_timestamp = None;
     let mut previous_raw_timestamp = None;
     let mut timestamp_epoch = 0_u64;
+    let mut has_video_frame = false;
     while offset < file_len {
         if file_len.saturating_sub(offset) < 15 {
             return Err(InvalidMediaReason::MalformedContainer(
@@ -566,6 +570,7 @@ fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
             _ => false,
         };
         if is_media {
+            has_video_frame |= tag_type == 9;
             if let Some(previous) = previous_raw_timestamp
                 && timestamp < previous
                 && previous.wrapping_sub(timestamp) > (u32::MAX / 2)
@@ -585,6 +590,7 @@ fn probe_flv(path: &Path) -> Result<MediaProbe, InvalidMediaReason> {
         offset = next;
     }
     match (first_media_timestamp, last_media_timestamp) {
+        (Some(_), Some(_)) if !has_video_frame => Err(InvalidMediaReason::NoVideoTrack),
         (Some(first), Some(last)) => Ok(MediaProbe {
             duration: Some(StdDuration::from_millis(last.saturating_sub(first))),
             first_media_timestamp_ms: Some(first),
@@ -819,6 +825,46 @@ mod media_validation_tests {
             ));
         }
         assert!(path.exists());
+    }
+
+    #[test]
+    fn flv_with_audio_frames_but_no_video_frame_is_invalid() {
+        // 生产样本（#91）：AVC sequence header + 2 个 AAC 帧，0 个视频帧，B 站转码报「缺少视频轨」。
+        fn tag(tag_type: u8, timestamp_ms: u32, body: &[u8]) -> Vec<u8> {
+            let size = body.len();
+            let mut bytes = vec![
+                tag_type,
+                (size >> 16) as u8,
+                (size >> 8) as u8,
+                size as u8,
+                (timestamp_ms >> 16) as u8,
+                (timestamp_ms >> 8) as u8,
+                timestamp_ms as u8,
+                (timestamp_ms >> 24) as u8,
+                0,
+                0,
+                0,
+            ];
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(&((11 + size) as u32).to_be_bytes());
+            bytes
+        }
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        bytes.extend(tag(9, 0, &[0x17, 0, 0, 0, 0, 1, 0x64])); // AVC sequence header
+        bytes.extend(tag(8, 0, &[0xaf, 0, 0x12, 0x10])); // AAC sequence header
+        bytes.extend(tag(8, 22_992, &[0xaf, 1, 0x21, 0x00]));
+        bytes.extend(tag(8, 23_013, &[0xaf, 1, 0x21, 0x00]));
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audio-only.flv");
+        fs::write(&path, bytes).unwrap();
+        for min_size in [20_000_000, 0] {
+            assert_eq!(
+                FileValidator::new(min_size, true).validate(&path).unwrap(),
+                MediaValidation::Invalid {
+                    reason: InvalidMediaReason::NoVideoTrack
+                }
+            );
+        }
     }
 
     #[test]

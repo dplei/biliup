@@ -44,7 +44,7 @@ schema_version=1；capture_kind=native|legacy_bridge。旧输出保持原调用�
 - `recording.segment_discarded`：WARN、executed，只在校验后实际删除原文件成功时发出，携带
   R、S、DA、`original_file`、`size_bytes`、`threshold_bytes`。删除失败保留原文件且不发成功事件。
 - `reason_code` 固定为 `below_filtering_threshold`、`empty_file`、`header_only`、
-  `unsupported_format`、`malformed_container`、`no_media_track` 或 `probe_failed`；探测错误正文
+  `unsupported_format`、`malformed_container`、`no_media_track`、`no_video_track` 或 `probe_failed`；探测错误正文
   不进入结构化原因。删除由当前分段处理流程等待，不再交给 detached task。
 - 该事件只覆盖实际删除，不能与 created/enrolled 拼成场次计数等式：外部下载器、record-only、
   短分段保留/合并路径的生命周期边界不同。

@@ -664,6 +664,7 @@ fn invalid_media_reason_code(reason: &InvalidMediaReason) -> &'static str {
         InvalidMediaReason::UnsupportedFormat(_) => "unsupported_format",
         InvalidMediaReason::MalformedContainer(_) => "malformed_container",
         InvalidMediaReason::NoMediaTrack => "no_media_track",
+        InvalidMediaReason::NoVideoTrack => "no_video_track",
         InvalidMediaReason::ProbeFailed(_) => "probe_failed",
     }
 }
@@ -2375,6 +2376,7 @@ mod segment_discard_tests {
                 "malformed_container",
             ),
             (InvalidMediaReason::NoMediaTrack, "no_media_track"),
+            (InvalidMediaReason::NoVideoTrack, "no_video_track"),
             (
                 InvalidMediaReason::ProbeFailed("secret detail".into()),
                 "probe_failed",
