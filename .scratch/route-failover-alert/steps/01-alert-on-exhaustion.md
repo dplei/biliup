@@ -1,6 +1,6 @@
 # 01 · 告警挪到全部冷却时
 
-Status: done
+Status: resolved
 
 来源：[issue #92](https://github.com/dplei/biliup/issues/92)，设计见 [spec](../spec.md)。
 

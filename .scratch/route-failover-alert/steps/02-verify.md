@@ -1,6 +1,6 @@
 # 02 · 验证
 
-Status: ready-for-human
+Status: ready-for-human（已合并发版 1.3.45，issue #92 挂 awaiting-verification）
 
 来源：[issue #92](https://github.com/dplei/biliup/issues/92)，设计见 [spec](../spec.md)。
 
@@ -15,7 +15,7 @@ Status: ready-for-human
 
 1. 出现 `circuit_opened=true` 且紧接着 `selected a different healthy stream route` 的场次，
    **不再**收到拉流告警。
-2. 出现 `all routes cooling down; probing one while live`（`half_open=true`）或
+2. 出现 `all stream routes cooling down; probing one while live`（`half_open=true`）或
    `all refreshed stream routes are cooling down` 的场次，收到一次「⚠️ 直播拉流所有线路均失败」，
    同一轮故障内不重复。
 3. 旧文案「⚠️ 直播拉流线路故障，正在自动切换」在新版本上线后不再出现。
