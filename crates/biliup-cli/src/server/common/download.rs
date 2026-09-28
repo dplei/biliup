@@ -1,7 +1,9 @@
 use crate::server::common::cookie_health;
 use crate::server::common::process_priority::background_std;
 use crate::server::common::recording_lease;
-use crate::server::common::route_health::{HealthUpdate, RouteHealthState, RouteSelection};
+use crate::server::common::route_health::{
+    HALF_OPEN_INTERVAL, HealthUpdate, RouteHealthState, RouteSelection,
+};
 use crate::server::common::segment_enrollment::{
     EnrollmentOutcome, EnrollmentRequest, EnrollmentStore, enroll_validated_segment,
     normalize_segment_path,
@@ -1267,7 +1269,6 @@ impl DownloadTask {
                                 ref key,
                                 failures,
                                 circuit_opened,
-                                alert,
                             } => {
                                 route_failure_count = failures;
                                 warn!(
@@ -1290,19 +1291,6 @@ impl DownloadTask {
                                     failures,
                                     circuit_opened,
                                 );
-                                if alert && failover_enabled {
-                                    cookie_health::notify_alert(
-                                        cookie_webhook.as_deref(),
-                                        "⚠️ 直播拉流线路故障，正在自动切换",
-                                        &format!(
-                                            "{}：当前 {} / {} / {} 线路连续失败，已熔断并尝试备用线路。后续同一轮故障不再重复告警。",
-                                            ctx.live_streamer().remark,
-                                            key.host.as_deref().unwrap_or("unknown"),
-                                            key.protocol,
-                                            key.quality.as_deref().unwrap_or("unknown"),
-                                        ),
-                                    );
-                                }
                             }
                             HealthUpdate::AuthRefresh { ref key } => info!(
                                 url = url,
@@ -1330,11 +1318,26 @@ impl DownloadTask {
                     let has_candidates = !stream.stream_candidates.is_empty();
                     let selection =
                         route_health.select_route(&mut stream, Instant::now(), failover_enabled);
+                    if let RouteSelection::Selected { alert: true, .. }
+                    | RouteSelection::Unavailable { alert: true, .. } = selection
+                    {
+                        cookie_health::notify_alert(
+                            cookie_webhook.as_deref(),
+                            "⚠️ 直播拉流所有线路均失败",
+                            &format!(
+                                "{}：{} 条拉流线路都已连续失败并熔断，自动切线没能恢复录制。直播仍在进行，每 {} 秒会探测一条线路。恢复前不再重复告警。",
+                                ctx.live_streamer().remark,
+                                stream.stream_candidates.len(),
+                                HALF_OPEN_INTERVAL.as_secs(),
+                            ),
+                        );
+                    }
                     let (route_changed, selection_backoff) = match selection {
                         RouteSelection::Selected {
                             ref key,
                             changed,
                             half_open,
+                            ..
                         } => {
                             can_download = true;
                             if half_open {
@@ -1379,7 +1382,7 @@ impl DownloadTask {
                             }
                             (changed, None)
                         }
-                        RouteSelection::Unavailable { retry_after } => {
+                        RouteSelection::Unavailable { retry_after, .. } => {
                             can_download = false;
                             warn!(
                                 url = url,

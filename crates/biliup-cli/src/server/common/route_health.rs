@@ -76,7 +76,6 @@ pub enum HealthUpdate {
         key: RouteKey,
         failures: u32,
         circuit_opened: bool,
-        alert: bool,
     },
     Recovered {
         key: RouteKey,
@@ -89,9 +88,12 @@ pub enum RouteSelection {
         key: RouteKey,
         changed: bool,
         half_open: bool,
+        /// 所有候选都已熔断，切线没能恢复录制：本轮故障的第一次为 true。
+        alert: bool,
     },
     Unavailable {
         retry_after: Duration,
+        alert: bool,
     },
 }
 
@@ -325,15 +327,10 @@ impl RouteHealthState {
         if circuit_opened {
             record.cooldown_until = Some(now + ROUTE_COOLDOWN);
         }
-        let alert = circuit_opened && !self.storm_alert_sent;
-        if alert {
-            self.storm_alert_sent = true;
-        }
         HealthUpdate::Failure {
             key,
             failures: record.consecutive_failures,
             circuit_opened,
-            alert,
         }
     }
 
@@ -352,6 +349,7 @@ impl RouteHealthState {
                 changed: previous.as_ref().is_some_and(|previous| previous != &key),
                 key,
                 half_open: false,
+                alert: false,
             };
         }
 
@@ -378,7 +376,12 @@ impl RouteHealthState {
         };
 
         // 全部冷却：调用方已确认在播，每个 HALF_OPEN_INTERVAL 放行冷却最早到期的一条。
+        // 这也是切线失败的时刻，每轮故障只告警一次。
         let half_open = selected_index.is_none();
+        let alert = half_open && !self.storm_alert_sent;
+        if alert {
+            self.storm_alert_sent = true;
+        }
         let selected_index = match selected_index {
             Some(index) => index,
             None => {
@@ -389,6 +392,7 @@ impl RouteHealthState {
                     self.all_routes_backoffs += 1;
                     return RouteSelection::Unavailable {
                         retry_after: HALF_OPEN_INTERVAL - since_probe,
+                        alert,
                     };
                 }
                 let index = (0..candidates.len())
@@ -429,6 +433,7 @@ impl RouteHealthState {
             changed,
             key,
             half_open,
+            alert,
         }
     }
 
@@ -736,7 +741,7 @@ mod tests {
         let selection = health.select_route(&mut again, at, true);
         assert!(matches!(
             selection,
-            RouteSelection::Unavailable { retry_after }
+            RouteSelection::Unavailable { retry_after, .. }
                 if !retry_after.is_zero() && retry_after <= HALF_OPEN_INTERVAL
         ));
         assert_eq!(health.metrics_snapshot().half_open_probes, 1);
@@ -763,7 +768,6 @@ mod tests {
             HealthUpdate::Failure {
                 failures: 1,
                 circuit_opened: true,
-                alert: false,
                 ..
             }
         ));
@@ -772,7 +776,7 @@ mod tests {
         let selection = health.select_route(&mut next, at + HALF_OPEN_INTERVAL, true);
         assert!(matches!(
             selection,
-            RouteSelection::Selected { half_open: true, changed: true, ref key } if key.protocol == "hls"
+            RouteSelection::Selected { half_open: true, changed: true, ref key, .. } if key.protocol == "hls"
         ));
     }
 
@@ -805,7 +809,7 @@ mod tests {
         let selection = health.select_route(&mut next, at + Duration::from_secs(21), true);
         assert!(matches!(
             selection,
-            RouteSelection::Selected { half_open: false, changed: false, ref key } if key.protocol == "flv"
+            RouteSelection::Selected { half_open: false, changed: false, ref key, .. } if key.protocol == "flv"
         ));
     }
 
@@ -846,7 +850,7 @@ mod tests {
         let selection = health.select_route(&mut current, at, true);
         assert!(matches!(
             selection,
-            RouteSelection::Selected { half_open: false, changed: true, ref key } if key.protocol == "hls"
+            RouteSelection::Selected { half_open: false, changed: true, ref key, .. } if key.protocol == "hls"
         ));
         for _ in 0..2 {
             let _ = observe(
@@ -878,7 +882,7 @@ mod tests {
                     );
                     at += Duration::from_secs(2);
                 }
-                RouteSelection::Unavailable { retry_after } => {
+                RouteSelection::Unavailable { retry_after, .. } => {
                     assert!(retry_after <= HALF_OPEN_INTERVAL);
                     at += retry_after;
                 }
@@ -1123,87 +1127,100 @@ mod tests {
         assert_eq!(stream.suffix, "flv");
     }
 
+    /// issue #92：熔断后切到备用线路成功不告警；备用线路也熔断（切线失败）才告警，
+    /// 之后的半开探测与等待不重复告警，线路恢复后下一轮故障重新告警。
     #[test]
-    fn failure_storm_alert_is_emitted_once_until_recovery() {
+    fn alert_only_when_failover_is_exhausted() {
         let now = Instant::now();
-        let mut stream = stream(vec![
-            candidate(
-                "flv.example",
-                StreamProtocol::Flv,
-                "origin",
-                "h264",
-                "1080p",
-                0,
-            ),
-            candidate(
-                "hls.example",
-                StreamProtocol::Hls,
-                "origin",
-                "h264",
-                "1080p",
-                1,
-            ),
-        ]);
         let mut health = RouteHealthState::new(true);
-        health.begin_attempt(&stream);
-        let _ = health.observe_live_attempt(None, Duration::ZERO, false, false, now);
-        health.begin_attempt(&stream);
-        let first = health.observe_live_attempt(
-            None,
-            Duration::ZERO,
-            false,
-            false,
-            now + Duration::from_secs(1),
-        );
-        assert!(matches!(first, HealthUpdate::Failure { alert: true, .. }));
-        let _ = health.select_route(&mut stream, now + Duration::from_secs(2), true);
-        health.begin_attempt(&stream);
-        let _ = health.observe_live_attempt(
-            None,
-            Duration::ZERO,
-            false,
-            false,
-            now + Duration::from_secs(3),
-        );
-        health.begin_attempt(&stream);
-        let second = health.observe_live_attempt(
-            None,
-            Duration::ZERO,
-            false,
-            false,
-            now + Duration::from_secs(4),
-        );
-        assert!(matches!(second, HealthUpdate::Failure { alert: false, .. }));
-
-        health.begin_attempt(&stream);
+        let mut current = stream(flv_and_hls());
+        fail_twice(&mut health, &current, now);
+        let switched = health.select_route(&mut current, now + Duration::from_secs(32), true);
         assert!(matches!(
-            health.observe_live_attempt(
-                Some(&DownloadStatus::SegmentCompleted),
-                Duration::from_secs(60),
-                true,
-                false,
-                now + Duration::from_secs(5),
-            ),
-            HealthUpdate::Recovered { .. }
+            switched,
+            RouteSelection::Selected { changed: true, alert: false, ref key, .. } if key.protocol == "hls"
         ));
-        health.begin_attempt(&stream);
-        let _ = health.observe_live_attempt(
-            None,
-            Duration::ZERO,
-            false,
-            false,
-            now + Duration::from_secs(6),
-        );
-        health.begin_attempt(&stream);
+
+        fail_twice(&mut health, &current, now + Duration::from_secs(40));
+        let at = now + Duration::from_secs(72);
+        let mut probe = stream(flv_and_hls());
         assert!(matches!(
-            health.observe_live_attempt(
-                None,
-                Duration::ZERO,
-                false,
-                false,
-                now + Duration::from_secs(7),
+            health.select_route(&mut probe, at, true),
+            RouteSelection::Selected {
+                half_open: true,
+                alert: true,
+                ..
+            }
+        ));
+        let _ = observe(
+            &mut health,
+            &probe,
+            DownloadStatus::HttpStatus { status: 404 },
+            false,
+            at + Duration::from_secs(1),
+        );
+        assert!(matches!(
+            health.select_route(
+                &mut stream(flv_and_hls()),
+                at + Duration::from_secs(2),
+                true
             ),
-            HealthUpdate::Failure { alert: true, .. }
+            RouteSelection::Unavailable { alert: false, .. }
+        ));
+        let mut probe = stream(flv_and_hls());
+        assert!(matches!(
+            health.select_route(&mut probe, at + HALF_OPEN_INTERVAL, true),
+            RouteSelection::Selected {
+                half_open: true,
+                alert: false,
+                ..
+            }
+        ));
+
+        // 探测有产出：线路恢复，风暴复位。
+        let _ = observe(
+            &mut health,
+            &probe,
+            DownloadStatus::SegmentCompleted,
+            true,
+            at + Duration::from_secs(40),
+        );
+        let later = at + ROUTE_COOLDOWN * 2;
+        let mut current = probe;
+        fail_twice(&mut health, &current, later);
+        let _ = health.select_route(&mut current, later + Duration::from_secs(32), true);
+        fail_twice(&mut health, &current, later + Duration::from_secs(40));
+        assert!(matches!(
+            health.select_route(&mut current, later + Duration::from_secs(72), true),
+            RouteSelection::Selected { alert: true, .. }
+        ));
+    }
+
+    #[test]
+    fn single_candidate_circuit_alerts_immediately() {
+        let now = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        let mut current = stream(vec![flv_and_hls().remove(0)]);
+        fail_twice(&mut health, &current, now);
+        assert!(matches!(
+            health.select_route(&mut current, now + Duration::from_secs(32), true),
+            RouteSelection::Selected {
+                half_open: true,
+                alert: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disabled_failover_never_alerts() {
+        let now = Instant::now();
+        let mut health = RouteHealthState::new(true);
+        let mut current = stream(flv_and_hls());
+        fail_twice(&mut health, &current, now);
+        assert!(matches!(
+            health.select_route(&mut current, now + Duration::from_secs(32), false),
+            RouteSelection::Selected { alert: false, .. }
         ));
     }
 }
