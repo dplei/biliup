@@ -461,6 +461,26 @@ impl BiliBili {
         }
     }
 
+    /// 列出合集分区（section）里已有稿件的 aid，补录时用来跳过已加入的。
+    pub async fn list_section_aids(&self, section_id: i64) -> Result<Vec<u64>> {
+        let ret: serde_json::Value = self
+            .client
+            .get("https://member.bilibili.com/x2/creative/web/season/section")
+            .query(&[("id", section_id.to_string())])
+            .send()
+            .await?
+            .json()
+            .await?;
+        if ret["code"].as_i64() != Some(0) {
+            return Err(Kind::Custom(format!("list_section_aids failed: {ret:?}")));
+        }
+        // 空分区时 episodes 为 null
+        Ok(ret["data"]["episodes"]
+            .as_array()
+            .map(|eps| eps.iter().filter_map(|e| e["aid"].as_u64()).collect())
+            .unwrap_or_default())
+    }
+
     /// 查询稿件信息（标题、cid），加入合集前需要。
     async fn get_archive_view(&self, aid: u64) -> Result<(String, u64)> {
         let ret: serde_json::Value = self

@@ -1,6 +1,7 @@
 use crate::server::api::audio_normalization::audio_normalization_router;
 use crate::server::api::bilibili_endpoints::{
     archive_pre_endpoint, get_myinfo_endpoint, get_proxy_endpoint, get_seasons_endpoint,
+    season_backfill_preview_endpoint, season_backfill_run_endpoint,
 };
 use crate::server::api::cover_background::cover_background_router;
 use crate::server::api::cover_preview::cover_preview_router;
@@ -95,6 +96,11 @@ pub fn router(service_register: ServiceRegister) -> Router<()> {
         .route("/bili/archive/pre", get(archive_pre_endpoint)) // 投稿预处理
         .route("/bili/space/myinfo", get(get_myinfo_endpoint)) // 获取用户信息
         .route("/bili/seasons", get(get_seasons_endpoint)) // 列出视频合集（查 section_id）
+        .route(
+            "/bili/seasons/backfill",
+            get(season_backfill_preview_endpoint) // 预演：历史稿件待补录进合集
+                .post(season_backfill_run_endpoint), // 执行补录
+        )
         .route("/bili/proxy", get(get_proxy_endpoint)) // 代理请求
         // 认证相关路由
         .route("/v1/get_qrcode", get(get_qrcode)) // 获取二维码
