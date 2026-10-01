@@ -79,7 +79,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 
 # Deploy Biliup
-FROM python:3.13-slim@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b AS biliup
+FROM python:3.13-slim@sha256:8296499feed1c18bd8064c279d45e2a1b4b6be586f8b9e16dcf2aaf843480d88 AS biliup
 
 ENV TZ="Asia/Shanghai"
 ENV LANG="C.UTF-8"
