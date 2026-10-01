@@ -1,6 +1,9 @@
+use crate::server::config::Config;
 use crate::server::errors::{AppError, report_to_response};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use crate::server::infrastructure::models::Configuration;
+use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+use crate::server::infrastructure::models::upload_streamer::UploadStreamer;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -9,7 +12,10 @@ use biliup::uploader::credential::login_by_cookies;
 use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use ormlite::Model;
-use std::collections::HashMap;
+use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use struct_patch::Patch;
 
 /// B站投稿预处理端点
 pub async fn archive_pre_endpoint(
@@ -82,6 +88,128 @@ pub async fn get_seasons_endpoint(
     ))
 }
 
+/// 预演历史稿件补录进合集：只列出每个主播待加入的 aid，不写 B 站。参数 id=主播id（可选）。
+pub async fn season_backfill_preview_endpoint(
+    State(pool): State<ConnectionPool>,
+    State(config): State<Arc<RwLock<Config>>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    season_backfill(&pool, &config, &params, false).await
+}
+
+/// 执行历史稿件补录进合集。已在合集里的跳过，可重复执行。参数同预演。
+pub async fn season_backfill_run_endpoint(
+    State(pool): State<ConnectionPool>,
+    State(config): State<Arc<RwLock<Config>>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, Response> {
+    season_backfill(&pool, &config, &params, true).await
+}
+
+/// 按主播把 upload_session 里的历史 aid 补进该主播生效配置里的 season_section_id。
+/// 没配 season_section_id 的主播跳过；单个主播出错只记在它自己那一项里。
+async fn season_backfill(
+    pool: &ConnectionPool,
+    config: &Arc<RwLock<Config>>,
+    params: &HashMap<String, String>,
+    execute: bool,
+) -> Result<Json<serde_json::Value>, Response> {
+    let only: Option<i64> = params.get("id").and_then(|s| s.parse().ok());
+    let streamers = LiveStreamer::select()
+        .fetch_all(pool)
+        .await
+        .change_context(AppError::Unknown)
+        .map_err(report_to_response)?;
+    let base = config.read().unwrap().clone();
+    let mut report = Vec::new();
+    for ls in streamers
+        .into_iter()
+        .filter(|s| only.is_none_or(|id| s.id == id))
+    {
+        let mut cfg = base.clone();
+        if let Some(o) = ls.override_cfg.clone() {
+            cfg.apply(o);
+        }
+        let Some(section_id) = cfg.season_section_id else {
+            continue;
+        };
+        let mut entry = match backfill_streamer(pool, &ls, section_id, execute).await {
+            Ok(v) => v,
+            Err(e) => json!({ "error": e }),
+        };
+        entry["id"] = json!(ls.id);
+        entry["remark"] = json!(ls.remark);
+        entry["section_id"] = json!(section_id);
+        report.push(entry);
+    }
+    Ok(Json(json!({ "execute": execute, "streamers": report })))
+}
+
+async fn backfill_streamer(
+    pool: &ConnectionPool,
+    ls: &LiveStreamer,
+    section_id: i64,
+    execute: bool,
+) -> Result<serde_json::Value, String> {
+    let template_id = ls.upload_streamers_id.ok_or("未挂投稿模板")?;
+    let template = UploadStreamer::select()
+        .where_("id = ?")
+        .bind(template_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("读取投稿模板失败: {e}"))?;
+    let cookie = template.user_cookie.as_deref().unwrap_or("cookies.json");
+    let bili = login_by_cookies(cookie, None)
+        .await
+        .map_err(|e| format!("cookie 登录失败({cookie}): {e:?}"))?;
+
+    let db_aids: Vec<i64> = sqlx::query_scalar(
+        "SELECT aid FROM upload_session WHERE live_streamer_id = ? AND aid IS NOT NULL \
+         ORDER BY created_at, id",
+    )
+    .bind(ls.id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("读取 upload_session 失败: {e}"))?;
+    let existing = bili
+        .list_section_aids(section_id)
+        .await
+        .map_err(|e| format!("读取合集分区失败: {e:?}"))?;
+    let to_add = backfill_plan(&db_aids, &existing);
+
+    let mut entry = json!({
+        "cookie": cookie,
+        "db_aids": db_aids.len(),
+        "already_in_section": existing.len(),
+        "to_add": to_add,
+    });
+    if !execute {
+        return Ok(entry);
+    }
+    let (mut added, mut failed) = (Vec::new(), Vec::new());
+    for aid in to_add {
+        match bili.add_archive_to_season(section_id, aid).await {
+            Ok(()) => added.push(aid),
+            Err(e) => failed.push(json!({ "aid": aid, "error": format!("{e:?}") })),
+        }
+        // 逐个加，给创作中心接口留点间隔，避免触发频控
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    entry["added"] = json!(added);
+    entry["failed"] = json!(failed);
+    Ok(entry)
+}
+
+/// 待加入合集的 aid：保持库里的时间顺序、去重、跳过已在合集里的。
+fn backfill_plan(db_aids: &[i64], existing: &[u64]) -> Vec<u64> {
+    let mut seen: HashSet<u64> = existing.iter().copied().collect();
+    db_aids
+        .iter()
+        .filter_map(|&a| u64::try_from(a).ok())
+        .filter(|a| seen.insert(*a))
+        .collect()
+}
+
 /// 代理请求端点
 pub async fn get_proxy_endpoint(
     State(client): State<StatelessClient>,
@@ -99,4 +227,16 @@ pub async fn get_proxy_endpoint(
         .await
         .change_context(AppError::Unknown)
         .map_err(report_to_response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backfill_plan;
+
+    #[test]
+    fn backfill_plan_keeps_order_dedupes_and_skips_existing() {
+        // 同一稿件多场续接会出现多行；3 已在合集里
+        assert_eq!(backfill_plan(&[5, 3, 5, 1, 7], &[3]), vec![5, 1, 7]);
+        assert!(backfill_plan(&[], &[1]).is_empty());
+    }
 }
