@@ -39,3 +39,13 @@
 
 - 单测：待加入列表的计算（去重、跳过已在合集、保持时间顺序）。
 - dev 环境：GET 预演核对主播与 aid 对得上，再对一个主播 POST，到创作中心确认合集内容与顺序。
+
+## 进度
+
+- 已合并（[dplei/biliup#95](https://github.com/dplei/biliup/pull/95)），随 1.3.46 发版。
+- 待验收（未通过前不归档）：
+  - [ ] `GET /bili/seasons/backfill` 预演：每个配了 `season_section_id` 的主播都列出，
+        `already_in_section` 与创作中心里合集的实际稿件数一致（验证 `season/section` 响应结构）。
+  - [ ] 单个主播 `POST ...?id=<主播id>`：`failed` 只有审核中或已属于其他合集的稿件；
+        创作中心里合集顺序从旧到新。
+  - [ ] 再跑一次同一 POST：`to_add` 为空（幂等）。
