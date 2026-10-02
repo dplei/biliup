@@ -41,7 +41,7 @@ RUN set -eux; \
 
 
 # Build biliup's python wheel
-FROM rust:latest@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS wheel-builder
+FROM rust:latest@sha256:5d05167b28cef0fa3a6c781cd77949386848191f3382e82cf53bd1277a47a98f AS wheel-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
@@ -79,7 +79,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 
 # Deploy Biliup
-FROM python:3.13-slim@sha256:8296499feed1c18bd8064c279d45e2a1b4b6be586f8b9e16dcf2aaf843480d88 AS biliup
+FROM python:3.13-slim@sha256:bb2988715db2cf7ace7b53f38f3cffbef7c7046a656bee66245eb0ed386e2e81 AS biliup
 
 ENV TZ="Asia/Shanghai"
 ENV LANG="C.UTF-8"
