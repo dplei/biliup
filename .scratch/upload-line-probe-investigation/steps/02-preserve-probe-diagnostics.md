@@ -1,7 +1,7 @@
 # 02 保留探测失败诊断并更正降级告警
 
 Type: task
-Status: ready-for-human
+Status: resolved
 Blocked by: —
 
 ## 目标
@@ -46,4 +46,5 @@ Probe 公共函数签名保留，独立 CLI 和 Python 上传调用不需改参�
 ## Comments
 
 本地验证使用脚本化探测结果、临时 SQLite 与本地连接，不需账号或真实上传。
-代码等待 PR 审阅与合并；真实运行验收见 spec，本目录暂不归档。
+[PR #98](https://github.com/dplei/biliup/pull/98) 已合入 `dev`，实现步骤完成。
+真实运行验收见 spec，本目录暂不归档，issue 保持开放。

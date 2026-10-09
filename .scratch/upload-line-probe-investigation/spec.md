@@ -4,14 +4,15 @@
 
 ## 本轮范围与状态
 
-排查与诊断方案实现均已完成，代码待 PR 审阅、合并及真实运行验收。
+排查与诊断方案实现均已完成，[PR #98](https://github.com/dplei/biliup/pull/98) 已合入 `dev`，
+本地回归与工作区检查通过；剩余真实运行验收见下方清单。
 本轮实现保留两轮探测失败、区分无候选与全失败、修正告警和探测 TLS 分类；
 issue 保持开放，本目录保留在 `.scratch/`。
 
 | 步骤 | 内容 | 状态 |
 | --- | --- | --- |
 | [01](steps/01-investigate.md) | 核对故障判读与状态机 | resolved |
-| [02](steps/02-preserve-probe-diagnostics.md) | 保留探测失败诊断并更正降级告警 | ready-for-human |
+| [02](steps/02-preserve-probe-diagnostics.md) | 保留探测失败诊断并更正降级告警 | resolved |
 
 ## 结论
 
