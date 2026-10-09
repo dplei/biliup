@@ -76,6 +76,7 @@ fn classify_text(text: &str) -> Option<UploadFailureKind> {
     if lower.contains("certificate has expired")
         || lower.contains("certificate expired")
         || lower.contains("cert has expired")
+        || lower.contains("expiredcontext")
     {
         Some(UploadFailureKind::CertificateExpired)
     } else if lower.contains("certificate")

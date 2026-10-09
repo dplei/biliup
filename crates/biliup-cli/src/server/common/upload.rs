@@ -28,7 +28,7 @@ use crate::server::common::upload_line_health::{
     self, LineAvailability, UploadFailureKind, classify_kind, sanitize_error,
 };
 use crate::server::common::upload_line_selection::{
-    LineSource, SelectedLine, cooling_lines, log_line_decision, plan_upload_line,
+    LineSource, ProbeFailure, SelectedLine, cooling_lines, log_line_decision, plan_upload_line,
     resolve_planned_line,
 };
 use crate::server::common::upload_rate_gate::{self, UploadRateGateSettings};
@@ -518,11 +518,47 @@ pub(crate) async fn decide_upload_line(
 ) -> AppResult<SelectedLine> {
     let now = chrono::Utc::now();
     let plan = plan_upload_line(configured, forced, &cooling_lines(pool, now).await?, now);
-    let (selected, probe_failures) = resolve_planned_line(pool, client, plan).await?;
-    for failure in probe_failures {
-        record_line_probe_failure(pool, &failure.line_key, webhook, &failure.error).await;
-    }
+    let resolved = resolve_planned_line(pool, client, plan).await;
+    let selected = finish_line_probe(pool, resolved, webhook).await?;
     log_line_decision(context, &selected, configured);
+    Ok(selected)
+}
+
+async fn finish_line_probe(
+    pool: &ConnectionPool,
+    resolved: AppResult<(SelectedLine, Vec<ProbeFailure>)>,
+    webhook: Option<&str>,
+) -> AppResult<SelectedLine> {
+    let probe_failures = match &resolved {
+        Ok((_, failures)) => failures.as_slice(),
+        Err(error) => error
+            .downcast_ref::<Vec<ProbeFailure>>()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    };
+    let selected_key = resolved
+        .as_ref()
+        .ok()
+        .map(|(selected, _)| selected.key.as_str());
+    let mut recorded = HashMap::new();
+    // A later timeout must not dilute a TLS failure from the other probe round.
+    for failure in probe_failures {
+        let error = recorded
+            .entry(failure.line_key.as_str())
+            .or_insert(&failure.error);
+        if !matches!(
+            classify_kind(error),
+            UploadFailureKind::CertificateExpired | UploadFailureKind::CertificateInvalid
+        ) {
+            *error = &failure.error;
+        }
+    }
+    for (line_key, error) in recorded {
+        if selected_key != Some(line_key) {
+            record_line_probe_failure(pool, line_key, webhook, error).await;
+        }
+    }
+    let (selected, _) = resolved?;
     Ok(selected)
 }
 
@@ -2317,27 +2353,26 @@ async fn upload_single_file(
 }
 
 /// Same persistent breaker update as [`record_line_kind_failure`], but for a probe failure whose
-/// error has already been rendered to a string by the prober.
+/// typed error retains the cause chain. Ordinary probe errors keep their short cooldown.
 async fn record_line_probe_failure(
     pool: &ConnectionPool,
     line_key: &str,
     webhook: Option<&str>,
-    error: &str,
+    error: &Kind,
 ) {
-    let summary = sanitize_error(error);
+    let summary = sanitize_error(&format!("{error:?}"));
+    let kind = match classify_kind(error) {
+        kind @ (UploadFailureKind::CertificateExpired | UploadFailureKind::CertificateInvalid) => {
+            kind
+        }
+        _ => UploadFailureKind::Probe,
+    };
     let now = chrono::Utc::now();
-    match upload_line_health::record_failure(
-        pool,
-        line_key,
-        UploadFailureKind::Probe,
-        &summary,
-        now,
-    )
-    .await
-    {
+    match upload_line_health::record_failure(pool, line_key, kind, &summary, now).await {
         Ok(tripped) => {
             warn!(
                 line = line_key,
+                kind = kind.as_str(),
                 error = %summary,
                 breaker_tripped = tripped,
                 "upload line probe failure recorded"
@@ -2346,7 +2381,7 @@ async fn record_line_probe_failure(
                 notify_alert(
                     webhook,
                     "biliup 上传线路探测失败",
-                    &format!("{line_key} 线路探测连续失败，已进入冷却，上传会自动换线。"),
+                    &format!("{line_key} 线路探测遇到证书错误，已进入冷却，上传会自动换线。"),
                 );
             }
         }
@@ -5311,6 +5346,103 @@ mod tests {
         .await
         .unwrap();
         (dir, pool)
+    }
+
+    #[tokio::test]
+    async fn failed_line_probe_persists_tls_once_and_leaves_the_segment_unclaimed() {
+        let (directory, pool) = deferred_test_pool().await;
+        let enrollment = v2_enrollment(&pool, directory.path(), "probe-failure.flv").await;
+        let failures = vec![
+            ProbeFailure {
+                line_key: "bldsa".into(),
+                error: Kind::Custom("InvalidCertificate(ExpiredContext)".into()),
+            },
+            ProbeFailure {
+                line_key: "bldsa".into(),
+                error: Kind::Custom("request timed out".into()),
+            },
+            ProbeFailure {
+                line_key: "bda2".into(),
+                error: Kind::Custom(
+                    "request timed out https://example.invalid/OK?auth=secret X-Upos-Auth: token"
+                        .into(),
+                ),
+            },
+        ];
+        let result = Err(error_stack::Report::new(AppError::Custom(
+            "no healthy upload line".into(),
+        ))
+        .attach_opaque(failures));
+        assert!(finish_line_probe(&pool, result, None).await.is_err());
+        let health = upload_line_health::all_health(&pool).await.unwrap();
+        let tls = health.iter().find(|row| row.line_key == "bldsa").unwrap();
+        assert_eq!(tls.consecutive_failures, 1);
+        assert_eq!(
+            tls.last_failure_kind.as_deref(),
+            Some("certificate_expired")
+        );
+        assert!(tls.cooldown_until.unwrap() > Utc::now() + chrono::Duration::hours(23));
+        let ordinary = health.iter().find(|row| row.line_key == "bda2").unwrap();
+        assert_eq!(ordinary.last_failure_kind.as_deref(), Some("probe_failure"));
+        assert!(ordinary.cooldown_until.unwrap() < Utc::now() + chrono::Duration::minutes(2));
+        assert!(!ordinary.last_error.as_ref().unwrap().contains("secret"));
+        assert!(!ordinary.last_error.as_ref().unwrap().contains("token"));
+        let plan = plan_upload_line(
+            "bldsa",
+            Some("bldsa"),
+            &cooling_lines(&pool, Utc::now()).await.unwrap(),
+            Utc::now(),
+        );
+        assert_ne!(
+            plan.chosen, "bldsa",
+            "an explicit line must respect a TLS probe breaker"
+        );
+
+        let state: (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, attempt_token FROM upload_missing_segment WHERE id = ?",
+        )
+        .bind(enrollment.missing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("pending".into(), 0, None));
+        assert!(enrollment.normalized_file_path.is_file());
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upload_attempt WHERE missing_id = ?")
+                .bind(enrollment.missing_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_line_probe_does_not_cool_the_line_that_recovered() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let plan = plan_upload_line("auto", None, &HashMap::new(), Utc::now());
+        let selected = SelectedLine {
+            line: Line::explicit("bda2"),
+            key: "bda2".into(),
+            source: LineSource::AutoProbe,
+            plan,
+        };
+        let failures = vec![
+            ProbeFailure {
+                line_key: "bda2".into(),
+                error: Kind::Custom("certificate expired".into()),
+            },
+            ProbeFailure {
+                line_key: "bldsa".into(),
+                error: Kind::Custom("certificate expired".into()),
+            },
+        ];
+        let selected = finish_line_probe(&pool, Ok((selected, failures)), None)
+            .await
+            .unwrap();
+        assert_eq!(selected.key, "bda2");
+        let health = upload_line_health::all_health(&pool).await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].line_key, "bldsa");
     }
 
     fn normalized_row(audio_normalized_at: Option<DateTime<Utc>>) -> UploadMissingSegment {
