@@ -136,7 +136,10 @@ pub struct ProbeFailure {
     pub error: crate::error::Kind,
 }
 
-fn choose_line_and_failures<I>(candidates: I) -> Result<(Line, Vec<ProbeFailure>)>
+fn choose_line_and_failures<I>(
+    candidates: I,
+    total_lines: usize,
+) -> Result<(Line, Vec<ProbeFailure>)>
 where
     I: IntoIterator<Item = (Line, Option<crate::error::Kind>)>,
 {
@@ -150,8 +153,18 @@ where
             });
         }
         (line, succeeded)
-    }))?;
-    Ok((line, failures))
+    }));
+    match line {
+        Ok(line) => Ok((line, failures)),
+        Err(_) => Err(crate::error::Kind::ProbeFailed {
+            message: if total_lines == 0 {
+                "no upload line candidates remain after filtering"
+            } else {
+                "no upload line probe succeeded"
+            },
+            failures,
+        }),
+    }
 }
 
 pub fn choose_fastest_successful_line<I>(candidates: I) -> Result<Line>
@@ -235,7 +248,7 @@ impl Probe {
             }
         }
 
-        choose_line_and_failures(candidates)
+        choose_line_and_failures(candidates, total_lines)
     }
 
     /// B 站当前公布的线路索引。
@@ -244,9 +257,11 @@ impl Probe {
             .get("https://member.bilibili.com/preupload?r=probe")
             .timeout(PROBE_INDEX_TIMEOUT)
             .send()
-            .await?
+            .await
+            .map_err(reqwest::Error::without_url)?
             .json()
-            .await?)
+            .await
+            .map_err(reqwest::Error::without_url)?)
     }
 
     /// 索引里每条线路的 `upcdn` key，按 B 站给出的顺序。页面下拉靠它渲染，不再维护登记表。
@@ -255,7 +270,10 @@ impl Probe {
     }
 
     fn keys(&self) -> Vec<String> {
-        self.lines.iter().map(|line| line.key().to_string()).collect()
+        self.lines
+            .iter()
+            .map(|line| line.key().to_string())
+            .collect()
     }
 
     async fn probe_line(
@@ -284,7 +302,8 @@ impl Probe {
                 )
             }
             Err(err) => {
-                warn!(query = %line.query, error = %err, "upload line probe failed");
+                let err = err.without_url();
+                warn!(line = line.key(), cost = instant.elapsed().as_millis(), error = ?err, "upload line probe failed");
                 (line, Some(err.into()))
             }
         }
@@ -549,18 +568,81 @@ mod tests {
     fn successful_auto_probe_preserves_other_line_failures_for_breaker() {
         let mut healthy = Line::explicit("bda2");
         healthy.cost = 20;
-        let (selected, failures) = choose_line_and_failures(vec![
-            (
-                Line::explicit("bldsa"),
-                Some(Custom("certificate has expired".to_string())),
-            ),
-            (healthy, None),
-        ])
+        let (selected, failures) = choose_line_and_failures(
+            vec![
+                (
+                    Line::explicit("bldsa"),
+                    Some(Custom("certificate has expired".to_string())),
+                ),
+                (healthy, None),
+            ],
+            2,
+        )
         .unwrap();
 
         assert_eq!(selected.key(), "bda2");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].line_key, "bldsa");
+    }
+
+    #[test]
+    fn all_failed_probes_preserve_causes_and_differ_from_an_empty_candidate_set() {
+        let error = choose_line_and_failures(
+            vec![
+                (
+                    Line::explicit("bda2"),
+                    Some(Custom("request timed out".into())),
+                ),
+                (
+                    Line::explicit("bldsa"),
+                    Some(Custom("InvalidCertificate(ExpiredContext)".into())),
+                ),
+            ],
+            2,
+        )
+        .unwrap_err();
+        let crate::error::Kind::ProbeFailed { message, failures } = error else {
+            panic!("failed probes must retain their typed causes");
+        };
+        assert_eq!(message, "no upload line probe succeeded");
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[1].line_key, "bldsa");
+        assert!(failures[1].error.to_string().contains("ExpiredContext"));
+
+        let empty = choose_line_and_failures(Vec::new(), 0).unwrap_err();
+        assert!(
+            empty
+                .to_string()
+                .contains("no upload line candidates remain after filtering")
+        );
+        // A deadline with unfinished requests is not an empty candidate set.
+        let timed_out = choose_line_and_failures(Vec::new(), 2).unwrap_err();
+        assert_eq!(timed_out.to_string(), message);
+    }
+
+    #[tokio::test]
+    async fn failed_probe_strips_the_request_url_and_keeps_the_cause_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let mut line = Line::explicit("bda2");
+        line.probe_url = format!("//{address}/OK?auth=secret");
+        let (_, error) = Probe::probe_line(
+            json!({"get": true}),
+            line,
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+        )
+        .await;
+        server.await.unwrap();
+        let Some(crate::error::Kind::Reqwest(error)) = error else {
+            panic!("the closed connection must produce a typed request error");
+        };
+        assert!(error.url().is_none());
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(!format!("{error:?}").contains("secret"));
     }
 
     /// 显式线路只靠 key 就能构造：`pre_upload` 只读 `query`，而 `query` 里除 key 外全是常量。

@@ -14,13 +14,15 @@
 use crate::server::common::upload_line_health::{self, LineAvailability, UploadFailureKind};
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
+use biliup::error::Kind;
+pub use biliup::uploader::line::ProbeFailure;
 use biliup::uploader::line::{Line, Probe};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
 /// Implicit fallbacks, in order, after the operator's own choice. `bldsa` is deliberately absent:
-/// it is only ever used when explicitly configured.
+/// AUTO may still discover it in Bilibili's index after the recoverable subset fails.
 pub(crate) const IMPLICIT_FALLBACKS: [&str; 2] = ["bda2", "tx"];
 
 /// 上传完还能凭原始 `X-Upos-Auth` 把源对象整体 GET 回来的线路。
@@ -291,35 +293,11 @@ pub async fn resolve_planned_line(
         .into_iter()
         .map(|row| row.line_key)
         .collect::<Vec<_>>();
-    // 先只在有灾后取回通道的线路里探测，见 `RECOVERABLE_LINES`。
-    let recoverable: Vec<String> = RECOVERABLE_LINES.iter().map(|key| key.to_string()).collect();
-    let probed = match Probe::probe_filtered_with_failures(client, &recoverable, &excluded).await {
-        Ok(probed) => probed,
-        Err(error) => {
-            // 传不上去比失去取回通道更严重，所以这里放开限制而不是失败。但要说清代价：
-            // 落在其它线路上的分段，事后拿不回源文件。
-            warn!(
-                ?error,
-                recoverable = ?RECOVERABLE_LINES,
-                "可取回线路全部不可用，放开限制重新探测；本次上传的分段将没有灾后取回通道"
-            );
-            Probe::probe_filtered_with_failures(client, &[], &excluded)
-                .await
-                .map_err(|error| {
-                    error_stack::Report::new(AppError::Custom(format!(
-                        "no healthy upload line is currently available: {error}"
-                    )))
-                })?
-        }
-    };
-    let (line, failures) = probed;
-    let probe_failures = failures
-        .into_iter()
-        .map(|failure| ProbeFailure {
-            line_key: failure.line_key,
-            error: format!("{:?}", failure.error),
-        })
-        .collect();
+    let (line, probe_failures) = probe_with_fallback(|allowed| {
+        let excluded = &excluded;
+        async move { Probe::probe_filtered_with_failures(client, &allowed, excluded).await }
+    })
+    .await?;
     let key = line.key().to_string();
     let source = if plan.chosen == AUTO {
         plan.source
@@ -337,16 +315,58 @@ pub async fn resolve_planned_line(
     ))
 }
 
-/// A line that failed during probing. Reported back to the caller instead of being recorded here,
-/// so the breaker update stays in one place next to the other failure paths.
-pub struct ProbeFailure {
-    pub line_key: String,
-    pub error: String,
+async fn probe_with_fallback<F, Fut>(mut probe: F) -> AppResult<(Line, Vec<ProbeFailure>)>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = biliup::error::Result<(Line, Vec<ProbeFailure>)>>,
+{
+    let recoverable: Vec<String> = RECOVERABLE_LINES
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    let mut probe_failures = Vec::new();
+    let probed = match probe(recoverable).await {
+        Ok(probed) => probed,
+        Err(error) => {
+            warn!(
+                error = %upload_line_health::sanitize_error(&format!("{error:?}")),
+                recoverable = ?RECOVERABLE_LINES,
+                "可取回线路候选未选出可用线路，放宽范围重新探测"
+            );
+            if let Kind::ProbeFailed { failures, .. } = error {
+                probe_failures.extend(failures);
+            }
+            match probe(Vec::new()).await {
+                Ok(probed) => probed,
+                Err(mut error) => {
+                    let message = upload_line_health::sanitize_error(&format!(
+                        "no healthy upload line is currently available: {error}"
+                    ));
+                    if let Kind::ProbeFailed { failures, .. } = &mut error {
+                        probe_failures.append(failures);
+                    }
+                    return Err(error_stack::Report::new(error)
+                        .change_context(AppError::Custom(message))
+                        .attach_opaque(probe_failures));
+                }
+            }
+        }
+    };
+    let (line, failures) = probed;
+    probe_failures.extend(failures);
+    Ok((line, probe_failures))
 }
 
 /// Log the decision in one structured line so "which line did this attempt use, and why" is
 /// answerable from the log alone.
 pub fn log_line_decision(context: &str, selected: &SelectedLine, configured: &str) {
+    if !RECOVERABLE_LINES.contains(&selected.key.as_str()) {
+        warn!(
+            context,
+            chosen = %selected.key,
+            "所选上传线路不在已验证取回白名单中，灾后取回能力未验证"
+        );
+    }
     let skipped = selected.skip_reason();
     if skipped.is_some() {
         warn!(
@@ -377,6 +397,72 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap()
+    }
+
+    fn failed_probe(key: &str) -> Kind {
+        Kind::ProbeFailed {
+            message: "no upload line probe succeeded",
+            failures: vec![ProbeFailure {
+                line_key: key.into(),
+                error: Kind::Custom("request timed out".into()),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_first_round_failures_and_can_select_a_recoverable_line() {
+        let mut rounds = std::collections::VecDeque::from([
+            Err(failed_probe("bda2")),
+            Ok((
+                Line::explicit("bda2"),
+                vec![ProbeFailure {
+                    line_key: "bldsa".into(),
+                    error: Kind::Custom("certificate expired".into()),
+                }],
+            )),
+        ]);
+        let mut allowed_rounds = Vec::new();
+        let (line, failures) = probe_with_fallback(|allowed| {
+            allowed_rounds.push(allowed);
+            std::future::ready(rounds.pop_front().unwrap())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            allowed_rounds,
+            [RECOVERABLE_LINES.map(String::from).to_vec(), Vec::new()]
+        );
+        assert_eq!(line.key(), "bda2");
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.line_key.as_str())
+                .collect::<Vec<_>>(),
+            ["bda2", "bldsa"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_attaches_both_rounds_for_the_health_recorder() {
+        let mut rounds = std::collections::VecDeque::from([
+            Err(failed_probe("bda2")),
+            Err(failed_probe("estx")),
+        ]);
+        let error =
+            match probe_with_fallback(|_| std::future::ready(rounds.pop_front().unwrap())).await {
+                Ok(_) => panic!("both rounds failed"),
+                Err(error) => error,
+            };
+        let failures = error.downcast_ref::<Vec<ProbeFailure>>().unwrap();
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.line_key.as_str())
+                .collect::<Vec<_>>(),
+            ["bda2", "estx"]
+        );
+        assert!(error.to_string().contains("no healthy upload line"));
     }
 
     fn cooling(keys: &[(&str, &str)]) -> HashMap<String, CoolingLine> {

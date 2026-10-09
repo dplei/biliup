@@ -1,7 +1,7 @@
 # 02 保留探测失败诊断并更正降级告警
 
 Type: task
-Status: ready-for-agent
+Status: ready-for-human
 Blocked by: —
 
 ## 目标
@@ -27,12 +27,23 @@ Blocked by: —
 - 领取前选线失败不删文件、不增加 attempt、不遗留 uploading claim。
 - TLS 校验保留；未重新验证的线路不加入取回白名单。
 
-## 待决策
+## 实现回执
 
-优先选择不破坏既有 API 的诊断传递方式。
-探测 TLS 分类与普通 probe 冷却是否分开作为独立取舍，
-不要为了补日志同时放大所有探测失败的冷却时间。
+已完成核心库 typed 失败、两轮诊断合并、成功/失败健康记录、准确告警及 TLS 分类。
+Probe 公共函数签名保留，独立 CLI 和 Python 上传调用不需改参。
+
+健康记录每条线路只计一次，证书错误优先于普通超时；本次已成功选中的线路不再因首轮失败冷却。
+普通 Probe 冷却仍可被显式线路绕过，TLS 冷却不可绕过。
+
+验证：
+
+- `cargo test -p biliup --lib`：86 passed，1 ignored。
+- `cargo test -p biliup-cli --lib`：429 passed，12 ignored。
+- 新增请求 URL 脱敏与底层原因链回归另行运行：1 passed。
+- `SQLX_OFFLINE=true cargo check --workspace`：通过，覆盖 Rust CLI 与 Python 绑定。
+- `python3 scripts/check_code_index.py`、`git diff --check` 与修改文件的 rustfmt 检查：通过。
 
 ## Comments
 
-本轮仅完成前置排查；尚未实现或执行这些验收项。
+本地验证使用脚本化探测结果、临时 SQLite 与本地连接，不需账号或真实上传。
+代码等待 PR 审阅与合并；真实运行验收见 spec，本目录暂不归档。

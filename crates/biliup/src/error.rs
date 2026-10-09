@@ -9,6 +9,12 @@ pub enum Kind {
     #[error("{0}")]
     Custom(String),
 
+    #[error("{message}")]
+    ProbeFailed {
+        message: &'static str,
+        failures: Vec<crate::uploader::line::ProbeFailure>,
+    },
+
     #[error(transparent)]
     IO(#[from] std::io::Error),
 
