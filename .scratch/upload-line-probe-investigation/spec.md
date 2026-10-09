@@ -1,0 +1,84 @@
+# 上传线路探测与补传事件排查
+
+来源：[GitHub issue #96](https://github.com/dplei/biliup/issues/96)
+
+## 本轮范围与状态
+
+本轮完成原始日志、只读账本、选线与补传调用链、公开线路索引和 TLS 校验的排查。
+不更改业务代码、配置、生产数据或 TLS 校验策略。排查已完成，诊断缺口尚未修复；
+issue 保持开放，本目录保留在 `.scratch/`。
+
+| 步骤 | 内容 | 状态 |
+| --- | --- | --- |
+| [01](steps/01-investigate.md) | 核对故障判读与状态机 | resolved |
+| [02](steps/02-preserve-probe-diagnostics.md) | 保留探测失败诊断并更正降级告警 | ready-for-agent |
+
+## 结论
+
+### 原 issue 的持续故障判断不成立
+
+原始日志同时存在 `upload line probe succeeded`、`upload line selected chosen=estx`、
+`Upload completed` 和 `upload attempt completed`；关联补传账本为
+`status=succeeded`，确认字节与总字节一致，claim 已释放，错误已清空。
+
+因此可确认：候选探测曾短暂全失败，随后备用线路成功，关联补传已完成。
+不能继续描述成「窗口结束仍全线不可用」「任务永久卡住」或「分段已丢失」。
+上传成功与取回描述符落库也不等于凭据现在还能 GET 原片，本轮未验证取回能力。
+
+### 候选不可选，不等于所有 CDN 都请求失败
+
+`retained_lines` 先排除冷却项，再限制白名单；上游索引里没有的 key 不会参加探测。
+冷却后候选为空和候选实际请求全部失败最终都返回
+`no upload line probe succeeded`。日志不足以把它们都解释成出口全面故障。
+已完成上传的慢吞吐同样能经 `record_success` 进入短冷却；
+`strands_recoverable_lines` 按固定白名单判断，并不知道实时索引中哪些 key 缺席。
+
+### TLS 故障真实，但不是持续失效或固化候选的证据
+
+原日志的 `InvalidCertificate(ExpiredContext)` 证明一次握手遇到过期证书。
+本轮同域名的证书校验通过；公开 `preupload?r=probe` 索引仍包含 `bldsa`。
+该 AUTO 候选来自索引，不是本地固定表。不能据此永久屏蔽域名，更不能绕过 TLS 校验。
+其他失败仅留下 reqwest Display 摘要，无法还原当时全部 DNS、连接、超时和证书分类。
+
+## 已确认的代码缺口
+
+1. `resolve_planned_line` 在不受限探测开始之前就宣称「本次上传的分段将没有灾后取回通道」。
+   第二次探测可能失败，也可能重新选到可取回白名单内的线路；
+   白名单之外只是没有验证取回能力，不能一律断言不可取回。
+2. `choose_line_and_failures` 收集失败后，选不出成功线路时由 `?` 返回普通错误，
+   失败列表随即丢失。白名单轮全失败后，即使全量轮成功，首轮失败也未返回。
+   `decide_upload_line` 在 resolve 返回 Err 时也不会执行记录失败的循环。
+   因而「失败会写持久健康」的现有注释仅对成功选出线路的返回路径成立。
+3. `Probe::probe_line` 用 `error=%err` 记录顶层文本，全部失败时没有另一条日志补出底层原因。
+   只有存在成功候选、失败列表被传回调用方时，才有 Debug 诊断。
+4. `record_line_probe_failure` 无论错误原因都写 `UploadFailureKind::Probe`，
+   该类型不会打开 TLS breaker；所以探测遇过期证书也只走普通冷却，
+   不能从 `breaker_tripped=false` 推断证书校验没失败。
+
+这些属于诊断与健康状态传递的缺口，尚不能证明它们造成这次短暂网络失败。
+
+## 状态机与数据安全
+
+- `recover_due_segments` 自动扫描已到期的 pending/failed 行。
+- `claim_manual_recovery` 先将可重试行的 `next_retry_at` 对齐领取时间，再探测，
+  成功选线后才领取 attempt。探测失败不会消耗上传次数或进入 uploading，也不会删除源文件。
+  所以日志的「保留原状」指未领取、未丢弃，不能理解成整行绝对未写。
+- 领取前失败不进入上传失败退避表，由扫描周期再次探测；线路已记录的冷却继续生效。
+- 真正领取后上传失败才释放 claim、增加次数并按已有退避表调度。
+- 原片清理由成功路径驱动；没有证据显示领取失败删除原片。
+
+## 后续最小方案
+
+见 [步骤 02](steps/02-preserve-probe-diagnostics.md)。只修诊断传递与准确措辞，
+先不扩大取回白名单、不新增退避配置、不禁用上游候选、不改分段清理策略。
+若之后要调整探测 TLS 的持久分类，须覆盖显式线路只绕过普通 probe 冷却的现有契约，
+不能把普通短时探测失败统一升级为长时间熔断。
+
+## 验证与限制
+
+- 原日志、关联账本终态交叉核对，并执行只读断言确认 succeeded、字节一致、无 claim、无错误。
+- 使用开启证书校验的 TLS 客户端与公开索引请求核对当前端点。
+- 静态追踪候选过滤、失败返回、补传领取与领取后失败退避。
+- 不把当前端点正常推断为当时所有请求正常；历史底层错误未留全，无法补造。
+- 未实际 GET 上传对象、未重新上传、未人为制造网络中断，未执行业务测试套件。
+
