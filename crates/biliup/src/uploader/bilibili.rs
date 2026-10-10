@@ -481,11 +481,13 @@ impl BiliBili {
             .unwrap_or_default())
     }
 
-    /// 查询稿件信息（标题、cid），加入合集前需要。
+    /// 查询稿件信息（标题、首 P 的 cid），加入合集前需要。
+    /// 走创作中心的 UP 主视角接口：审核中的稿件也能取到。公开的 web-interface/view
+    /// 对审核中稿件返回 -404，投稿后立即入合集必然失败。
     async fn get_archive_view(&self, aid: u64) -> Result<(String, u64)> {
         let ret: serde_json::Value = self
             .client
-            .get("https://api.bilibili.com/x/web-interface/view")
+            .get("https://member.bilibili.com/x/vupre/web/archive/view")
             .query(&[("aid", aid.to_string())])
             .send()
             .await?
@@ -494,13 +496,12 @@ impl BiliBili {
         if ret["code"].as_i64() != Some(0) {
             return Err(Kind::Custom(format!("get archive view failed: {ret:?}")));
         }
-        let title = ret["data"]["title"]
+        let title = ret["data"]["archive"]["title"]
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let cid = ret["data"]["cid"]
+        let cid = ret["data"]["videos"][0]["cid"]
             .as_u64()
-            .or_else(|| ret["data"]["pages"][0]["cid"].as_u64())
             .ok_or_else(|| Kind::Custom(format!("cid not found in view: {ret:?}")))?;
         Ok((title, cid))
     }
