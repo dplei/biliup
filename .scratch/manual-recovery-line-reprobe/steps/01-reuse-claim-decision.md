@@ -1,5 +1,7 @@
 # 01 手动补传复用 claim 时的线路决策
 
+Status: ready-for-human（代码已合并 `5d14bc27`，待生产验收）
+
 - 改动：`crates/biliup-cli/src/server/common/upload.rs` 的 `initialize_upload_context`、
   `process_with_upload`、`run_claimed_recovery`。
 - 验证：`cargo test -p biliup-cli -- upload` 全绿。`initialize_upload_context` 依赖 cookie 登录，

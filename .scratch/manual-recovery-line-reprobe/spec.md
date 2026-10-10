@@ -1,4 +1,6 @@
-# 手动补传二次探测导致手选线路失效（dplei/biliup#101）
+# 手动补传二次探测导致手选线路失效
+
+来源：https://github.com/dplei/biliup/issues/101
 
 ## 根因
 
@@ -19,4 +21,4 @@
 
 ## 进度
 
-- [x] 01 修复与回归测试（`steps/01-reuse-claim-decision.md`）
+- [x] 01 修复（`steps/01-reuse-claim-decision.md`）——PR #102 已合并，发版 1.3.49，待生产验收
