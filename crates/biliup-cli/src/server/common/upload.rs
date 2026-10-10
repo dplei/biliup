@@ -321,6 +321,7 @@ pub async fn process_with_upload(
         ctx.stateless_client(),
         upload_config,
         ctx.pool(),
+        None,
     )
     .await
     {
@@ -469,6 +470,7 @@ async fn initialize_upload_context(
     client: &StatelessClient,
     upload_config: &UploadStreamer,
     pool: &ConnectionPool,
+    preselected: Option<SelectedLine>,
 ) -> AppResult<UploadContext> {
     // 登录处理
     let cookie_file = upload_config
@@ -480,15 +482,21 @@ async fn initialize_upload_context(
     let bilibili = login_with_retry(&cookie_file).await?;
 
     // 获取上传线路。显式配置也必须服从持久熔断；冷却时按候选序列回退，回退必须留痕。
-    let selected = decide_upload_line(
-        pool,
-        &client.client,
-        &config.lines,
-        None,
-        config.cookie_health_webhook.as_deref(),
-        "session_init",
-    )
-    .await?;
+    // 手动补传在 claim 时已按页面所选线路决策过，再按配置探测一次只会让手选线路被全线冷却挡掉。
+    let selected = match preselected {
+        Some(selected) => selected,
+        None => {
+            decide_upload_line(
+                pool,
+                &client.client,
+                &config.lines,
+                None,
+                config.cookie_health_webhook.as_deref(),
+                "session_init",
+            )
+            .await?
+        }
+    };
 
     Ok(UploadContext {
         bilibili,
@@ -4631,18 +4639,14 @@ pub async fn run_claimed_recovery(
         if let Some(override_config) = live_streamer.override_cfg.clone() {
             effective_config.apply(override_config);
         }
-        let mut upload_context = initialize_upload_context(
+        let upload_context = initialize_upload_context(
             &effective_config,
             &StatelessClient::default(),
             &upload_config,
             pool,
+            selected_recovery,
         )
         .await?;
-        if let Some(selected) = &selected_recovery {
-            upload_context.line = selected.line.clone();
-            upload_context.line_key = selected.key.clone();
-            upload_context.line_source = selected.source;
-        }
         let path = PathBuf::from(&row.file_path);
         let repair_enabled = effective_config.timestamp_repair.unwrap_or(true);
         let normalization =
