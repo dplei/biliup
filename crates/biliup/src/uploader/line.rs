@@ -136,6 +136,9 @@ pub struct ProbeFailure {
     pub error: crate::error::Kind,
 }
 
+/// 过滤（排除冷却线路、限定子集）之后一条候选都不剩时的错误信息；上层据此判断「全部在冷却」。
+pub const NO_LINE_CANDIDATES: &str = "no upload line candidates remain after filtering";
+
 fn choose_line_and_failures<I>(
     candidates: I,
     total_lines: usize,
@@ -158,7 +161,7 @@ where
         Ok(line) => Ok((line, failures)),
         Err(_) => Err(crate::error::Kind::ProbeFailed {
             message: if total_lines == 0 {
-                "no upload line candidates remain after filtering"
+                NO_LINE_CANDIDATES
             } else {
                 "no upload line probe succeeded"
             },
@@ -610,11 +613,7 @@ mod tests {
         assert!(failures[1].error.to_string().contains("ExpiredContext"));
 
         let empty = choose_line_and_failures(Vec::new(), 0).unwrap_err();
-        assert!(
-            empty
-                .to_string()
-                .contains("no upload line candidates remain after filtering")
-        );
+        assert_eq!(empty.to_string(), NO_LINE_CANDIDATES);
         // A deadline with unfinished requests is not an empty candidate set.
         let timed_out = choose_line_and_failures(Vec::new(), 2).unwrap_err();
         assert_eq!(timed_out.to_string(), message);

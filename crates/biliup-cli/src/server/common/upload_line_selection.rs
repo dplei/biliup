@@ -16,7 +16,7 @@ use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::connection_pool::ConnectionPool;
 use biliup::error::Kind;
 pub use biliup::uploader::line::ProbeFailure;
-use biliup::uploader::line::{Line, Probe};
+use biliup::uploader::line::{Line, NO_LINE_CANDIDATES, Probe};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use tracing::{info, warn};
@@ -293,11 +293,20 @@ pub async fn resolve_planned_line(
         .into_iter()
         .map(|row| row.line_key)
         .collect::<Vec<_>>();
-    let (line, probe_failures) = probe_with_fallback(|allowed| {
+    let probed = probe_with_fallback(|allowed| {
         let excluded = &excluded;
         async move { Probe::probe_filtered_with_failures(client, &allowed, excluded).await }
     })
-    .await?;
+    .await;
+    let (line, probe_failures) = match probed {
+        Err(error) if no_candidates_remain(&error) => {
+            match upload_line_health::claim_half_open_probe(pool, Utc::now()).await? {
+                Some(key) => half_open_probe(pool, client, key).await?,
+                None => return Err(error),
+            }
+        }
+        probed => probed?,
+    };
     let key = line.key().to_string();
     let source = if plan.chosen == AUTO {
         plan.source
@@ -313,6 +322,45 @@ pub async fn resolve_planned_line(
         },
         probe_failures,
     ))
+}
+
+/// 两轮探测都因过滤后无候选而失败 = 索引里的线路全部在冷却。
+fn no_candidates_remain(error: &error_stack::Report<AppError>) -> bool {
+    matches!(
+        error.downcast_ref::<Kind>(),
+        Some(Kind::ProbeFailed { message, .. }) if *message == NO_LINE_CANDIDATES
+    )
+}
+
+/// 全部线路冷却时只探领到的那一条。失败挂到 report 上，由 `finish_line_probe` 照常重新冷却；
+/// 成功即清掉它的冷却，排队的其他上传不必再各等一次半开。
+async fn half_open_probe(
+    pool: &ConnectionPool,
+    client: &reqwest::Client,
+    key: String,
+) -> AppResult<(Line, Vec<ProbeFailure>)> {
+    match Probe::probe_filtered_with_failures(client, std::slice::from_ref(&key), &[]).await {
+        Ok(probed) => {
+            upload_line_health::record_success(pool, &key, f64::NAN, Utc::now()).await?;
+            info!(line = %key, "所有上传线路都在冷却，半开探测成功，提前启用该线路");
+            Ok(probed)
+        }
+        Err(mut error) => {
+            let message = upload_line_health::sanitize_error(&format!(
+                "no healthy upload line is currently available: half-open probe of {key} failed: {error}"
+            ));
+            let mut failures = Vec::new();
+            if let Kind::ProbeFailed {
+                failures: probed, ..
+            } = &mut error
+            {
+                failures.append(probed);
+            }
+            Err(error_stack::Report::new(error)
+                .change_context(AppError::Custom(message))
+                .attach_opaque(failures))
+        }
+    }
 }
 
 async fn probe_with_fallback<F, Fut>(mut probe: F) -> AppResult<(Line, Vec<ProbeFailure>)>
@@ -463,6 +511,30 @@ mod tests {
             ["bda2", "estx"]
         );
         assert!(error.to_string().contains("no healthy upload line"));
+    }
+
+    #[tokio::test]
+    async fn only_an_empty_candidate_set_triggers_half_open() {
+        let empty = || Kind::ProbeFailed {
+            message: NO_LINE_CANDIDATES,
+            failures: Vec::new(),
+        };
+        let mut rounds = std::collections::VecDeque::from([Err(empty()), Err(empty())]);
+        let Err(all_cooling) =
+            probe_with_fallback(|_| std::future::ready(rounds.pop_front().unwrap())).await
+        else {
+            panic!("both rounds failed");
+        };
+        assert!(no_candidates_remain(&all_cooling));
+
+        let mut rounds =
+            std::collections::VecDeque::from([Err(failed_probe("bda2")), Err(failed_probe("tx"))]);
+        let Err(probe_failed) =
+            probe_with_fallback(|_| std::future::ready(rounds.pop_front().unwrap())).await
+        else {
+            panic!("both rounds failed");
+        };
+        assert!(!no_candidates_remain(&probe_failed));
     }
 
     fn cooling(keys: &[(&str, &str)]) -> HashMap<String, CoolingLine> {

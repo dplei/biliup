@@ -15,6 +15,8 @@ pub(crate) const SLOW_RATIO: f64 = 4.0;
 const SLOW_COOLDOWN: Duration = Duration::minutes(30);
 pub const SLOW_THROUGHPUT: &str = "slow_throughput";
 const PROBE_LEASE: Duration = Duration::minutes(5);
+/// 全部线路冷却时，相邻两次半开探测的最小间隔（含最近一次真实探测失败）。
+const HALF_OPEN_INTERVAL: Duration = Duration::minutes(2);
 const MAX_ERROR_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +220,31 @@ pub async fn acquire_line(
         }
     }
     Ok(LineAvailability::Available)
+}
+
+/// 所有线路都在冷却时，领取一条做半开探测：只在 `probe_failure` 冷却里挑最早到期的那条；
+/// TLS、慢传、真实传输失败的冷却不碰。单条 UPDATE 原子完成，`updated_at` 兼作节流戳——
+/// 任一探测冷却行在间隔内被写过（领取或刚探测失败）就领不到，所以跨 worker、跨进程每个
+/// 间隔最多一次半开探测。
+pub async fn claim_half_open_probe(
+    pool: &ConnectionPool,
+    now: DateTime<Utc>,
+) -> AppResult<Option<String>> {
+    sqlx::query_scalar(
+        "UPDATE upload_line_health SET updated_at = ?1 \
+         WHERE line_key = (SELECT line_key FROM upload_line_health \
+                           WHERE cooldown_until > ?1 AND last_failure_kind = ?3 \
+                           ORDER BY cooldown_until LIMIT 1) \
+           AND NOT EXISTS (SELECT 1 FROM upload_line_health \
+                           WHERE cooldown_until > ?1 AND last_failure_kind = ?3 AND updated_at > ?2) \
+         RETURNING line_key",
+    )
+    .bind(now)
+    .bind(now - HALF_OPEN_INTERVAL)
+    .bind(UploadFailureKind::Probe.as_str())
+    .fetch_optional(pool)
+    .await
+    .change_context(AppError::Unknown)
 }
 
 pub async fn active_cooldowns(
@@ -528,6 +555,61 @@ mod tests {
                 Some(now + Duration::minutes(minutes))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn half_open_claims_the_earliest_probe_cooldown_once_per_interval() {
+        let (_dir, pool) = migrated_pool().await;
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        for (line, at) in [("tx", t0 + Duration::minutes(10)), ("bda2", t0)] {
+            for _ in 0..4 {
+                record_failure(&pool, line, UploadFailureKind::Probe, "timed out", at)
+                    .await
+                    .unwrap();
+            }
+        }
+        let first = t0 + Duration::minutes(10) + HALF_OPEN_INTERVAL;
+        assert_eq!(
+            claim_half_open_probe(&pool, first)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bda2")
+        );
+        assert_eq!(
+            claim_half_open_probe(&pool, first + Duration::minutes(1))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            claim_half_open_probe(&pool, first + HALF_OPEN_INTERVAL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bda2")
+        );
+    }
+
+    #[tokio::test]
+    async fn half_open_never_claims_tls_or_transfer_cooldowns() {
+        let (_dir, pool) = migrated_pool().await;
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        for (line, kind) in [
+            ("bldsa", UploadFailureKind::CertificateExpired),
+            ("tx", UploadFailureKind::SlowTransfer),
+            ("bda2", UploadFailureKind::Transport),
+        ] {
+            for _ in 0..4 {
+                record_failure(&pool, line, kind, "boom", t0).await.unwrap();
+            }
+        }
+        assert_eq!(
+            claim_half_open_probe(&pool, t0 + Duration::minutes(10))
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     async fn row(pool: &ConnectionPool, line_key: &str) -> UploadLineHealth {
