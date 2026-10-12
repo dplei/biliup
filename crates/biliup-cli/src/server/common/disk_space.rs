@@ -10,11 +10,7 @@ use std::path::Path;
 /// `path` 可以是文件（用其所在目录）或目录本身，且不必已经存在——产物还没写出来时也要
 /// 能问。探测不出来时返回 `None`，调用方一律按「不做限制」处理。
 pub fn available_bytes(path: &Path) -> Option<u64> {
-    let directory = if path.is_dir() {
-        path
-    } else {
-        path.parent()?
-    };
+    let directory = if path.is_dir() { path } else { path.parent()? };
     statvfs_available(directory)
 }
 

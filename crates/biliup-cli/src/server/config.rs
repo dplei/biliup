@@ -776,10 +776,9 @@ mod audio_normalization_config_tests {
         assert!(config.validate_segment_limits().is_ok());
 
         for value in [0u64, 2048] {
-            let config: Config = serde_yaml::from_str(&format!(
-                "audio_normalization_disk_reserve_gib: {value}"
-            ))
-            .unwrap();
+            let config: Config =
+                serde_yaml::from_str(&format!("audio_normalization_disk_reserve_gib: {value}"))
+                    .unwrap();
             assert!(config.validate_segment_limits().is_err());
         }
 

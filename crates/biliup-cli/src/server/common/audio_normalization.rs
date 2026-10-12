@@ -1328,8 +1328,18 @@ async fn create_reference_sample(
     }
     // 退出码不够：`-ss` 落到文件尾之外时 ffmpeg 照样退 0，只是产出一个几百字节的空容器。
     // 空样片一路带到后面只会变成难懂的测量失败，在这里就挡住。
-    let raw_bytes = tokio::fs::metadata(&raw).await.map(|m| m.len()).unwrap_or(0);
-    if raw_bytes == 0 || runner.probe(&raw).await.ok().and_then(|v| v.duration_seconds).is_none() {
+    let raw_bytes = tokio::fs::metadata(&raw)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if raw_bytes == 0
+        || runner
+            .probe(&raw)
+            .await
+            .ok()
+            .and_then(|v| v.duration_seconds)
+            .is_none()
+    {
         let _ = remove_if_exists(&raw).await;
         bail!(AppError::Custom(format!(
             "sample extraction produced an empty clip ({raw_bytes} bytes); \
@@ -1644,7 +1654,14 @@ Target Offset:        +9.8 LU\n";
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("有 空格.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
-        let outcome = normalize_for_upload(&source, -16.0, &FakeRunner::clean(), true, DiskBudget::unlimited()).await;
+        let outcome = normalize_for_upload(
+            &source,
+            -16.0,
+            &FakeRunner::clean(),
+            true,
+            DiskBudget::unlimited(),
+        )
+        .await;
         let output = match outcome {
             NormalizationOutcome::Normalized {
                 form: NormalizedForm::Artifact(artifact),
@@ -1711,7 +1728,14 @@ Target Offset:        +9.8 LU\n";
         let source = dir.path().join("segment.flv");
         tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
         assert!(matches!(
-            normalize_for_upload(&source, -16.0, &FakeRunner::failing(), false, DiskBudget::unlimited()).await,
+            normalize_for_upload(
+                &source,
+                -16.0,
+                &FakeRunner::failing(),
+                false,
+                DiskBudget::unlimited()
+            )
+            .await,
             NormalizationOutcome::Original {
                 reason: OriginalReason::MeasureFailed
             }
@@ -1727,7 +1751,8 @@ Target Offset:        +9.8 LU\n";
         let runner = FakeRunner::clean();
         let expected = runner.output_bytes.clone();
 
-        let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
+        let outcome =
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
         assert!(matches!(
             outcome,
@@ -1782,7 +1807,8 @@ Target Offset:        +9.8 LU\n";
             let source = dir.path().join("segment.flv");
             tokio::fs::write(&source, SOURCE_BYTES).await.unwrap();
 
-            let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
+            let outcome =
+                normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
             assert!(
                 matches!(
@@ -2035,14 +2061,17 @@ Target Offset:        +9.8 LU\n";
         // 的替换失败方式（只读目录在以 root 运行的容器里挡不住）。
         let source = dir.path().join("segment.flv");
         tokio::fs::create_dir(&source).await.unwrap();
-        tokio::fs::write(source.join("occupant"), b"busy").await.unwrap();
+        tokio::fs::write(source.join("occupant"), b"busy")
+            .await
+            .unwrap();
         // 目录的 `len()` 是几十到几百字节，产物要够大才能越过体积判据、走到 rename 那一步。
         let runner = FakeRunner {
             output_bytes: vec![b'n'; 4096],
             ..FakeRunner::default()
         };
 
-        let outcome = normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
+        let outcome =
+            normalize_for_upload(&source, -16.0, &runner, false, DiskBudget::unlimited()).await;
 
         assert!(matches!(
             outcome,
@@ -2050,7 +2079,11 @@ Target Offset:        +9.8 LU\n";
                 reason: OriginalReason::TranscodeFailed
             }
         ));
-        assert!(tokio::fs::try_exists(source.join("occupant")).await.unwrap());
+        assert!(
+            tokio::fs::try_exists(source.join("occupant"))
+                .await
+                .unwrap()
+        );
         assert!(leftover_artifacts(dir.path()).await.is_empty());
         assert_eq!(active_artifacts_under(dir.path()), 0);
     }
@@ -2109,10 +2142,7 @@ Target Offset:        +9.8 LU\n";
 
         let outcome = normalize_for_upload(&source, -16.0, &runner, false, budget).await;
 
-        assert!(matches!(
-            outcome,
-            NormalizationOutcome::Normalized { .. }
-        ));
+        assert!(matches!(outcome, NormalizationOutcome::Normalized { .. }));
         assert!(*measured.lock().unwrap());
     }
 
@@ -2311,12 +2341,29 @@ Target Offset:        +9.8 LU\n";
             let source = dir.path().join(format!("{label}.flv"));
             let status = tokio::process::Command::new("ffmpeg")
                 .args([
-                    "-y", "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi", "-i", "sine=frequency=440:duration=20:sample_rate=48000",
-                    "-f", "lavfi", "-i", "testsrc=duration=20:size=160x120:rate=10",
-                    "-filter:a", audio_filter,
-                    "-c:v", "libx264", "-preset", "ultrafast",
-                    "-c:a", "aac", "-b:a", "128k", "-shortest",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=20:sample_rate=48000",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=20:size=160x120:rate=10",
+                    "-filter:a",
+                    audio_filter,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-shortest",
                 ])
                 .arg(&source)
                 .status()
@@ -2325,9 +2372,14 @@ Target Offset:        +9.8 LU\n";
             assert!(status.success(), "{label}: fixture generation failed");
 
             let runner = SystemAudioFfmpeg::default();
-            let measured =
-                parse_loudnorm_measurement(&runner.measure(&source, LoudnessTarget(target)).await.unwrap().stderr)
-                    .unwrap();
+            let measured = parse_loudnorm_measurement(
+                &runner
+                    .measure(&source, LoudnessTarget(target))
+                    .await
+                    .unwrap()
+                    .stderr,
+            )
+            .unwrap();
             // 测量遍永远自报 dynamic——它没有 measured_* 输入，本来就做不了线性。
             // 钉住这一点，免得将来有人又把它当成预测器。
             let output = dir.path().join(format!("{label}-out.flv"));
@@ -2344,7 +2396,9 @@ Target Offset:        +9.8 LU\n";
                 Some(expected_mode),
                 "{label}: unexpected normalization mode"
             );
-            let output_i = report.output_i.expect("summary must carry Output Integrated");
+            let output_i = report
+                .output_i
+                .expect("summary must carry Output Integrated");
             if tolerance.is_finite() {
                 assert!(
                     (output_i - target).abs() <= tolerance,
@@ -2426,11 +2480,11 @@ Target Offset:        +9.8 LU\n";
             .await
             .expect("sample was not produced")
             .len();
-        let probe = SystemAudioFfmpeg::for_sample().probe(&sample).await.unwrap();
-        println!(
-            "sample: {bytes} bytes, span={:?}s",
-            probe.duration_seconds
-        );
+        let probe = SystemAudioFfmpeg::for_sample()
+            .probe(&sample)
+            .await
+            .unwrap();
+        println!("sample: {bytes} bytes, span={:?}s", probe.duration_seconds);
         assert!(probe.primary_audio_stream.is_some());
         // 空容器只有几百字节、探不到时长；真样片是 30 秒 96k AAC，几百 KB 起。
         assert!(
@@ -2532,17 +2586,35 @@ Target Offset:        +9.8 LU\n";
         let dir = tempfile::tempdir().unwrap();
         // 四种音频配置，用来看产物/原片比值随音频码率怎么变——准入水位的
         // `OUTPUT_SIZE_FACTOR` 就是按这个比值定的。
-        let variants = [("64k", "44100"), ("128k", "48000"), ("192k", "48000"), ("320k", "48000")];
+        let variants = [
+            ("64k", "44100"),
+            ("128k", "48000"),
+            ("192k", "48000"),
+            ("320k", "48000"),
+        ];
         let mut sources = Vec::new();
         for (index, (bitrate, rate)) in variants.iter().enumerate() {
             let source = dir.path().join(format!("segment-{index}.mp4"));
             let status = tokio::process::Command::new("ffmpeg")
                 .args([
-                    "-y", "-f", "lavfi", "-i",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
                     "testsrc=duration=15:size=640x480:rate=15",
-                    "-f", "lavfi", "-i", "sine=frequency=440:duration=15",
-                    "-filter:a", "volume=-24dB",
-                    "-c:a", "aac", "-b:a", bitrate, "-ar", rate, "-shortest",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=15",
+                    "-filter:a",
+                    "volume=-24dB",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    bitrate,
+                    "-ar",
+                    rate,
+                    "-shortest",
                 ])
                 .arg(&source)
                 .status()
@@ -2602,7 +2674,11 @@ Target Offset:        +9.8 LU\n";
             );
         }
 
-        println!("\n并发 {} 段，历时 {:.1}s", sources.len(), elapsed.as_secs_f64());
+        println!(
+            "\n并发 {} 段，历时 {:.1}s",
+            sources.len(),
+            elapsed.as_secs_f64()
+        );
         println!("{:<8} {:>12} {:>12} {:>8}", "音频", "原片", "产物", "倍率");
         let mut worst_ratio = 0.0_f64;
         for (source, before, bitrate) in &sources {
@@ -2611,9 +2687,7 @@ Target Offset:        +9.8 LU\n";
             worst_ratio = worst_ratio.max(ratio);
             println!("{bitrate:<8} {before:>12} {after:>12} {ratio:>8.2}");
         }
-        println!(
-            "最大倍率 {worst_ratio:.2}，准入用的 OUTPUT_SIZE_FACTOR = {OUTPUT_SIZE_FACTOR}"
-        );
+        println!("最大倍率 {worst_ratio:.2}，准入用的 OUTPUT_SIZE_FACTOR = {OUTPUT_SIZE_FACTOR}");
         println!(
             "⚠️ 这组倍率不能外推到真实录像：合成素材的视频只有几十 kbps，音频占了大头，\n\
              而真实直播录像是 Mbps 级视频 + 192k 音频，音频占比 <2%，重编再怎么变都动不了\n\

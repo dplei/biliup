@@ -1,4 +1,5 @@
 use crate::observe::{self, standalone::UploadTask};
+use crate::server::common::upload_line_selection::explicit_upload_line;
 use crate::server::errors::{AppError, AppResult};
 use crate::upload_lock::UploadLock;
 use biliup::client::StatelessClient;
@@ -6,7 +7,6 @@ use biliup::error::Kind;
 use biliup::uploader::bilibili::{BiliBili, Studio, Vid, Video};
 use biliup::uploader::credential::{Credential, LoginInfo};
 use biliup::uploader::line::Probe;
-use crate::server::common::upload_line_selection::explicit_upload_line;
 use biliup::uploader::util::SubmitOption;
 use biliup::uploader::{VideoFile, credential, load_config};
 use bytes::{Buf, Bytes};
@@ -227,14 +227,7 @@ pub async fn upload_by_config(
         task.check(cover_up(&mut studio, &bilibili).await, "cover_failed")?;
 
         studio.videos = task.check(
-            upload_with_task(
-                &paths,
-                &bilibili,
-                config.line.clone(),
-                config.limit,
-                &task,
-            )
-            .await,
+            upload_with_task(&paths, &bilibili, config.line.clone(), config.limit, &task).await,
             "upload_failed",
         )?;
         // 命令行参数优先，如果没有提供则使用配置文件中的设置
@@ -303,8 +296,7 @@ pub async fn append(
         "target_lookup_failed",
     )?;
     if let Some(part) = replace {
-        let index = replace_index(part, studio.videos.len())
-            .map_err(AppError::Custom)?;
+        let index = replace_index(part, studio.videos.len()).map_err(AppError::Custom)?;
         if video_path.len() != 1 {
             return Err(AppError::Custom(format!(
                 "替换一个分P只能给一个文件，收到 {} 个",
@@ -318,7 +310,9 @@ pub async fn append(
         println!("  换成  {}", video_path[0].display());
         if !execute {
             println!();
-            println!("这是预演：没有上传任何文件，也没有改动稿件。确认无误后加 --execute 再跑一次。");
+            println!(
+                "这是预演：没有上传任何文件，也没有改动稿件。确认无误后加 --execute 再跑一次。"
+            );
             return Ok(());
         }
     }
@@ -329,8 +323,7 @@ pub async fn append(
     match replace {
         Some(part) => {
             // 序号在上传前已经校验过，这里重算一次只是为了拿下标。
-            let index = replace_index(part, studio.videos.len())
-                .map_err(AppError::Custom)?;
+            let index = replace_index(part, studio.videos.len()).map_err(AppError::Custom)?;
             let replacement = uploaded_videos.remove(0);
             println!(
                 "替换第 {part} 个分P：{} -> {}",
@@ -365,7 +358,11 @@ pub async fn append(
             "unknown"
         },
         if result.is_ok() {
-            if replace.is_some() { "part_replaced" } else { "appended" }
+            if replace.is_some() {
+                "part_replaced"
+            } else {
+                "appended"
+            }
         } else {
             "request_failed"
         },
@@ -575,7 +572,10 @@ async fn upload_with_task(
         Some(line) => line,
         None => {
             if let Some(rejected) = line.as_deref().filter(|l| !l.eq_ignore_ascii_case("auto")) {
-                warn!(line = rejected, "上传线路不是合法的 upcdn key，改为自动探测");
+                warn!(
+                    line = rejected,
+                    "上传线路不是合法的 upcdn key，改为自动探测"
+                );
             }
             Probe::probe(&client.client)
                 .await
