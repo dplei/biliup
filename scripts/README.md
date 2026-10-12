@@ -3,7 +3,7 @@
 | 脚本 | 做什么 | 什么时候用 |
 | --- | --- | --- |
 | [`dev.sh`](dev.sh) | 起本机开发环境：按需构建前端与后端，绑 `127.0.0.1:19159` | 本地跑服务、手工验收 |
-| [`check_code_index.py`](check_code_index.py) | 校验 `CODE_INDEX.md` 的路径、重复条目和悬空关系 | 改完 `CODE_INDEX.md` 之后 |
+| [`check_code_index.py`](check_code_index.py) | 联合校验根导航与领域子索引的路径、链接、重复条目和悬空关系 | 改完根导航或子索引之后 |
 | [`structured_logging/check_diagnostic_classification.py`](structured_logging/check_diagnostic_classification.py) | 校验 P3/14 的旧 tracing 文件都已进入分类清单，新增/删除日志文件时阻止静默漏审 | 改观测调用点、下载器或诊断分类之后 |
 | [`consistency-audit.sh`](consistency-audit.sh) | 只读巡检：找出投稿与本地账本之间的错位 | 怀疑稿件重复/缺分P、或想确认某类问题是孤例还是系统性 |
 | [`normalization-disk-sample.py`](normalization-disk-sample.py) | 采样响度标准化中间件的数量与字节峰值，并判定是否超过上限 | 验收「就地替换」是否真的把磁盘峰值压到一份，或排查 `.part` 残留 |
@@ -26,7 +26,7 @@ scripts/dev.sh --release  # release 档编译后端，贴近镜像里的性能�
 python3 scripts/check_code_index.py
 ```
 
-改过 `CODE_INDEX.md` 就跑一次。约定见 [`docs/agents/code-index.md`](../docs/agents/code-index.md)。
+改过 `CODE_INDEX.md` 或 `docs/code-index/*.md` 就跑一次。约定见 [`docs/agents/code-index.md`](../docs/agents/code-index.md)。
 
 ## `structured_logging/check_diagnostic_classification.py`
 
