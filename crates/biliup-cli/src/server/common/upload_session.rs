@@ -863,6 +863,34 @@ pub async fn hold_session_submit(
     Ok(updated.rows_affected() == 1)
 }
 
+/// A reconnect inside the hold window has re-attached to this session: take back the close-time
+/// submit intent, otherwise the scanner finalizes it once the hold expires while recording is
+/// still running, and every later segment is rejected as late. The caller re-requests on close.
+///
+/// Claimed and remote-ambiguous sessions are left alone; withdrawing those could duplicate a
+/// manuscript.
+pub async fn withdraw_session_submit(
+    pool: &ConnectionPool,
+    live_streamer_id: i64,
+    streamer_info_id: i64,
+    now: DateTime<Utc>,
+) -> AppResult<Vec<i64>> {
+    sqlx::query_scalar(
+        "UPDATE upload_session SET submit_requested_at = NULL, next_submit_at = NULL, \
+         updated_at = ?1 \
+         WHERE live_streamer_id = ?2 AND streamer_info_id = ?3 AND status != 'finalized' \
+           AND submit_requested_at IS NOT NULL AND submit_claim_token IS NULL \
+           AND COALESCE(submit_state, '') NOT IN ('ok_no_aid', 'submitting', 'unknown_remote_result') \
+         RETURNING id",
+    )
+    .bind(now)
+    .bind(live_streamer_id)
+    .bind(streamer_info_id)
+    .fetch_all(pool)
+    .await
+    .change_context(AppError::Unknown)
+}
+
 /// Read only session-level submit state. This query deliberately does not aggregate lifecycle
 /// rows; the strict ledger check remains `claim_complete_session` after this cheap preflight.
 pub async fn session_submit_readiness(
@@ -1298,6 +1326,58 @@ mod tests {
         assert_eq!(
             session_submit_readiness(&pool, 70, later).await.unwrap(),
             SessionSubmitReadiness::Finalized
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_withdraws_held_submit_but_not_a_claimed_one() {
+        let (_directory, pool) = completeness_pool().await;
+        let closed = Utc.with_ymd_and_hms(2026, 10, 11, 5, 11, 46).unwrap();
+        let reconnected = closed + chrono::Duration::seconds(34);
+        request_session_submit(&pool, 70, closed).await.unwrap();
+        assert!(
+            hold_session_submit(&pool, 70, closed + chrono::Duration::seconds(300))
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            withdraw_session_submit(&pool, 7, 9, reconnected)
+                .await
+                .unwrap(),
+            vec![70]
+        );
+        let due = crate::server::common::submission_scheduler::due_submission_session_ids(
+            &pool,
+            closed + chrono::Duration::minutes(10),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            due.is_empty(),
+            "withdrawn session must not be finalized mid-recording"
+        );
+        assert_eq!(
+            session_submit_readiness(&pool, 70, reconnected)
+                .await
+                .unwrap(),
+            SessionSubmitReadiness::NotRequested
+        );
+
+        // The next close re-requests; a submission already in flight is never touched.
+        request_session_submit(&pool, 70, reconnected)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE upload_session SET submit_claim_token = 'claim' WHERE id = 70")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            withdraw_session_submit(&pool, 7, 9, reconnected)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -10,7 +10,7 @@ use crate::server::common::segment_enrollment::{
 };
 use crate::server::common::upload::{SubmissionTrigger, UploaderMessage, spawn_session_submission};
 use crate::server::common::upload_session::{
-    RequestSessionSubmit, hold_session_submit, request_session_submit,
+    RequestSessionSubmit, hold_session_submit, request_session_submit, withdraw_session_submit,
 };
 use crate::server::common::util::{FileValidator, InvalidMediaReason, MediaValidation};
 use crate::server::core::downloader::cover_downloader;
@@ -1187,6 +1187,20 @@ impl DownloadTask {
 
         // 初始化组件
         let mut processor = SegmentEventProcessor::new(sender, ctx.clone());
+        if ctx.reused_session() {
+            // 下播窗口内重连续接了同一会话：撤回上次关闭写下的投稿意图，否则 hold 到期后调度器
+            // 会在录制中途定稿，之后的分段全被当成迟到段拒收。登记进本轮集合，finish() 重新请求。
+            match withdraw_session_submit(ctx.pool(), ctx.worker_id(), ctx.id(), chrono::Utc::now())
+                .await
+            {
+                Ok(ids) => processor.enrolled_session_ids.extend(ids),
+                Err(error) => warn!(
+                    ?error,
+                    streamer_info_id = ctx.id(),
+                    "撤回续接会话的投稿意图失败，本场可能被提前定稿"
+                ),
+            }
+        }
         let failover_enabled = douyin_failover_enabled(
             &stream.platform,
             ctx.config().douyin_route_failover,
