@@ -41,7 +41,7 @@ RUN set -eux; \
 
 
 # Build biliup's python wheel
-FROM rust:latest@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c27b541a6238a181 AS wheel-builder
+FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS wheel-builder
 ARG repo_url=https://github.com/biliup/biliup
 ARG branch_name=master
 
