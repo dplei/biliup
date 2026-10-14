@@ -58,6 +58,8 @@
 - `crates/stream-gears/src/uploader.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`upload_with_task`）：Python 传入 task 关联底层传输与后续投稿。
 - `crates/biliup-cli/src/uploader.rs`、`crates/stream-gears/src/uploader.rs` → `crates/biliup-cli/src/observe/standalone.rs`（`UploadTask`）：早退记录投稿未开始的原因，远端请求返回后单独区分成功、失败与不确定结果。
 
+- `crates/biliup-cli/src/server/common/upload.rs` → `crates/biliup/src/uploader/bilibili.rs`（`build_studio`、`Studio.extra_fields`）：模板的 `extra_fields` JSON 经解析及 `serde(flatten)` 合并进投稿请求；`season_section_id` 仅在投稿成功后调用 `add_archive_to_season`，不自动设置动态防刷屏参数。
+
 ## 跨领域继续阅读
 
 - [媒体预处理](processing.md)
