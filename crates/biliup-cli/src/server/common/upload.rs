@@ -157,6 +157,7 @@ impl SubmissionTrigger {
 /// Stable outcome vocabulary shared by every submission wakeup source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionSubmissionOutcome {
+    ShuttingDown,
     NotRequested,
     NotDue {
         next_at: chrono::DateTime<chrono::Utc>,
@@ -182,6 +183,28 @@ pub enum SessionSubmissionOutcome {
     Held {
         error: String,
     },
+}
+
+#[derive(Default)]
+struct SubmissionLifecycle {
+    shutting_down: tokio::sync::RwLock<bool>,
+}
+
+impl SubmissionLifecycle {
+    async fn shutdown(&self) {
+        // Tokio queues this writer ahead of new readers and waits for admitted submissions.
+        *self.shutting_down.write().await = true;
+    }
+}
+
+static SUBMISSION_LIFECYCLE: OnceLock<SubmissionLifecycle> = OnceLock::new();
+
+/// Stop admission and drain coordinators before download cleanup can create more wakeups.
+pub async fn shutdown_session_submissions() {
+    SUBMISSION_LIFECYCLE
+        .get_or_init(Default::default)
+        .shutdown()
+        .await;
 }
 
 /// Fire-and-forget wakeup used after durable local state transitions. The coordinator owns all
@@ -864,6 +887,34 @@ pub async fn reconcile_session_submission(
     session_row_id: i64,
     trigger: SubmissionTrigger,
 ) -> AppResult<SessionSubmissionOutcome> {
+    reconcile_with_lifecycle(
+        config,
+        pool,
+        session_row_id,
+        trigger,
+        SUBMISSION_LIFECYCLE.get_or_init(Default::default),
+    )
+    .await
+}
+
+async fn reconcile_with_lifecycle(
+    config: &Config,
+    pool: &ConnectionPool,
+    session_row_id: i64,
+    trigger: SubmissionTrigger,
+    lifecycle: &SubmissionLifecycle,
+) -> AppResult<SessionSubmissionOutcome> {
+    // Keep admission until the claim has reached its existing definite/ambiguous result path.
+    let admission = lifecycle.shutting_down.read().await;
+    if *admission {
+        crate::observe::submission_decided(
+            &crate::observe::SubmissionIdentity::session(session_row_id),
+            "waiting",
+            "server_shutdown",
+            0,
+        );
+        return Ok(SessionSubmissionOutcome::ShuttingDown);
+    }
     let now = chrono::Utc::now();
     let submission = crate::observe::SubmissionIdentity::session(session_row_id);
     match session_submit_readiness(pool, session_row_id, now).await? {
@@ -5787,6 +5838,138 @@ mod tests {
             existing, None,
             "migration must not invent a normalization time for rows recorded before it"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_admitted_coordinator_to_return() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let config = Config::default();
+        let lifecycle = SubmissionLifecycle::default();
+        let connection_a = pool.acquire().await.unwrap();
+        let connection_b = pool.acquire().await.unwrap();
+        let active = reconcile_with_lifecycle(
+            &config,
+            &pool,
+            30,
+            SubmissionTrigger::DownloadClosed,
+            &lifecycle,
+        );
+        tokio::pin!(active);
+        tokio::select! {
+            biased;
+            _ = &mut active => panic!("coordinator must wait for a database connection"),
+            _ = std::future::ready(()) => {}
+        }
+        let shutdown = lifecycle.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown must wait for the coordinator"),
+            _ = std::future::ready(()) => {}
+        }
+        drop((connection_a, connection_b));
+        assert_eq!(
+            active.await.unwrap(),
+            SessionSubmissionOutcome::NotRequested
+        );
+        shutdown.await;
+    }
+
+    #[tokio::test]
+    async fn submission_shutdown_drains_and_preserves_intent_for_restart() {
+        let (_directory, pool) = deferred_test_pool().await;
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO upload_missing_segment \
+             (live_streamer_id, streamer_info_id, upload_session_id, file_path, segment_order, \
+              status, next_retry_at, created_at, updated_at, lifecycle_version, video_json) \
+             VALUES (10, 20, 30, '/complete.flv', 0, 'succeeded', ?1, ?1, ?1, 2, ?2)",
+        )
+        .bind(now)
+        .bind(serde_json::to_string(&Video::new("complete")).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        request_session_submit(&pool, 30, now).await.unwrap();
+        let config = Config::default();
+        let lifecycle = SubmissionLifecycle::default();
+
+        let active = lifecycle.shutting_down.read().await;
+        let shutdown = lifecycle.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => panic!("shutdown must wait for admitted work"),
+            _ = std::future::ready(()) => {}
+        }
+        let late = reconcile_with_lifecycle(
+            &config,
+            &pool,
+            30,
+            SubmissionTrigger::DownloadClosed,
+            &lifecycle,
+        );
+        tokio::pin!(late);
+        tokio::select! {
+            biased;
+            _ = &mut late => panic!("queued shutdown must prevent new admission"),
+            _ = std::future::ready(()) => {}
+        }
+        drop(active);
+        shutdown.await;
+        assert_eq!(late.await.unwrap(), SessionSubmissionOutcome::ShuttingDown);
+
+        for trigger in [
+            SubmissionTrigger::SegmentPersisted,
+            SubmissionTrigger::StaleSession,
+            SubmissionTrigger::ManualRecovery,
+            SubmissionTrigger::StartupScan,
+            SubmissionTrigger::PeriodicScan,
+        ] {
+            assert_eq!(
+                reconcile_with_lifecycle(&config, &pool, 30, trigger, &lifecycle)
+                    .await
+                    .unwrap(),
+                SessionSubmissionOutcome::ShuttingDown,
+            );
+        }
+        let session = UploadSession::select()
+            .where_("id = ?")
+            .bind(30)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(session.submit_requested_at.is_some());
+        let claim: Option<String> =
+            sqlx::query_scalar("SELECT submit_claim_token FROM upload_session WHERE id = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(claim.is_none());
+        assert!(session.submit_state.is_none());
+        assert_eq!(
+            crate::server::common::submission_scheduler::due_submission_session_ids(
+                &pool, now, true
+            )
+            .await
+            .unwrap(),
+            vec![30],
+        );
+
+        let restarted = SubmissionLifecycle::default();
+        // No live streamer fixture: after claiming, preparation safely schedules a retry.
+        assert!(matches!(
+            reconcile_with_lifecycle(
+                &config,
+                &pool,
+                30,
+                SubmissionTrigger::StartupScan,
+                &restarted
+            )
+            .await
+            .unwrap(),
+            SessionSubmissionOutcome::RetryScheduled { .. },
+        ));
     }
 
     #[tokio::test]

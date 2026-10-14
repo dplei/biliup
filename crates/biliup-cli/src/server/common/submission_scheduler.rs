@@ -76,7 +76,8 @@ impl SubmissionScanSummary {
             SessionSubmissionOutcome::ClaimedElsewhere => self.claimed_elsewhere.push(session_id),
             SessionSubmissionOutcome::ManualInspectionRequired { .. }
             | SessionSubmissionOutcome::Held { .. } => self.manual_inspection.push(session_id),
-            SessionSubmissionOutcome::NotRequested
+            SessionSubmissionOutcome::ShuttingDown
+            | SessionSubmissionOutcome::NotRequested
             | SessionSubmissionOutcome::NotDue { .. }
             | SessionSubmissionOutcome::DiscardedEmpty
             | SessionSubmissionOutcome::Finalized => self.skipped.push(session_id),
