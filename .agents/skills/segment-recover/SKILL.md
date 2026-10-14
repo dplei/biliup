@@ -73,18 +73,25 @@ ffmpeg -hide_banner -loglevel verbose -nostats -fflags +igndts \
   -i 取回的原片.flv -c copy -f null - 2>&1 | grep -c "non monotonically increasing dts"
 ```
 
-零命中说明这个文件的时间戳在 ffmpeg 眼里是单调的。**这不等于没问题**：32 位回绕会被
-解复用器展开成「单调但巨大的向前跳变」，扫描发现不了。这时改用 `ffprobe` 看首尾时间戳
-和相邻包的跳变，别急着说文件是好的。
+零命中说明这个文件的时间戳在 ffmpeg 眼里是单调的。**这不等于没问题**：直播源断流
+（相邻包向前跳十几、几十秒，B 站报「视频在第 N 秒跳变到 M 秒」）和 32 位回绕展开出的
+巨大前跳，这个扫描都发现不了。脚本会同时检查回退和前跳，直接跑它。
 
 修复用平移，不是夹取：
 
 ```bash
-python3 scripts/timestamp_shift.py 取回的原片.flv 修好的.mp4
+python3 scripts/timestamp_shift.py 取回的原片.flv 修好的.flv
 ```
 
-脚本会算出每条流「从第几个包开始、加多少偏移」，打印一条现成的 ffmpeg 命令，你跑它。
-没有回退它会直说，那就别硬套。
+产物保持源容器（flv 转 mp4 的 edit list 会让解码少出帧）。脚本按 DTS 判定，打印一条
+现成的 ffmpeg 命令，你跑它：
+
+- **回退**：每条流算「从第几个包开始、加多少偏移」。
+- **前跳**：所有流在同一处一起跳才算断流，空洞之后音视频用同一个偏移往回收，偏移给
+  B 帧留了余量（断流截断的 GOP，空洞前最大 PTS 可能比 DTS 晚好几帧）。只有一条流跳、
+  或回退与前跳混在一起，它会直说不处理——那就停下来跟用户说，别手搓 `setts=ts=`
+  （它会把 PTS 写成 DTS，抹掉 B 帧顺序）。
+- 两种都没有它也直说，那就别硬套。
 
 **为什么是平移不是夹取**：服务端用的是 `setts=...max(TS, PREV_OUT+1)`，把回退那段时间
 夹掉；回退量一大，后面的真实内容会被压进几百毫秒变成帧风暴，所以服务端设了 10 秒闸门，
@@ -99,6 +106,9 @@ python3 scripts/timestamp_shift.py 取回的原片.flv 修好的.mp4
 ## 第 3 步 · 复检
 
 **这一步是你干的，不是用户干的。** 四项都要对：
+
+`python3 scripts/test_timestamp_shift.py 取回的原片.flv 修好的.flv` 一次打印下面四项和
+解码输出序是否单调；也可以手工跑：
 
 ```bash
 # 1. 扫描零命中

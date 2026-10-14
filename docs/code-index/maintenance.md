@@ -16,7 +16,8 @@
 | `scripts/structured_logging/check_diagnostic_classification.py` | 校验 P3/14 的机器分类目录：四个 Rust 运行时源码根里每个含 tracing 级别宏的文件必须恰好有一个默认处置，新增/删除文件会阻断；只做文件级漂移检测，不替代调用点语义复核。 | `main`、`scanned_files` |
 | `.scratch/structured-logging/diagnostic-classification-v1.json` | P3/14 未迁移诊断的机器目录：按文件冻结 native/bridge/no-persistence/coverage-gap 默认处置，并另列有理由的明确不支持能力边界。人类可读语义与阶段结论见同目录 `diagnostic-classification.md`。 | `version`、`groups`、`explicitly_unsupported_boundaries` |
 | `scripts/dev.sh` | 本机开发环境启动脚本：按需构建前端产物与后端二进制，可选带起 Next.js 热重载，绑 127.0.0.1 起服务。 | — |
-| `scripts/timestamp_shift.py` | 算出把回退的时间戳「平移」接回去所需的 setts 参数并打印现成的 ffmpeg 命令：逐流找回退点、按典型帧间隔补偏移、多次回退累加。服务端已改成增量模型（`timestamp_repair.rs` 的 `delta_setts`）后两者效果相当，本脚本留给本机应急与服务端修不好的存量片；只算回退，前跳形态尚未覆盖。`segment-recover` skill 用它。 | `find_drops`、`expression`、`typical_delta` |
+| `scripts/timestamp_shift.py` | 算出把坏时间戳「平移」接回去所需的 setts 参数并打印现成的 ffmpeg 命令，按 DTS 判定：回退逐流补偏移、多次累加；前跳（直播断流）要求所有流同处一起跳，空洞后音视频共用一个收回偏移并给 B 帧 composition 留余量；混合形态或单流前跳拒绝处理；产物默认保持源容器。服务端增量模型见 `timestamp_repair.rs` 的 `delta_setts`。`segment-recover` skill 用它。 | `build`、`plan_forward`、`find_drops`、`find_gaps` |
+| `scripts/test_timestamp_shift.py` | 合成带 B 帧、截断 GOP、两处断流的小样本验 `timestamp_shift.py`；带两个文件参数时直接打印复检数字。 | `recheck`、`ForwardJumpTests` |
 | `scripts/normalization-disk-sample.py` | 采样响度标准化中间件的数量与字节峰值并判定是否超过上限；只读，直播中可跑。 | `scan`、`Peaks` |
 | `scripts/structured_logging/evidence.py` | 有界只读双源证据导出与确定性校验：固定高水位分批、原生/桥接分列、旧文件代次与字节边界、批内一致匿名映射，manifest 记录不完整原因。 | `export`、`validate`、`Bundle`、`Budget`、`readonly` |
 | `scripts/structured_logging/recording_pilot.py` | P3/12 的受控录制演练：本地回环发合成 FLV（含人工注入的 DTS 倒退与中途截断），跑真实 Python 下载入口，核对身份链与分段/断连事件，并生成证据包请求与预期事实清单。 | `inject_dts_backward`、`serve`、`check`、`expectations` |
