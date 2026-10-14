@@ -9,6 +9,7 @@ use crate::server::common::recording_lease::{
 };
 use crate::server::common::recovery_scheduler::start_due_recovery_scan;
 use crate::server::common::submission_scheduler::start_submission_reconciliation_scan;
+use crate::server::common::upload::shutdown_session_submissions;
 use crate::server::errors::{AppError, AppResult};
 use crate::server::infrastructure::service_register::ServiceRegister;
 use crate::server::infrastructure::users::Backend;
@@ -185,5 +186,6 @@ async fn shutdown_signal(
         _ = terminate => { deletion_task_abort_handle.abort() },
     }
     recording_lease_tasks.abort();
+    shutdown_session_submissions().await;
     service_register.cleanup().await;
 }

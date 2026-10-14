@@ -22,6 +22,8 @@ HTTP 路由、认证边界、业务端点、配置模型、业务 SQLite 连接�
 
 ## 高信号关系
 
+- `crates/biliup-cli/src/server/app.rs` → `crates/biliup-cli/src/server/common/upload.rs`（`shutdown_session_submissions`）：信号后先关闭投稿准入并等待已准入协调收尾，再清理下载任务；关停产生的持久投稿意图留给重启扫描。
+
 以下箭头包含控制流、数据流和跨语言边界，具体含义以边后的说明为准；不等同于完整函数调用图。
 
 - `crates/biliup-cli/src/server/common/cookie_health.rs`、`crates/biliup-cli/src/uploader.rs`、`crates/stream-gears/src/lib.rs` → `crates/biliup-cli/src/observe/auth.rs`（`health_changed`、`operation_failed`、`observe`）：健康跃迁只从状态机的两次转变发出，登录/续期/Python 登录辅助函数只报告单次失败，不改变健康状态。
