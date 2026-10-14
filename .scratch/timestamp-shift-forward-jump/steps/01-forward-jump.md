@@ -1,6 +1,6 @@
 # 01 前跳处理与 DTS 判定
 
-Status: ready-for-human（PR 待合并）
+Status: ready-for-human（PR #110 已合并 `76c5ccc3`，待下一个前跳样本验收）
 
 - 改动：`scripts/timestamp_shift.py`；新增 `scripts/test_timestamp_shift.py`；
   `segment-recover` skill 第 2、3 步（`.claude/` 与 `.agents/` 两份）；`docs/code-index/maintenance.md`。

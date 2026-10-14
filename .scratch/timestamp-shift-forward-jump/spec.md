@@ -31,4 +31,4 @@
 
 ## 进度
 
-- [x] 01 实现与自检（`steps/01-forward-jump.md`）——PR 待合并
+- [x] 01 实现与自检（`steps/01-forward-jump.md`）——PR #110 已合并（`76c5ccc3`），issue 挂 awaiting-verification 待实际样本验收
