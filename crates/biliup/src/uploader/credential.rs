@@ -165,9 +165,12 @@ impl Credential {
             .get("https://passport.bilibili.com/x/passport-login/oauth2/info")
             .query(&payload)
             .send()
-            .await?
+            // The query contains login credentials; strip it before any caller logs the error.
+            .await
+            .map_err(reqwest::Error::without_url)?
             .json()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         // if response.code != 0 {
         //     return Err(CustomError::Custom(response.to_string()));
         // }
@@ -660,5 +663,55 @@ impl Credential {
 impl Default for Credential {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn token_validation_error_keeps_cause_without_credentials() {
+        // This proxy accepts TCP but never responds, so no request reaches Bilibili.
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut credential = Credential::default();
+        credential.0.client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap())
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let login_info = LoginInfo {
+            cookie_info: Value::Null,
+            sso: vec![],
+            token_info: TokenInfo {
+                access_token: "fixture-access-secret".into(),
+                expires_in: 0,
+                mid: 0,
+                refresh_token: "fixture-refresh-secret".into(),
+            },
+            platform: None,
+        };
+
+        let error = credential.validate_tokens(&login_info).await.unwrap_err();
+        let Kind::Reqwest(request_error) = &error else {
+            panic!("expected typed request error");
+        };
+        assert!(request_error.is_timeout());
+        assert!(request_error.url().is_none());
+        assert!(std::error::Error::source(request_error).is_some());
+        let mut cause: Option<&dyn std::error::Error> = Some(&error);
+        while let Some(error) = cause {
+            for rendered in [format!("{error}"), format!("{error:?}")] {
+                for secret in [
+                    "fixture-access-secret",
+                    "fixture-refresh-secret",
+                    "access_key=",
+                    "sign=",
+                ] {
+                    assert!(!rendered.contains(secret));
+                }
+            }
+            cause = error.source();
+        }
     }
 }
