@@ -11,7 +11,7 @@ Status: ready-for-human
 
 ## 回执
 
-实现已完成，待 PR 合并及真实环境验收。
+实现已完成，[PR #108](https://github.com/dplei/biliup/pull/108) 已合并至 dev；仍待真实环境验收，暂不归档。
 
 - `cargo test -p biliup-cli --lib --tests`：501 项通过，12 项原有忽略，零失败（完整测试时包含首项新回归）。
 - 补充真实协调器数据库等待测试后，`cargo test -p biliup-cli --lib shutdown`：两项关停回归通过。
