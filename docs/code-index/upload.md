@@ -12,6 +12,7 @@
 
 | 文件 | 主要作用 | 关键符号 |
 | --- | --- | --- |
+| `crates/biliup/src/uploader/credential.rs` | 账号登录、cookie/token 校验与刷新；token 校验的发送与 JSON 解码错误移除请求 URL，保留 typed 原因供各入口处理。 | `Credential`、`login_by_cookies`、`validate_tokens`、`renew_tokens` |
 | `crates/biliup-cli/examples/upload_pilot.rs` | P3/13 的受控后处理演练：本地 sqlite 跑真实登记、投稿判定与补传资格判定，两个 sink 同时输出，并生成证据包请求与预期事实清单。无账号、无网络。 | `drill`、`write_evidence_request` |
 | `crates/biliup-cli/src/uploader.rs` | 独立 CLI 上传、配置逐稿投稿、追加与登录工具；保留 checkpoint 和限流锁，上传调用显式传 task，预上传重试分别分配 attempt。 | `upload_by_command`、`upload_by_config`、`append`、`upload_with_task`、`UploadCheckpoint` |
 | `crates/stream-gears/src/uploader.rs` | Python 上传参数到上传/封面/投稿的编排，显式传递同一 task，复用服务端线路及持久限流准入。 | `StudioPre`、`upload` |
