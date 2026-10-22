@@ -1,5 +1,9 @@
 # 开录首段的 sequence header 不再建立时间基准（issue #116）
 
+来源：https://github.com/dplei/biliup/issues/116
+
+状态：已合并（#117，1.3.53），等待生产验收；验收清单见 issue #116 评论。验收通过前不归档。
+
 ## 问题
 
 B 站 CDN 码流开头的 AAC sequence header 带陈旧时间戳（实测 2147178），AVC sequence
