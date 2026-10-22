@@ -181,7 +181,40 @@ fn follows(from: i64, to: i64) -> bool {
     to >= from && to - from <= REBASE_MAX_STEP_MS
 }
 
+fn slot(tag_type: TagType) -> usize {
+    match tag_type {
+        TagType::Audio => 0,
+        TagType::Video => 1,
+        TagType::Script => 2,
+    }
+}
+
+/// AAC / AVC / HEVC 的 sequence header。它们是解码配置，不承载时间轴。
+fn is_sequence_header(tag_type: TagType, body: &[u8]) -> bool {
+    match (tag_type, body) {
+        (TagType::Audio, [flags, packet_type, ..]) => flags >> 4 == 10 && *packet_type == 0,
+        (TagType::Video, [flags, packet_type, ..]) => {
+            matches!(flags & 0x0f, 7 | 12) && *packet_type == 0
+        }
+        _ => false,
+    }
+}
+
 impl TimestampRebase {
+    /// sequence header 不参与基准判定，只贴在本流上一个写出值之后（还没有就贴已写出最大值）。
+    /// B 站 CDN 开录时 AAC sequence header 带陈旧时间戳、AVC 的为 0，真实媒体在另一个基准上；
+    /// 交给 `map` 会让它们各自建立本流基准，首段音画相差约 2147 秒（issue #116）。
+    fn map_config(&mut self, tag_type: TagType) -> u32 {
+        let stream = &mut self.streams[slot(tag_type)];
+        let emit = stream
+            .last_emit
+            .map_or(self.high_water, |last| last + 1)
+            .clamp(0, u32::MAX as i64);
+        stream.last_emit = Some(emit);
+        self.high_water = self.high_water.max(emit);
+        emit as u32
+    }
+
     fn map(&mut self, tag_type: TagType, src: u32) -> Mapped {
         // script tag 不走连续性判据：切段 prelude 的 onMetaData 一段只有一个，相邻两个隔着整段
         // 时长，必然超过 `REBASE_MAX_STEP_MS`，于是每次都判成偏离、写成「上一个 script +1ms」，
@@ -201,11 +234,7 @@ impl TimestampRebase {
                 deviation: None,
             };
         }
-        let slot = match tag_type {
-            TagType::Audio => 0,
-            TagType::Video => 1,
-            TagType::Script => 2,
-        };
+        let slot = slot(tag_type);
         let src = src as i64;
         let stream = self.streams[slot];
         let mut deviation = None;
@@ -634,7 +663,14 @@ pub(crate) async fn parse_flv(
                 segment.set_time_position(Duration::from_millis(timestamp));
                 for (tag_header, flv_tag_data, previous_tag_size_bytes) in &flv_tags_cache {
                     let source_ms = tag_header.timestamp;
-                    let mapped = rebase.map(tag_header.tag_type, source_ms);
+                    let mapped = if is_sequence_header(tag_header.tag_type, flv_tag_data) {
+                        Mapped {
+                            emit: rebase.map_config(tag_header.tag_type),
+                            deviation: None,
+                        }
+                    } else {
+                        rebase.map(tag_header.tag_type, source_ms)
+                    };
                     if let Some((previous_ms, reason_code)) = mapped.deviation {
                         warn!(
                             "Non-monotonous DTS in output stream; previous: {previous_ms}, current: {source_ms}, written as {};",
@@ -1483,8 +1519,8 @@ mod tests {
         bytes
     }
 
-    /// 按 FLV 结构走一遍落盘文件，返回 `(tag_type, timestamp)`。
-    fn written_tags(path: &std::path::Path) -> Vec<(u8, u32)> {
+    /// 按 FLV 结构走一遍落盘文件，返回 `(tag_type, timestamp, 是否 sequence header)`。
+    fn written_tags(path: &std::path::Path) -> Vec<(u8, u32, bool)> {
         let data = std::fs::read(path).unwrap();
         let mut offset = 13;
         let mut tags = Vec::new();
@@ -1497,7 +1533,13 @@ mod tests {
                 data[offset + 5],
                 data[offset + 6],
             ]);
-            tags.push((data[offset], timestamp));
+            let body = &data[offset + 11..offset + 11 + size];
+            let is_header = match data[offset] {
+                8 => body[0] >> 4 == 10 && body[1] == 0,
+                9 => matches!(body[0] & 0x0f, 7 | 12) && body[1] == 0,
+                _ => false,
+            };
+            tags.push((data[offset], timestamp, is_header));
             offset += 11 + size + 4;
         }
         tags
@@ -1542,8 +1584,8 @@ mod tests {
             for tag_type in [8u8, 9, 18] {
                 let stamps: Vec<_> = tags
                     .iter()
-                    .filter(|(kind, _)| *kind == tag_type)
-                    .map(|(_, timestamp)| *timestamp)
+                    .filter(|(kind, _, _)| *kind == tag_type)
+                    .map(|(_, timestamp, _)| *timestamp)
                     .collect();
                 assert!(
                     stamps.windows(2).all(|pair| pair[0] < pair[1]),
@@ -1559,6 +1601,70 @@ mod tests {
             }),
             "换基准仍然要留下事件，运维才知道文件被重基过"
         );
+    }
+
+    /// B 站 CDN 的开录码流：AAC sequence header 带陈旧时间戳、AVC sequence header 为 0，
+    /// 真实媒体从另一个大基准起且音视频同步。sequence header 曾被当成各流的时间基准，
+    /// 视频首帧被压到 1ms、音频接在陈旧基准后，首段音画相差约 2147 秒（issue #116）。
+    #[tokio::test]
+    async fn leading_sequence_headers_do_not_set_the_time_base() {
+        const MEDIA: u32 = 2_963_844;
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_tag(&mut bytes, 18, &metadata, 0);
+        append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 2_147_178);
+        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        for index in 0..90u32 {
+            let timestamp = MEDIA + index * 33;
+            let frame_type = if index % 30 == 0 { 0x17 } else { 0x27 };
+            append_tag(&mut bytes, 9, &[frame_type, 0x01, 0, 0, 0, 0x41], timestamp);
+            append_tag(&mut bytes, 8, &[0xaf, 0x01, 0x41], timestamp + 17);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("seqhdr").display().to_string();
+        let mut connection = Connection::new(complete_response(bytes));
+        connection.read_frame(9).await.unwrap();
+        let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
+        let segment = crate::downloader::util::Segmentable::new(None, None);
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut connection, file, segment, &mut progress)
+            .await
+            .unwrap();
+
+        let path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "flv"))
+            .unwrap();
+        let tags = written_tags(&path);
+        let media = |tag_type: u8| -> Vec<u32> {
+            tags.iter()
+                .filter(|(kind, _, header)| *kind == tag_type && !header)
+                .map(|(_, timestamp, _)| *timestamp)
+                .collect()
+        };
+        let (audio, video) = (media(8), media(9));
+        assert!(
+            !audio.is_empty() && !video.is_empty(),
+            "没写出媒体帧：{tags:?}"
+        );
+        assert!(
+            audio[0].abs_diff(video[0]) < 100,
+            "音视频首帧相差过大：video {} / audio {}",
+            video[0],
+            audio[0]
+        );
+        for (kind, stamps) in [("audio", &audio), ("video", &video)] {
+            assert!(
+                stamps
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1] && pair[1] - pair[0] < 1_000),
+                "{kind} 时间戳不连续：{stamps:?}"
+            );
+        }
     }
 
     /// 构造一个「先吐若干 chunk、之后永远不再产出」的响应。
